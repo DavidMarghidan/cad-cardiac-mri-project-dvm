@@ -300,7 +300,7 @@ auc = roc_auc_score(y_val, preds)
 print("AUC:", auc)
 aucs.append(auc)
 
-# TEST1
+# TEST2
 
 ################################## end for
 
