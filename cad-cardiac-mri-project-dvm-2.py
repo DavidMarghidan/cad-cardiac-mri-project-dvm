@@ -41,6 +41,8 @@ from sklearn.metrics import roc_auc_score             # Evaluation metric → se
 
 import torch.nn.functional as F          # Functional ops (upsampling) → used for resizing segmentation masks
 
+import matplotlib.pyplot as plt
+
 # =============================
 # CONFIGURATION
 # =============================
@@ -260,6 +262,45 @@ def apply_mask(img, mask):
     # ✅ Keep only heart region
     return img * mask   # Zero out non-heart pixels
 
+
+
+def denormalize(img):
+    img = img * 0.5 + 0.5
+    return img.clamp(0, 1)
+
+
+def debug_visualization(imgs, masks, roi_imgs, scores, batch_idx, max_show=1):
+    imgs = imgs.cpu()
+    masks = masks.cpu()
+    roi_imgs = roi_imgs.cpu()
+    scores = scores.cpu()
+
+    os.makedirs("debug_output", exist_ok=True)
+
+    for i in range(min(max_show, imgs.shape[0])):
+        fig, ax = plt.subplots(1, 3, figsize=(12, 4))
+
+        # Original
+        ax[0].imshow(denormalize(imgs[i]).permute(1, 2, 0).numpy())
+        ax[0].set_title("Original")
+        ax[0].axis("off")
+
+        # Mask
+        ax[1].imshow(masks[i][0], cmap='gray')
+        ax[1].set_title("Mask")
+        ax[1].axis("off")
+
+        # ROI
+        ax[2].imshow(denormalize(roi_imgs[i]).permute(1, 2, 0).numpy())
+        ax[2].set_title(f"ROI (std={scores[i]:.3f})")
+        ax[2].axis("off")
+
+        plt.tight_layout()
+        plt.savefig(f"debug_output/batch{batch_idx}_img{i}.png")
+        plt.close()
+
+
+
 # =============================
 # PIPELINE STEP 4
 # EfficientNet-B0 – FEATURE EXTRACTION
@@ -290,14 +331,14 @@ feature_extractor.eval()
 # Feature Extraction + Slice Filtering
 # =============================
 
-def extract_features(dataset):
+def extract_features(dataset, debug=False):
 
     loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False)
 
     all_features, all_labels, all_patients = [], [], []
 
     with torch.no_grad():   # Disable gradients → faster inference
-        for imgs, labels, patients in tqdm(loader):
+        for batch_idx, (imgs, labels, patients) in enumerate(tqdm(loader)):
 
             imgs = imgs.to(DEVICE)
 
@@ -318,6 +359,11 @@ def extract_features(dataset):
             # Compute intensity variability
             # Low std → flat image (likely no heart or poor quality)
             scores = torch.std(roi_imgs, dim=[1,2,3])
+
+
+            # ✅ DEBUG VISUAL (doar primele batch-uri)
+            if debug and batch_idx == 0:
+                debug_visualization(imgs, masks, roi_imgs, scores, batch_idx)
 
             # ✅ Keep informative slices only
             keep = scores > scores.median()
@@ -380,12 +426,16 @@ test_patients  = normal[1:2] + sick[1:2]
 train_samples = [s for s in samples if s[2] in train_patients]
 test_samples  = [s for s in samples if s[2] in test_patients]
 
+# train_samples = train_samples[0:100]
+# test_samples = test_samples[0:100]
+
 train_ds = MRIDataset(train_samples, transform)
 test_ds  = MRIDataset(test_samples, transform)
 
 # ✅ Extract features
-X_train, y_train, p_train = extract_features(train_ds)
-X_test,  y_test,  p_test  = extract_features(test_ds)
+X_train, y_train, p_train = extract_features(train_ds, debug=True)
+X_test,  y_test,  p_test  = extract_features(test_ds, debug=True)
+
 
 # ✅ Logistic Regression (can replace with SVM easily)
 clf = LogisticRegression(max_iter=1000)
