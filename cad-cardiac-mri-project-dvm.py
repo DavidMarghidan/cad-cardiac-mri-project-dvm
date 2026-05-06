@@ -386,15 +386,15 @@ normal = [p for p in patients if p.startswith("Normal")]
 sick = [p for p in patients if p.startswith("Sick")]
 
 # Split manual (dataset mic)
-train_patients = normal[:2] + sick[:2]
-test_patients  = normal[2:4] + sick[2:4]
+train_patients = normal[:1] + sick[:1]
+test_patients  = normal[1:2] + sick[1:2]
 
 # Construim seturile
 train_samples = [s for s in samples if s[2] in train_patients]
 test_samples  = [s for s in samples if s[2] in test_patients]
 
-train_samples = train_samples[0:11]
-test_samples = test_samples[0:11]
+# train_samples = train_samples[0:200]
+# test_samples = test_samples[0:200]
 
 train_ds = MRIDataset(train_samples, transform)
 test_ds  = MRIDataset(test_samples, transform)
