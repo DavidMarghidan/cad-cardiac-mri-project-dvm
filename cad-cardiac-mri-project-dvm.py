@@ -20,7 +20,7 @@
 # The pipeline is intentionally modular so every stage can later be replaced
 # independently:
 #
-#   - Segmentation model → ACDC pretrained 2D model / U-Net / SAM / MedSAM
+#   - Segmentation model → MedSAM Pretrained 2D model / U-Net / SAM / MedSAM
 #   - Backbone → EfficientNet / ConvNeXt / ViT
 #   - Fusion → Bayesian / Mean / Attention pooling
 #   - Final classifier → LR / SVM / XGBoost
@@ -31,7 +31,7 @@
 #
 # MRI slice (2D)
 #    ↓
-# ACDC pretrained 2D segmentation model (segmentare inimă)
+# MedSAM Pretrained 2D segmentation model (segmentare inimă)
 #    ↓
 # Soft probability mask
 #    ↓
@@ -158,6 +158,10 @@ import matplotlib.pyplot as plt
 #   - debugging masks
 #   - ROI inspection
 #   - sanity checks
+
+
+from segment_anything import sam_model_registry, SamPredictor
+from huggingface_hub import hf_hub_download
 
 
 # =============================
@@ -444,454 +448,197 @@ transform = transforms.Compose([
     #   - improved transfer learning
 ])
 
-
 # =============================
 # PIPELINE STEP 2
-# ACDC PRETRAINED 2D SEGMENTATION MODEL – HEART SEGMENTATION
+# MEDSAM PRETRAINED SEGMENTATION MODEL
 # =============================
 
-class ACDCPretrainedSegmentationModel(nn.Module):
+
+class MedSAMPretrainedSegmentationModel(nn.Module):
     """
     PIPELINE STEP 2:
-    Uses a pretrained 2D cardiac MRI segmentation model trained on ACDC.
+    MedSAM-based cardiac ROI extraction.
 
     =========================================================================
-    WHY ACDC PRETRAINED SEGMENTATION?
+    WHY MEDSAM?
     =========================================================================
 
-    Instead of training a segmentation network from scratch on the CAD
-    dataset, we reuse a model that has already learned cardiac anatomy from
-    the ACDC (Automated Cardiac Diagnosis Challenge) dataset.
+    The original ACDC segmentation network was trained exclusively on ACDC
+    cardiac MRI data.
 
-    The selected public ACDC model:
-        - is trained specifically on cardiac MRI
-        - expects single-channel grayscale MRI
-        - uses 256 x 256 input images
-        - predicts 4 anatomical classes:
-              0 = background
-              1 = right ventricle
-              2 = myocardium
-              3 = left ventricle
+    The CAD Cardiac MRI Dataset contains substantially different image
+    characteristics:
 
-    This is especially useful here because the CAD dataset contains 2D MRI
-    slices but does not provide the heart segmentation masks required to
-    train a new segmentation network.
+        - larger field of view
+        - coronal acquisitions
+        - surrounding thoracic organs
+        - different scanner settings
 
-    Therefore the segmentation stage becomes:
+    As a consequence, the ACDC model often predicts only background.
 
-        CAD MRI slice
-              ↓
-        ACDC pretrained model
-              ↓
-        4-class anatomical prediction
-              ↓
-        foreground probability
-              ↓
-        pseudo-mask of the heart
-              ↓
-        ROI extraction
-              ↓
-        EfficientNet-B0
+    MedSAM is a foundation segmentation model built upon Segment Anything and
+    adapted to medical imaging.
+
+    It generalizes significantly better to unseen medical datasets.
 
     =========================================================================
-    WHY "PSEUDO-MASK"?
+    INPUT
     =========================================================================
 
-    The ACDC model produces a segmentation prediction for the current CAD
-    image. This prediction is not a manual annotation created for the CAD
-    dataset.
+        [B,3,224,224]
 
-    Therefore it is used as a PSEUDO-MASK:
-
-        ACDC pretrained model
-              ↓
-        predicted cardiac structures
-              ↓
-        pseudo-mask
-
-    The pseudo-mask is then used only to isolate the cardiac region before
-    feature extraction.
+    identical to the original pipeline.
 
     =========================================================================
-    WHY NOT TRAIN THIS MODEL HERE?
+    OUTPUT
     =========================================================================
 
-    The purpose of this pipeline is to use the available CAD labels for the
-    final CAD classifier, while obtaining cardiac localization from a model
-    already trained on an independent cardiac segmentation dataset.
+        [B,1,224,224]
 
-    This has several advantages:
-
-        - no manual segmentation annotations are required
-        - no segmentation training stage is added
-        - the segmentation model already learned cardiac anatomy
-        - the CAD classifier receives a cleaner cardiac ROI
-        - the entire pipeline remains relatively simple
+    soft ROI mask.
 
     =========================================================================
-    IMPORTANT INPUT DIFFERENCE
-    =========================================================================
-
-    The existing CAD pipeline uses:
-
-        3-channel
-        224 x 224
-
-    because EfficientNet-B0 expects ImageNet-style input.
-
-    The ACDC segmentation model uses:
-
-        1-channel grayscale
-        256 x 256
-
-    Therefore this class performs the required conversion internally.
-
-    This allows the rest of the original pipeline to remain unchanged.
-
-    =========================================================================
-    IMPORTANT OUTPUT DIFFERENCE
-    =========================================================================
-
-    The pretrained ACDC model produces 4 segmentation classes.
-
-    We convert them into one cardiac foreground probability:
-
-        P(heart) =
-            P(RV) + P(Myocardium) + P(LV)
-
-    Background is excluded.
-
-    The resulting single-channel probability map is returned to the original
-    pipeline as the segmentation mask.
-
-    =========================================================================
-    PRETRAINED MODEL SOURCE
-    =========================================================================
-
-    The model weights are downloaded automatically from the public
-    Hugging Face repository:
-
-        MohidAbdullah/ACDC-Heart-Segmentation
-
-    A single fold is used here (fold_1_model.pth) to keep the pipeline simple
-    and avoid downloading the complete 5-fold ensemble.
-
-    The model architecture file is downloaded together with the checkpoint
-    because the checkpoint must be loaded into its exact architecture.
-
-    =========================================================================
-    REPRODUCIBILITY
-    =========================================================================
-
-    The repository revision is pinned so that the same architecture and
-    checkpoint are used when the pipeline is executed again.
-
-    =========================================================================
-    NOTE
-    =========================================================================
-
-    The pretrained model is used ONLY for inference.
-
-    It is therefore put into:
-
-        eval()
-
-    and gradients are not calculated during its use.
     """
 
     def __init__(self):
-
         super().__init__()
 
-        # =========================================================
-        # ACDC MODEL LOCATION
-        # =========================================================
-
-        # Public Hugging Face repository containing:
-        #   - model.py
-        #   - fold_1_model.pth
-        #
-        # The model was trained on the ACDC cardiac MRI dataset.
-        self.repo_id = "MohidAbdullah/ACDC-Heart-Segmentation"
-
-        # Pin the repository revision for reproducibility.
-        #
-        # This avoids silently changing the architecture/checkpoint if the
-        # public repository is updated in the future.
-        self.repo_revision = "5f17ef5"
-
-        # Local directory used to cache the downloaded segmentation model.
         self.model_dir = os.path.join(
             "pretrained_models",
-            "ACDC_Heart_Segmentation"
+            "MedSAM"
         )
 
-        os.makedirs(self.model_dir, exist_ok=True)
-
-        # =========================================================
-        # DOWNLOAD MODEL ARCHITECTURE + PRETRAINED WEIGHTS
-        # =========================================================
-
-        # The checkpoint contains learned parameters only, while the Python
-        # architecture is stored separately as model.py.
-        #
-        # Both files therefore have to be available before loading the model.
-        model_py_path = os.path.join(
+        os.makedirs(
             self.model_dir,
-            "model.py"
+            exist_ok=True
         )
 
-        weights_path = os.path.join(
-            self.model_dir,
-            "fold_1_model.pth"
-        )
 
-        model_py_url = (
-            "https://huggingface.co/"
-            f"{self.repo_id}/resolve/{self.repo_revision}/model.py"
-        )
 
-        weights_url = (
-            "https://huggingface.co/"
-            f"{self.repo_id}/resolve/{self.repo_revision}/fold_1_model.pth"
-        )
+        # checkpoint_path = hf_hub_download(
+        #     repo_id="wanglab/medsam-vit-b",
+        #     filename="medsam_vit_b.pth",
+        #     local_dir=self.model_dir
+        # )
 
-        # ---------------------------------------------------------
-        # Download model.py only if it is not already cached.
-        # ---------------------------------------------------------
+        # =========================================================
+        # LOAD LOCAL MEDSAM CHECKPOINT
+        # =========================================================
 
-        if not os.path.exists(model_py_path):
+        checkpoint_path = "./pretrained_models/MedSAM/medsam_vit_b.pth"
 
-            print("Downloading ACDC segmentation architecture...")
-
-            import urllib.request
-
-            urllib.request.urlretrieve(
-                model_py_url,
-                model_py_path
-            )
-
-        # ---------------------------------------------------------
-        # Download pretrained checkpoint only if it is not cached.
-        # ---------------------------------------------------------
-
-        if not os.path.exists(weights_path):
-
-            print(
-                "Downloading ACDC pretrained segmentation weights "
-                "(fold 1)..."
-            )
-
-            import urllib.request
-
-            urllib.request.urlretrieve(
-                weights_url,
-                weights_path
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(
+                f"MedSAM checkpoint not found:\n{checkpoint_path}"
             )
 
         # =========================================================
-        # LOAD THE ORIGINAL ACDC MODEL DEFINITION
+        # CREATE SAM MODEL
         # =========================================================
 
-        # The pretrained checkpoint was created using the exact architecture
-        # provided by model.py in the repository.
-        #
-        # Loading that file avoids manually recreating the architecture and
-        # reduces the risk of a mismatch between:
-        #
-        #   model architecture
-        #   checkpoint parameters
-        #
-        import importlib.util
+        self.sam = sam_model_registrycheckpoint = checkpoint_path
 
-        spec = importlib.util.spec_from_file_location(
-            "acdc_model_definition",
-            model_py_path
+        self.sam.to(DEVICE)
+
+        self.sam.eval()
+
+        self.predictor = SamPredictor(
+            self.sam
         )
-
-        if spec is None or spec.loader is None:
-
-            raise RuntimeError(
-                "Could not load the ACDC model definition from model.py."
-            )
-
-        acdc_module = importlib.util.module_from_spec(spec)
-
-        spec.loader.exec_module(acdc_module)
-
-        # =========================================================
-        # INITIALIZE THE PRETRAINED ACDC NETWORK
-        # =========================================================
-
-        # According to the model definition, the network expects:
-        #
-        #   img_ch = 1
-        #       → grayscale MRI
-        #
-        #   output_ch = 4
-        #       → background + RV + myocardium + LV
-        #
-        self.model = acdc_module.AttentionUNet(
-            img_ch=1,
-            output_ch=4
-        )
-
-        # =========================================================
-        # LOAD PRETRAINED PARAMETERS
-        # =========================================================
-
-        # PyTorch versions differ in support for the "weights_only"
-        # argument. The fallback keeps the pipeline compatible with older
-        # PyTorch installations as well.
-        try:
-            checkpoint = torch.load(
-                weights_path,
-                map_location="cpu",
-                weights_only=False
-            )
-        except TypeError:
-            checkpoint = torch.load(
-                weights_path,
-                map_location="cpu"
-            )
-
-        # Some checkpoints store parameters directly as a state_dict,
-        # while others wrap them inside "model_state_dict".
-        #
-        # The following makes the loading code compatible with both formats.
-        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-
-            state_dict = checkpoint["model_state_dict"]
-
-        else:
-
-            state_dict = checkpoint
-
-        self.model.load_state_dict(state_dict)
-
-        # The segmentation model is used only for inference.
-        self.model.eval()
-
-        # Keep the pretrained model on the same device as the rest of the
-        # pipeline.
-        self.model.to(DEVICE)
 
     def forward(self, x):
+        batch_masks = []
 
-        # =========================================================
-        # ORIGINAL CAD IMAGE
-        # =========================================================
+        for img_tensor in x:
+            # =====================================================
+            # REVERSE NORMALIZATION
+            # =====================================================
 
-        # At this point x is still the tensor produced by MRIDataset:
-        #
-        #   [B, 3, 224, 224]
-        #
-        # because the rest of the original pipeline is intentionally kept
-        # unchanged.
+            img = img_tensor.detach().cpu()
 
-        original_size = x.shape[-2:]
+            img = img * 0.5 + 0.5
 
-        # =========================================================
-        # CONVERT 3-CHANNEL IMAGE → 1-CHANNEL MRI
-        # =========================================================
+            img = img.permute(
+                1,
+                2,
+                0
+            ).numpy()
 
-        # The three channels contain identical grayscale information.
-        #
-        # Taking the first channel restores the original MRI representation.
-        grayscale = x[:, 0:1, :, :]
+            img = np.clip(
+                img,
+                0,
+                1
+            )
 
-        # =========================================================
-        # RESIZE TO ACDC INPUT SIZE
-        # =========================================================
+            img = (
+                    img * 255
+            ).astype(
+                np.uint8
+            )
 
-        # The pretrained ACDC model was trained using 256 x 256 images.
-        #
-        # We therefore resize the MRI slice before segmentation.
-        grayscale = F.interpolate(
-            grayscale,
-            size=(256, 256),
-            mode="bilinear",
-            align_corners=False
+            # =====================================================
+            # MEDSAM IMAGE ENCODING
+            # =====================================================
+
+            self.predictor.set_image(img)
+
+            h, w = img.shape[:2]
+
+            # =====================================================
+            # AUTOMATIC CARDIAC BOX PROMPT
+            # =====================================================
+
+            #
+            # The CAD dataset usually places the
+            # heart near the central thoracic area.
+            #
+            # A box prompt produces much better
+            # masks than a single positive point.
+            #
+
+            input_box = np.array([
+                w * 0.25,
+                h * 0.05,
+                w * 0.75,
+                h * 0.60
+            ])
+
+            masks, scores, logits = self.predictor.predict(
+                box=input_box,
+                multimask_output=True
+            )
+
+            best_mask = masks[
+                np.argmax(scores)
+            ]
+
+            best_mask = torch.tensor(
+                best_mask,
+                dtype=torch.float32
+            )
+
+            best_mask = best_mask.unsqueeze(0)
+
+            batch_masks.append(
+                best_mask
+            )
+
+        batch_masks = torch.stack(
+            batch_masks,
+            dim=0
         )
 
-        # =========================================================
-        # ACDC SEGMENTATION
-        # =========================================================
-
-        # The model produces:
-        #
-        #   [B, 4, 256, 256]
-        #
-        # where the four channels correspond to:
-        #
-        #   0 → background
-        #   1 → right ventricle
-        #   2 → myocardium
-        #   3 → left ventricle
-        #
-        logits = self.model(grayscale)
-
-        # =========================================================
-        # MULTI-CLASS LOGITS → CLASS PROBABILITIES
-        # =========================================================
-
-        # Softmax converts the four logits at every pixel into probabilities
-        # whose sum is 1.
-        probabilities = torch.softmax(logits, dim=1)
-
-        # =========================================================
-        # BUILD CARDIAC FOREGROUND PSEUDO-MASK
-        # =========================================================
-
-        # We do not need the individual anatomical labels for the next stage.
-        #
-        # The ROI only needs to know:
-        #
-        #   "Is this pixel part of the heart?"
-        #
-        # Therefore we combine:
-        #
-        #   RV + Myocardium + LV
-        #
-        # and exclude:
-        #
-        #   Background
-        #
-        # This produces a SOFT pseudo-mask in [0,1].
-        heart_probability = probabilities[:, 1:4, :, :].sum(
-            dim=1,
-            keepdim=True
+        batch_masks = batch_masks.to(
+            DEVICE
         )
 
-        # =========================================================
-        # RETURN TO ORIGINAL CAD IMAGE SIZE
-        # =========================================================
-
-        # The rest of the pipeline still works at 224 x 224.
-        #
-        # Resizing here means that:
-        #
-        #   - ACDC operates at its native 256 x 256 resolution
-        #   - EfficientNet pipeline remains unchanged at 224 x 224
-        heart_probability = F.interpolate(
-            heart_probability,
-            size=original_size,
-            mode="bilinear",
-            align_corners=False
-        )
-
-        return heart_probability
+        return batch_masks
 
 
-# Initialize the ACDC pretrained segmentation model.
-#
-# The variable name "unet" is intentionally preserved so that the remaining
-# original pipeline does not need to be modified.
-unet = ACDCPretrainedSegmentationModel().to(DEVICE)
+unet = MedSAMPretrainedSegmentationModel().to(
+    DEVICE
+)
 
-# Inference mode:
-#   disables dropout
-#   freezes batchnorm updates
 unet.eval()
 
 
@@ -935,7 +682,7 @@ def apply_mask(img, mask):
     """
 
     # Convert soft probabilities → binary mask
-    mask = mask.float()
+    mask = (mask > 0.5).float()
 
     # Duplicate mask across RGB channels
     mask = mask.repeat(1, 3, 1, 1)
