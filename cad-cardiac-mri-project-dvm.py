@@ -1,5 +1,5 @@
 #%% ============================================================
-# 🧠 CAD Detection from Cardiac MRI – Full Series-Level Pipeline (Single File)
+# 🧠 CAD Detection from Cardiac MRI – MONAI Series-Level Pipeline (Single File)
 # ============================================================
 
 # ============================================================================
@@ -7,47 +7,85 @@
 # ============================================================================
 #
 # This script implements a FULL END-TO-END CAD (Coronary Artery Disease)
-# series-level classification pipeline using Cardiac MRI slices.
+# series-level classification pipeline using 2D Cardiac MRI JPEG images from:
+#
+#   CAD Cardiac MRI Dataset
+#   https://www.kaggle.com/datasets/danialsharifrazi/cad-cardiac-mri-dataset/data
+#
+# The public JPEG release does not expose a reliable patient identifier.
+# Therefore, the observable prediction unit used by this implementation is the
+# folder-series (for example, SR_10 or series0003-Body), not the patient.
 #
 # The architecture combines:
 #
-#   1. Deep Learning segmentation
-#   2. ROI extraction
-#   3. Deep feature extraction
-#   4. Classical Machine Learning classification
-#   5. Series-level probabilistic fusion
+#   1. Pretrained MONAI cardiac MRI segmentation
+#   2. Confidence-gated soft ROI extraction
+#   3. ImageNet-pretrained EfficientNet-B0 feature extraction
+#   4. Slice quality filtering
+#   5. Classical Machine Learning classification
+#   6. Series-level probabilistic fusion
+#   7. Directory-grouped train/test evaluation
 #
-# The pipeline is intentionally modular so every stage can later be replaced
-# independently:
+# The segmentation stage uses the official MONAI Model Zoo bundle:
 #
-#   - Segmentation model → U-Net / Attention U-Net / SAM / MedSAM
-#   - Backbone → EfficientNet / ConvNeXt / ViT
-#   - Fusion → Bayesian / Mean / Attention pooling
-#   - Final classifier → LR / SVM / XGBoost
+#   ventricular_short_axis_3label, version 0.3.5
+#
+# The bundle contains a pretrained 2D residual U-Net that produces four output
+# channels:
+#
+#   0 = background
+#   1 = left-ventricular blood pool
+#   2 = left-ventricular myocardium
+#   3 = right-ventricular blood pool
+#
+# IMPORTANT DOMAIN LIMITATION:
+# The MONAI model was trained for 2D short-axis cardiac MR images. The CAD
+# dataset also contains heterogeneous series, including long-axis images,
+# localizers, derived exports, and possibly other acquisition types. For that
+# reason, this script does NOT trust every segmentation unconditionally.
+# A plausibility gate checks mask size and confidence. If a mask is implausible,
+# the full image is used instead of a potentially destructive ROI mask.
+#
+# Required packages:
+#
+#   pip install monai==1.6.0 huggingface_hub
+#   pip install torch torchvision opencv-python numpy scikit-learn matplotlib tqdm
+#
+# On first execution, the script downloads the pinned MONAI bundle into the
+# local monai_bundles directory. Set AUTO_DOWNLOAD_MONAI_BUNDLE = False if the
+# bundle must be supplied manually or the machine has no internet access.
 #
 # ============================================================================
 # PIPELINE FLOW
 # ============================================================================
 #
-# MRI slice (2D)
+# Raw MRI JPEG slice
 #    ↓
-# Attention U-Net (segmentare inimă)
+# Min-max intensity scaling to [0,1]
 #    ↓
-# Soft probability mask
+# Aspect-ratio-preserving zero padding to 256×256
 #    ↓
-# ROI extraction (heart isolation)
+# Pretrained MONAI residual U-Net
 #    ↓
-# EfficientNet-B0 (ImageNet pretrained)
+# Four-class ventricular probability map
 #    ↓
-# 1280D feature vector / slice
+# Cardiac probability = LV pool + myocardium + RV pool
 #    ↓
-# Slice quality filtering
+# Mask plausibility / confidence check
 #    ↓
-# Bayesian series fusion
+# Confidence-gated soft ROI
 #    ↓
-# Logistic Regression / SVM
+# EfficientNet-B0 ImageNet normalization
 #    ↓
-# Series-level CAD-associated prediction
+# EfficientNet-B0 feature encoding
+#    ↓
+# 1280D feature vector / retained slice
+#    ↓
+# Logistic Regression slice probabilities
+#    ↓
+# Bayesian fusion across slices in one folder-series
+#    ↓
+# Series-level CAD-associated probability
 #
 # ============================================================================
 # WHY THIS PIPELINE?
@@ -55,21 +93,34 @@
 #
 # Medical MRI datasets are usually:
 #
-#   - Small
+#   - Small relative to natural-image datasets
 #   - Noisy
-#   - Highly variable between acquisitions and series
-#   - Difficult to annotate
+#   - Heterogeneous across scanners, protocols, views, and exports
+#   - Difficult and expensive to annotate
 #
 # Therefore:
 #
-#   - Transfer learning improves generalization
-#   - Segmentation reduces background noise
-#   - Slice filtering removes uninformative views
-#   - Series-level aggregation stabilizes predictions
+#   - A cardiac-MRI-pretrained segmenter is preferable to a randomly
+#     initialized segmentation head.
+#   - Soft ROI weighting reduces irrelevant anatomy without deleting all
+#     contextual information.
+#   - Confidence gating protects the pipeline when the pretrained segmenter is
+#     applied outside its original short-axis domain.
+#   - Transfer learning improves feature quality when labeled CAD data are
+#     limited.
+#   - Slice filtering removes low-information images.
+#   - Series-level aggregation combines evidence from multiple images.
+#   - Directory-grouped splitting keeps known exact duplicates and related
+#     folder-series from the same Directory_* on the same side of the split.
 #
-# The pipeline mimics radiologist reasoning:
+# The pipeline approximates the following reasoning process:
 #
-#   "Inspect multiple slices from one series → combine evidence → classify the series"
+#   "Localize cardiac anatomy when reliable → inspect several informative
+#    images from one folder-series → combine evidence → classify the series."
+#
+# This is an exploratory series-level classifier. It must not be described as
+# a patient-level diagnostic model because the public release does not provide
+# a defensible image-to-patient mapping.
 #
 # ============================================================================
 
@@ -78,86 +129,97 @@
 # IMPORTS
 # =============================
 
+import hashlib
+# Used to verify the SHA-256 checksum of the downloaded MONAI checkpoint.
+# Checksum verification makes the experiment more reproducible and helps detect
+# corrupted or unintended model files.
+
 import os
-# OS interaction (files, paths)
+# OS interaction (files, paths, environment variables).
 # Used for:
 #   - traversing dataset folders
-#   - building portable file paths
-#   - checking execution environment (Kaggle vs local)
+#   - building portable paths
+#   - detecting Kaggle versus local execution
+#   - reading optional bundle path overrides
+
+from pathlib import Path
+# Object-oriented path manipulation.
+# Used to manage the MONAI bundle directory and checkpoint files safely.
 
 import cv2
-# OpenCV image processing library
-# Efficient for:
-#   - grayscale MRI loading
-#   - image resizing
-#   - low-level pixel manipulation
+# OpenCV image processing library.
+# Used for:
+#   - grayscale JPEG loading
+#   - aspect-ratio-preserving resizing
+#   - creating fixed-size inputs for MONAI and EfficientNet
 
 import numpy as np
-# Core numerical computation library
-# Used heavily for:
-#   - matrix operations
+# Core numerical computation library.
+# Used for:
+#   - image preprocessing
 #   - probability fusion
-#   - feature aggregation
-#   - tensor-like preprocessing
+#   - feature and label arrays
+#   - deterministic directory shuffling
 
 from tqdm import tqdm
-# Progress visualization utility
-# Helpful for:
-#   - monitoring extraction progress
-#   - debugging long-running inference pipelines
+# Progress visualization utility.
+# Useful for monitoring segmentation and feature extraction over many slices.
 
 import torch
-# PyTorch Deep Learning framework
+# PyTorch Deep Learning framework.
 # Provides:
+#   - tensor computation
 #   - GPU acceleration
-#   - automatic differentiation
-#   - tensor computations
+#   - model inference
 
 import torch.nn as nn
-# Neural network building blocks:
-#   - convolution layers
-#   - activation functions
-#   - modules
-
-from torch.utils.data import Dataset, DataLoader
-# Dataset utilities:
-#   - batching
-#   - shuffling
-#   - multiprocessing data loading
-
-import torchvision.transforms as transforms
-# Image preprocessing utilities:
-#   - tensor conversion
-#   - normalization
-#   - augmentation (optional)
-
-from torchvision import models
-# Access to pretrained ImageNet architectures:
-#   - ResNet
-#   - EfficientNet
-#   - ViT
-# etc.
-
-from sklearn.linear_model import LogisticRegression
-# Classical ML classifier
-# Used after deep feature extraction
-
-from sklearn.metrics import roc_auc_score
-# Evaluation metric:
-# ROC-AUC measures ranking quality
-# Extremely important for medical binary classification
+# Neural-network module API.
+# Used for the EfficientNet feature-extractor wrapper.
 
 import torch.nn.functional as F
-# Functional API
-# Used here mainly for:
-#   - interpolation
-#   - resizing masks
+# Functional tensor operations.
+# Used for:
+#   - softmax over MONAI output channels
+#   - mask dilation with max pooling
+#   - mask resizing from 256×256 to 224×224
+
+from torch.utils.data import Dataset, DataLoader
+# Dataset utilities for batching and deterministic inference.
+
+import torchvision.transforms as transforms
+# Converts NumPy HWC arrays to PyTorch CHW tensors.
+# EfficientNet normalization is intentionally applied AFTER ROI extraction.
+
+from torchvision import models
+# Provides ImageNet-pretrained EfficientNet-B0.
+
+try:
+    from monai.bundle.scripts import download as download_monai_bundle
+    from monai.networks.nets import UNet as MONAIUNet
+except ImportError as exc:
+    raise ImportError(
+        "MONAI is required for the pretrained cardiac segmentation stage. "
+        "Install it with: pip install monai==1.6.0 huggingface_hub"
+    ) from exc
+# MONAI provides:
+#   - the residual 2D U-Net architecture used by the official bundle
+#   - the bundle download utility
+#
+# The architecture below is instantiated directly from the official bundle
+# configuration. This avoids depending on unrelated training-only components
+# in train.json while still loading the official pretrained weights.
+
+from sklearn.linear_model import LogisticRegression
+# Classical ML classifier trained on EfficientNet slice embeddings.
+
+from sklearn.metrics import roc_auc_score
+# ROC-AUC evaluation metric for binary series-level ranking.
 
 import matplotlib.pyplot as plt
-# Visualization utility for:
-#   - debugging masks
-#   - ROI inspection
-#   - sanity checks
+# Visualization utility for inspecting:
+#   - the padded input
+#   - the MONAI cardiac probability map
+#   - the confidence-gated soft ROI
 
 
 # =============================
@@ -165,173 +227,332 @@ import matplotlib.pyplot as plt
 # =============================
 
 IMG_SIZE = 224
-# CNN input size
+# EfficientNet-B0 input resolution.
 #
-# Why 224?
-#   - Standard ImageNet resolution
-#   - Compatible with pretrained EfficientNet/ResNet
-#   - Good trade-off between:
-#       detail retention
-#       GPU memory usage
-#
-# WARNING:
-# Excessive resizing may distort anatomy.
+# The original JPEG is first placed inside a 256×256 zero-padded MONAI canvas.
+# The complete canvas is then resized to 224×224 for EfficientNet. Because the
+# whole square canvas is resized uniformly, the MONAI mask and EfficientNet
+# image remain spatially aligned.
+
+MONAI_INPUT_SIZE = 256
+# Input size used to train the official ventricular_short_axis_3label bundle.
+# Images smaller than this size are centered and zero-padded instead of being
+# enlarged. This follows the bundle documentation, which states that many
+# training images were smaller than 256×256 and were zero-padded.
 
 BATCH_SIZE = 8
-# Number of slices processed simultaneously
+# Number of slices processed simultaneously.
 #
-# Trade-off:
-#   Larger batch:
-#       + faster GPU utilization
-#       - higher VRAM usage
-#
-#   Smaller batch:
-#       + lower memory usage
-#       - slower training/inference
+# Both MONAI segmentation and EfficientNet inference are performed for every
+# batch, so reduce this value if GPU memory is insufficient.
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-# Automatically select:
-#
-#   CUDA GPU → if available
-#   CPU      → fallback
-#
-# GPU acceleration is critical for:
-#   - segmentation
-#   - feature extraction
-#   - large datasets
+# Automatically select CUDA when available; otherwise use CPU.
 
-# Dataset path (Kaggle vs local)
+# ---------------------------------------------------------------------------
+# MONAI BUNDLE CONFIGURATION
+# ---------------------------------------------------------------------------
+
+MONAI_BUNDLE_NAME = "ventricular_short_axis_3label"
+# Official MONAI Model Zoo bundle used for cardiac segmentation.
+
+MONAI_BUNDLE_VERSION = "0.3.5"
+# Pinned bundle version for reproducibility.
+
+MONAI_DOWNLOAD_SOURCE = "monaihosting"
+# Official MONAI-hosted bundle source. Current MONAI releases resolve this
+# source through the MONAI model hosting infrastructure.
+
+AUTO_DOWNLOAD_MONAI_BUNDLE = True
+# When True, the bundle is downloaded automatically if model.pt is missing.
+# Set to False for an offline environment and copy the bundle manually to:
+#
+#   <MONAI_BUNDLE_DIR>/ventricular_short_axis_3label/models/model.pt
+
+VERIFY_MONAI_CHECKPOINT_SHA256 = True
+# Verify the checkpoint against the hash published for the pinned official
+# model file. Set to False only when intentionally using another compatible
+# checkpoint.
+
+MONAI_MODEL_SHA256 = (
+    "464ca796028831f6c9e2b1cdaebe9af002fc1d7f494f7a89a63f2079e38837a1"
+)
+# SHA-256 of the official model.pt stored in the MONAI bundle repository.
+
+MONAI_ROI_DILATION_KERNEL = 17
+# Expands the predicted ventricular structures to retain a margin around the
+# myocardium. Must be an odd positive integer so output size remains unchanged.
+
+MONAI_BACKGROUND_WEIGHT = 0.15
+# Soft ROI background retention.
+#
+# A value of 0 would remove all pixels outside the predicted cardiac region.
+# That is risky under domain shift. A value of 0.15 keeps 15% of the original
+# background signal while emphasizing the predicted heart region.
+
+MONAI_MIN_HEART_AREA_RATIO = 0.003
+MONAI_MAX_HEART_AREA_RATIO = 0.50
+MONAI_MIN_PEAK_HEART_PROBABILITY = 0.50
+# Initial plausibility thresholds for deciding whether to trust a MONAI mask.
+#
+# These are safeguards, not clinically validated constants. They should be
+# calibrated on a manually reviewed subset of this CAD dataset. A slice falls
+# back to the full image when:
+#   - the predicted heart is nearly empty,
+#   - the predicted heart occupies implausibly much of the field of view, or
+#   - no pixel receives sufficient non-background probability.
+
+# ---------------------------------------------------------------------------
+# EFFICIENTNET NORMALIZATION
+# ---------------------------------------------------------------------------
+
+EFFICIENTNET_MEAN = (0.485, 0.456, 0.406)
+EFFICIENTNET_STD = (0.229, 0.224, 0.225)
+# Official ImageNet normalization associated with torchvision's pretrained
+# EfficientNet-B0 weights. It is applied after soft ROI extraction so masking
+# operates on interpretable [0,1] image intensities.
+
+# ---------------------------------------------------------------------------
+# MONAI BUNDLE LOCATION
+# ---------------------------------------------------------------------------
+
+if os.path.exists("/kaggle/working"):
+    default_bundle_parent = Path("/kaggle/working/monai_bundles")
+else:
+    try:
+        default_bundle_parent = Path(__file__).resolve().parent / "monai_bundles"
+    except NameError:
+        # __file__ is unavailable in some notebook environments.
+        default_bundle_parent = Path.cwd() / "monai_bundles"
+
+MONAI_BUNDLE_DIR = Path(
+    os.environ.get("MONAI_BUNDLE_DIR", str(default_bundle_parent))
+)
+# The MONAI_BUNDLE_DIR environment variable can override the default location.
+
+# ---------------------------------------------------------------------------
+# DATASET LOCATION
+# ---------------------------------------------------------------------------
+
 if os.path.exists("/kaggle/input/datasets/danialsharifrazi/cad-cardiac-mri-dataset"):
-    # Detect Kaggle execution environment
     DATASET_PATH = "/kaggle/input/datasets/danialsharifrazi/cad-cardiac-mri-dataset"
 else:
-    # Local Windows path
-    DATASET_PATH = r'C:\F\_Develop\AI\Datasets\CAD Cardiac MRI Dataset'
+    DATASET_PATH = r"C:\F\_Develop\AI\Datasets\CAD Cardiac MRI Dataset"
+
+
+# =============================
+# IMAGE PREPROCESSING HELPERS
+# =============================
+
+def scale_intensity_0_1(image):
+    """
+    Scale one grayscale MRI JPEG to float32 values in [0,1].
+
+    MONAI's official training configuration applies ScaleIntensity to the input.
+    JPEG images in this dataset do not share a physically standardized MRI
+    intensity scale, so each image is normalized independently.
+
+    A constant image is converted to zeros to avoid division by zero.
+    """
+
+    image = image.astype(np.float32)
+
+    minimum = float(image.min())
+    maximum = float(image.max())
+
+    if maximum <= minimum:
+        return np.zeros_like(image, dtype=np.float32)
+
+    return (image - minimum) / (maximum - minimum)
+
+
+def zero_pad_to_monai_canvas(image):
+    """
+    Place a 2D image inside a centered 256×256 MONAI input canvas.
+
+    Design rules:
+
+        1. Preserve aspect ratio.
+        2. Do not enlarge images already smaller than 256×256.
+        3. Downscale only when an image exceeds the MONAI input dimensions.
+        4. Fill unused pixels with zero.
+
+    The official bundle was trained with many smaller images that had been
+    zero-padded to 256×256. Avoiding unnecessary upscaling follows that training
+    convention and reduces interpolation-induced anatomical distortion.
+    """
+
+    if image.ndim != 2:
+        raise ValueError(
+            f"Expected a 2D grayscale image, received shape {image.shape}."
+        )
+
+    height, width = image.shape
+
+    if height <= 0 or width <= 0:
+        raise ValueError(f"Invalid image dimensions: {image.shape}.")
+
+    scale = min(
+        1.0,
+        MONAI_INPUT_SIZE / height,
+        MONAI_INPUT_SIZE / width,
+    )
+
+    resized_height = max(1, int(round(height * scale)))
+    resized_width = max(1, int(round(width * scale)))
+
+    if resized_height != height or resized_width != width:
+        resized = cv2.resize(
+            image,
+            (resized_width, resized_height),
+            interpolation=cv2.INTER_AREA,
+        )
+    else:
+        resized = image
+
+    canvas = np.zeros(
+        (MONAI_INPUT_SIZE, MONAI_INPUT_SIZE),
+        dtype=np.float32,
+    )
+
+    top = (MONAI_INPUT_SIZE - resized_height) // 2
+    left = (MONAI_INPUT_SIZE - resized_width) // 2
+
+    canvas[
+        top:top + resized_height,
+        left:left + resized_width,
+    ] = resized
+
+    return canvas
 
 
 # =============================
 # PIPELINE STEP 1
-# MRI slice (2D) – DATASET
+# MRI SLICE (2D) – DATASET
 # =============================
 
 class MRIDataset(Dataset):
     """
     PIPELINE STEP 1:
-    Loads MRI slices (2D images)
+    Load one JPEG MRI slice and construct two aligned inputs.
 
     Returns:
-        (image, label, series_id)
+        classification_image:
+            Tensor [3, 224, 224], values in [0,1].
+            Used by EfficientNet after ROI extraction and ImageNet
+            normalization.
+
+        monai_image:
+            Tensor [1, 256, 256], values in [0,1].
+            Used by the pretrained MONAI cardiac segmenter.
+
+        label:
+            0 for Normal, 1 for Sick.
+
+        series_id:
+            Globally unique relative folder path representing the observable
+            folder-series unit.
 
     =========================================================================
-    MEDICAL IMAGING CONTEXT
+    WHY TWO INPUT TENSORS?
     =========================================================================
 
-    Each MRI slice represents a 2D cross-sectional view of the thoracic area.
+    The two networks were trained with different input conventions:
 
-    Important observations:
+        MONAI cardiac segmenter:
+            - one grayscale channel
+            - 256×256
+            - intensity range [0,1]
 
-        - Some slices contain full heart anatomy
-        - Some contain only partial heart
-        - Some may contain almost no useful anatomy
+        EfficientNet-B0:
+            - three channels
+            - 224×224
+            - ImageNet mean/std normalization
 
-    This motivates later:
-        → segmentation
-        → slice filtering
+    Reusing one already-normalized tensor for both networks would violate at
+    least one model's expected input distribution. Therefore, segmentation and
+    classification preprocessing are kept explicitly separate.
 
     =========================================================================
-    WHY SLICE-LEVEL PROCESSING?
+    SPATIAL ALIGNMENT
     =========================================================================
 
-    MRI volumes are 3D, but:
-        - 2D CNNs are simpler
-        - Require less GPU memory
-        - Easier to train on small datasets
-
-    Later we aggregate slice predictions into series-level predictions.
+    The original MRI is first placed in a 256×256 square canvas. The 224×224
+    classifier image is created by uniformly resizing that complete square.
+    Consequently, a MONAI probability map resized from 256×256 to 224×224 aligns
+    with the EfficientNet image without requiring DICOM geometry metadata.
     """
 
     def __init__(self, samples, transform=None):
 
         self.samples = samples
         # List containing:
-        #   (img_path, label, series_id)
+        #   (image_path, binary_label, series_id)
 
         self.transform = transform
-        # Preprocessing pipeline:
-        #   tensor conversion
-        #   normalization
-        #   augmentation (optional)
+        # Classifier-side conversion from NumPy HWC to PyTorch CHW.
+        # ImageNet normalization is deliberately deferred until after ROI
+        # weighting.
 
     def __len__(self):
 
         return len(self.samples)
-        # Total number of MRI slices
 
     def __getitem__(self, idx):
 
         img_path, label, series = self.samples[idx]
 
         # =========================================================
-        # LOAD MRI SLICE
+        # LOAD RAW GRAYSCALE MRI JPEG
         # =========================================================
 
-        # ✅ MRI images are grayscale by nature
-        #
-        # Pixel intensities encode:
-        #   - tissue density
-        #   - relaxation properties
-        #   - proton behavior
-        #
-        # Unlike RGB images:
-        #   intensity has PHYSICAL meaning.
-        #
-        # IMPORTANT:
-        # MRI intensity is NOT standardized between scanners.
-        #
-        img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+        image = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+
+        if image is None:
+            raise FileNotFoundError(
+                f"OpenCV could not read the MRI image: {img_path}"
+            )
 
         # =========================================================
-        # RESIZE
+        # MONAI INTENSITY PREPROCESSING
         # =========================================================
 
-        # CNNs require fixed spatial dimensions.
-        #
-        # Resizing ensures:
-        #   - batch compatibility
-        #   - consistent receptive fields
-        #   - stable transfer learning behavior
-        #
-        # Potential downside:
-        #   anatomical distortion if aspect ratio changes.
-        #
-        img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
+        image = scale_intensity_0_1(image)
+
+        # Preserve native size when possible and zero-pad to 256×256.
+        monai_canvas = zero_pad_to_monai_canvas(image)
+
+        # MONAI expects [channel, height, width] with one channel.
+        monai_image = torch.from_numpy(monai_canvas).unsqueeze(0)
 
         # =========================================================
-        # CONVERT 1-CHANNEL → 3-CHANNEL
+        # EFFICIENTNET SPATIAL PREPROCESSING
         # =========================================================
 
-        # ImageNet pretrained models expect RGB input.
-        #
-        # Since MRI is grayscale:
-        #   we replicate the same channel 3 times.
-        #
-        # NOTE:
-        # This DOES NOT create new information.
-        #
-        img = np.stack([img] * 3, axis=-1)
+        # Resize the complete square canvas to EfficientNet resolution.
+        # This retains exact alignment with the MONAI output mask.
+        classification_gray = cv2.resize(
+            monai_canvas,
+            (IMG_SIZE, IMG_SIZE),
+            interpolation=cv2.INTER_AREA,
+        )
 
-        # =========================================================
-        # PREPROCESSING
-        # =========================================================
+        # ImageNet-pretrained models expect three channels. Replicating a
+        # grayscale channel does not add information, but makes the tensor
+        # compatible with the pretrained first convolution.
+        classification_image = np.stack(
+            [classification_gray] * 3,
+            axis=-1,
+        )
 
-        # Includes:
-        #   - tensor conversion
-        #   - normalization
-        #
         if self.transform:
-            img = self.transform(img)
+            classification_image = self.transform(classification_image)
+        else:
+            classification_image = torch.from_numpy(
+                classification_image
+            ).permute(2, 0, 1)
 
-        return img, label, series
+        return classification_image, monai_image, label, series
 
 
 # =============================
@@ -340,7 +561,9 @@ class MRIDataset(Dataset):
 
 def load_samples(root_dir):
     """
-    Expected structure:
+    Discover every image-containing folder-series in the public dataset.
+
+    Expected high-level structure:
 
         Normal/
             Directory_1/
@@ -358,31 +581,24 @@ def load_samples(root_dir):
     IMPORTANT DESIGN CHOICE
     =========================================================================
 
-    We organize samples PER FOLDER-SERIES because the public JPEG release
-    does not expose a reliable patient identifier.
-
+    The public JPEG release does not expose a reliable patient identifier.
     Therefore:
-        classification is SERIES-LEVEL
-        NOT patient-level.
 
-    For leakage-resistant evaluation, all folder-series from the same
-    Directory_* are assigned to the same train/test partition.
+        classification target = FOLDER-SERIES
+        evaluation grouping   = Directory_*
 
-    This prevents:
-        - exact duplicate images from crossing train/test boundaries
-        - closely related series from the same acquisition directory
-          being evaluated as independent train/test observations
+    Every folder that directly contains image files becomes one series_id.
+    The full relative path is used because names such as SR_1 repeat across
+    multiple Directory_* containers.
 
-    =========================================================================
-    WHY THIS MATTERS
-    =========================================================================
+    All folder-series from one Directory_* remain in the same train/test
+    partition. Earlier dataset analysis found exact duplicate images between
+    some series inside the same Directory_*, but no exact duplicates crossing
+    Directory_* boundaries. Directory grouping therefore protects against the
+    known exact-duplicate leakage route.
 
-    If duplicate or strongly related series from the SAME Directory_* appear in:
-        train AND test
-
-    then:
-        the model may memorize acquisition/export-specific patterns,
-        producing unrealistically high performance.
+    This still must not be described as a patient-independent split because a
+    patient mapping is not available.
     """
 
     samples = []
@@ -390,10 +606,14 @@ def load_samples(root_dir):
 
     for class_name in ["Normal", "Sick"]:
 
-        # Binary encoding
         label = 0 if class_name == "Normal" else 1
 
         class_path = os.path.join(root_dir, class_name)
+
+        if not os.path.isdir(class_path):
+            raise FileNotFoundError(
+                f"Missing expected class directory: {class_path}"
+            )
 
         for directory in sorted(os.listdir(class_path)):
 
@@ -402,32 +622,35 @@ def load_samples(root_dir):
             if not os.path.isdir(directory_path):
                 continue
 
-            # Build globally unique acquisition-directory ID
             directory_id = f"{class_name}/{directory}"
 
             for root, _, files in os.walk(directory_path):
 
-                if not any(
-                    f.lower().endswith((".png", ".jpg", ".jpeg"))
-                    for f in files
-                ):
+                image_files = [
+                    f for f in files
+                    if f.lower().endswith((".png", ".jpg", ".jpeg"))
+                ]
+
+                if not image_files:
                     continue
 
                 series_id = os.path.relpath(root, root_dir).replace(os.sep, "/")
                 series_to_directory[series_id] = directory_id
 
-                for f in sorted(files):
+                for filename in sorted(image_files):
 
-                    if f.lower().endswith((".png", ".jpg", ".jpeg")):
-
-                        # Store:
-                        #   image path
-                        #   class label
-                        #   series identifier
-                        #
-                        samples.append(
-                            (os.path.join(root, f), label, series_id)
+                    samples.append(
+                        (
+                            os.path.join(root, filename),
+                            label,
+                            series_id,
                         )
+                    )
+
+    if not samples:
+        raise RuntimeError(
+            f"No MRI images were discovered under dataset path: {root_dir}"
+        )
 
     return samples, series_to_directory
 
@@ -436,627 +659,831 @@ samples, series_to_directory = load_samples(DATASET_PATH)
 
 
 # =============================
-# PREPROCESSING
+# CLASSIFIER-SIDE TENSOR CONVERSION
 # =============================
 
 transform = transforms.Compose([
-
     transforms.ToTensor(),
-    # Converts:
-    #   HWC → CHW
-    #
-    # Also rescales:
-    #   [0,255] → [0,1]
-
-    transforms.Normalize([0.5]*3, [0.5]*3)
-    # Normalize intensities:
-    #
-    # Formula:
-    #   x_norm = (x - mean) / std
-    #
-    # Here:
-    #   mean = 0.5
-    #   std  = 0.5
-    #
-    # Result:
-    #   range becomes approximately [-1,1]
-    #
-    # Benefits:
-    #   - faster convergence
-    #   - stable gradients
-    #   - improved transfer learning
 ])
+# ToTensor converts:
+#
+#   NumPy HWC → PyTorch CHW
+#
+# The source array is already float32 in [0,1], so no additional 255 division
+# is needed. EfficientNet mean/std normalization is performed only after the
+# MONAI-derived ROI has been applied.
 
 
 # =============================
 # PIPELINE STEP 2
-# Attention U-Net – HEART SEGMENTATION
+# PRETRAINED MONAI CARDIAC SEGMENTATION
 # =============================
 
-class AttentionBlock(nn.Module):
+def sha256_file(path):
+    """Calculate a file's SHA-256 digest without loading it fully into memory."""
+
+    digest = hashlib.sha256()
+
+    with open(path, "rb") as file:
+        while True:
+            chunk = file.read(1024 * 1024)
+
+            if not chunk:
+                break
+
+            digest.update(chunk)
+
+    return digest.hexdigest()
+
+
+def locate_monai_bundle_root():
     """
-    Attention Gate
+    Find the extracted bundle directory containing models/model.pt.
 
-    Goal:
-        Focus only on relevant anatomical regions.
+    The normal location is:
 
-    =========================================================================
-    WHY ATTENTION?
-    =========================================================================
+        MONAI_BUNDLE_DIR/
+            ventricular_short_axis_3label/
+                models/model.pt
+                configs/train.json
 
-    MRI slices contain:
-        - lungs
-        - ribs
-        - fat
-        - scanner artifacts
-        - background
-
-    Attention suppresses irrelevant spatial regions and highlights:
-        - myocardium
-        - ventricles
-        - atria
-
-    =========================================================================
-    CONCEPT
-    =========================================================================
-
-    Produces spatial weights in [0,1].
-
-    High weight:
-        important region
-
-    Low weight:
-        irrelevant region
+    A recursive fallback is included because bundle download behavior can vary
+    slightly between MONAI versions and storage sources.
     """
 
-    def __init__(self, F_g, F_l, F_int):
+    direct_root = MONAI_BUNDLE_DIR / MONAI_BUNDLE_NAME
+    direct_model = direct_root / "models" / "model.pt"
 
-        super().__init__()
+    if direct_model.is_file():
+        return direct_root
 
-        self.W_g = nn.Conv2d(F_g, F_int, 1)
-        # Gating signal projection
+    if MONAI_BUNDLE_DIR.exists():
+        for model_path in MONAI_BUNDLE_DIR.rglob("model.pt"):
+            candidate_root = model_path.parent.parent
 
-        self.W_x = nn.Conv2d(F_l, F_int, 1)
-        # Local feature projection
+            if (
+                candidate_root.name == MONAI_BUNDLE_NAME
+                or (candidate_root / "configs" / "train.json").is_file()
+            ):
+                return candidate_root
 
-        self.psi = nn.Conv2d(F_int, 1, 1)
-        # Final attention map generator
-
-        self.relu = nn.ReLU()
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, g, x):
-
-        # Combine global + local context
-        psi = self.relu(self.W_g(g) + self.W_x(x))
-
-        # Convert activations → probabilities
-        psi = self.sigmoid(self.psi(psi))
-
-        # Apply spatial weighting
-        return x * psi
+    return direct_root
 
 
-# =============================
-# Attention UNet
-# =============================
-
-class AttentionUNet(nn.Module):
+def ensure_monai_bundle():
     """
-    PIPELINE STEP 2:
-    Heart segmentation network
+    Ensure that the pinned pretrained MONAI bundle is available locally.
 
-    Output:
-        Soft probability segmentation mask
-
-    =========================================================================
-    WHY SEGMENTATION FIRST?
-    =========================================================================
-
-    Feature extraction on full MRI slices introduces:
-        - irrelevant anatomy
-        - noise
-        - scanner artifacts
-
-    Segmentation constrains the classifier to:
-        HEART REGION ONLY
-
-    This usually improves:
-        - robustness
-        - explainability
-        - generalization
+    The bundle is downloaded only when model.pt is absent. A clear error is
+    raised when automatic download is disabled or fails.
     """
 
-    def __init__(self):
+    bundle_root = locate_monai_bundle_root()
+    model_path = bundle_root / "models" / "model.pt"
 
-        super().__init__()
+    if model_path.is_file():
+        return bundle_root
 
-        self.encoder = models.resnet18(weights="IMAGENET1K_V1")
-
-        # Remove classification head
-        self.encoder.fc = nn.Identity()
-
-        self.conv1 = nn.Conv2d(512, 256, 3, padding=1)
-        # Feature refinement
-
-        self.att = AttentionBlock(256, 256, 128)
-        # Spatial attention gate
-
-        self.conv_out = nn.Conv2d(256, 1, 1)
-        # Final 1-channel segmentation mask
-
-    def forward(self, x):
-
-        input_size = x.shape[-2:]
-
-        # =====================================================
-        # ENCODER
-        # =====================================================
-
-        # Initial feature extraction
-        x = self.encoder.conv1(x)
-
-        # Batch normalization stabilizes activations
-        x = self.encoder.bn1(x)
-
-        # Non-linear activation
-        x = self.encoder.relu(x)
-
-        # Spatial downsampling
-        x = self.encoder.maxpool(x)
-
-        # Residual feature extraction
-        x = self.encoder.layer1(x)
-        x = self.encoder.layer2(x)
-        x = self.encoder.layer3(x)
-
-        # Deep semantic features
-        x = self.encoder.layer4(x)
-
-        # =====================================================
-        # ATTENTION
-        # =====================================================
-
-        g = self.conv1(x)
-
-        x = self.att(g, g)
-
-        # =====================================================
-        # SEGMENTATION HEAD
-        # =====================================================
-
-        x = self.conv_out(x)
-
-        # Convert logits → probabilities
-        x = torch.sigmoid(x)
-
-        # =====================================================
-        # UPSAMPLING
-        # =====================================================
-
-        # Resize mask back to original resolution
-        #
-        # Bilinear interpolation:
-        #   smooth
-        #   computationally efficient
-        #
-        x = F.interpolate(
-            x,
-            size=input_size,
-            mode='bilinear',
-            align_corners=False
+    if not AUTO_DOWNLOAD_MONAI_BUNDLE:
+        raise FileNotFoundError(
+            "The MONAI checkpoint was not found and automatic download is "
+            "disabled. Expected a bundle containing models/model.pt under: "
+            f"{MONAI_BUNDLE_DIR}"
         )
 
-        return x
+    MONAI_BUNDLE_DIR.mkdir(parents=True, exist_ok=True)
+
+    print(
+        "Downloading MONAI bundle "
+        f"{MONAI_BUNDLE_NAME} version {MONAI_BUNDLE_VERSION}..."
+    )
+
+    try:
+        download_monai_bundle(
+            name=MONAI_BUNDLE_NAME,
+            version=MONAI_BUNDLE_VERSION,
+            bundle_dir=str(MONAI_BUNDLE_DIR),
+            source=MONAI_DOWNLOAD_SOURCE,
+            progress=True,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "Automatic MONAI bundle download failed. Verify internet access "
+            "and install the optional downloader dependency with: "
+            "pip install huggingface_hub. The equivalent CLI command is: "
+            "python -m monai.bundle download "
+            f"--name {MONAI_BUNDLE_NAME} "
+            f"--version {MONAI_BUNDLE_VERSION} "
+            f"--bundle_dir \"{MONAI_BUNDLE_DIR}\" "
+            f"--source {MONAI_DOWNLOAD_SOURCE}"
+        ) from exc
+
+    bundle_root = locate_monai_bundle_root()
+    model_path = bundle_root / "models" / "model.pt"
+
+    if not model_path.is_file():
+        raise FileNotFoundError(
+            "MONAI reported a completed bundle download, but model.pt could "
+            f"not be located under {MONAI_BUNDLE_DIR}."
+        )
+
+    return bundle_root
 
 
-# Initialize segmentation model
-unet = AttentionUNet().to(DEVICE)
+def load_checkpoint_state_dict(path):
+    """
+    Load an official PyTorch checkpoint as weights only.
 
-# Inference mode:
-#   disables dropout
-#   freezes batchnorm updates
-unet.eval()
+    weights_only=True reduces the risk associated with arbitrary pickle object
+    loading. The fallback exists for older PyTorch releases that do not expose
+    the weights_only argument.
+    """
+
+    try:
+        checkpoint = torch.load(
+            path,
+            map_location="cpu",
+            weights_only=True,
+        )
+    except TypeError:
+        checkpoint = torch.load(
+            path,
+            map_location="cpu",
+        )
+
+    if isinstance(checkpoint, dict):
+        for key in ("state_dict", "model_state_dict", "network_state_dict"):
+            nested = checkpoint.get(key)
+
+            if isinstance(nested, dict):
+                checkpoint = nested
+                break
+
+    if not isinstance(checkpoint, dict):
+        raise TypeError(
+            f"Expected a state-dictionary checkpoint, got {type(checkpoint)}."
+        )
+
+    return checkpoint
+
+
+def build_monai_segmenter():
+    """
+    Build and initialize the official pretrained MONAI ventricular segmenter.
+
+    The architecture exactly matches the official bundle configuration:
+
+        MONAI UNet
+        spatial_dims = 2
+        in_channels  = 1
+        out_channels = 4
+        channels     = (16, 32, 64, 128, 256)
+        strides      = (2, 2, 2, 2)
+        num_res_units = 2
+
+    Unlike the removed custom Attention U-Net, every segmentation layer in this
+    model receives pretrained cardiac-MRI weights.
+    """
+
+    bundle_root = ensure_monai_bundle()
+    model_path = bundle_root / "models" / "model.pt"
+
+    if VERIFY_MONAI_CHECKPOINT_SHA256:
+        actual_hash = sha256_file(model_path)
+
+        if actual_hash.lower() != MONAI_MODEL_SHA256.lower():
+            raise RuntimeError(
+                "MONAI model.pt SHA-256 mismatch. "
+                f"Expected {MONAI_MODEL_SHA256}, got {actual_hash}. "
+                "Delete the bundle and download the pinned version again, or "
+                "disable verification only when intentionally using a different "
+                "compatible checkpoint."
+            )
+
+    network = MONAIUNet(
+        spatial_dims=2,
+        in_channels=1,
+        out_channels=4,
+        channels=(16, 32, 64, 128, 256),
+        strides=(2, 2, 2, 2),
+        num_res_units=2,
+    )
+
+    state_dict = load_checkpoint_state_dict(model_path)
+
+    # strict=True guarantees that architecture and checkpoint keys match.
+    network.load_state_dict(state_dict, strict=True)
+
+    network = network.to(DEVICE)
+    network.eval()
+    network.requires_grad_(False)
+
+    print(f"Loaded pretrained MONAI segmenter from: {model_path}")
+
+    return network
+
+
+monai_segmenter = build_monai_segmenter()
 
 
 # =============================
 # PIPELINE STEP 3
-# Masked ROI
+# MONAI PROBABILITY MAP + SOFT ROI
 # =============================
 
-def apply_mask(img, mask):
+@torch.inference_mode()
+def predict_monai_heart_masks(monai_images, classifier_size):
     """
-    Apply segmentation mask → ROI extraction
+    Predict cardiac probability maps and mask-quality indicators.
 
-    =========================================================================
-    ROI = REGION OF INTEREST
-    =========================================================================
+    Args:
+        monai_images:
+            Tensor [B,1,256,256] in [0,1].
 
-    Goal:
-        isolate cardiac anatomy
-        suppress irrelevant tissue
-
-    =========================================================================
-    WHY ROI EXTRACTION?
-    =========================================================================
-
-    CNNs are sensitive to:
-        - irrelevant texture
-        - scanner borders
-        - anatomy outside target organ
-
-    ROI masking improves:
-        - signal-to-noise ratio
-        - feature quality
-        - explainability
-
-    =========================================================================
-    OUTPUT
-    =========================================================================
+        classifier_size:
+            Spatial size of the aligned EfficientNet images, normally
+            (224,224).
 
     Returns:
-        image where only heart pixels remain visible
+        roi_probability:
+            Dilated soft cardiac probability map aligned to classifier images.
+
+        hard_mask:
+            Binary argmax-derived cardiac mask aligned to classifier images.
+
+        valid_mask:
+            Boolean tensor indicating whether the segmentation passes initial
+            plausibility tests.
+
+        area_ratio:
+            Fraction of MONAI input pixels assigned to a cardiac class.
+
+        peak_probability:
+            Maximum non-background cardiac probability in each image.
+
+    =========================================================================
+    OUTPUT INTERPRETATION
+    =========================================================================
+
+    MONAI returns logits for four mutually exclusive classes. Softmax converts
+    them into probabilities. The cardiac probability used for ROI extraction is:
+
+        P(heart) = P(LV blood pool)
+                 + P(LV myocardium)
+                 + P(RV blood pool)
+
+    Because the model is short-axis-specific, the hard mask is screened before
+    it is trusted. Invalid masks trigger a full-image fallback later.
     """
 
-    # Convert soft probabilities → binary mask
-    mask = (mask > 0.5).float()
+    logits = monai_segmenter(monai_images)
 
-    # Duplicate mask across RGB channels
-    mask = mask.repeat(1, 3, 1, 1)
+    if logits.ndim != 4 or logits.shape[1] != 4:
+        raise RuntimeError(
+            "Unexpected MONAI output shape. Expected [B,4,H,W], got "
+            f"{tuple(logits.shape)}."
+        )
 
-    # Zero-out non-heart pixels
-    return img * mask
+    class_probabilities = torch.softmax(logits, dim=1)
+
+    heart_probability = class_probabilities[:, 1:, :, :].sum(
+        dim=1,
+        keepdim=True,
+    ).clamp(0.0, 1.0)
+
+    class_map = torch.argmax(
+        class_probabilities,
+        dim=1,
+        keepdim=True,
+    )
+
+    hard_mask_256 = (class_map > 0).float()
+
+    area_ratio = hard_mask_256.mean(dim=(1, 2, 3))
+    peak_probability = heart_probability.amax(dim=(1, 2, 3))
+
+    valid_mask = (
+        (area_ratio >= MONAI_MIN_HEART_AREA_RATIO)
+        & (area_ratio <= MONAI_MAX_HEART_AREA_RATIO)
+        & (peak_probability >= MONAI_MIN_PEAK_HEART_PROBABILITY)
+    )
+
+    # Max pooling expands the ROI around the predicted ventricles and
+    # myocardium. This prevents a narrow segmentation from cutting away nearby
+    # diagnostically useful cardiac tissue.
+    roi_probability_256 = F.max_pool2d(
+        heart_probability,
+        kernel_size=MONAI_ROI_DILATION_KERNEL,
+        stride=1,
+        padding=MONAI_ROI_DILATION_KERNEL // 2,
+    )
+
+    hard_mask_256 = F.max_pool2d(
+        hard_mask_256,
+        kernel_size=MONAI_ROI_DILATION_KERNEL,
+        stride=1,
+        padding=MONAI_ROI_DILATION_KERNEL // 2,
+    )
+
+    roi_probability = F.interpolate(
+        roi_probability_256,
+        size=classifier_size,
+        mode="bilinear",
+        align_corners=False,
+    )
+
+    hard_mask = F.interpolate(
+        hard_mask_256,
+        size=classifier_size,
+        mode="nearest",
+    )
+
+    return (
+        roi_probability,
+        hard_mask,
+        valid_mask,
+        area_ratio,
+        peak_probability,
+    )
 
 
-def denormalize(img):
+def apply_confidence_gated_soft_roi(images, roi_probability, valid_mask):
+    """
+    Apply MONAI-derived soft ROI weighting with per-slice fallback.
 
-    # Reverse normalization for visualization
-    img = img * 0.5 + 0.5
+    For a valid segmentation:
 
-    return img.clamp(0, 1)
+        ROI_weight = background_weight
+                   + (1 - background_weight) × P(heart)
+
+        ROI_image = original_image × ROI_weight
+
+    Therefore, predicted cardiac pixels retain nearly full intensity while
+    background pixels are attenuated but not completely erased.
+
+    For an invalid segmentation, the original full image is returned. This is
+    critical because the pretrained model is intended for short-axis MRI and
+    may not generalize to every series in the CAD JPEG release.
+    """
+
+    if images.ndim != 4 or images.shape[1] != 3:
+        raise ValueError(
+            f"Expected classifier images [B,3,H,W], got {tuple(images.shape)}."
+        )
+
+    if roi_probability.ndim != 4 or roi_probability.shape[1] != 1:
+        raise ValueError(
+            "Expected ROI probability [B,1,H,W], got "
+            f"{tuple(roi_probability.shape)}."
+        )
+
+    roi_probability = roi_probability.clamp(0.0, 1.0)
+
+    roi_weight = (
+        MONAI_BACKGROUND_WEIGHT
+        + (1.0 - MONAI_BACKGROUND_WEIGHT) * roi_probability
+    )
+
+    roi_weight = roi_weight.repeat(1, 3, 1, 1)
+
+    weighted_images = images * roi_weight
+
+    valid_mask = valid_mask.view(-1, 1, 1, 1)
+
+    # torch.where applies the decision independently to every slice in a batch.
+    return torch.where(valid_mask, weighted_images, images)
+
+
+def normalize_for_efficientnet(images):
+    """
+    Apply the official ImageNet normalization for EfficientNet-B0.
+
+    Input images must already be float tensors in [0,1]. ROI extraction is
+    intentionally completed before this step.
+    """
+
+    mean = torch.tensor(
+        EFFICIENTNET_MEAN,
+        device=images.device,
+        dtype=images.dtype,
+    ).view(1, 3, 1, 1)
+
+    std = torch.tensor(
+        EFFICIENTNET_STD,
+        device=images.device,
+        dtype=images.dtype,
+    ).view(1, 3, 1, 1)
+
+    return (images - mean) / std
 
 
 def debug_visualization(
-    imgs,
-    masks,
-    roi_imgs,
+    images,
+    roi_probability,
+    hard_mask,
+    roi_images,
     scores,
+    valid_masks,
+    area_ratios,
+    peak_probabilities,
     batch_idx,
-    max_show=1
+    max_show=2,
 ):
     """
-    Visualization helper for debugging.
+    Save MONAI segmentation and ROI sanity-check figures.
 
-    Saves:
-        - original image
-        - segmentation mask
-        - extracted ROI
+    Each row shows:
 
-    Useful for:
-        - verifying segmentation quality
-        - detecting preprocessing bugs
-        - sanity checking filtering logic
+        1. Aligned input image
+        2. Soft MONAI cardiac probability map
+        3. Dilated hard cardiac mask
+        4. Confidence-gated ROI used by EfficientNet
+
+    The titles also report:
+
+        - mask plausibility status
+        - predicted cardiac area ratio
+        - peak cardiac probability
+        - ROI intensity standard deviation
+
+    Visual review is mandatory before treating the pretrained masks as valid on
+    this heterogeneous CAD dataset.
     """
 
-    imgs = imgs.cpu()
-    masks = masks.cpu()
-    roi_imgs = roi_imgs.cpu()
-    scores = scores.cpu()
+    images = images.detach().cpu()
+    roi_probability = roi_probability.detach().cpu()
+    hard_mask = hard_mask.detach().cpu()
+    roi_images = roi_images.detach().cpu()
+    scores = scores.detach().cpu()
+    valid_masks = valid_masks.detach().cpu()
+    area_ratios = area_ratios.detach().cpu()
+    peak_probabilities = peak_probabilities.detach().cpu()
 
     os.makedirs("debug_output", exist_ok=True)
 
-    for i in range(min(max_show, imgs.shape[0])):
+    for i in range(min(max_show, images.shape[0])):
 
-        fig, ax = plt.subplots(1, 3, figsize=(12, 4))
+        fig, axes = plt.subplots(1, 4, figsize=(16, 4))
 
-        # =====================================================
-        # ORIGINAL IMAGE
-        # =====================================================
-
-        ax[0].imshow(
-            denormalize(imgs[i]).permute(1, 2, 0).numpy()
+        axes[0].imshow(
+            images[i].permute(1, 2, 0).numpy(),
+            vmin=0.0,
+            vmax=1.0,
         )
+        axes[0].set_title("Aligned input")
+        axes[0].axis("off")
 
-        ax[0].set_title("Original")
-        ax[0].axis("off")
-
-        # =====================================================
-        # SEGMENTATION MASK
-        # =====================================================
-
-        ax[1].imshow(masks[i][0], cmap='gray')
-
-        ax[1].set_title("Mask")
-        ax[1].axis("off")
-
-        # =====================================================
-        # ROI
-        # =====================================================
-
-        ax[2].imshow(
-            denormalize(roi_imgs[i]).permute(1, 2, 0).numpy()
+        axes[1].imshow(
+            roi_probability[i, 0].numpy(),
+            cmap="magma",
+            vmin=0.0,
+            vmax=1.0,
         )
+        axes[1].set_title(
+            "MONAI P(heart)\n"
+            f"peak={peak_probabilities[i]:.3f}"
+        )
+        axes[1].axis("off")
 
-        ax[2].set_title(f"ROI (std={scores[i]:.3f})")
-        ax[2].axis("off")
+        axes[2].imshow(
+            hard_mask[i, 0].numpy(),
+            cmap="gray",
+            vmin=0.0,
+            vmax=1.0,
+        )
+        axes[2].set_title(
+            f"Mask valid={bool(valid_masks[i])}\n"
+            f"area={area_ratios[i]:.4f}"
+        )
+        axes[2].axis("off")
+
+        axes[3].imshow(
+            roi_images[i].permute(1, 2, 0).numpy(),
+            vmin=0.0,
+            vmax=1.0,
+        )
+        axes[3].set_title(f"ROI / fallback\nstd={scores[i]:.3f}")
+        axes[3].axis("off")
 
         plt.tight_layout()
 
         plt.savefig(
-            f"debug_output/batch{batch_idx}_img{i}.png"
+            f"debug_output/batch{batch_idx}_img{i}.png",
+            dpi=150,
         )
 
-        plt.close()
+        plt.close(fig)
 
 
 # =============================
 # PIPELINE STEP 4
-# EfficientNet-B0 – FEATURE EXTRACTION
+# EFFICIENTNET-B0 FEATURE EXTRACTION
 # =============================
 
 class FeatureExtractor(nn.Module):
     """
-    Extracts deep feature embeddings from ROI images.
+    Extract 1280-dimensional embeddings from ROI-weighted MRI slices.
 
-    Output:
-        1280-dimensional feature vector
+    EfficientNet-B0 is initialized with ImageNet pretrained weights. The
+    classification head is removed so the output is the penultimate feature
+    representation rather than one of the 1000 ImageNet classes.
 
-    =========================================================================
-    WHAT ARE FEATURES?
-    =========================================================================
+    MONAI and EfficientNet have complementary roles:
 
-    Learned representations encoding:
-        - texture
-        - anatomical structure
-        - shape
-        - intensity distribution
-        - pathological patterns
+        MONAI:
+            anatomical localization of ventricular structures
 
-    =========================================================================
-    WHY TRANSFER LEARNING?
-    =========================================================================
+        EfficientNet:
+            generic feature encoding for the downstream CAD-associated
+            classifier
 
-    Medical datasets are usually small.
-
-    Using ImageNet-pretrained networks:
-        - accelerates convergence
-        - improves generalization
-        - reduces overfitting
-
-    Even though ImageNet is natural-image based,
-    early CNN filters remain highly useful.
+    The ImageNet model is not itself a CAD classifier.
     """
 
     def __init__(self):
 
         super().__init__()
 
+        weights = models.EfficientNet_B0_Weights.DEFAULT
+
         self.model = models.efficientnet_b0(
-            weights="IMAGENET1K_V1"
+            weights=weights,
         )
 
-        # Remove classifier head
         self.model.classifier = nn.Identity()
 
     def forward(self, x):
 
-        # Returns embedding vector
         return self.model(x)
 
 
 feature_extractor = FeatureExtractor().to(DEVICE)
 feature_extractor.eval()
+feature_extractor.requires_grad_(False)
 
 
 # =============================
 # PIPELINE STEP 5 + 6
-# Feature Extraction + Slice Filtering
+# FEATURE EXTRACTION + SLICE FILTERING
 # =============================
 
 def extract_features(dataset, debug=False):
+    """
+    Run MONAI segmentation, ROI construction, EfficientNet encoding, and
+    low-information slice filtering.
+
+    Returns:
+        features:
+            Matrix [retained_slices, 1280].
+
+        labels:
+            Binary label for each retained slice.
+
+        series_ids:
+            Folder-series identifier for each retained slice.
+
+    The function also prints the proportion of slices whose MONAI masks passed
+    the plausibility gate. A very low valid-mask rate is a warning that the
+    pretrained short-axis segmenter is strongly out of domain for this subset.
+    """
 
     loader = DataLoader(
         dataset,
         batch_size=BATCH_SIZE,
-        shuffle=False
+        shuffle=False,
+        num_workers=0,
+        pin_memory=(DEVICE == "cuda"),
     )
 
-    all_features, all_labels, all_series = [], [], []
+    all_features = []
+    all_labels = []
+    all_series = []
 
-    # Disable gradient computation
-    #
-    # Benefits:
-    #   - lower memory usage
-    #   - faster inference
-    #
-    with torch.no_grad():
+    total_masks = 0
+    valid_masks_count = 0
 
-        for batch_idx, (imgs, labels, series) in enumerate(tqdm(loader)):
+    with torch.inference_mode():
 
-            imgs = imgs.to(DEVICE)
+        for batch_idx, batch in enumerate(tqdm(loader)):
 
-            # =====================================================
-            # STEP 2: SEGMENTATION
-            # =====================================================
+            images, monai_images, labels, series = batch
 
-            masks = unet(imgs)
+            images = images.to(
+                DEVICE,
+                non_blocking=True,
+            )
 
-            # =====================================================
-            # STEP 3: ROI EXTRACTION
-            # =====================================================
-
-            roi_imgs = apply_mask(imgs, masks)
+            monai_images = monai_images.to(
+                DEVICE,
+                non_blocking=True,
+            )
 
             # =====================================================
-            # STEP 4: FEATURE EXTRACTION
+            # STEP 2: PRETRAINED MONAI SEGMENTATION
             # =====================================================
 
-            feats = feature_extractor(roi_imgs)
+            (
+                roi_probability,
+                hard_mask,
+                valid_mask,
+                area_ratio,
+                peak_probability,
+            ) = predict_monai_heart_masks(
+                monai_images,
+                classifier_size=images.shape[-2:],
+            )
+
+            total_masks += int(valid_mask.numel())
+            valid_masks_count += int(valid_mask.sum().item())
 
             # =====================================================
-            # PIPELINE STEP 5
-            # SLICE FILTERING
+            # STEP 3: CONFIDENCE-GATED SOFT ROI
             # =====================================================
 
-            # Compute image intensity variability
-            #
-            # Intuition:
-            #
-            # Low standard deviation:
-            #   → flat / empty image
-            #   → weak anatomical information
-            #
-            # High standard deviation:
-            #   → richer anatomical structure
-            #
-            scores = torch.std(roi_imgs, dim=[1,2,3])
+            roi_images = apply_confidence_gated_soft_roi(
+                images,
+                roi_probability,
+                valid_mask,
+            )
+
+            # =====================================================
+            # STEP 4: EFFICIENTNET FEATURE EXTRACTION
+            # =====================================================
+
+            efficientnet_inputs = normalize_for_efficientnet(
+                roi_images
+            )
+
+            features = feature_extractor(efficientnet_inputs)
+
+            # =====================================================
+            # STEP 5: SLICE QUALITY FILTERING
+            # =====================================================
+
+            # Standard deviation is measured before ImageNet normalization.
+            # Low variability often indicates an empty, flat, or weakly
+            # informative image. This remains only a simple heuristic and can
+            # later be replaced with a learned quality model.
+            scores = torch.std(
+                roi_images,
+                dim=(1, 2, 3),
+            )
 
             # =====================================================
             # DEBUG VISUALIZATION
             # =====================================================
 
             if debug and batch_idx == 0:
-
                 debug_visualization(
-                    imgs,
-                    masks,
-                    roi_imgs,
+                    images,
+                    roi_probability,
+                    hard_mask,
+                    roi_images,
                     scores,
-                    batch_idx
+                    valid_mask,
+                    area_ratio,
+                    peak_probability,
+                    batch_idx,
                 )
 
             # =====================================================
-            # KEEP MOST INFORMATIVE SLICES
+            # KEEP MORE INFORMATIVE SLICES
             # =====================================================
 
-            # Retain only slices above median variability
-            #
-            # This removes:
-            #   - near-empty slices
-            #   - poor quality scans
-            #   - low-information anatomy
-            #
-            keep = scores > scores.median()
+            # Use >= instead of > so a final batch containing one image is not
+            # discarded completely when its score equals its median.
+            keep = scores >= scores.median()
 
-            feats = feats[keep]
+            if not bool(keep.any()):
+                # Defensive fallback for pathological numerical cases.
+                keep[torch.argmax(scores)] = True
 
-            labels = labels[keep.cpu().numpy()]
+            features = features[keep]
 
-            series = np.array(series)[keep.cpu().numpy()]
+            keep_cpu = keep.detach().cpu()
 
-            all_features.append(feats.cpu().numpy())
+            labels = labels[keep_cpu]
+            series = np.asarray(series)[keep_cpu.numpy()]
 
-            all_labels.extend(labels)
+            all_features.append(features.cpu().numpy())
+            all_labels.extend(labels.numpy().tolist())
+            all_series.extend(series.tolist())
 
-            all_series.extend(series)
+    if not all_features:
+        raise RuntimeError(
+            "No slice features were retained. Inspect image loading, MONAI "
+            "masks, and slice-quality scores."
+        )
+
+    valid_rate = valid_masks_count / max(total_masks, 1)
+
+    print(
+        "MONAI plausible-mask rate: "
+        f"{valid_masks_count}/{total_masks} ({valid_rate:.2%})"
+    )
 
     return (
         np.vstack(all_features),
-        np.array(all_labels),
-        np.array(all_series)
+        np.asarray(all_labels, dtype=np.int64),
+        np.asarray(all_series),
     )
 
 
 # =============================
 # PIPELINE STEP 7
-# Bayesian Fusion (series-level)
+# BAYESIAN FUSION (SERIES-LEVEL)
 # =============================
 
 def bayesian_fusion(slice_probs):
     """
-    Combines slice probabilities into ONE series-level probability.
+    Combine slice probabilities into one folder-series probability.
 
-    =========================================================================
-    WHY FUSION?
-    =========================================================================
+    The classifier first produces one probability per retained image. Log-odds
+    averaging then combines evidence across all retained images belonging to the
+    same series_id.
 
-    The evaluation target in this public release is series-level.
-
-    A single slice may be:
-        - noisy
-        - ambiguous
-        - incomplete
-
-    Combining multiple slices improves robustness.
-
-    =========================================================================
-    WHY LOG-ODDS?
-    =========================================================================
-
-    Direct averaging of probabilities is unstable.
-
-    Log-odds aggregation:
-        - accumulates evidence better
-        - handles confidence more naturally
-        - behaves more probabilistically
+    This is SERIES-LEVEL fusion. It must not be called patient-level fusion
+    because the public JPEG release does not expose patient identities.
     """
 
     eps = 1e-6
 
-    # Prevent numerical instability
-    slice_probs = np.clip(slice_probs, eps, 1-eps)
+    slice_probs = np.clip(slice_probs, eps, 1 - eps)
 
-    # Convert probability → log-odds
-    #
-    # log(p / (1-p))
-    #
     log_odds = np.log(slice_probs / (1 - slice_probs))
 
-    # Average evidence and reconvert to probability
     return 1 / (1 + np.exp(-log_odds.mean()))
 
 
 def aggregate_series(features, labels, series, clf):
-    """
-    Aggregates slice-level predictions into series-level predictions.
-    """
+    """Aggregate retained slice predictions into folder-series predictions."""
 
-    series_probs, series_labels = {}, {}
+    series_probs = {}
+    series_labels = {}
 
-    # Slice-level probabilities
-    slice_probs = clf.predict_proba(features)[:,1]
+    slice_probs = clf.predict_proba(features)[:, 1]
 
-    for prob, label, series_id in zip(slice_probs, labels, series):
+    for probability, label, series_id in zip(
+        slice_probs,
+        labels,
+        series,
+    ):
 
-        series_probs.setdefault(series_id, []).append(prob)
+        series_probs.setdefault(series_id, []).append(probability)
+        series_labels[series_id] = int(label)
 
-        series_labels[series_id] = label
+    fused_probabilities = []
+    fused_labels = []
 
-    X, y = [], []
+    for series_id in sorted(series_probs):
 
-    for series_id in series_probs:
-
-        # Bayesian aggregation
-        X.append(
-            bayesian_fusion(np.array(series_probs[series_id]))
+        fused_probabilities.append(
+            bayesian_fusion(
+                np.asarray(series_probs[series_id])
+            )
         )
 
-        y.append(series_labels[series_id])
+        fused_labels.append(series_labels[series_id])
 
-    return np.array(X), np.array(y)
+    return (
+        np.asarray(fused_probabilities, dtype=np.float64),
+        np.asarray(fused_labels, dtype=np.int64),
+    )
 
 
 # =============================
 # PIPELINE STEP 8
-# Final Classifier
+# DIRECTORY-GROUPED SERIES-LEVEL EVALUATION
 # =============================
 
 # =============================================================
 # BUILD SERIES / DIRECTORY LIST
 # =============================================================
 
-series = sorted(set([s[2] for s in samples]))
+series = sorted(set(sample[2] for sample in samples))
 
 directories = sorted(set(series_to_directory.values()))
-normal_directories = [d for d in directories if d.startswith("Normal/")]
-sick_directories = [d for d in directories if d.startswith("Sick/")]
+normal_directories = [
+    directory for directory in directories
+    if directory.startswith("Normal/")
+]
+sick_directories = [
+    directory for directory in directories
+    if directory.startswith("Sick/")
+]
 
 rng = np.random.RandomState(42)
 normal_directories = list(rng.permutation(normal_directories))
 sick_directories = list(rng.permutation(sick_directories))
 
-normal_test_count = max(1, int(round(len(normal_directories) * 0.2)))
-sick_test_count = max(1, int(round(len(sick_directories) * 0.2)))
+normal_test_count = max(
+    1,
+    int(round(len(normal_directories) * 0.2)),
+)
+sick_test_count = max(
+    1,
+    int(round(len(sick_directories) * 0.2)),
+)
 
 # =============================================================
 # TRAIN / TEST SPLIT
@@ -1065,9 +1492,13 @@ sick_test_count = max(1, int(round(len(sick_directories) * 0.2)))
 # IMPORTANT:
 # Split is DIRECTORY-GROUPED for SERIES-LEVEL evaluation.
 #
-# NEVER split by slices or individual series directly because exact duplicate
-# images were observed between series inside the same Directory_*.
+# Never split directly by image or folder-series. Exact duplicate images were
+# identified between some series inside the same Directory_*. Keeping the whole
+# Directory_* together prevents those known copies from crossing train/test.
 #
+# This grouping is the most conservative unit recoverable from the public
+# release, but it is not proof of patient independence.
+
 train_directories = (
     normal_directories[normal_test_count:]
     + sick_directories[sick_test_count:]
@@ -1089,65 +1520,81 @@ test_series = [
 ]
 
 train_samples = [
-    s for s in samples
-    if s[2] in train_series
+    sample for sample in samples
+    if sample[2] in train_series
 ]
 
 test_samples = [
-    s for s in samples
-    if s[2] in test_series
+    sample for sample in samples
+    if sample[2] in test_series
 ]
 
-# Optional debugging subset
+print(f"Training directories: {len(train_directories)}")
+print(f"Testing directories:  {len(test_directories)}")
+print(f"Training series:      {len(train_series)}")
+print(f"Testing series:       {len(test_series)}")
+print(f"Training images:      {len(train_samples)}")
+print(f"Testing images:       {len(test_samples)}")
+
+# Optional debugging subset:
 # train_samples = train_samples[0:100]
 # test_samples = test_samples[0:100]
 
-train_ds = MRIDataset(train_samples, transform)
-test_ds  = MRIDataset(test_samples, transform)
+train_dataset = MRIDataset(
+    train_samples,
+    transform,
+)
+
+test_dataset = MRIDataset(
+    test_samples,
+    transform,
+)
 
 # =============================================================
 # FEATURE EXTRACTION
 # =============================================================
 
-X_train, y_train, s_train = extract_features(
-    train_ds,
-    debug=True
+X_train, y_train, series_train = extract_features(
+    train_dataset,
+    debug=True,
 )
 
-X_test, y_test, s_test = extract_features(
-    test_ds,
-    debug=True
+X_test, y_test, series_test = extract_features(
+    test_dataset,
+    debug=True,
 )
 
 # =============================================================
 # CLASSICAL ML CLASSIFIER
 # =============================================================
 
-# Logistic Regression chosen because:
+# Logistic Regression is used as the slice-level classifier because it is:
 #
-#   + simple
-#   + interpretable
-#   + robust on small datasets
-#   + fast training
+#   - simple
+#   - relatively interpretable
+#   - robust as a baseline on pretrained embeddings
+#   - fast to train compared with an additional deep classifier
 #
-# Can easily replace with:
-#   - SVM
-#   - XGBoost
-#   - Random Forest
-#
-clf = LogisticRegression(max_iter=1000)
+# It can later be replaced with SVM, XGBoost, or a small calibrated MLP.
 
-clf.fit(X_train, y_train)
+classifier = LogisticRegression(
+    max_iter=1000,
+)
+
+classifier.fit(
+    X_train,
+    y_train,
+)
 
 # =============================================================
 # SERIES-LEVEL PREDICTION
 # =============================================================
 
-Xs_test, ys_test = aggregate_series(
+series_probabilities, series_labels = aggregate_series(
     X_test,
     y_test,
-    s_test,
-    clf
+    series_test,
+    classifier,
 )
 
 # =============================================================
@@ -1156,16 +1603,17 @@ Xs_test, ys_test = aggregate_series(
 
 # ROC-AUC:
 #
-#   1.0 → perfect
-#   0.5 → random guessing
+#   1.0 = perfect ranking
+#   0.5 = random ranking
 #
-# In medical imaging:
-# ROC-AUC is preferred over accuracy because:
-#   - datasets are often imbalanced
-#   - ranking quality matters
-#
-auc = roc_auc_score(ys_test, Xs_test)
+# The metric below is SERIES-LEVEL ROC-AUC. It is not patient-level ROC-AUC.
+# The label attached to each folder-series is inherited weakly from the top-level
+# Normal/Sick directory.
+
+auc = roc_auc_score(
+    series_labels,
+    series_probabilities,
+)
 
 print("SERIES-LEVEL AUC:", auc)
-
 print("Done!")
