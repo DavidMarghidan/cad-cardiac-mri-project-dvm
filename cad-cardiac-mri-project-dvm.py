@@ -1,5 +1,5 @@
 #%% ============================================================
-# 🧠 CAD Detection from Cardiac MRI – Full Pipeline (Single File)
+# 🧠 CAD Detection from Cardiac MRI – Full Series-Level Pipeline (Single File)
 # ============================================================
 
 # ============================================================================
@@ -7,7 +7,7 @@
 # ============================================================================
 #
 # This script implements a FULL END-TO-END CAD (Coronary Artery Disease)
-# detection pipeline using Cardiac MRI slices.
+# series-level classification pipeline using Cardiac MRI slices.
 #
 # The architecture combines:
 #
@@ -15,12 +15,12 @@
 #   2. ROI extraction
 #   3. Deep feature extraction
 #   4. Classical Machine Learning classification
-#   5. Patient-level probabilistic fusion
+#   5. Series-level probabilistic fusion
 #
 # The pipeline is intentionally modular so every stage can later be replaced
 # independently:
 #
-#   - Segmentation model → MedSAM Pretrained 2D model / U-Net / SAM / MedSAM
+#   - Segmentation model → U-Net / Attention U-Net / SAM / MedSAM
 #   - Backbone → EfficientNet / ConvNeXt / ViT
 #   - Fusion → Bayesian / Mean / Attention pooling
 #   - Final classifier → LR / SVM / XGBoost
@@ -31,7 +31,7 @@
 #
 # MRI slice (2D)
 #    ↓
-# MedSAM Pretrained 2D segmentation model (segmentare inimă)
+# Attention U-Net (segmentare inimă)
 #    ↓
 # Soft probability mask
 #    ↓
@@ -43,11 +43,11 @@
 #    ↓
 # Slice quality filtering
 #    ↓
-# Bayesian patient fusion
+# Bayesian series fusion
 #    ↓
 # Logistic Regression / SVM
 #    ↓
-# Patient-level CAD prediction
+# Series-level CAD-associated prediction
 #
 # ============================================================================
 # WHY THIS PIPELINE?
@@ -57,7 +57,7 @@
 #
 #   - Small
 #   - Noisy
-#   - Highly variable between patients
+#   - Highly variable between acquisitions and series
 #   - Difficult to annotate
 #
 # Therefore:
@@ -65,11 +65,11 @@
 #   - Transfer learning improves generalization
 #   - Segmentation reduces background noise
 #   - Slice filtering removes uninformative views
-#   - Patient-level aggregation stabilizes predictions
+#   - Series-level aggregation stabilizes predictions
 #
 # The pipeline mimics radiologist reasoning:
 #
-#   "Inspect multiple slices → combine evidence → decide diagnosis"
+#   "Inspect multiple slices from one series → combine evidence → classify the series"
 #
 # ============================================================================
 
@@ -160,10 +160,6 @@ import matplotlib.pyplot as plt
 #   - sanity checks
 
 
-from segment_anything import sam_model_registry, SamPredictor
-from huggingface_hub import hf_hub_download
-
-
 # =============================
 # CONFIGURATION
 # =============================
@@ -224,7 +220,7 @@ class MRIDataset(Dataset):
     Loads MRI slices (2D images)
 
     Returns:
-        (image, label, patient_id)
+        (image, label, series_id)
 
     =========================================================================
     MEDICAL IMAGING CONTEXT
@@ -251,14 +247,14 @@ class MRIDataset(Dataset):
         - Require less GPU memory
         - Easier to train on small datasets
 
-    Later we aggregate slice predictions into patient-level predictions.
+    Later we aggregate slice predictions into series-level predictions.
     """
 
     def __init__(self, samples, transform=None):
 
         self.samples = samples
         # List containing:
-        #   (img_path, label, patient_id)
+        #   (img_path, label, series_id)
 
         self.transform = transform
         # Preprocessing pipeline:
@@ -273,7 +269,7 @@ class MRIDataset(Dataset):
 
     def __getitem__(self, idx):
 
-        img_path, label, patient = self.samples[idx]
+        img_path, label, series = self.samples[idx]
 
         # =========================================================
         # LOAD MRI SLICE
@@ -335,7 +331,7 @@ class MRIDataset(Dataset):
         if self.transform:
             img = self.transform(img)
 
-        return img, label, patient
+        return img, label, series
 
 
 # =============================
@@ -347,39 +343,50 @@ def load_samples(root_dir):
     Expected structure:
 
         Normal/
-            Patient001/
-            Patient002/
+            Directory_1/
+                series0001-Body/
+                series0002-Body/
+                ...
 
         Sick/
-            Patient001/
-            Patient002/
+            Directory_17/
+                SR_1/
+                SR_2/
+                ...
 
     =========================================================================
     IMPORTANT DESIGN CHOICE
     =========================================================================
 
-    We organize samples PER PATIENT because:
+    We organize samples PER FOLDER-SERIES because the public JPEG release
+    does not expose a reliable patient identifier.
 
-        diagnosis is PATIENT-LEVEL
-        NOT slice-level.
+    Therefore:
+        classification is SERIES-LEVEL
+        NOT patient-level.
+
+    For leakage-resistant evaluation, all folder-series from the same
+    Directory_* are assigned to the same train/test partition.
 
     This prevents:
-        - data leakage
-        - train/test contamination
+        - exact duplicate images from crossing train/test boundaries
+        - closely related series from the same acquisition directory
+          being evaluated as independent train/test observations
 
     =========================================================================
     WHY THIS MATTERS
     =========================================================================
 
-    If slices from the SAME patient appear in:
+    If duplicate or strongly related series from the SAME Directory_* appear in:
         train AND test
 
     then:
-        model memorizes patient-specific patterns,
+        the model may memorize acquisition/export-specific patterns,
         producing unrealistically high performance.
     """
 
     samples = []
+    series_to_directory = {}
 
     for class_name in ["Normal", "Sick"]:
 
@@ -388,32 +395,44 @@ def load_samples(root_dir):
 
         class_path = os.path.join(root_dir, class_name)
 
-        for patient in os.listdir(class_path):
+        for directory in sorted(os.listdir(class_path)):
 
-            patient_path = os.path.join(class_path, patient)
+            directory_path = os.path.join(class_path, directory)
 
-            # Build globally unique patient ID
-            patient_id = f"{class_name}_{patient}"
+            if not os.path.isdir(directory_path):
+                continue
 
-            for root, _, files in os.walk(patient_path):
+            # Build globally unique acquisition-directory ID
+            directory_id = f"{class_name}/{directory}"
 
-                for f in files:
+            for root, _, files in os.walk(directory_path):
+
+                if not any(
+                    f.lower().endswith((".png", ".jpg", ".jpeg"))
+                    for f in files
+                ):
+                    continue
+
+                series_id = os.path.relpath(root, root_dir).replace(os.sep, "/")
+                series_to_directory[series_id] = directory_id
+
+                for f in sorted(files):
 
                     if f.lower().endswith((".png", ".jpg", ".jpeg")):
 
                         # Store:
                         #   image path
                         #   class label
-                        #   patient identifier
+                        #   series identifier
                         #
                         samples.append(
-                            (os.path.join(root, f), label, patient_id)
+                            (os.path.join(root, f), label, series_id)
                         )
 
-    return samples
+    return samples, series_to_directory
 
 
-samples = load_samples(DATASET_PATH)
+samples, series_to_directory = load_samples(DATASET_PATH)
 
 
 # =============================
@@ -448,197 +467,195 @@ transform = transforms.Compose([
     #   - improved transfer learning
 ])
 
+
 # =============================
 # PIPELINE STEP 2
-# MEDSAM PRETRAINED SEGMENTATION MODEL
+# Attention U-Net – HEART SEGMENTATION
 # =============================
 
+class AttentionBlock(nn.Module):
+    """
+    Attention Gate
 
-class MedSAMPretrainedSegmentationModel(nn.Module):
+    Goal:
+        Focus only on relevant anatomical regions.
+
+    =========================================================================
+    WHY ATTENTION?
+    =========================================================================
+
+    MRI slices contain:
+        - lungs
+        - ribs
+        - fat
+        - scanner artifacts
+        - background
+
+    Attention suppresses irrelevant spatial regions and highlights:
+        - myocardium
+        - ventricles
+        - atria
+
+    =========================================================================
+    CONCEPT
+    =========================================================================
+
+    Produces spatial weights in [0,1].
+
+    High weight:
+        important region
+
+    Low weight:
+        irrelevant region
+    """
+
+    def __init__(self, F_g, F_l, F_int):
+
+        super().__init__()
+
+        self.W_g = nn.Conv2d(F_g, F_int, 1)
+        # Gating signal projection
+
+        self.W_x = nn.Conv2d(F_l, F_int, 1)
+        # Local feature projection
+
+        self.psi = nn.Conv2d(F_int, 1, 1)
+        # Final attention map generator
+
+        self.relu = nn.ReLU()
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, g, x):
+
+        # Combine global + local context
+        psi = self.relu(self.W_g(g) + self.W_x(x))
+
+        # Convert activations → probabilities
+        psi = self.sigmoid(self.psi(psi))
+
+        # Apply spatial weighting
+        return x * psi
+
+
+# =============================
+# Attention UNet
+# =============================
+
+class AttentionUNet(nn.Module):
     """
     PIPELINE STEP 2:
-    MedSAM-based cardiac ROI extraction.
+    Heart segmentation network
+
+    Output:
+        Soft probability segmentation mask
 
     =========================================================================
-    WHY MEDSAM?
+    WHY SEGMENTATION FIRST?
     =========================================================================
 
-    The original ACDC segmentation network was trained exclusively on ACDC
-    cardiac MRI data.
+    Feature extraction on full MRI slices introduces:
+        - irrelevant anatomy
+        - noise
+        - scanner artifacts
 
-    The CAD Cardiac MRI Dataset contains substantially different image
-    characteristics:
+    Segmentation constrains the classifier to:
+        HEART REGION ONLY
 
-        - larger field of view
-        - coronal acquisitions
-        - surrounding thoracic organs
-        - different scanner settings
-
-    As a consequence, the ACDC model often predicts only background.
-
-    MedSAM is a foundation segmentation model built upon Segment Anything and
-    adapted to medical imaging.
-
-    It generalizes significantly better to unseen medical datasets.
-
-    =========================================================================
-    INPUT
-    =========================================================================
-
-        [B,3,224,224]
-
-    identical to the original pipeline.
-
-    =========================================================================
-    OUTPUT
-    =========================================================================
-
-        [B,1,224,224]
-
-    soft ROI mask.
-
-    =========================================================================
+    This usually improves:
+        - robustness
+        - explainability
+        - generalization
     """
 
     def __init__(self):
+
         super().__init__()
 
-        self.model_dir = os.path.join(
-            "pretrained_models",
-            "MedSAM"
-        )
+        self.encoder = models.resnet18(weights="IMAGENET1K_V1")
 
-        os.makedirs(
-            self.model_dir,
-            exist_ok=True
-        )
+        # Remove classification head
+        self.encoder.fc = nn.Identity()
 
+        self.conv1 = nn.Conv2d(512, 256, 3, padding=1)
+        # Feature refinement
 
+        self.att = AttentionBlock(256, 256, 128)
+        # Spatial attention gate
 
-        # checkpoint_path = hf_hub_download(
-        #     repo_id="wanglab/medsam-vit-b",
-        #     filename="medsam_vit_b.pth",
-        #     local_dir=self.model_dir
-        # )
-
-        # =========================================================
-        # LOAD LOCAL MEDSAM CHECKPOINT
-        # =========================================================
-
-        checkpoint_path = "./pretrained_models/MedSAM/medsam_vit_b.pth"
-
-        if not os.path.exists(checkpoint_path):
-            raise FileNotFoundError(
-                f"MedSAM checkpoint not found:\n{checkpoint_path}"
-            )
-
-        # =========================================================
-        # CREATE SAM MODEL
-        # =========================================================
-
-        self.sam = sam_model_registrycheckpoint = checkpoint_path
-
-        self.sam.to(DEVICE)
-
-        self.sam.eval()
-
-        self.predictor = SamPredictor(
-            self.sam
-        )
+        self.conv_out = nn.Conv2d(256, 1, 1)
+        # Final 1-channel segmentation mask
 
     def forward(self, x):
-        batch_masks = []
 
-        for img_tensor in x:
-            # =====================================================
-            # REVERSE NORMALIZATION
-            # =====================================================
+        input_size = x.shape[-2:]
 
-            img = img_tensor.detach().cpu()
+        # =====================================================
+        # ENCODER
+        # =====================================================
 
-            img = img * 0.5 + 0.5
+        # Initial feature extraction
+        x = self.encoder.conv1(x)
 
-            img = img.permute(
-                1,
-                2,
-                0
-            ).numpy()
+        # Batch normalization stabilizes activations
+        x = self.encoder.bn1(x)
 
-            img = np.clip(
-                img,
-                0,
-                1
-            )
+        # Non-linear activation
+        x = self.encoder.relu(x)
 
-            img = (
-                    img * 255
-            ).astype(
-                np.uint8
-            )
+        # Spatial downsampling
+        x = self.encoder.maxpool(x)
 
-            # =====================================================
-            # MEDSAM IMAGE ENCODING
-            # =====================================================
+        # Residual feature extraction
+        x = self.encoder.layer1(x)
+        x = self.encoder.layer2(x)
+        x = self.encoder.layer3(x)
 
-            self.predictor.set_image(img)
+        # Deep semantic features
+        x = self.encoder.layer4(x)
 
-            h, w = img.shape[:2]
+        # =====================================================
+        # ATTENTION
+        # =====================================================
 
-            # =====================================================
-            # AUTOMATIC CARDIAC BOX PROMPT
-            # =====================================================
+        g = self.conv1(x)
 
-            #
-            # The CAD dataset usually places the
-            # heart near the central thoracic area.
-            #
-            # A box prompt produces much better
-            # masks than a single positive point.
-            #
+        x = self.att(g, g)
 
-            input_box = np.array([
-                w * 0.25,
-                h * 0.05,
-                w * 0.75,
-                h * 0.60
-            ])
+        # =====================================================
+        # SEGMENTATION HEAD
+        # =====================================================
 
-            masks, scores, logits = self.predictor.predict(
-                box=input_box,
-                multimask_output=True
-            )
+        x = self.conv_out(x)
 
-            best_mask = masks[
-                np.argmax(scores)
-            ]
+        # Convert logits → probabilities
+        x = torch.sigmoid(x)
 
-            best_mask = torch.tensor(
-                best_mask,
-                dtype=torch.float32
-            )
+        # =====================================================
+        # UPSAMPLING
+        # =====================================================
 
-            best_mask = best_mask.unsqueeze(0)
-
-            batch_masks.append(
-                best_mask
-            )
-
-        batch_masks = torch.stack(
-            batch_masks,
-            dim=0
+        # Resize mask back to original resolution
+        #
+        # Bilinear interpolation:
+        #   smooth
+        #   computationally efficient
+        #
+        x = F.interpolate(
+            x,
+            size=input_size,
+            mode='bilinear',
+            align_corners=False
         )
 
-        batch_masks = batch_masks.to(
-            DEVICE
-        )
-
-        return batch_masks
+        return x
 
 
-unet = MedSAMPretrainedSegmentationModel().to(
-    DEVICE
-)
+# Initialize segmentation model
+unet = AttentionUNet().to(DEVICE)
 
+# Inference mode:
+#   disables dropout
+#   freezes batchnorm updates
 unet.eval()
 
 
@@ -844,7 +861,7 @@ def extract_features(dataset, debug=False):
         shuffle=False
     )
 
-    all_features, all_labels, all_patients = [], [], []
+    all_features, all_labels, all_series = [], [], []
 
     # Disable gradient computation
     #
@@ -854,7 +871,7 @@ def extract_features(dataset, debug=False):
     #
     with torch.no_grad():
 
-        for batch_idx, (imgs, labels, patients) in enumerate(tqdm(loader)):
+        for batch_idx, (imgs, labels, series) in enumerate(tqdm(loader)):
 
             imgs = imgs.to(DEVICE)
 
@@ -898,7 +915,7 @@ def extract_features(dataset, debug=False):
             # DEBUG VISUALIZATION
             # =====================================================
 
-            if debug: # and batch_idx == 0:
+            if debug and batch_idx == 0:
 
                 debug_visualization(
                     imgs,
@@ -925,35 +942,35 @@ def extract_features(dataset, debug=False):
 
             labels = labels[keep.cpu().numpy()]
 
-            patients = np.array(patients)[keep.cpu().numpy()]
+            series = np.array(series)[keep.cpu().numpy()]
 
             all_features.append(feats.cpu().numpy())
 
             all_labels.extend(labels)
 
-            all_patients.extend(patients)
+            all_series.extend(series)
 
     return (
         np.vstack(all_features),
         np.array(all_labels),
-        np.array(all_patients)
+        np.array(all_series)
     )
 
 
 # =============================
 # PIPELINE STEP 7
-# Bayesian Fusion (patient-level)
+# Bayesian Fusion (series-level)
 # =============================
 
 def bayesian_fusion(slice_probs):
     """
-    Combines slice probabilities into ONE patient probability.
+    Combines slice probabilities into ONE series-level probability.
 
     =========================================================================
     WHY FUSION?
     =========================================================================
 
-    CAD diagnosis is patient-level.
+    The evaluation target in this public release is series-level.
 
     A single slice may be:
         - noisy
@@ -989,32 +1006,32 @@ def bayesian_fusion(slice_probs):
     return 1 / (1 + np.exp(-log_odds.mean()))
 
 
-def aggregate_patient(features, labels, patients, clf):
+def aggregate_series(features, labels, series, clf):
     """
-    Aggregates slice-level predictions into patient-level predictions.
+    Aggregates slice-level predictions into series-level predictions.
     """
 
-    patient_probs, patient_labels = {}, {}
+    series_probs, series_labels = {}, {}
 
     # Slice-level probabilities
     slice_probs = clf.predict_proba(features)[:,1]
 
-    for prob, label, patient in zip(slice_probs, labels, patients):
+    for prob, label, series_id in zip(slice_probs, labels, series):
 
-        patient_probs.setdefault(patient, []).append(prob)
+        series_probs.setdefault(series_id, []).append(prob)
 
-        patient_labels[patient] = label
+        series_labels[series_id] = label
 
     X, y = [], []
 
-    for p in patient_probs:
+    for series_id in series_probs:
 
         # Bayesian aggregation
         X.append(
-            bayesian_fusion(np.array(patient_probs[p]))
+            bayesian_fusion(np.array(series_probs[series_id]))
         )
 
-        y.append(patient_labels[p])
+        y.append(series_labels[series_id])
 
     return np.array(X), np.array(y)
 
@@ -1025,35 +1042,60 @@ def aggregate_patient(features, labels, patients, clf):
 # =============================
 
 # =============================================================
-# BUILD PATIENT LIST
+# BUILD SERIES / DIRECTORY LIST
 # =============================================================
 
-patients = list(set([s[2] for s in samples]))
+series = sorted(set([s[2] for s in samples]))
 
-normal = [p for p in patients if p.startswith("Normal")]
-sick = [p for p in patients if p.startswith("Sick")]
+directories = sorted(set(series_to_directory.values()))
+normal_directories = [d for d in directories if d.startswith("Normal/")]
+sick_directories = [d for d in directories if d.startswith("Sick/")]
+
+rng = np.random.RandomState(42)
+normal_directories = list(rng.permutation(normal_directories))
+sick_directories = list(rng.permutation(sick_directories))
+
+normal_test_count = max(1, int(round(len(normal_directories) * 0.2)))
+sick_test_count = max(1, int(round(len(sick_directories) * 0.2)))
 
 # =============================================================
 # TRAIN / TEST SPLIT
 # =============================================================
 
 # IMPORTANT:
-# Split is PATIENT-LEVEL.
+# Split is DIRECTORY-GROUPED for SERIES-LEVEL evaluation.
 #
-# NEVER split by slices directly.
+# NEVER split by slices or individual series directly because exact duplicate
+# images were observed between series inside the same Directory_*.
 #
-train_patients = normal[:1] + sick[:1]
+train_directories = (
+    normal_directories[normal_test_count:]
+    + sick_directories[sick_test_count:]
+)
 
-test_patients  = normal[1:2] + sick[1:2]
+test_directories = (
+    normal_directories[:normal_test_count]
+    + sick_directories[:sick_test_count]
+)
+
+train_series = [
+    series_id for series_id in series
+    if series_to_directory[series_id] in train_directories
+]
+
+test_series = [
+    series_id for series_id in series
+    if series_to_directory[series_id] in test_directories
+]
 
 train_samples = [
     s for s in samples
-    if s[2] in train_patients
+    if s[2] in train_series
 ]
 
 test_samples = [
     s for s in samples
-    if s[2] in test_patients
+    if s[2] in test_series
 ]
 
 # Optional debugging subset
@@ -1067,12 +1109,12 @@ test_ds  = MRIDataset(test_samples, transform)
 # FEATURE EXTRACTION
 # =============================================================
 
-X_train, y_train, p_train = extract_features(
+X_train, y_train, s_train = extract_features(
     train_ds,
     debug=True
 )
 
-X_test, y_test, p_test = extract_features(
+X_test, y_test, s_test = extract_features(
     test_ds,
     debug=True
 )
@@ -1098,13 +1140,13 @@ clf = LogisticRegression(max_iter=1000)
 clf.fit(X_train, y_train)
 
 # =============================================================
-# PATIENT-LEVEL PREDICTION
+# SERIES-LEVEL PREDICTION
 # =============================================================
 
-Xp_test, yp_test = aggregate_patient(
+Xs_test, ys_test = aggregate_series(
     X_test,
     y_test,
-    p_test,
+    s_test,
     clf
 )
 
@@ -1122,8 +1164,8 @@ Xp_test, yp_test = aggregate_patient(
 #   - datasets are often imbalanced
 #   - ranking quality matters
 #
-auc = roc_auc_score(yp_test, Xp_test)
+auc = roc_auc_score(ys_test, Xs_test)
 
-print("PATIENT-LEVEL AUC:", auc)
+print("SERIES-LEVEL AUC:", auc)
 
 print("Done!")
