@@ -57,9 +57,11 @@
 #   pip install monai==1.6.0 huggingface_hub
 #   pip install torch torchvision opencv-python numpy scikit-learn matplotlib tqdm
 #
-# On first execution, the script downloads the pinned MONAI bundle into the
-# local monai_bundles directory. Set AUTO_DOWNLOAD_MONAI_BUNDLE = False if the
-# bundle must be supplied manually or the machine has no internet access.
+# On first execution, the script downloads the pinned MONAI bundle if needed,
+# imports MONAI once, and exports the segmenter to a local TorchScript cache.
+# Later executions load that cache directly and do not import MONAI at startup.
+# Set AUTO_DOWNLOAD_MONAI_BUNDLE = False if the original bundle must be supplied
+# manually or the machine has no internet access.
 #
 # ============================================================================
 # PIPELINE FLOW
@@ -205,20 +207,18 @@ import torchvision.transforms as transforms
 from torchvision import models
 # Provides ImageNet-pretrained EfficientNet-B0.
 
-try:
-    from monai.networks.nets import UNet as MONAIUNet
-except ImportError as exc:
-    raise ImportError(
-        "MONAI is required for the pretrained cardiac segmentation stage. "
-        "Install it with: pip install monai==1.6.0 huggingface_hub"
-    ) from exc
-# MONAI provides:
-#   - the residual 2D U-Net architecture used by the official bundle
-#   - the bundle download utility
+# IMPORTANT STARTUP OPTIMIZATION:
 #
-# The architecture below is instantiated directly from the official bundle
-# configuration. This avoids depending on unrelated training-only components
-# in train.json while still loading the official pretrained weights.
+# MONAI is intentionally NOT imported at module startup.
+#
+# On the first run, build_monai_segmenter() imports MONAI lazily, constructs
+# the official pretrained UNet, and exports it once to a TorchScript cache.
+# On all later runs, the segmentation network is loaded directly with
+# torch.jit.load(), so neither monai.networks.nets nor monai.bundle.scripts is
+# imported at startup. This removes the slow MONAI import from normal runs.
+#
+# The MONAI bundle downloader remains lazy as well and is imported only if the
+# original model.pt checkpoint is missing.
 
 from sklearn.linear_model import LogisticRegression
 # Classical ML classifier trained on EfficientNet slice embeddings.
@@ -349,6 +349,29 @@ MONAI_BUNDLE_DIR = Path(
     os.environ.get("MONAI_BUNDLE_DIR", str(default_bundle_parent))
 )
 # The MONAI_BUNDLE_DIR environment variable can override the default location.
+
+MONAI_TORCHSCRIPT_PATH = Path(
+    os.environ.get(
+        "MONAI_TORCHSCRIPT_PATH",
+        str(
+            MONAI_BUNDLE_DIR
+            / f"{MONAI_BUNDLE_NAME}_{MONAI_BUNDLE_VERSION}_torchscript.pt"
+        ),
+    )
+)
+# Fast-start cache of the complete pretrained segmentation network.
+#
+# First run:
+#   model.pt -> lazy MONAI import -> construct UNet -> TorchScript export
+#
+# Later runs:
+#   TorchScript cache -> torch.jit.load()
+#
+# MONAI itself is therefore not imported during normal later executions.
+
+FORCE_REBUILD_MONAI_TORCHSCRIPT = False
+# Set True only when intentionally rebuilding the cached TorchScript model,
+# for example after changing the MONAI architecture or checkpoint version.
 
 # ---------------------------------------------------------------------------
 # DATASET LOCATION
@@ -795,6 +818,7 @@ def ensure_monai_bundle():
     model_path = bundle_root / "models" / "model.pt"
 
     if model_path.is_file():
+        print(f"Using cached MONAI checkpoint: {model_path}")
         return bundle_root
 
     if not AUTO_DOWNLOAD_MONAI_BUNDLE:
@@ -804,14 +828,21 @@ def ensure_monai_bundle():
             f"{MONAI_BUNDLE_DIR}"
         )
 
-    # Heavy import happens ONLY the first time,
-    # when the model actually needs to be downloaded.
-    from monai.bundle.scripts import download as download_monai_bundle
+    # Import the heavy MONAI downloader only when the checkpoint is absent.
+    # This path is normally executed only on the first run.
+    try:
+        from monai.bundle.scripts import download as download_monai_bundle
+    except ImportError as exc:
+        raise ImportError(
+            "The MONAI checkpoint is missing and the bundle downloader could "
+            "not be imported. Install the downloader dependency with: "
+            "pip install monai==1.6.0 huggingface_hub"
+        ) from exc
 
     MONAI_BUNDLE_DIR.mkdir(parents=True, exist_ok=True)
 
     print(
-        "Downloading MONAI bundle "
+        "MONAI checkpoint not found locally. Downloading bundle once: "
         f"{MONAI_BUNDLE_NAME} version {MONAI_BUNDLE_VERSION}..."
     )
 
@@ -844,6 +875,7 @@ def ensure_monai_bundle():
             f"not be located under {MONAI_BUNDLE_DIR}."
         )
 
+    print(f"MONAI bundle cached for future runs: {model_path}")
     return bundle_root
 
 
@@ -886,21 +918,62 @@ def load_checkpoint_state_dict(path):
 
 def build_monai_segmenter():
     """
-    Build and initialize the official pretrained MONAI ventricular segmenter.
+    Load the pretrained MONAI ventricular segmenter with a fast-start cache.
 
-    The architecture exactly matches the official bundle configuration:
+    NORMAL RUNS
+    ------------
+    If MONAI_TORCHSCRIPT_PATH already exists, load it directly with
+    torch.jit.load(). No MONAI import is performed.
 
-        MONAI UNet
-        spatial_dims = 2
-        in_channels  = 1
-        out_channels = 4
-        channels     = (16, 32, 64, 128, 256)
-        strides      = (2, 2, 2, 2)
-        num_res_units = 2
+    FIRST RUN ONLY
+    --------------
+    If the TorchScript cache does not exist:
 
-    Unlike the removed custom Attention U-Net, every segmentation layer in this
-    model receives pretrained cardiac-MRI weights.
+        1. Ensure the official MONAI bundle/checkpoint is present.
+        2. Import MONAI UNet lazily.
+        3. Build the exact official network architecture.
+        4. Load the pretrained checkpoint.
+        5. Trace and validate the network on the fixed 256x256 input used by
+           this pipeline.
+        6. Save a TorchScript model for all future runs.
+
+    This keeps the same pretrained segmentation network while avoiding the
+    expensive ``from monai.networks.nets import UNet`` import after the cache
+    has been created once.
     """
+
+    # =========================================================
+    # FAST PATH: NO MONAI IMPORT
+    # =========================================================
+
+    if (
+        MONAI_TORCHSCRIPT_PATH.is_file()
+        and not FORCE_REBUILD_MONAI_TORCHSCRIPT
+    ):
+        try:
+            network = torch.jit.load(
+                str(MONAI_TORCHSCRIPT_PATH),
+                map_location=DEVICE,
+            )
+            network.eval()
+
+            print(
+                "Loaded cached MONAI TorchScript segmenter (no MONAI import): "
+                f"{MONAI_TORCHSCRIPT_PATH}"
+            )
+
+            return network
+
+        except Exception as exc:
+            print(
+                "Cached MONAI TorchScript model could not be loaded. "
+                "It will be rebuilt once from the official checkpoint. "
+                f"Reason: {exc}"
+            )
+
+    # =========================================================
+    # FIRST-RUN / REBUILD PATH
+    # =========================================================
 
     bundle_root = ensure_monai_bundle()
     model_path = bundle_root / "models" / "model.pt"
@@ -917,6 +990,21 @@ def build_monai_segmenter():
                 "compatible checkpoint."
             )
 
+    print(
+        "TorchScript cache not found. Importing MONAI once to build the "
+        "pretrained segmenter..."
+    )
+
+    try:
+        # Deliberately lazy. This expensive import happens only when the
+        # TorchScript cache must be created or rebuilt.
+        from monai.networks.nets import UNet as MONAIUNet
+    except ImportError as exc:
+        raise ImportError(
+            "MONAI is required only to create the segmentation cache the first "
+            "time. Install it with: pip install monai==1.6.0 huggingface_hub"
+        ) from exc
+
     network = MONAIUNet(
         spatial_dims=2,
         in_channels=1,
@@ -930,12 +1018,75 @@ def build_monai_segmenter():
 
     # strict=True guarantees that architecture and checkpoint keys match.
     network.load_state_dict(state_dict, strict=True)
-
-    network = network.to(DEVICE)
     network.eval()
     network.requires_grad_(False)
 
-    print(f"Loaded pretrained MONAI segmenter from: {model_path}")
+    # Trace on CPU using the exact fixed spatial input used throughout this
+    # pipeline. Keeping export on CPU avoids CUDA-specific serialization.
+    example_input = torch.zeros(
+        1,
+        1,
+        MONAI_INPUT_SIZE,
+        MONAI_INPUT_SIZE,
+        dtype=torch.float32,
+    )
+
+    network = network.cpu()
+
+    print(
+        "Creating MONAI TorchScript cache. This is done only once..."
+    )
+
+    with torch.inference_mode():
+        reference_output = network(example_input)
+
+        traced_network = torch.jit.trace(
+            network,
+            example_input,
+            strict=False,
+        )
+
+        traced_output = traced_network(example_input)
+
+    # Verify that tracing preserved the numerical output before saving it.
+    if not torch.allclose(
+        reference_output,
+        traced_output,
+        rtol=1e-4,
+        atol=1e-5,
+    ):
+        max_difference = float(
+            (reference_output - traced_output).abs().max().item()
+        )
+        raise RuntimeError(
+            "TorchScript validation failed: traced MONAI output differs from "
+            f"the original network (max abs difference={max_difference:.6g})."
+        )
+
+    # Freeze inference-only graph where supported.
+    try:
+        traced_network = torch.jit.freeze(traced_network.eval())
+    except Exception:
+        traced_network.eval()
+
+    MONAI_TORCHSCRIPT_PATH.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    traced_network.save(str(MONAI_TORCHSCRIPT_PATH))
+
+    print(
+        "Saved MONAI TorchScript cache for future fast starts: "
+        f"{MONAI_TORCHSCRIPT_PATH}"
+    )
+
+    # Use the cached representation immediately, including on the first run.
+    network = torch.jit.load(
+        str(MONAI_TORCHSCRIPT_PATH),
+        map_location=DEVICE,
+    )
+    network.eval()
 
     return network
 
