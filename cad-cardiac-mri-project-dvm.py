@@ -206,7 +206,6 @@ from torchvision import models
 # Provides ImageNet-pretrained EfficientNet-B0.
 
 try:
-    from monai.bundle.scripts import download as download_monai_bundle
     from monai.networks.nets import UNet as MONAIUNet
 except ImportError as exc:
     raise ImportError(
@@ -291,16 +290,25 @@ MONAI_MODEL_SHA256 = (
 )
 # SHA-256 of the official model.pt stored in the MONAI bundle repository.
 
-MONAI_ROI_DILATION_KERNEL = 17
+MONAI_ROI_DILATION_KERNEL = 41
 # Expands the predicted ventricular structures to retain a margin around the
 # myocardium. Must be an odd positive integer so output size remains unchanged.
+# 17  → extindere mică
+# 31  → extindere moderată
+# 41  → extindere mare
+# 51  → foarte mare
 
-MONAI_BACKGROUND_WEIGHT = 0.15
+MONAI_BACKGROUND_WEIGHT = 0.30
 # Soft ROI background retention.
 #
 # A value of 0 would remove all pixels outside the predicted cardiac region.
 # That is risky under domain shift. A value of 0.15 keeps 15% of the original
 # background signal while emphasizing the predicted heart region.
+# 0.00 = exterior complet eliminat
+# 0.15 = exterior foarte atenuat       ← actual
+# 0.30 = păstrează destul context
+# 0.40 = păstrează mult context
+# 1.00 = practic fără ROI
 
 MONAI_MIN_HEART_AREA_RATIO = 0.003
 MONAI_MAX_HEART_AREA_RATIO = 0.50
@@ -795,6 +803,10 @@ def ensure_monai_bundle():
             "disabled. Expected a bundle containing models/model.pt under: "
             f"{MONAI_BUNDLE_DIR}"
         )
+
+    # Heavy import happens ONLY the first time,
+    # when the model actually needs to be downloaded.
+    from monai.bundle.scripts import download as download_monai_bundle
 
     MONAI_BUNDLE_DIR.mkdir(parents=True, exist_ok=True)
 
