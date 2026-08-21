@@ -290,7 +290,7 @@ MONAI_MODEL_SHA256 = (
 )
 # SHA-256 of the official model.pt stored in the MONAI bundle repository.
 
-MONAI_ROI_DILATION_KERNEL = 41
+MONAI_ROI_DILATION_KERNEL = 31
 # Expands the predicted ventricular structures to retain a margin around the
 # myocardium. Must be an odd positive integer so output size remains unchanged.
 # 17  → extindere mică
@@ -298,7 +298,7 @@ MONAI_ROI_DILATION_KERNEL = 41
 # 41  → extindere mare
 # 51  → foarte mare
 
-MONAI_BACKGROUND_WEIGHT = 0.30
+MONAI_BACKGROUND_WEIGHT = 0.15
 # Soft ROI background retention.
 #
 # A value of 0 would remove all pixels outside the predicted cardiac region.
