@@ -428,8 +428,8 @@ USE_SLICE_QUALITY_WEIGHTS = False
 SLICE_QUALITY_MIN_WEIGHT = 0.25
 # Lower bound used only when USE_SLICE_QUALITY_WEIGHTS=True.
 
-DEBUG_VISUALIZATION = True
-DEBUG_INDICES = "full"
+DEBUG_VISUALIZATION = False
+DEBUG_INDICES = "10%"
 # Select debug figures from the complete image list. Use "full" to save a
 # figure for every image, or a percentage such as "10%" to save an evenly
 # spaced, deterministic 10% of all images. Numeric percentages (for example,
