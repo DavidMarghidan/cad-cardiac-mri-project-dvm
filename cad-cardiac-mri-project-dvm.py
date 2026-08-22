@@ -24,20 +24,30 @@
 #
 # The architecture combines:
 #
-#   1. Pretrained MONAI cardiac MRI segmentation
-#   2. Confidence-gated soft ROI extraction
-#   3. ImageNet-pretrained EfficientNet-B0 feature extraction
-#   4. Series-aware slice quality filtering
-#   5. Patient-balanced classical Machine Learning classification
-#   6. Hierarchical probabilistic fusion: slices → series → patient
-#   7. Patient-stratified train/test evaluation
+#   1. Patient-level grouping and leakage-safe evaluation
+#   2. Pretrained MONAI cardiac ventricular segmentation (SAX-specific)
+#   3. Confidence-gated soft ROI extraction with full-image fallback
+#   4. ImageNet-pretrained EfficientNet-B0 feature extraction
+#   5. Series-aware quality weighting (without discarding an entire series)
+#   6. Patient-balanced Logistic Regression on frozen embeddings
+#   7. Hierarchical probabilistic fusion: slices → series → patient
+#   8. Stratified Group K-fold patient-level evaluation
+#
+# IMPORTANT METHODOLOGICAL CHANGE:
+# The original version used a single 80/20 patient split and discarded roughly
+# half of the slices in every series. The revised version uses 5-fold
+# StratifiedGroupKFold and keeps all retained slices, weighting them by a
+# within-series quality score. This gives a substantially more stable estimate
+# on a dataset with approximately 1,224 patients and avoids throwing away
+# potentially diagnostic slices merely because their intensity standard
+# deviation is below the series median.
 #
 # The segmentation stage uses the official MONAI Model Zoo bundle:
 #
 #   ventricular_short_axis_3label, version 0.3.5
 #
-# The bundle contains a pretrained 2D residual U-Net that produces four output
-# channels:
+# The bundle contains a pretrained 2D residual U-Net (MONAI UNet with residual
+# units) that produces four output channels:
 #
 #   0 = background
 #   1 = left-ventricular blood pool
@@ -56,6 +66,13 @@
 #
 #   pip install monai==1.6.0 huggingface_hub
 #   pip install torch torchvision opencv-python numpy scikit-learn matplotlib tqdm
+#
+# NOTE ABOUT THE PRETRAINED SEGMENTER:
+# The MONAI bundle metadata identifies version 0.3.5 and records the original
+# bundle environment as MONAI 1.3.0 / PyTorch 1.13.0. The network definition is
+# verified from the official bundle configuration. The current script can use a
+# newer MONAI version to build/load the network, but the exact checkpoint and
+# architecture should be kept pinned for reproducibility.
 #
 # On first execution, the script downloads the pinned MONAI bundle if needed,
 # imports MONAI once, and exports the segmenter to a local TorchScript cache.
@@ -226,6 +243,18 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 # ROC-AUC evaluation metric for binary patient-level ranking.
 
+from sklearn.model_selection import StratifiedGroupKFold
+# Patient-level cross-validation.
+# Stratification preserves the Normal/Sick proportion as far as possible while
+# the group constraint guarantees that a patient can occur in only one fold.
+
+from sklearn.pipeline import Pipeline
+# Bundles feature standardization and Logistic Regression so the scaler is fit
+# ONLY on the training patients of each fold.
+
+from sklearn.preprocessing import StandardScaler
+# Standardizes the 1280-dimensional EfficientNet embeddings inside each fold.
+
 import matplotlib.pyplot as plt
 # Visualization utility for inspecting:
 #   - the padded input
@@ -280,15 +309,17 @@ AUTO_DOWNLOAD_MONAI_BUNDLE = True
 #
 #   <MONAI_BUNDLE_DIR>/ventricular_short_axis_3label/models/model.pt
 
-VERIFY_MONAI_CHECKPOINT_SHA256 = True
-# Verify the checkpoint against the hash published for the pinned official
-# model file. Set to False only when intentionally using another compatible
-# checkpoint.
+VERIFY_MONAI_CHECKPOINT_SHA256 = False
+# The MONAI model-zoo registry publishes a checksum for the downloadable bundle
+# archive, not the model.pt file itself. The previous version of this script
+# contained a hard-coded SHA-256 for model.pt without a verifiable public source.
+# That check has therefore been removed rather than pretending it is authoritative.
+#
+# If you download a specific archive/checkpoint yourself and have its published
+# SHA-256, you can re-enable a file-level check by setting the value below.
 
-MONAI_MODEL_SHA256 = (
-    "464ca796028831f6c9e2b1cdaebe9af002fc1d7f494f7a89a63f2079e38837a1"
-)
-# SHA-256 of the official model.pt stored in the MONAI bundle repository.
+MONAI_MODEL_SHA256 = ""
+# Optional SHA-256 for a locally supplied model.pt. Leave empty to skip.
 
 MONAI_ROI_DILATION_KERNEL = 31
 # Expands the predicted ventricular structures to retain a margin around the
@@ -614,50 +645,41 @@ class MRIDataset(Dataset):
 
 def load_samples(root_dir):
     """
-    Discover every MRI image and attach both patient and series identifiers.
+    Discover MRI images and attach patient + series identifiers.
 
-    Expected high-level structure:
+    DATASET-LEVEL ASSUMPTION
+    ------------------------
+    The Scientific Reports paper describing this dataset reports 1,224
+    participants (722 healthy and 502 CAD) and 63,648 CMR images. The released
+    directory names must still be inspected locally before publication; this
+    function therefore DOES NOT hard-code those counts.
 
-        Normal/
-            Directory_1/                 <- one Normal patient
-                series0001-Body/          <- one imaging series
-                series0002-Body/
-                ...
+    PATIENT UNIT
+    ------------
+    One immediate ``Directory_*`` folder under Normal/ or Sick/ is treated as
+    one patient because this is the directory convention used by the present
+    dataset release.
 
-        Sick/
-            Directory_17/                <- one Sick patient
-                SR_1/                     <- one imaging series
-                SR_2/
-                ...
+    SERIES UNIT
+    -----------
+    The first directory level below the patient is treated as the imaging
+    series. This is safer than using ``os.walk(root)`` as the series definition:
+    nested folders inside a series should not silently become separate series.
 
-    =========================================================================
-    PATIENT-LEVEL DESIGN CHOICE
-    =========================================================================
+    Example:
 
-    This implementation uses the mapping supplied for this dataset:
+        Sick/Directory_24/SR_3/image001.jpg
+        Sick/Directory_24/SR_3/subfolder/image002.jpg
 
-        one immediate Directory_* folder = one patient
+    Both images remain in the same series:
 
-    The patient_id is the class-qualified relative path, for example:
+        Sick/Directory_24/SR_3
 
-        Normal/Directory_1
-        Sick/Directory_24
+    Images directly inside Directory_* receive the special series ID
+    ``<patient_id>/__ROOT__``.
 
-    Qualifying the identifier with Normal/Sick avoids any accidental collision
-    if a Directory number is ever reused between the two class folders.
-
-    Every image-containing child folder receives a unique series_id based on
-    its full relative path. Images placed directly inside a Directory_* folder
-    are also supported; in that case, patient_id and series_id are identical.
-
-    The sample tuple is:
-
-        (image_path, label, patient_id, series_id)
-
-    The patient identifier is later used for train/test splitting and final
-    evaluation. The series identifier is retained for two-stage aggregation:
-
-        slice probabilities → series probability → patient probability
+    The function returns:
+        (image_path, binary_label, patient_id, series_id)
     """
 
     samples = []
@@ -666,7 +688,6 @@ def load_samples(root_dir):
     for class_name in ["Normal", "Sick"]:
 
         label = 0 if class_name == "Normal" else 1
-
         class_path = os.path.join(root_dir, class_name)
 
         if not os.path.isdir(class_path):
@@ -681,41 +702,76 @@ def load_samples(root_dir):
             if not os.path.isdir(patient_path):
                 continue
 
-            # The dataset convention used here is that only Directory_* folders
-            # represent patients. Other auxiliary folders are ignored.
             if not directory.lower().startswith("directory_"):
                 continue
 
             patient_id = f"{class_name}/{directory}"
-            patient_image_count = 0
+            discovered_patients.add(patient_id)
 
-            for root, _, files in os.walk(patient_path):
+            # ---------------------------------------------------------
+            # First collect images directly inside the patient folder.
+            # ---------------------------------------------------------
+            root_images = [
+                filename
+                for filename in sorted(os.listdir(patient_path))
+                if filename.lower().endswith((".png", ".jpg", ".jpeg"))
+                and os.path.isfile(os.path.join(patient_path, filename))
+            ]
 
-                image_files = [
-                    filename
-                    for filename in files
-                    if filename.lower().endswith((".png", ".jpg", ".jpeg"))
-                ]
+            root_series_id = f"{patient_id}/__ROOT__"
 
-                if not image_files:
-                    continue
-
-                series_id = os.path.relpath(root, root_dir).replace(os.sep, "/")
-
-                for filename in sorted(image_files):
-
-                    samples.append(
-                        (
-                            os.path.join(root, filename),
-                            label,
-                            patient_id,
-                            series_id,
-                        )
+            for filename in root_images:
+                samples.append(
+                    (
+                        os.path.join(patient_path, filename),
+                        label,
+                        patient_id,
+                        root_series_id,
                     )
-                    patient_image_count += 1
+                )
 
-            if patient_image_count > 0:
-                discovered_patients.add(patient_id)
+            # ---------------------------------------------------------
+            # Find immediate child directories. Each child directory is
+            # treated as one imaging series. os.walk is still used to
+            # collect images recursively inside that series.
+            # ---------------------------------------------------------
+            child_series_dirs = [
+                child
+                for child in sorted(os.listdir(patient_path))
+                if os.path.isdir(os.path.join(patient_path, child))
+            ]
+
+            for series_name in child_series_dirs:
+
+                series_path = os.path.join(patient_path, series_name)
+                series_id = f"{patient_id}/{series_name}"
+
+                found_images = False
+
+                for root, _, files in os.walk(series_path):
+
+                    for filename in sorted(files):
+
+                        if not filename.lower().endswith(
+                            (".png", ".jpg", ".jpeg")
+                        ):
+                            continue
+
+                        found_images = True
+
+                        samples.append(
+                            (
+                                os.path.join(root, filename),
+                                label,
+                                patient_id,
+                                series_id,
+                            )
+                        )
+
+                if not found_images:
+                    # Empty series folders are ignored rather than becoming
+                    # artificial series with zero observations.
+                    continue
 
     if not samples:
         raise RuntimeError(
@@ -724,14 +780,41 @@ def load_samples(root_dir):
 
     if not discovered_patients:
         raise RuntimeError(
-            "Images were found, but no image-containing Directory_* patient "
-            "folders were discovered. Verify the dataset directory structure."
+            "No Directory_* patient folders were discovered. "
+            "Verify the dataset path and folder structure."
         )
 
+    # -------------------------------------------------------------
+    # Sanity checks that should fail early rather than silently
+    # contaminating a publication experiment.
+    # -------------------------------------------------------------
+    patient_to_label = {}
+
+    for _, label, patient_id, _ in samples:
+
+        previous = patient_to_label.get(patient_id)
+
+        if previous is not None and previous != label:
+            raise RuntimeError(
+                f"Patient {patient_id} appears with both class labels."
+            )
+
+        patient_to_label[patient_id] = label
+
+    print("Dataset discovery summary")
+    print(f"  Patients: {len(patient_to_label)}")
+    print(
+        "  Normal patients:",
+        sum(label == 0 for label in patient_to_label.values()),
+    )
+    print(
+        "  Sick patients:",
+        sum(label == 1 for label in patient_to_label.values()),
+    )
+    print(f"  Images: {len(samples)}")
+    print(f"  Series: {len(set(sample[3] for sample in samples))}")
+
     return samples
-
-
-samples = load_samples(DATASET_PATH)
 
 
 # =============================
@@ -978,16 +1061,13 @@ def build_monai_segmenter():
     bundle_root = ensure_monai_bundle()
     model_path = bundle_root / "models" / "model.pt"
 
-    if VERIFY_MONAI_CHECKPOINT_SHA256:
+    if VERIFY_MONAI_CHECKPOINT_SHA256 and MONAI_MODEL_SHA256:
         actual_hash = sha256_file(model_path)
 
         if actual_hash.lower() != MONAI_MODEL_SHA256.lower():
             raise RuntimeError(
                 "MONAI model.pt SHA-256 mismatch. "
-                f"Expected {MONAI_MODEL_SHA256}, got {actual_hash}. "
-                "Delete the bundle and download the pinned version again, or "
-                "disable verification only when intentionally using a different "
-                "compatible checkpoint."
+                f"Expected {MONAI_MODEL_SHA256}, got {actual_hash}."
             )
 
     print(
@@ -1435,33 +1515,90 @@ feature_extractor.requires_grad_(False)
 # FEATURE EXTRACTION + SLICE FILTERING
 # =============================
 
+def _normalize_quality_weights(scores, minimum_weight=0.25):
+    """
+    Convert raw slice-quality scores into stable weights within ONE series.
+
+    Why weights instead of deleting slices?
+    ---------------------------------------
+    A hard "top 50%" rule can remove diagnostically useful slices and makes the
+    result depend on an arbitrary cutoff. Instead, every slice is retained and
+    receives a bounded weight.
+
+    The weights are normalized to have mean 1 within each series, while a
+    minimum floor prevents a low-quality slice from receiving zero influence.
+
+    IMPORTANT:
+    This is still a heuristic. It should be reported as such and ideally
+    replaced or validated against a manually reviewed slice-quality subset.
+    """
+
+    scores = np.asarray(scores, dtype=np.float64)
+
+    if scores.size == 1:
+        return np.ones(1, dtype=np.float64)
+
+    # Robust normalization using the 25th and 75th percentiles. This is less
+    # sensitive to one extremely noisy slice than min-max scaling.
+    q25, q75 = np.percentile(scores, [25, 75])
+    scale = max(q75 - q25, 1e-8)
+
+    normalized = (scores - q25) / scale
+    normalized = np.clip(normalized, 0.0, 1.0)
+
+    weights = minimum_weight + (1.0 - minimum_weight) * normalized
+
+    # Mean=1 means the absolute magnitude of weights does not change the
+    # effective sample-size scale for the classifier.
+    weights /= max(weights.mean(), 1e-8)
+
+    return weights
+
+
 def extract_features(dataset, debug=False):
     """
-    Run MONAI segmentation, ROI construction, EfficientNet encoding, and
-    series-aware low-information slice filtering.
+    Run the frozen image-processing pipeline and return one embedding per slice.
+
+    PIPELINE:
+        JPEG
+          ↓
+        per-image intensity scaling
+          ↓
+        MONAI-compatible 256×256 canvas
+          ↓
+        MONAI ventricular segmentation
+          ↓
+        confidence gate
+          ↓
+        soft cardiac ROI / full-image fallback
+          ↓
+        EfficientNet-B0
+          ↓
+        1280-D embedding
+          ↓
+        series-aware quality weight
+
+    No class labels are used to generate features or quality weights.
+
+    This function intentionally keeps ALL slices. The previous implementation
+    selected slices above the per-series median standard deviation. That is a
+    brittle hard filter because high standard deviation can also reflect noise,
+    artefact, or extracardiac anatomy. The revised implementation returns a
+    quality weight for every slice instead.
 
     Returns:
         features:
-            Matrix [retained_slices, 1280].
-
+            [N, 1280] EfficientNet embeddings.
         labels:
-            Binary patient label repeated for each retained slice.
-
+            [N] binary patient labels.
         patient_ids:
-            Directory_* patient identifier for each retained slice.
-
+            [N] patient identifiers.
         series_ids:
-            Imaging-series identifier for each retained slice.
-
-    Slice-quality filtering is applied AFTER all batches have been encoded and
-    independently inside every series. The top half by ROI intensity standard
-    deviation is retained in each series. This makes the result independent of
-    DataLoader batch boundaries and guarantees that every non-empty series, and
-    therefore every patient, keeps at least one slice.
-
-    The function also prints the proportion of slices whose MONAI masks passed
-    the plausibility gate. A very low valid-mask rate is a warning that the
-    pretrained short-axis segmenter is strongly out of domain for this subset.
+            [N] series identifiers.
+        quality_weights:
+            [N] non-negative slice weights, normalized within each series.
+        monai_valid:
+            [N] boolean segmentation-gate result.
     """
 
     loader = DataLoader(
@@ -1477,9 +1614,7 @@ def extract_features(dataset, debug=False):
     all_patients = []
     all_series = []
     all_scores = []
-
-    total_masks = 0
-    valid_masks_count = 0
+    all_monai_valid = []
 
     with torch.inference_mode():
 
@@ -1493,19 +1628,8 @@ def extract_features(dataset, debug=False):
                 series_ids,
             ) = batch
 
-            images = images.to(
-                DEVICE,
-                non_blocking=True,
-            )
-
-            monai_images = monai_images.to(
-                DEVICE,
-                non_blocking=True,
-            )
-
-            # =====================================================
-            # STEP 2: PRETRAINED MONAI SEGMENTATION
-            # =====================================================
+            images = images.to(DEVICE, non_blocking=True)
+            monai_images = monai_images.to(DEVICE, non_blocking=True)
 
             (
                 roi_probability,
@@ -1518,47 +1642,30 @@ def extract_features(dataset, debug=False):
                 classifier_size=images.shape[-2:],
             )
 
-            total_masks += int(valid_mask.numel())
-            valid_masks_count += int(valid_mask.sum().item())
-
-            # =====================================================
-            # STEP 3: CONFIDENCE-GATED SOFT ROI
-            # =====================================================
-
             roi_images = apply_confidence_gated_soft_roi(
                 images,
                 roi_probability,
                 valid_mask,
             )
 
-            # =====================================================
-            # STEP 4: EFFICIENTNET FEATURE EXTRACTION
-            # =====================================================
-
-            efficientnet_inputs = normalize_for_efficientnet(
-                roi_images
-            )
+            efficientnet_inputs = normalize_for_efficientnet(roi_images)
 
             features = feature_extractor(efficientnet_inputs)
 
-            # =====================================================
-            # STEP 5: SLICE QUALITY SCORING
-            # =====================================================
-
-            # Standard deviation is measured before ImageNet normalization.
-            # Low variability often indicates an empty, flat, or weakly
-            # informative image. This remains only a simple heuristic and can
-            # later be replaced with a learned quality model.
+            # ---------------------------------------------------------
+            # Slice-quality signal
+            # ---------------------------------------------------------
+            # Standard deviation is only a proxy for image information. It is
+            # NOT a clinical quality metric and must not be described as one.
+            #
+            # We calculate it before ImageNet normalization because the [0,1]
+            # intensity scale is easier to interpret.
             scores = torch.std(
                 roi_images,
                 dim=(1, 2, 3),
             )
 
-            # =====================================================
-            # DEBUG VISUALIZATION
-            # =====================================================
-
-            if debug:  # Add "and batch_idx == 0" to save only the first batch.
+            if debug:
                 debug_visualization(
                     images,
                     roi_probability,
@@ -1571,25 +1678,22 @@ def extract_features(dataset, debug=False):
                     batch_idx,
                 )
 
-            # Store every encoded slice first. Filtering is performed per
-            # series after all batches are available, not per arbitrary batch.
             all_features.append(features.cpu().numpy())
             all_labels.extend(labels.numpy().tolist())
             all_patients.extend(list(patient_ids))
             all_series.extend(list(series_ids))
             all_scores.extend(scores.cpu().numpy().tolist())
+            all_monai_valid.extend(valid_mask.cpu().numpy().tolist())
 
     if not all_features:
-        raise RuntimeError(
-            "No slice features were extracted. Inspect image loading, MONAI "
-            "masks, and EfficientNet inference."
-        )
+        raise RuntimeError("No slice features were extracted.")
 
     features = np.vstack(all_features)
     labels = np.asarray(all_labels, dtype=np.int64)
     patient_ids = np.asarray(all_patients)
     series_ids = np.asarray(all_series)
     scores = np.asarray(all_scores, dtype=np.float32)
+    monai_valid = np.asarray(all_monai_valid, dtype=bool)
 
     if not (
         len(features)
@@ -1597,64 +1701,54 @@ def extract_features(dataset, debug=False):
         == len(patient_ids)
         == len(series_ids)
         == len(scores)
+        == len(monai_valid)
     ):
         raise RuntimeError(
             "Feature extraction produced arrays with inconsistent lengths."
         )
 
-    # =============================================================
-    # SERIES-AWARE SLICE QUALITY FILTERING
-    # =============================================================
-
-    keep = np.zeros(len(scores), dtype=bool)
+    # -------------------------------------------------------------
+    # QUALITY WEIGHTS ARE COMPUTED WITHIN EACH SERIES.
+    #
+    # This prevents a series with globally higher contrast from receiving
+    # larger weights merely because its scanner/export intensity scale differs.
+    # -------------------------------------------------------------
+    quality_weights = np.zeros(len(scores), dtype=np.float64)
 
     for series_id in np.unique(series_ids):
 
-        series_indices = np.flatnonzero(series_ids == series_id)
-        series_scores = scores[series_indices]
+        indices = np.flatnonzero(series_ids == series_id)
 
-        threshold = np.median(series_scores)
-        retained_indices = series_indices[series_scores >= threshold]
-
-        if retained_indices.size == 0:
-            # Defensive fallback for pathological numerical cases.
-            retained_indices = np.asarray(
-                [series_indices[int(np.argmax(series_scores))]]
-            )
-
-        keep[retained_indices] = True
-
-    if not bool(keep.any()):
-        raise RuntimeError(
-            "No slice features were retained after series-aware filtering."
+        quality_weights[indices] = _normalize_quality_weights(
+            scores[indices]
         )
 
-    retained_patients = set(patient_ids[keep].tolist())
-    all_patients_set = set(patient_ids.tolist())
-
-    if retained_patients != all_patients_set:
-        missing = sorted(all_patients_set - retained_patients)
+    # Every patient must still have at least one series and one slice.
+    if set(patient_ids.tolist()) != set(
+        patient_ids[quality_weights > 0].tolist()
+    ):
         raise RuntimeError(
-            "Slice filtering removed every image from one or more patients: "
-            f"{missing}"
+            "Quality weighting unexpectedly removed at least one patient."
         )
 
-    valid_rate = valid_masks_count / max(total_masks, 1)
+    valid_rate = float(monai_valid.mean())
 
     print(
         "MONAI plausible-mask rate: "
-        f"{valid_masks_count}/{total_masks} ({valid_rate:.2%})"
+        f"{int(monai_valid.sum())}/{len(monai_valid)} ({valid_rate:.2%})"
     )
     print(
-        "Series-aware slice retention: "
-        f"{int(keep.sum())}/{len(keep)} ({float(keep.mean()):.2%})"
+        "All extracted slices retained; "
+        f"mean quality weight={quality_weights.mean():.3f}"
     )
 
     return (
-        features[keep],
-        labels[keep],
-        patient_ids[keep],
-        series_ids[keep],
+        features,
+        labels,
+        patient_ids,
+        series_ids,
+        quality_weights,
+        monai_valid,
     )
 
 
@@ -1663,16 +1757,22 @@ def extract_features(dataset, debug=False):
 # HIERARCHICAL FUSION (SLICE → SERIES → PATIENT)
 # =============================
 
-def log_odds_fusion(probabilities):
+def weighted_log_odds_fusion(probabilities, weights=None):
     """
-    Fuse a collection of probabilities by averaging their log-odds.
+    Fuse probabilities in log-odds space, optionally weighted.
 
-    Averaging, rather than summing, prevents the number of elements alone from
-    making the fused result artificially extreme. The same function is used at
-    both hierarchy levels:
+    Mathematical form:
 
-        retained slice probabilities → one series probability
-        series probabilities         → one patient probability
+        logit(p_fused) = Σ w_i * logit(p_i) / Σ w_i
+
+    This is preferable to multiplying probabilities directly because the
+    number of slices/series does not automatically force the fused result
+    toward 0 or 1.
+
+    LIMITATION:
+    The individual Logistic Regression probabilities are not guaranteed to be
+    perfectly calibrated. Therefore this fusion should be described as a
+    probabilistic aggregation rule, not as a formally calibrated posterior.
     """
 
     probabilities = np.asarray(probabilities, dtype=np.float64)
@@ -1680,13 +1780,27 @@ def log_odds_fusion(probabilities):
     if probabilities.size == 0:
         raise ValueError("Cannot fuse an empty probability collection.")
 
+    if weights is None:
+        weights = np.ones_like(probabilities, dtype=np.float64)
+    else:
+        weights = np.asarray(weights, dtype=np.float64)
+
+    if probabilities.shape != weights.shape:
+        raise ValueError("probabilities and weights must have the same shape.")
+
+    if np.any(weights < 0) or not np.any(weights > 0):
+        raise ValueError("weights must be non-negative and not all zero.")
+
     eps = 1e-6
     probabilities = np.clip(probabilities, eps, 1 - eps)
 
-    log_odds = np.log(probabilities / (1 - probabilities))
-    mean_log_odds = float(log_odds.mean())
+    log_odds = np.log(probabilities / (1.0 - probabilities))
 
-    return 1.0 / (1.0 + np.exp(-mean_log_odds))
+    weighted_mean_log_odds = float(
+        np.average(log_odds, weights=weights)
+    )
+
+    return 1.0 / (1.0 + np.exp(-weighted_mean_log_odds))
 
 
 def aggregate_patients(
@@ -1694,33 +1808,55 @@ def aggregate_patients(
     labels,
     patient_ids,
     series_ids,
+    quality_weights,
     clf,
 ):
     """
-    Aggregate retained slice predictions into one probability per patient.
+    Aggregate slice predictions hierarchically:
 
-    Hierarchy:
+        slice probabilities
+              ↓
+        weighted series probability
+              ↓
+        equal-weight series probabilities
+              ↓
+        patient probability
 
-        1. Predict one CAD-associated probability for every retained slice.
-        2. Fuse all retained slices belonging to the same imaging series.
-        3. Fuse all series probabilities belonging to the same Directory_*
-           patient.
+    WHY TWO LEVELS?
+    ---------------
+    A patient may have different numbers of images in different series. If all
+    slices were fused directly, a long series would dominate the patient merely
+    because it contains more frames.
 
-    The second fusion level gives each imaging series one vote regardless of
-    how many JPEG frames it contains. This avoids over-weighting a long cine
-    series relative to a short series from the same patient.
+    The revised strategy therefore:
+        1. weights slices by within-series quality;
+        2. gives each series one fused probability;
+        3. gives each series equal influence at patient level.
+
+    This is still a hand-designed fusion rule. For a stronger publication,
+    compare it prospectively with a learned attention-pooling model.
     """
+
+    if not (
+        len(features)
+        == len(labels)
+        == len(patient_ids)
+        == len(series_ids)
+        == len(quality_weights)
+    ):
+        raise ValueError("All aggregation arrays must have the same length.")
 
     slice_probabilities = clf.predict_proba(features)[:, 1]
 
     patient_series_probabilities = {}
     patient_labels = {}
 
-    for probability, label, patient_id, series_id in zip(
+    for probability, label, patient_id, series_id, quality_weight in zip(
         slice_probabilities,
         labels,
         patient_ids,
         series_ids,
+        quality_weights,
     ):
 
         patient_id = str(patient_id)
@@ -1731,17 +1867,24 @@ def aggregate_patients(
 
         if existing_label is not None and existing_label != label:
             raise RuntimeError(
-                f"Patient {patient_id} has inconsistent labels: "
-                f"{existing_label} and {label}."
+                f"Patient {patient_id} has inconsistent labels."
             )
 
         patient_labels[patient_id] = label
 
         patient_series_probabilities.setdefault(patient_id, {})
-        patient_series_probabilities[patient_id].setdefault(series_id, [])
-        patient_series_probabilities[patient_id][series_id].append(
-            float(probability)
+        patient_series_probabilities[patient_id].setdefault(
+            series_id,
+            {"probabilities": [], "weights": []},
         )
+
+        patient_series_probabilities[patient_id][series_id][
+            "probabilities"
+        ].append(float(probability))
+
+        patient_series_probabilities[patient_id][series_id][
+            "weights"
+        ].append(float(quality_weight))
 
     fused_patient_probabilities = []
     fused_patient_labels = []
@@ -1753,16 +1896,18 @@ def aggregate_patients(
 
         for series_id in sorted(patient_series_probabilities[patient_id]):
 
-            retained_slice_probabilities = np.asarray(
-                patient_series_probabilities[patient_id][series_id],
-                dtype=np.float64,
+            series_data = patient_series_probabilities[patient_id][series_id]
+
+            series_probability = weighted_log_odds_fusion(
+                series_data["probabilities"],
+                series_data["weights"],
             )
 
-            series_probability_values.append(
-                log_odds_fusion(retained_slice_probabilities)
-            )
+            series_probability_values.append(series_probability)
 
-        patient_probability = log_odds_fusion(
+        # Equal weighting of series prevents one acquisition type from
+        # dominating simply because it contains more frames.
+        patient_probability = weighted_log_odds_fusion(
             np.asarray(series_probability_values, dtype=np.float64)
         )
 
@@ -1777,20 +1922,29 @@ def aggregate_patients(
     )
 
 
-def compute_patient_balanced_sample_weights(labels, patient_ids):
+def compute_patient_balanced_sample_weights(
+    labels,
+    patient_ids,
+    quality_weights=None,
+):
     """
-    Give every patient equal total influence within its class and give both
-    classes equal total influence during slice-level Logistic Regression.
+    Give every patient equal total training influence.
 
-    Without these weights, a patient with thousands of retained slices would
-    contribute far more optimization weight than a patient with fewer slices.
+    For patient p with n_p slices, the base weight is:
 
-    For one slice from patient p with class c:
+        1 / n_p
 
-        weight = 1 / (number_of_patients_in_class_c × slices_from_patient_p)
+    This prevents patients with more exported JPEG images from dominating the
+    slice-level classifier.
 
-    The weights are finally rescaled to have mean 1, which does not change their
-    relative effect but keeps their numerical scale conventional.
+    If quality_weights are supplied, the patient-balanced base weight is
+    multiplied by the within-series quality weight. The final vector is scaled
+    to mean 1.
+
+    We deliberately DO NOT additionally use class_weight="balanced" in the
+    Logistic Regression because patient balancing already gives each class the
+    same total weight when the number of patients is equalized through the
+    class denominator below.
     """
 
     labels = np.asarray(labels, dtype=np.int64)
@@ -1798,6 +1952,14 @@ def compute_patient_balanced_sample_weights(labels, patient_ids):
 
     if len(labels) != len(patient_ids):
         raise ValueError("labels and patient_ids must have identical lengths.")
+
+    if quality_weights is None:
+        quality_weights = np.ones(len(labels), dtype=np.float64)
+    else:
+        quality_weights = np.asarray(quality_weights, dtype=np.float64)
+
+    if len(quality_weights) != len(labels):
+        raise ValueError("quality_weights length does not match labels.")
 
     patient_to_label = {}
     patient_to_slice_count = {}
@@ -1807,11 +1969,11 @@ def compute_patient_balanced_sample_weights(labels, patient_ids):
         patient_id = str(patient_id)
         label = int(label)
 
-        existing_label = patient_to_label.get(patient_id)
+        previous = patient_to_label.get(patient_id)
 
-        if existing_label is not None and existing_label != label:
+        if previous is not None and previous != label:
             raise RuntimeError(
-                f"Patient {patient_id} has inconsistent training labels."
+                f"Patient {patient_id} has inconsistent labels."
             )
 
         patient_to_label[patient_id] = label
@@ -1822,12 +1984,37 @@ def compute_patient_balanced_sample_weights(labels, patient_ids):
     class_to_patient_count = {}
 
     for label in patient_to_label.values():
-        class_to_patient_count[label] = class_to_patient_count.get(label, 0) + 1
+        class_to_patient_count[label] = (
+            class_to_patient_count.get(label, 0) + 1
+        )
 
     if set(class_to_patient_count) != {0, 1}:
         raise RuntimeError(
-            "Training data must contain at least one Normal and one Sick "
-            "patient."
+            "Training fold must contain both Normal and Sick patients."
+        )
+
+    # -------------------------------------------------------------
+    # First normalize quality weights WITHIN EACH PATIENT.
+    #
+    # This is important because the same patient can contain several series.
+    # If we simply divided by the number of slices, a patient with more series
+    # would still receive more total training weight. The normalization below
+    # guarantees:
+    #
+    #       sum(slice weights for one patient) = 1
+    #
+    # before the class-level balancing factor is applied.
+    # -------------------------------------------------------------
+    patient_quality_sum = {}
+
+    for patient_id, quality_weight in zip(
+        patient_ids,
+        quality_weights,
+    ):
+        patient_id = str(patient_id)
+        patient_quality_sum[patient_id] = (
+            patient_quality_sum.get(patient_id, 0.0)
+            + float(quality_weight)
         )
 
     weights = np.empty(len(labels), dtype=np.float64)
@@ -1837,231 +2024,398 @@ def compute_patient_balanced_sample_weights(labels, patient_ids):
         patient_id = str(patient_id)
         label = int(label)
 
-        weights[index] = 1.0 / (
-            class_to_patient_count[label]
-            * patient_to_slice_count[patient_id]
+        patient_normalized_quality = (
+            quality_weights[index]
+            / max(patient_quality_sum[patient_id], 1e-12)
         )
 
-    weights *= len(weights) / weights.sum()
+        # Each patient receives the same total weight inside its class.
+        # Dividing by the number of patients in the class makes the total
+        # nominal class contribution approximately equal between Normal and
+        # Sick, regardless of class prevalence.
+        weights[index] = (
+            patient_normalized_quality
+            / class_to_patient_count[label]
+        )
+
+    weights *= len(weights) / max(weights.sum(), 1e-12)
 
     return weights
 
 
 # =============================
 # PIPELINE STEP 8
-# PATIENT-LEVEL TRAIN / TEST EVALUATION
+# PATIENT-LEVEL STRATIFIED GROUP K-FOLD EVALUATION
 # =============================
 
 # =============================================================
-# BUILD PATIENT AND SERIES LISTS
+# WHY K-FOLD INSTEAD OF ONE 80/20 SPLIT?
 # =============================================================
+#
+# The original implementation used one random 80/20 holdout. With ~1,224
+# patients, that is valid as a simple experiment, but its AUC can vary
+# noticeably depending on which patients happen to enter the test set.
+#
+# For a research paper, a stronger default is:
+#
+#   StratifiedGroupKFold(n_splits=5)
+#
+# where:
+#
+#   - "stratified" tries to preserve Normal/Sick proportions;
+#   - "group" guarantees that ALL slices and ALL series from a patient stay
+#     in exactly one fold.
+#
+# The test prediction for every patient is therefore OUT-OF-FOLD (OOF):
+# the classifier has never been trained on that patient's slices.
+#
+# IMPORTANT:
+# The MONAI segmenter and EfficientNet are frozen pretrained models. Feature
+# extraction itself does not use CAD labels. Nevertheless, the classifier,
+# scaler, and any future hyperparameter tuning MUST be fitted inside each
+# training fold only.
+# =============================================================
+
+
+def print_fold_summary(
+    fold_index,
+    y_train,
+    y_valid,
+    patient_train,
+    patient_valid,
+):
+    """Print patient-level rather than slice-level fold statistics."""
+
+    train_patient_labels = {}
+    valid_patient_labels = {}
+
+    for label, patient_id in zip(y_train, patient_train):
+        train_patient_labels[str(patient_id)] = int(label)
+
+    for label, patient_id in zip(y_valid, patient_valid):
+        valid_patient_labels[str(patient_id)] = int(label)
+
+    print(f"\n========== FOLD {fold_index} ==========")
+    print(
+        f"Train patients: {len(train_patient_labels)} "
+        f"(Normal={sum(v == 0 for v in train_patient_labels.values())}, "
+        f"Sick={sum(v == 1 for v in train_patient_labels.values())})"
+    )
+    print(
+        f"Validation patients: {len(valid_patient_labels)} "
+        f"(Normal={sum(v == 0 for v in valid_patient_labels.values())}, "
+        f"Sick={sum(v == 1 for v in valid_patient_labels.values())})"
+    )
+
+
+# -------------------------------------------------------------
+# Load the complete dataset ONCE.
+# -------------------------------------------------------------
+#
+# Feature extraction is label-independent and expensive. We therefore extract
+# the frozen MONAI/EfficientNet embeddings once and reuse them in each fold.
+#
+# This does NOT let the Logistic Regression see validation labels.
+# The scaler and classifier are still fitted separately inside each fold.
+# -------------------------------------------------------------
+
+samples = load_samples(DATASET_PATH)
+
+transform = transforms.Compose([
+    transforms.ToTensor(),
+])
+
+all_dataset = MRIDataset(
+    samples,
+    transform,
+)
+
+(
+    X_all,
+    y_all,
+    patient_all,
+    series_all,
+    quality_weights_all,
+    monai_valid_all,
+) = extract_features(
+    all_dataset,
+    debug=True,
+)
+
+# -------------------------------------------------------------
+# Build ONE patient-level label table.
+# -------------------------------------------------------------
 
 patient_labels = {}
 
-for _, label, patient_id, _ in samples:
+for label, patient_id in zip(y_all, patient_all):
 
-    existing_label = patient_labels.get(patient_id)
+    patient_id = str(patient_id)
+    label = int(label)
 
-    if existing_label is not None and existing_label != label:
+    previous = patient_labels.get(patient_id)
+
+    if previous is not None and previous != label:
         raise RuntimeError(
             f"Patient {patient_id} occurs with conflicting labels."
         )
 
-    patient_labels[patient_id] = int(label)
+    patient_labels[patient_id] = label
 
-normal_patients = sorted(
-    patient_id
-    for patient_id, label in patient_labels.items()
-    if label == 0
+all_patient_ids = np.asarray(sorted(patient_labels))
+all_patient_labels = np.asarray(
+    [patient_labels[patient_id] for patient_id in all_patient_ids],
+    dtype=np.int64,
 )
 
-sick_patients = sorted(
-    patient_id
-    for patient_id, label in patient_labels.items()
-    if label == 1
-)
-
-if len(normal_patients) < 2 or len(sick_patients) < 2:
+if np.unique(all_patient_labels).size != 2:
     raise RuntimeError(
-        "A patient-level holdout split requires at least two Normal and two "
-        "Sick Directory_* patients."
+        "The dataset must contain both Normal and Sick patients."
     )
 
-rng = np.random.RandomState(42)
-normal_patients = list(rng.permutation(normal_patients))
-sick_patients = list(rng.permutation(sick_patients))
+print("\nFinal patient-level dataset")
+print(f"  Patients: {len(all_patient_ids)}")
+print(
+    "  Normal:",
+    int(np.sum(all_patient_labels == 0)),
+)
+print(
+    "  Sick:",
+    int(np.sum(all_patient_labels == 1)),
+)
+print(f"  Slice embeddings: {len(X_all)}")
 
+# -------------------------------------------------------------
+# Map each slice to its patient-level fold.
+# -------------------------------------------------------------
+#
+# StratifiedGroupKFold is run on the patient table, not on individual slices.
+# This is important: if we passed every image as a separate sample, a patient
+# with 100 slices could appear in both train and validation.
+# -------------------------------------------------------------
 
-def calculate_test_patient_count(number_of_patients, test_fraction=0.2):
-    """Choose a non-empty test subset while preserving training patients."""
+N_SPLITS = 5
+CV_RANDOM_STATE = 42
 
-    return min(
-        max(1, int(round(number_of_patients * test_fraction))),
-        number_of_patients - 1,
+if len(all_patient_ids) < N_SPLITS:
+    raise RuntimeError(
+        f"Need at least {N_SPLITS} patients for {N_SPLITS}-fold CV."
     )
 
+cv = StratifiedGroupKFold(
+    n_splits=N_SPLITS,
+    shuffle=True,
+    random_state=CV_RANDOM_STATE,
+)
 
-normal_test_count = calculate_test_patient_count(len(normal_patients))
-sick_test_count = calculate_test_patient_count(len(sick_patients))
+# OOF patient predictions are stored here. Each patient should be assigned
+# exactly once by the cross-validation procedure.
+oof_probability_by_patient = {}
+oof_label_by_patient = {}
 
-# =============================================================
-# PATIENT-LEVEL TRAIN / TEST SPLIT
-# =============================================================
-
+# -------------------------------------------------------------
 # IMPORTANT:
-# The split unit is the Directory_* patient, never an image and never a series.
-# Consequently, every image and every series belonging to one patient remains
-# entirely in either train or test. This is the central leakage-prevention rule
-# required for patient-level evaluation.
+# We need a slice mask for every fold because X_all contains individual slices
+# while CV splits are defined on patient IDs.
+# -------------------------------------------------------------
 
-train_patients = (
-    normal_patients[normal_test_count:]
-    + sick_patients[sick_test_count:]
-)
+for fold_index, (train_patient_idx, valid_patient_idx) in enumerate(
+    cv.split(
+        all_patient_ids,
+        all_patient_labels,
+        groups=all_patient_ids,
+    ),
+    start=1,
+):
 
-test_patients = (
-    normal_patients[:normal_test_count]
-    + sick_patients[:sick_test_count]
-)
-
-train_patient_set = set(train_patients)
-test_patient_set = set(test_patients)
-
-patient_overlap = train_patient_set.intersection(test_patient_set)
-
-if patient_overlap:
-    raise RuntimeError(
-        "Patient leakage detected between train and test: "
-        f"{sorted(patient_overlap)}"
+    train_patient_fold = set(
+        all_patient_ids[train_patient_idx].tolist()
     )
 
-train_samples = [
-    sample
-    for sample in samples
-    if sample[2] in train_patient_set
-]
-
-test_samples = [
-    sample
-    for sample in samples
-    if sample[2] in test_patient_set
-]
-
-train_series = sorted(set(sample[3] for sample in train_samples))
-test_series = sorted(set(sample[3] for sample in test_samples))
-
-series_overlap = set(train_series).intersection(test_series)
-
-if series_overlap:
-    raise RuntimeError(
-        "Series leakage detected between train and test: "
-        f"{sorted(series_overlap)}"
+    valid_patient_fold = set(
+        all_patient_ids[valid_patient_idx].tolist()
     )
 
-print(f"Training patients: {len(train_patients)}")
-print(f"Testing patients:  {len(test_patients)}")
-print(f"Training series:   {len(train_series)}")
-print(f"Testing series:    {len(test_series)}")
-print(f"Training images:   {len(train_samples)}")
-print(f"Testing images:    {len(test_samples)}")
+    # Explicit leakage guard.
+    overlap = train_patient_fold.intersection(valid_patient_fold)
 
-# Optional debugging subset:
-# Do not truncate with train_samples[0:N] or test_samples[0:N] for a real
-# patient-level experiment because doing so can produce partial patients.
-# For debugging, select a small list of complete patient IDs instead.
+    if overlap:
+        raise RuntimeError(
+            f"Patient leakage detected in fold {fold_index}: "
+            f"{sorted(overlap)}"
+        )
 
-train_dataset = MRIDataset(
-    train_samples,
-    transform,
-)
+    train_slice_mask = np.isin(
+        patient_all,
+        list(train_patient_fold),
+    )
 
-test_dataset = MRIDataset(
-    test_samples,
-    transform,
-)
+    valid_slice_mask = np.isin(
+        patient_all,
+        list(valid_patient_fold),
+    )
+
+    X_train = X_all[train_slice_mask]
+    y_train = y_all[train_slice_mask]
+    patient_train = patient_all[train_slice_mask]
+    series_train = series_all[train_slice_mask]
+    quality_train = quality_weights_all[train_slice_mask]
+
+    X_valid = X_all[valid_slice_mask]
+    y_valid = y_all[valid_slice_mask]
+    patient_valid = patient_all[valid_slice_mask]
+    series_valid = series_all[valid_slice_mask]
+    quality_valid = quality_weights_all[valid_slice_mask]
+
+    print_fold_summary(
+        fold_index,
+        y_train,
+        y_valid,
+        patient_train,
+        patient_valid,
+    )
+
+    # ---------------------------------------------------------
+    # TRAINING WEIGHTS
+    # ---------------------------------------------------------
+    #
+    # Each patient gets equal total influence inside its class, and slice
+    # quality modifies that influence without allowing patient size to dominate.
+    # ---------------------------------------------------------
+
+    training_sample_weights = compute_patient_balanced_sample_weights(
+        y_train,
+        patient_train,
+        quality_weights=quality_train,
+    )
+
+    # ---------------------------------------------------------
+    # SCALER + CLASSIFIER
+    # ---------------------------------------------------------
+    #
+    # StandardScaler is FIT ONLY on the training fold. Putting it in a
+    # Pipeline guarantees that validation embeddings never influence the
+    # fitted mean/variance.
+    #
+    # Logistic Regression is intentionally kept simple because the primary
+    # objective here is to test the imaging representation and patient-level
+    # aggregation, not to overfit a high-capacity classifier to ~1,000 patients.
+    # ---------------------------------------------------------
+
+    classifier = Pipeline(
+        steps=[
+            (
+                "scaler",
+                StandardScaler(),
+            ),
+            (
+                "logreg",
+                LogisticRegression(
+                    C=1.0,
+                    max_iter=2000,
+                    solver="liblinear",
+                ),
+            ),
+        ]
+    )
+
+    classifier.fit(
+        X_train,
+        y_train,
+        logreg__sample_weight=training_sample_weights,
+    )
+
+    # ---------------------------------------------------------
+    # PATIENT-LEVEL VALIDATION
+    # ---------------------------------------------------------
+
+    (
+        patient_probabilities,
+        patient_ground_truth,
+        evaluated_patient_ids,
+    ) = aggregate_patients(
+        X_valid,
+        y_valid,
+        patient_valid,
+        series_valid,
+        quality_valid,
+        classifier,
+    )
+
+    if len(evaluated_patient_ids) != len(valid_patient_fold):
+        raise RuntimeError(
+            f"Fold {fold_index}: some validation patients have no prediction."
+        )
+
+    # Every patient must be assigned exactly once.
+    for patient_id, label, probability in zip(
+        evaluated_patient_ids,
+        patient_ground_truth,
+        patient_probabilities,
+    ):
+
+        patient_id = str(patient_id)
+
+        if patient_id in oof_probability_by_patient:
+            raise RuntimeError(
+                f"Patient {patient_id} received more than one OOF prediction."
+            )
+
+        oof_probability_by_patient[patient_id] = float(probability)
+        oof_label_by_patient[patient_id] = int(label)
+
+    if np.unique(patient_ground_truth).size == 2:
+        fold_auc = roc_auc_score(
+            patient_ground_truth,
+            patient_probabilities,
+        )
+        print(f"Fold {fold_index} patient-level AUC: {fold_auc:.4f}")
+    else:
+        print(
+            f"Fold {fold_index}: validation fold contains only one class; "
+            "fold-specific AUC is undefined."
+        )
 
 # =============================================================
-# FEATURE EXTRACTION
+# FINAL OUT-OF-FOLD PATIENT-LEVEL EVALUATION
 # =============================================================
 
-(
-    X_train,
-    y_train,
-    patient_train,
-    series_train,
-) = extract_features(
-    train_dataset,
-    debug=True,
+if set(oof_probability_by_patient) != set(all_patient_ids.tolist()):
+    missing = sorted(
+        set(all_patient_ids.tolist())
+        - set(oof_probability_by_patient)
+    )
+    raise RuntimeError(
+        "Some patients did not receive an out-of-fold prediction: "
+        f"{missing}"
+    )
+
+evaluated_patient_ids = np.asarray(
+    sorted(oof_probability_by_patient)
 )
 
-(
-    X_test,
-    y_test,
-    patient_test,
-    series_test,
-) = extract_features(
-    test_dataset,
-    debug=True,
+patient_probabilities = np.asarray(
+    [
+        oof_probability_by_patient[patient_id]
+        for patient_id in evaluated_patient_ids
+    ],
+    dtype=np.float64,
 )
 
-# =============================================================
-# PATIENT-BALANCED CLASSICAL ML CLASSIFIER
-# =============================================================
-
-# Logistic Regression remains a slice-level classifier on frozen EfficientNet
-# embeddings, but patient-balanced sample weights ensure that:
-#
-#   - every patient has equal total influence inside its class;
-#   - Normal and Sick patients have equal total class influence;
-#   - a patient with more exported JPEG frames cannot dominate optimization.
-
-classifier = LogisticRegression(
-    max_iter=1000,
+patient_ground_truth = np.asarray(
+    [
+        oof_label_by_patient[patient_id]
+        for patient_id in evaluated_patient_ids
+    ],
+    dtype=np.int64,
 )
 
-training_sample_weights = compute_patient_balanced_sample_weights(
-    y_train,
-    patient_train,
-)
-
-classifier.fit(
-    X_train,
-    y_train,
-    sample_weight=training_sample_weights,
-)
-
-# =============================================================
-# PATIENT-LEVEL PREDICTION
-# =============================================================
-
-(
-    patient_probabilities,
-    patient_ground_truth,
-    evaluated_patient_ids,
-) = aggregate_patients(
-    X_test,
-    y_test,
-    patient_test,
-    series_test,
-    classifier,
-)
-
-# =============================================================
-# PATIENT-LEVEL EVALUATION
-# =============================================================
-
-# ROC-AUC:
-#
-#   1.0 = perfect patient ranking
-#   0.5 = random patient ranking
-#
-# Each test patient contributes exactly one probability and one ground-truth
-# label, regardless of how many series or slices are stored in Directory_*.
-
+# The pooled OOF AUC is the main performance number. It uses one prediction
+# per patient and therefore does not let patients with more slices contribute
+# multiple times to the ROC curve.
 if np.unique(patient_ground_truth).size != 2:
     raise RuntimeError(
-        "Patient-level ROC-AUC requires both Normal and Sick patients in the "
-        "test set."
+        "Pooled patient-level ROC-AUC requires both Normal and Sick patients."
     )
 
 auc = roc_auc_score(
@@ -2069,7 +2423,13 @@ auc = roc_auc_score(
     patient_probabilities,
 )
 
-print("PATIENT-LEVEL PREDICTIONS:")
+print("\n============================================================")
+print("FINAL OUT-OF-FOLD PATIENT-LEVEL RESULT")
+print("============================================================")
+print(f"Patients evaluated: {len(evaluated_patient_ids)}")
+print(f"Patient-level OOF AUC: {auc:.6f}")
+
+print("\nPATIENT-LEVEL OOF PREDICTIONS:")
 
 for patient_id, label, probability in zip(
     evaluated_patient_ids,
@@ -2077,9 +2437,42 @@ for patient_id, label, probability in zip(
     patient_probabilities,
 ):
     print(
-        f"  {patient_id}: true_label={int(label)}, "
+        f"  {patient_id}: "
+        f"true_label={int(label)}, "
         f"CAD_probability={float(probability):.6f}"
     )
 
-print("PATIENT-LEVEL AUC:", auc)
-print("Done!")
+print("\nDone!")
+
+# =============================================================
+# RECOMMENDED NEXT EXPERIMENTS
+# =============================================================
+#
+# For a publication-quality study, do not report only this one AUC. The next
+# experiments should be:
+#
+# 1. Ablation: full image vs MONAI ROI.
+# 2. Ablation: all slices vs quality-weighted slices.
+# 3. Ablation: mean probability vs log-odds fusion.
+# 4. Compare Logistic Regression vs linear SVM.
+# 5. Compare frozen ImageNet EfficientNet-B0 with a cardiac-MRI-pretrained
+#    encoder if an appropriate public checkpoint is available.
+# 6. Evaluate each sequence/view separately if the folder structure allows
+#    reliable identification of LGE, Perfusion, T2 and SSFP.
+# 7. Report sensitivity, specificity, PPV, NPV and 95% bootstrap confidence
+#    intervals in addition to AUC.
+# 8. Perform external validation on an independent hospital dataset if possible.
+#
+# MOST IMPORTANT:
+# The MONAI segmenter is designed for 2D short-axis cardiac MR images. The
+# published CAD dataset contains heterogeneous CMR acquisitions including
+# LGE, Perfusion, T2-weighted and SSFP, with long- and short-axis views.
+# Therefore the segmentation mask should NOT be presented as valid anatomy
+# segmentation for every image in the dataset. The confidence gate and
+# fallback are safeguards, not proof of anatomical correctness.
+#
+# The Scientific Reports dataset paper reports 63,648 images and 1,224
+# participants (722 healthy, 502 CAD), and explicitly states that four sequence
+# families and both long- and short-axis planes were used. This domain mismatch
+# is one of the most important limitations of the pipeline and should be
+# discussed in any manuscript.
