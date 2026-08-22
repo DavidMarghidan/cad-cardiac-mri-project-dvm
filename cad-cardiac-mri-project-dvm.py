@@ -630,8 +630,17 @@ RUN_CONFIGURATION_TAG = hashlib.sha256(
 RUN_NAME = f"{CLASSIFICATION_STRATEGY}__{RUN_CONFIGURATION_TAG}"
 
 OUTPUT_DIR = OUTPUT_ROOT / RUN_NAME
-DEBUG_OUTPUT_DIR = OUTPUT_DIR / "debug_output"
 FEATURE_CACHE_ROOT = OUTPUT_ROOT / "feature_cache"
+
+# Keep every debug image directly in one flat folder, independent of the
+# configuration-specific result and cache directories.
+if os.path.exists("/kaggle/working"):
+    DEBUG_OUTPUT_DIR = Path("/kaggle/working/debug_output")
+else:
+    try:
+        DEBUG_OUTPUT_DIR = Path(__file__).resolve().parent / "debug_output"
+    except NameError:
+        DEBUG_OUTPUT_DIR = Path.cwd() / "debug_output"
 
 
 # =============================
@@ -880,7 +889,7 @@ class MRIDataset(Dataset):
 
         sample_index:
             Stable integer index in ``samples``. It is used only to select
-            deterministic, class-balanced debug examples.
+            deterministic debug examples from the complete image list.
 
         decoded_pixel_hash:
             SHA-256 of the decoded uint8 grayscale pixel matrix plus its shape.
@@ -2323,8 +2332,8 @@ def extract_features(
         optional series-local quality weight (default = 1)
 
     Class labels are never inputs to MONAI, EfficientNet, ROI gating or quality
-    weighting. They are carried as metadata for class-balanced debug selection,
-    QC summaries, supervised fitting and stratified evaluation.
+    weighting. They are carried as metadata for debug figures, QC summaries,
+    supervised fitting and stratified evaluation.
 
     This function retains every slice that is successfully decoded. An
     unreadable discovered file raises an explicit error instead of being silently
@@ -3913,6 +3922,7 @@ def collect_run_metadata():
         "efficientnet_weights": EFFICIENTNET_WEIGHTS_NAME,
         "debug_visualization": DEBUG_VISUALIZATION,
         "debug_indices": DEBUG_INDICES,
+        "debug_output_directory": str(DEBUG_OUTPUT_DIR),
         "use_slice_quality_weights": USE_SLICE_QUALITY_WEIGHTS,
         "audit_exact_decoded_pixel_duplicates": (
             AUDIT_EXACT_DECODED_PIXEL_DUPLICATES
