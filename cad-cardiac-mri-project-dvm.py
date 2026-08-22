@@ -429,10 +429,11 @@ SLICE_QUALITY_MIN_WEIGHT = 0.25
 # Lower bound used only when USE_SLICE_QUALITY_WEIGHTS=True.
 
 DEBUG_VISUALIZATION = True
-DEBUG_SAMPLES_PER_CLASS = 1000
-# Debug cases are chosen deterministically across patients in BOTH classes,
-# rather than taking the first batches (which are ordered by class/patient and
-# are not representative). These figures are qualitative QC only. ROI-gate
+DEBUG_INDICES = "full"
+# Select debug figures from the complete image list. Use "full" to save a
+# figure for every image, or a percentage such as "10%" to save an evenly
+# spaced, deterministic 10% of all images. Numeric percentages (for example,
+# 10 or 2.5) are also accepted. These figures are qualitative QC only. ROI-gate
 # thresholds must not be repeatedly adjusted after inspecting OOF performance.
 
 # ---------------------------------------------------------------------------
@@ -693,8 +694,7 @@ def validate_configuration():
     if DATALOADER_NUM_WORKERS < 0:
         raise ValueError("DATALOADER_NUM_WORKERS cannot be negative.")
 
-    if DEBUG_SAMPLES_PER_CLASS < 0:
-        raise ValueError("DEBUG_SAMPLES_PER_CLASS cannot be negative.")
+    _parse_debug_indices(DEBUG_INDICES)
 
     if not 0.0 < SLICE_QUALITY_MIN_WEIGHT <= 1.0:
         raise ValueError(
@@ -2065,7 +2065,8 @@ def debug_visualization(
         - mean foreground confidence
         - ROI intensity standard deviation
 
-    Examples are selected deterministically across patients in both classes.
+    Examples are selected deterministically from the complete image list using
+    DEBUG_INDICES (all images or a configured percentage).
     Visual review is mandatory before treating the pretrained masks as useful
     ROI proposals on this heterogeneous dataset. It still does not constitute a
     quantitative segmentation validation because no ground-truth masks exist.
@@ -2234,43 +2235,63 @@ def _normalize_quality_weights(scores, minimum_weight=SLICE_QUALITY_MIN_WEIGHT):
     return weights
 
 
-def choose_debug_sample_indices(samples, samples_per_class):
-    """Choose deterministic QC examples across patients in both classes.
+def _parse_debug_indices(selection):
+    """Return ``None`` for full selection or a percentage in [0, 100]."""
 
-    One middle-position image is selected from evenly spaced patients in each
-    class. This is substantially more representative than saving the first
-    batches of a dataset sorted as Normal -> Sick and Directory_* order.
-    """
-
-    by_class_patient = {}
-
-    for index, (_, label, patient_id, _) in enumerate(samples):
-        by_class_patient.setdefault(int(label), {})
-        by_class_patient[int(label)].setdefault(str(patient_id), []).append(index)
-
-    selected = set()
-
-    for label in sorted(by_class_patient):
-        patient_map = by_class_patient[label]
-        patient_names = sorted(patient_map)
-
-        if not patient_names:
-            continue
-
-        n_select = min(samples_per_class, len(patient_names))
-        positions = np.linspace(
-            0,
-            len(patient_names) - 1,
-            num=n_select,
-            dtype=int,
+    if isinstance(selection, str):
+        normalized = selection.strip().lower()
+        if normalized == "full":
+            return None
+        if not normalized.endswith("%"):
+            raise ValueError(
+                'DEBUG_INDICES must be "full" or a percentage such as "10%".'
+            )
+        numeric_value = normalized[:-1].strip()
+    elif (
+        isinstance(selection, (int, float))
+        and not isinstance(selection, bool)
+    ):
+        numeric_value = selection
+    else:
+        raise ValueError(
+            'DEBUG_INDICES must be "full" or a percentage such as "10%".'
         )
 
-        for position in np.unique(positions):
-            patient_id = patient_names[int(position)]
-            patient_indices = patient_map[patient_id]
-            selected.add(patient_indices[len(patient_indices) // 2])
+    try:
+        percentage = float(numeric_value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            'DEBUG_INDICES must be "full" or a percentage such as "10%".'
+        ) from error
 
-    return selected
+    if not np.isfinite(percentage) or not 0.0 <= percentage <= 100.0:
+        raise ValueError("DEBUG_INDICES percentage must lie in [0, 100].")
+
+    return percentage
+
+
+def choose_debug_sample_indices(samples, selection):
+    """Choose all images or a deterministic percentage of the full image list."""
+
+    percentage = _parse_debug_indices(selection)
+    n_images = len(samples)
+
+    if n_images == 0:
+        return set()
+
+    if percentage is None or percentage == 100.0:
+        return set(range(n_images))
+
+    if percentage == 0.0:
+        return set()
+
+    n_select = min(
+        n_images,
+        max(1, int(np.ceil(n_images * percentage / 100.0))),
+    )
+    return set(
+        np.linspace(0, n_images - 1, num=n_select, dtype=int).tolist()
+    )
 
 
 def extract_features(
@@ -2362,7 +2383,7 @@ def extract_features(
     debug_indices = (
         choose_debug_sample_indices(
             dataset.samples,
-            DEBUG_SAMPLES_PER_CLASS,
+            DEBUG_INDICES,
         )
         if debug and USE_MONAI_ROI
         else set()
@@ -3890,6 +3911,8 @@ def collect_run_metadata():
         "monai_runtime_source": MONAI_RUNTIME_SOURCE,
         "monai_runtime_artifact_path": MONAI_RUNTIME_ARTIFACT_PATH,
         "efficientnet_weights": EFFICIENTNET_WEIGHTS_NAME,
+        "debug_visualization": DEBUG_VISUALIZATION,
+        "debug_indices": DEBUG_INDICES,
         "use_slice_quality_weights": USE_SLICE_QUALITY_WEIGHTS,
         "audit_exact_decoded_pixel_duplicates": (
             AUDIT_EXACT_DECODED_PIXEL_DUPLICATES
