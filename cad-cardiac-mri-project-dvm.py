@@ -6,8 +6,11 @@
 # OVERVIEW
 # ============================================================================
 #
-# This script implements a FULL END-TO-END CAD (Coronary Artery Disease)
-# patient-level classification pipeline using 2D Cardiac MRI JPEG images from:
+# This script implements a COMPLETE EXECUTION PIPELINE for exploratory
+# patient-level CAD (Coronary Artery Disease) classification from 2D cardiac
+# MRI JPEG exports. It is "end-to-end" only in the operational sense that it
+# runs from files to patient scores; it is NOT an end-to-end jointly trained
+# neural network because MONAI and EfficientNet remain frozen:
 #
 #   CAD Cardiac MRI Dataset
 #   https://www.kaggle.com/datasets/danialsharifrazi/cad-cardiac-mri-dataset/data
@@ -21,35 +24,47 @@
 #   Normal/Directory_* -> label 0
 #   Sick/Directory_*   -> label 1
 #
-# IMPORTANT: SR_* / series* folders are NOT treated as patients. They are
-# imaging-series containers belonging to the Directory_* patient. All images
-# and all series from one Directory_* remain together in every train/validation
-# split and are fused back to one final patient-level prediction.
+# IMPORTANT: SR_* / series* folders are NOT treated as patients. They are used
+# as folder-defined SERIES PROXIES belonging to the Directory_* patient. Because
+# the release contains JPEG files rather than the original DICOM metadata, these
+# folder names must not be described as validated DICOM SeriesInstanceUIDs.
+# All images and all series proxies from one Directory_* remain together in
+# every train/validation split and are combined into one patient-level score.
 #
 # The architecture combines:
 #
-#   1. Patient-level grouping and leakage-safe evaluation
-#   2. Pretrained MONAI cardiac ventricular segmentation (SAX-specific)
+#   1. Patient-level grouping with patient_id fixed to Directory_*
+#   2. Optional pretrained MONAI ventricular segmentation (short-axis-specific)
 #   3. Confidence-gated soft ROI extraction with full-image fallback
-#   4. ImageNet-pretrained EfficientNet-B0 feature extraction
+#   4. Explicitly pinned ImageNet EfficientNet-B0 feature extraction
 #   5. Optional series-local slice-quality weighting (disabled by default)
-#   6. Hierarchically balanced Logistic Regression on frozen embeddings
-#      (class → patient → series → slice)
-#   7. Hierarchical probabilistic fusion: slices → series → patient
+#   6. Recommended direct patient-level training after hierarchical EMBEDDING
+#      pooling: slices → series proxy → patient
+#   7. Optional legacy weakly supervised slice classifier followed by
+#      hierarchical probability fusion, retained as an ablation
 #   8. Stratified K-fold evaluation defined directly on Directory_* patients
 #   9. Pooled out-of-fold AUC with a patient-level bootstrap confidence interval
+#  10. Exact decoded-pixel duplicate auditing across Directory_* patients
+#  11. Reusable feature caching and machine-readable QC/result files
 #
 # IMPORTANT METHODOLOGICAL CHANGES:
 # The original version used one 80/20 split and discarded roughly half of the
 # slices using a standard-deviation cutoff. This revision instead:
 #
 #   - performs cross-validation on the validated Directory_* patient units;
-#   - retains every readable slice by default;
-#   - keeps the standard-deviation score only as an OPTIONAL heuristic ablation;
-#   - balances training so that a patient with many series/slices cannot dominate;
-#   - fits StandardScaler with the SAME hierarchical sample weights as the
-#     classifier, avoiding a subtle slice-count bias in feature standardization;
-#   - reports a patient-level bootstrap CI around the pooled OOF ROC-AUC.
+#   - keeps every successfully decoded slice by default; an unreadable file
+#     raises an explicit error instead of being silently omitted;
+#   - keeps standard deviation only as an OPTIONAL, non-clinical heuristic;
+#   - uses direct patient-level embedding pooling as the recommended default,
+#     thereby avoiding repeated patient labels being treated as independent
+#     slice observations;
+#   - retains the prior slice-classifier/fusion method only as a selectable
+#     weakly supervised ablation;
+#   - when the slice method is selected, scales sample-weight mass to the number
+#     of training patients, because globally multiplying sample weights changes
+#     the effective regularization of a regularized Logistic Regression model;
+#   - reports a patient-level bootstrap CI around the pooled OOF ROC-AUC;
+#   - saves OOF predictions, fold assignments and MONAI QC summaries.
 #
 # The Scientific Reports paper reports 1,224 original participants, but this
 # script does NOT infer the number of computational patient units from that
@@ -78,23 +93,30 @@
 # A plausibility gate checks mask size and confidence. If a mask is implausible,
 # the full image is used instead of a potentially destructive ROI mask.
 #
-# Required packages:
+# Required packages for the normal path:
 #
-#   pip install monai==1.6.0 huggingface_hub
-#   pip install torch torchvision opencv-python numpy scikit-learn matplotlib tqdm
+#   pip install huggingface_hub
+#   pip install torch torchvision opencv-python numpy "scikit-learn>=1.0" matplotlib tqdm
+#
+# MONAI itself is only required for the exceptional fallback that reconstructs
+# the network from ``models/model.pt`` when the official ``models/model.ts``
+# artifact cannot be loaded:
+#
+#   pip install monai==1.6.0
+#
+# StandardScaler.fit(sample_weight=...) is required. Use mutually compatible
+# torch/torchvision builds for the installed CUDA runtime.
 #
 # NOTE ABOUT THE PRETRAINED SEGMENTER:
-# The MONAI bundle metadata identifies version 0.3.5 and records the original
-# bundle environment as MONAI 1.3.0 / PyTorch 1.13.0. The network definition is
-# verified from the official bundle configuration. The current script can use a
-# newer MONAI version to build/load the network, but the exact checkpoint and
-# architecture should be kept pinned for reproducibility.
+# The bundle metadata identifies version 0.3.5 and records the original bundle
+# environment as MONAI 1.3.0 / PyTorch 1.13.0. The Hugging Face repository is
+# pinned to a specific commit and the official model.ts/model.pt digests are
+# checked before use. The official TorchScript artifact is the preferred path:
+# it can be loaded directly by PyTorch and avoids both the slow MONAI import and
+# a locally re-traced copy during ordinary first and later executions.
 #
-# On first execution, the script downloads the pinned MONAI bundle if needed,
-# imports MONAI once, and exports the segmenter to a local TorchScript cache.
-# Later executions load that cache directly and do not import MONAI at startup.
-# Set AUTO_DOWNLOAD_MONAI_BUNDLE = False if the original bundle must be supplied
-# manually or the machine has no internet access.
+# Set AUTO_DOWNLOAD_MONAI_BUNDLE = False for an offline environment and place
+# the pinned bundle files under the configured MONAI bundle directory.
 #
 # ============================================================================
 # PIPELINE FLOW
@@ -102,33 +124,30 @@
 #
 # Raw MRI JPEG slice
 #    ↓
-# Min-max intensity scaling to [0,1]
+# Per-image min-max intensity scaling to [0,1]
 #    ↓
-# Aspect-ratio-preserving zero padding to 256×256
+# Aspect-ratio-preserving placement in a 256×256 zero-padded canvas
 #    ↓
-# Pretrained MONAI residual U-Net
+# Optional pretrained MONAI residual U-Net
 #    ↓
-# Four-class ventricular probability map
+# Confidence-gated soft ROI or unchanged full-image fallback
 #    ↓
-# Cardiac probability = LV pool + myocardium + RV pool
+# Custom 256→224 whole-canvas resize + ImageNet mean/std normalization
 #    ↓
-# Mask plausibility / confidence check
+# Frozen EfficientNet-B0 feature encoding
 #    ↓
-# Confidence-gated soft ROI
+# 1280D feature vector per successfully decoded slice
 #    ↓
-# EfficientNet-B0 ImageNet normalization
+# Hierarchical embedding pooling inside each folder-defined series proxy
 #    ↓
-# EfficientNet-B0 feature encoding
+# Equal-weight pooling across a Directory_* patient's series proxies
 #    ↓
-# 1280D feature vector / readable slice
+# Logistic Regression trained on one vector per Directory_* patient
 #    ↓
-# Logistic Regression slice probabilities
-#    ↓
-# Log-odds fusion across readable slices inside each imaging series
-#    ↓
-# Log-odds fusion across all series belonging to one Directory_* patient
-#    ↓
-# Patient-level CAD-associated probability
+# Out-of-fold patient-level CAD-associated MODEL SCORE
+#
+# Optional legacy ablation:
+#   slice Logistic Regression → series log-odds fusion → patient log-odds fusion
 #
 # ============================================================================
 # WHY THIS PIPELINE?
@@ -154,23 +173,28 @@
 #   - All slices are retained by default; optional quality weights are computed
 #     only inside their own series and are treated as a heuristic, not a clinical
 #     image-quality measurement.
-#   - Hierarchical aggregation prevents a very long series from dominating the
-#     patient simply because it contains more exported JPEG frames.
-#   - Hierarchical training weights give equal nominal influence to patients and
-#     equal nominal influence to the series inside each patient.
-#   - Patient-level splitting prevents images or series from the same
+#   - Hierarchical aggregation prevents a very long folder-defined series proxy
+#     from dominating simply because it contains more exported JPEG frames.
+#   - The recommended classifier receives one pooled embedding per patient, so
+#     the effective labeled sample size is the number of Directory_* folders,
+#     not the number of JPEG slices.
+#   - The optional legacy slice classifier uses hierarchical weights so patients
+#     and their folder-defined series proxies receive controlled nominal influence.
+#   - Patient-level splitting prevents images or series proxies from the same
 #     Directory_* patient from appearing in both training and validation folds.
 #
 # The pipeline approximates the following reasoning process:
 #
 #   "Localize cardiac anatomy when reliable → inspect informative slices from
-#    every series → combine series evidence → classify the patient."
+#    every folder proxy → combine patient evidence → classify the patient."
 #
 # This is an exploratory patient-level classifier under the validated dataset
 # mapping that every Directory_* is one patient. The top-level Normal/Sick
-# folder supplies the patient-level class label. When that label is propagated
-# to every slice during slice-level classifier training, the slice supervision
-# is weak because individual slices are not independently annotated for CAD.
+# folder supplies the patient-level class label. The recommended strategy trains
+# directly on one pooled vector per Directory_* patient. If the optional legacy
+# strategy propagates that label to every slice, its supervision is weak because
+# individual slices are not independently annotated for CAD and are strongly
+# correlated within the same patient.
 #
 # ============================================================================
 
@@ -179,10 +203,16 @@
 # IMPORTS
 # =============================
 
+import csv
+# Standard-library CSV writer used for reproducible machine-readable outputs.
+
 import hashlib
-# Used to verify the SHA-256 checksum of the downloaded MONAI checkpoint.
+# Used for checkpoint verification and feature-cache fingerprints.
 # Checksum verification makes the experiment more reproducible and helps detect
 # corrupted or unintended model files.
+
+import json
+# Serializes run configuration, software versions and evaluation summaries.
 
 import os
 # OS interaction (files, paths, environment variables).
@@ -191,6 +221,9 @@ import os
 #   - building portable paths
 #   - detecting Kaggle versus local execution
 #   - reading optional bundle path overrides
+
+import platform
+# Records operating-system and Python runtime information for reproducibility.
 
 from pathlib import Path
 # Object-oriented path manipulation.
@@ -236,6 +269,9 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 # Dataset utilities for batching and deterministic inference.
 
+import torchvision
+# Used only to report the exact torchvision version in the run metadata.
+
 import torchvision.transforms as transforms
 # Converts NumPy HWC arrays to PyTorch CHW tensors.
 # EfficientNet normalization is intentionally applied AFTER ROI extraction.
@@ -245,19 +281,21 @@ from torchvision import models
 
 # IMPORTANT STARTUP OPTIMIZATION:
 #
-# MONAI is intentionally NOT imported at module startup.
-#
-# On the first run, build_monai_segmenter() imports MONAI lazily, constructs
-# the official pretrained UNet, and exports it once to a TorchScript cache.
-# On all later runs, the segmentation network is loaded directly with
-# torch.jit.load(), so neither monai.networks.nets nor monai.bundle.scripts is
-# imported at startup. This removes the slow MONAI import from normal runs.
-#
-# The MONAI bundle downloader remains lazy as well and is imported only if the
-# original model.pt checkpoint is missing.
+# MONAI is intentionally NOT imported at module startup or on the normal model
+# loading path. The pinned bundle already provides ``models/model.ts``; the
+# script downloads that file with huggingface_hub and loads it directly through
+# ``torch.jit.load``. MONAI UNet is imported lazily only if the official
+# TorchScript artifact cannot be used and reconstruction from model.pt is needed.
+
+import sklearn
+# Used to record the exact scikit-learn version in the run metadata.
+
+from sklearn.decomposition import PCA
+# Optional fold-local dimensionality reduction for the very small patient cohort.
 
 from sklearn.linear_model import LogisticRegression
-# Classical ML classifier trained on EfficientNet slice embeddings.
+# Linear probabilistic classifier. By default it is trained on one pooled
+# embedding per Directory_* patient; slice-level training is an optional ablation.
 
 from sklearn.metrics import roc_auc_score
 # ROC-AUC evaluation metric for binary patient-level ranking.
@@ -319,6 +357,68 @@ torch.manual_seed(RANDOM_SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(RANDOM_SEED)
 
+# ---------------------------------------------------------------------------
+# EXECUTION / EVALUATION STRATEGY
+# ---------------------------------------------------------------------------
+
+CLASSIFICATION_STRATEGY = "patient_embedding"
+# Recommended default: "patient_embedding".
+#
+#   patient_embedding:
+#       weighted mean of slice embeddings inside each series proxy, followed by
+#       an equal mean across the patient's series proxies. Logistic Regression
+#       is then trained on exactly one vector per Directory_* patient.
+#
+#   slice_probability_fusion:
+#       legacy weakly supervised approach: train Logistic Regression on slice
+#       embeddings with hierarchical weights, then fuse slice probabilities to
+#       series and patient scores. This remains useful as a declared ablation,
+#       but it does not remove within-patient pseudo-replication from fitting.
+
+N_SPLITS = 5
+CV_RANDOM_STATE = RANDOM_SEED
+LOGISTIC_C = 1.0
+LOGISTIC_MAX_ITER = 2000
+USE_PATIENT_PCA = True
+PATIENT_PCA_EXPLAINED_VARIANCE = 0.95
+BOOTSTRAP_REPLICATES = 2000
+# Patient-level PCA is fitted ONLY on each training fold and can retain at most
+# n_train_patients - 1 components. It reduces the 1280D/very-small-N mismatch,
+# but remains an analysis choice that must be fixed before OOF evaluation.
+# All settings above are fixed BEFORE evaluation. If tuned using performance,
+# tuning must occur inside an inner patient-level CV loop, never on OOF results.
+
+USE_MONAI_ROI = True
+# Set False for the required full-image ablation. When False, MONAI is not built
+# or executed and the entire aligned image is passed to EfficientNet.
+
+USE_CUDA_AMP = True
+# Mixed-precision inference can substantially improve GPU throughput. Logits and
+# stored embeddings are converted back to float32 before downstream processing.
+# Set False when exact numerical comparability across hardware is more important.
+
+DATALOADER_NUM_WORKERS = 0
+# Zero is the safest cross-platform default, especially on Windows notebooks.
+# Because execution is protected by ``if __name__ == "__main__"``, this can be
+# increased after testing local RAM, storage throughput and multiprocessing.
+
+USE_FEATURE_CACHE = True
+FORCE_REBUILD_FEATURE_CACHE = False
+FEATURE_CACHE_SCHEMA_VERSION = "2026-08-22-v4"
+# Frozen MONAI/EfficientNet extraction is the expensive stage. A cache keyed by
+# dataset file metadata and all feature-affecting settings avoids repeating it.
+# Increment FEATURE_CACHE_SCHEMA_VERSION after changing extraction semantics.
+
+AUDIT_EXACT_DECODED_PIXEL_DUPLICATES = True
+FAIL_ON_CROSS_PATIENT_EXACT_DUPLICATES = False
+# During the same pass that decodes each image, the code hashes the raw decoded
+# grayscale pixel matrix (including its shape). This detects exact pixel copies
+# even when JPEG container metadata differs. It does NOT detect near-duplicates
+# or re-encoded copies whose decoded pixels changed slightly. Cross-patient
+# duplicate groups are written to CSV and trigger a prominent warning. Set the
+# failure flag True for a strict publication run after deciding how such groups
+# will be handled without redefining patient_id away from Directory_*.
+
 USE_SLICE_QUALITY_WEIGHTS = False
 # IMPORTANT DEFAULT:
 # Standard deviation after ROI weighting is NOT a validated MRI quality metric.
@@ -329,10 +429,11 @@ SLICE_QUALITY_MIN_WEIGHT = 0.25
 # Lower bound used only when USE_SLICE_QUALITY_WEIGHTS=True.
 
 DEBUG_VISUALIZATION = True
-DEBUG_MAX_BATCHES = 5
-# Saving figures for every batch can create thousands of PNG files and dominate
-# runtime. Enable visual QC deliberately; only the first DEBUG_MAX_BATCHES are
-# saved during a full extraction run.
+DEBUG_SAMPLES_PER_CLASS = 1000
+# Debug cases are chosen deterministically across patients in BOTH classes,
+# rather than taking the first batches (which are ordered by class/patient and
+# are not representative). These figures are qualitative QC only. ROI-gate
+# thresholds must not be repeatedly adjusted after inspecting OOF performance.
 
 # ---------------------------------------------------------------------------
 # MONAI BUNDLE CONFIGURATION
@@ -342,27 +443,35 @@ MONAI_BUNDLE_NAME = "ventricular_short_axis_3label"
 # Official MONAI Model Zoo bundle used for cardiac segmentation.
 
 MONAI_BUNDLE_VERSION = "0.3.5"
-# Pinned bundle version for reproducibility.
+# Human-readable bundle version declared by configs/metadata.json.
 
-MONAI_DOWNLOAD_SOURCE = "monaihosting"
-# Official MONAI-hosted bundle source. Current MONAI releases resolve this
-# source through the MONAI model hosting infrastructure.
+MONAI_HF_REPO_ID = "MONAI/ventricular_short_axis_3label"
+MONAI_HF_REVISION = "eefc17c8e002cc8a567bbfce8f02d7d3116408f4"
+# The immutable Hugging Face commit corresponding to the pinned metadata
+# release. Pinning a commit, rather than downloading ``main``, prevents a future
+# repository update from silently changing the files used by the experiment.
 
 AUTO_DOWNLOAD_MONAI_BUNDLE = True
-# When True, the bundle is downloaded automatically if model.pt is missing.
-# Set to False for an offline environment and copy the bundle manually to:
+# When True, missing pinned files are downloaded through huggingface_hub.
+# Set False for an offline machine and place at least these files manually:
 #
-#   <MONAI_BUNDLE_DIR>/ventricular_short_axis_3label/models/model.pt
+#   <MONAI_BUNDLE_DIR>/ventricular_short_axis_3label/models/model.ts
+#   <MONAI_BUNDLE_DIR>/ventricular_short_axis_3label/configs/metadata.json
+#
+# ``models/model.pt`` and ``configs/train.json`` are needed only for the
+# reconstruction fallback described below.
 
-VERIFY_MONAI_CHECKPOINT_SHA256 = False
-# No unverifiable model.pt digest is hard-coded. If you have an authoritative
-# SHA-256 for the exact local checkpoint used in your experiment, place it in
-# MONAI_MODEL_SHA256 and enable this flag. Otherwise reproducibility should be
-# documented by bundle name, bundle version, software versions and the archived
-# checkpoint itself.
+VERIFY_MONAI_ARTIFACT_SHA256 = True
+# Official SHA-256 digests published with the pinned Hugging Face artifacts.
+# Verification is enabled by default because a wrong or corrupted segmentation
+# model would invalidate both the ROI and the frozen feature cache.
 
-MONAI_MODEL_SHA256 = ""
-# Optional SHA-256 for a locally supplied model.pt. Leave empty to skip.
+MONAI_OFFICIAL_TORCHSCRIPT_SHA256 = (
+    "27d5532401fa6c1883872fa21635adbb7615981e7f385d0c58dd75b355e340b3"
+)
+MONAI_MODEL_SHA256 = (
+    "464ca796028831f6c9e2b1cdaebe9af002fc1d7f494f7a89a63f2079e38837a1"
+)
 
 MONAI_ROI_DILATION_KERNEL = 31
 # Expands the predicted ventricular structures to retain a margin around the
@@ -400,11 +509,19 @@ MONAI_MIN_PEAK_HEART_PROBABILITY = 0.50
 # EFFICIENTNET NORMALIZATION
 # ---------------------------------------------------------------------------
 
+EFFICIENTNET_WEIGHTS_NAME = "IMAGENET1K_V1"
+# Explicit enum name, rather than DEFAULT, prevents a future torchvision release
+# from silently changing the pretrained checkpoint selected by this experiment.
+
 EFFICIENTNET_MEAN = (0.485, 0.456, 0.406)
 EFFICIENTNET_STD = (0.229, 0.224, 0.225)
-# Official ImageNet normalization associated with torchvision's pretrained
-# EfficientNet-B0 weights. It is applied after soft ROI extraction so masking
-# operates on interpretable [0,1] image intensities.
+# Mean/std values associated with EfficientNet_B0_Weights.IMAGENET1K_V1.
+# Important: torchvision's complete reference transform also resizes to 256 and
+# center-crops to 224. This pipeline deliberately resizes the COMPLETE aligned
+# 256×256 canvas to 224×224 to avoid discarding peripheral MRI content and to
+# preserve simple MONAI-mask alignment. Therefore only the normalization values
+# and checkpoint are official; the spatial preprocessing is a documented custom
+# adaptation that should be included in the methods and ablated if necessary.
 
 # ---------------------------------------------------------------------------
 # MONAI BUNDLE LOCATION
@@ -429,23 +546,31 @@ MONAI_TORCHSCRIPT_PATH = Path(
         "MONAI_TORCHSCRIPT_PATH",
         str(
             MONAI_BUNDLE_DIR
-            / f"{MONAI_BUNDLE_NAME}_{MONAI_BUNDLE_VERSION}_torchscript.pt"
+            / (
+                f"{MONAI_BUNDLE_NAME}_{MONAI_BUNDLE_VERSION}_"
+                f"{MONAI_HF_REVISION[:8]}_fallback_torchscript.pt"
+            )
         ),
     )
 )
-# Fast-start cache of the complete pretrained segmentation network.
+# Local TorchScript cache used ONLY by the reconstruction fallback:
 #
-# First run:
-#   model.pt -> lazy MONAI import -> construct UNet -> TorchScript export
+#   official model.pt -> lazy MONAI import -> strict state-dict loading
+#                     -> validated local TorchScript export
 #
-# Later runs:
-#   TorchScript cache -> torch.jit.load()
-#
-# MONAI itself is therefore not imported during normal later executions.
+# The normal path loads the official bundle file ``models/model.ts`` directly,
+# so this fallback cache usually never has to be created.
 
 FORCE_REBUILD_MONAI_TORCHSCRIPT = False
-# Set True only when intentionally rebuilding the cached TorchScript model,
-# for example after changing the MONAI architecture or checkpoint version.
+# False (normal): use the verified official model.ts; consult a local fallback
+# cache only when that official artifact cannot execute on the current PyTorch.
+# True: deliberately ignore both TorchScript files and rebuild from model.pt.
+# This is intended for diagnostics, not routine execution.
+
+MONAI_RUNTIME_SOURCE = "not_loaded"
+MONAI_RUNTIME_ARTIFACT_PATH = None
+# Populated by load_and_validate_torchscript_segmenter() so run_metadata.json
+# records the artifact actually executed, not merely the files present on disk.
 
 # ---------------------------------------------------------------------------
 # DATASET LOCATION
@@ -455,6 +580,183 @@ if os.path.exists("/kaggle/input/datasets/danialsharifrazi/cad-cardiac-mri-datas
     DATASET_PATH = "/kaggle/input/datasets/danialsharifrazi/cad-cardiac-mri-dataset"
 else:
     DATASET_PATH = r"C:\F\_Develop\AI\Datasets\CAD Cardiac MRI Dataset"
+
+if os.path.exists("/kaggle/working"):
+    OUTPUT_ROOT = Path("/kaggle/working/cad_patient_pipeline_outputs")
+else:
+    try:
+        OUTPUT_ROOT = (
+            Path(__file__).resolve().parent / "cad_patient_pipeline_outputs"
+        )
+    except NameError:
+        OUTPUT_ROOT = Path.cwd() / "cad_patient_pipeline_outputs"
+
+# A deterministic configuration tag prevents one ablation from silently
+# overwriting another. The shared feature cache remains outside the run folder
+# because patient-level classifier settings do not change frozen embeddings.
+_run_identity = {
+    "strategy": CLASSIFICATION_STRATEGY,
+    "random_seed": RANDOM_SEED,
+    "n_splits": N_SPLITS,
+    "cv_seed": CV_RANDOM_STATE,
+    "bootstrap_replicates": BOOTSTRAP_REPLICATES,
+    "logistic_c": LOGISTIC_C,
+    "logistic_max_iter": LOGISTIC_MAX_ITER,
+    "use_patient_pca": USE_PATIENT_PCA,
+    "pca_variance": PATIENT_PCA_EXPLAINED_VARIANCE,
+    "img_size": IMG_SIZE,
+    "monai_input_size": MONAI_INPUT_SIZE,
+    "use_monai_roi": USE_MONAI_ROI,
+    "monai_bundle": MONAI_BUNDLE_NAME,
+    "monai_bundle_version": MONAI_BUNDLE_VERSION,
+    "monai_hf_revision": MONAI_HF_REVISION,
+    "monai_model_ts_sha256": MONAI_OFFICIAL_TORCHSCRIPT_SHA256,
+    "force_rebuild_monai_torchscript": FORCE_REBUILD_MONAI_TORCHSCRIPT,
+    "roi_dilation": MONAI_ROI_DILATION_KERNEL,
+    "roi_background": MONAI_BACKGROUND_WEIGHT,
+    "roi_min_area": MONAI_MIN_HEART_AREA_RATIO,
+    "roi_max_area": MONAI_MAX_HEART_AREA_RATIO,
+    "roi_min_peak": MONAI_MIN_PEAK_HEART_PROBABILITY,
+    "efficientnet_weights": EFFICIENTNET_WEIGHTS_NAME,
+    "use_cuda_amp": USE_CUDA_AMP,
+    "batch_size": BATCH_SIZE,
+    "use_quality_weights": USE_SLICE_QUALITY_WEIGHTS,
+    "quality_min_weight": SLICE_QUALITY_MIN_WEIGHT,
+}
+RUN_CONFIGURATION_TAG = hashlib.sha256(
+    json.dumps(_run_identity, sort_keys=True).encode("utf-8")
+).hexdigest()[:10]
+RUN_NAME = f"{CLASSIFICATION_STRATEGY}__{RUN_CONFIGURATION_TAG}"
+
+OUTPUT_DIR = OUTPUT_ROOT / RUN_NAME
+DEBUG_OUTPUT_DIR = OUTPUT_DIR / "debug_output"
+FEATURE_CACHE_ROOT = OUTPUT_ROOT / "feature_cache"
+
+
+# =============================
+# CONFIGURATION VALIDATION
+# =============================
+
+def validate_configuration():
+    """Fail early for settings that would create invalid or ambiguous runs."""
+
+    valid_strategies = {
+        "patient_embedding",
+        "slice_probability_fusion",
+    }
+
+    if CLASSIFICATION_STRATEGY not in valid_strategies:
+        raise ValueError(
+            "CLASSIFICATION_STRATEGY must be one of "
+            f"{sorted(valid_strategies)}, got {CLASSIFICATION_STRATEGY!r}."
+        )
+
+    if MONAI_ROI_DILATION_KERNEL <= 0 or MONAI_ROI_DILATION_KERNEL % 2 == 0:
+        raise ValueError(
+            "MONAI_ROI_DILATION_KERNEL must be a positive odd integer."
+        )
+
+    if not 0.0 <= MONAI_BACKGROUND_WEIGHT <= 1.0:
+        raise ValueError("MONAI_BACKGROUND_WEIGHT must lie in [0,1].")
+
+    if not (
+        0.0 <= MONAI_MIN_HEART_AREA_RATIO
+        < MONAI_MAX_HEART_AREA_RATIO
+        <= 1.0
+    ):
+        raise ValueError("Invalid MONAI heart-area plausibility interval.")
+
+    if not 0.0 <= MONAI_MIN_PEAK_HEART_PROBABILITY <= 1.0:
+        raise ValueError(
+            "MONAI_MIN_PEAK_HEART_PROBABILITY must lie in [0,1]."
+        )
+
+    if IMG_SIZE <= 0 or MONAI_INPUT_SIZE <= 0:
+        raise ValueError("Image sizes must be strictly positive.")
+
+    if IMG_SIZE != 224:
+        raise ValueError(
+            "This reviewed pipeline is spatially documented and cache-keyed "
+            "for EfficientNet-B0 at 224x224. Keep IMG_SIZE=224 unless all "
+            "preprocessing assumptions are revalidated."
+        )
+
+    if MONAI_INPUT_SIZE != 256:
+        raise ValueError(
+            "The pinned ventricular_short_axis_3label bundle documents a "
+            "256x256 input. Keep MONAI_INPUT_SIZE=256."
+        )
+
+    if BATCH_SIZE <= 0:
+        raise ValueError("BATCH_SIZE must be strictly positive.")
+
+    if DATALOADER_NUM_WORKERS < 0:
+        raise ValueError("DATALOADER_NUM_WORKERS cannot be negative.")
+
+    if DEBUG_SAMPLES_PER_CLASS < 0:
+        raise ValueError("DEBUG_SAMPLES_PER_CLASS cannot be negative.")
+
+    if not 0.0 < SLICE_QUALITY_MIN_WEIGHT <= 1.0:
+        raise ValueError(
+            "SLICE_QUALITY_MIN_WEIGHT must lie in (0,1]."
+        )
+
+    if (
+        FAIL_ON_CROSS_PATIENT_EXACT_DUPLICATES
+        and not AUDIT_EXACT_DECODED_PIXEL_DUPLICATES
+    ):
+        raise ValueError(
+            "The strict duplicate policy requires duplicate auditing to be "
+            "enabled."
+        )
+
+    if VERIFY_MONAI_ARTIFACT_SHA256:
+        for digest_name, digest_value in (
+            (
+                "MONAI_OFFICIAL_TORCHSCRIPT_SHA256",
+                MONAI_OFFICIAL_TORCHSCRIPT_SHA256,
+            ),
+            ("MONAI_MODEL_SHA256", MONAI_MODEL_SHA256),
+        ):
+            if len(digest_value) != 64 or any(
+                character not in "0123456789abcdefABCDEF"
+                for character in digest_value
+            ):
+                raise ValueError(
+                    f"{digest_name} must be a 64-character hexadecimal "
+                    "digest when verification is enabled."
+                )
+
+    if not MONAI_HF_REPO_ID or not MONAI_HF_REVISION:
+        raise ValueError(
+            "MONAI_HF_REPO_ID and MONAI_HF_REVISION must be non-empty."
+        )
+
+    if EFFICIENTNET_WEIGHTS_NAME not in (
+        models.EfficientNet_B0_Weights.__members__
+    ):
+        raise ValueError(
+            f"Unknown EfficientNet-B0 weight enum: "
+            f"{EFFICIENTNET_WEIGHTS_NAME!r}."
+        )
+
+    if N_SPLITS < 2:
+        raise ValueError("N_SPLITS must be at least 2.")
+
+    if LOGISTIC_C <= 0:
+        raise ValueError("LOGISTIC_C must be strictly positive.")
+
+    if LOGISTIC_MAX_ITER <= 0:
+        raise ValueError("LOGISTIC_MAX_ITER must be strictly positive.")
+
+    if not 0.0 < PATIENT_PCA_EXPLAINED_VARIANCE < 1.0:
+        raise ValueError(
+            "PATIENT_PCA_EXPLAINED_VARIANCE must lie strictly in (0,1) "
+            "when it is passed to PCA as an explained-variance fraction."
+        )
+
+    if BOOTSTRAP_REPLICATES <= 0:
+        raise ValueError("BOOTSTRAP_REPLICATES must be strictly positive.")
 
 
 # =============================
@@ -573,8 +875,17 @@ class MRIDataset(Dataset):
             The validated patient identifier itself, for example Directory_24.
 
         series_id:
-            Patient-scoped imaging-series identifier, for example
-            Directory_24/SR_3.
+            Patient-scoped folder-defined series proxy, for example
+            Directory_24/SR_3. This is not a recovered DICOM UID.
+
+        sample_index:
+            Stable integer index in ``samples``. It is used only to select
+            deterministic, class-balanced debug examples.
+
+        decoded_pixel_hash:
+            SHA-256 of the decoded uint8 grayscale pixel matrix plus its shape.
+            It supports an exact-pixel duplicate audit; it is not a perceptual
+            or near-duplicate hash.
 
     =========================================================================
     WHY TWO INPUT TENSORS?
@@ -636,6 +947,16 @@ class MRIDataset(Dataset):
                 f"OpenCV could not read the MRI image: {img_path}"
             )
 
+        # Hash the decoded uint8 matrix BEFORE any normalization or resizing.
+        # Shape is included so two byte streams with different geometry cannot
+        # collide merely because their flattened bytes happen to match.
+        pixel_digest = hashlib.sha256()
+        pixel_digest.update(
+            np.asarray(image.shape, dtype=np.int32).tobytes()
+        )
+        pixel_digest.update(image.tobytes(order="C"))
+        decoded_pixel_hash = pixel_digest.hexdigest()
+
         # =========================================================
         # MONAI INTENSITY PREPROCESSING
         # =========================================================
@@ -681,6 +1002,8 @@ class MRIDataset(Dataset):
             label,
             patient_id,
             series_id,
+            idx,
+            decoded_pixel_hash,
         )
 
 
@@ -690,7 +1013,7 @@ class MRIDataset(Dataset):
 
 def load_samples(root_dir):
     """
-    Discover MRI images and attach patient + series identifiers.
+    Discover MRI images and attach patient + folder-defined series identifiers.
 
     DATASET COHORT VS. COMPUTATIONAL PATIENT UNIT
     ----------------------------------------------
@@ -702,29 +1025,33 @@ def load_samples(root_dir):
     PATIENT UNIT -- VALIDATED FOR THIS DATASET RELEASE
     --------------------------------------------------
     ``patient_id`` is exactly the immediate ``Directory_*`` folder name.
-    ``SR_*`` and ``series*`` child folders remain imaging-series containers and
+    ``SR_*`` and ``series*`` child folders remain folder-defined containers and
     never become patients. The Normal/Sick parent folder supplies the class
     label but is not part of patient_id.
 
     The function explicitly rejects a Directory_* name that appears under both
     Normal and Sick, because patient_id must be globally unambiguous.
 
-    SERIES UNIT
-    -----------
-    The first directory level below the patient is treated as the imaging
-    series. This is safer than using ``os.walk(root)`` as the series definition:
-    nested folders inside a series should not silently become separate series.
+    SERIES PROXY -- NOT A VALIDATED DICOM SERIES UID
+    --------------------------------------------------
+    The first directory level below the patient is treated as an operational
+    series proxy. This preserves the released folder organization, but JPEG
+    exports do not expose enough DICOM metadata to prove that each child folder
+    is exactly one acquisition SeriesInstanceUID. Nested folders inside one
+    immediate child are intentionally kept in the same proxy.
 
     Example:
 
         Sick/Directory_24/SR_3/image001.jpg
         Sick/Directory_24/SR_3/subfolder/image002.jpg
 
-    Both images remain in the same series identifier:
+    Both images remain in the same series-proxy identifier:
 
         Directory_24/SR_3
 
-    Images directly inside Directory_* receive the special series ID
+    This identifier means "patient Directory_24, child folder SR_3"; it must not
+    be interpreted as a DICOM series UID. Images directly inside Directory_*
+    receive the special series ID
     ``<patient_id>/__ROOT__``.
 
     The function returns:
@@ -794,9 +1121,9 @@ def load_samples(root_dir):
                 )
 
             # ---------------------------------------------------------
-            # Find immediate child directories. Each child directory is
-            # treated as one imaging series. os.walk is still used to
-            # collect images recursively inside that series.
+            # Find immediate child directories. Each child is treated as one
+            # folder-defined series PROXY. os.walk is used only to collect
+            # images recursively without splitting nested subfolders again.
             # ---------------------------------------------------------
             child_series_dirs = [
                 child
@@ -811,7 +1138,12 @@ def load_samples(root_dir):
 
                 found_images = False
 
-                for root, _, files in os.walk(series_path):
+                for root, nested_dirs, files in os.walk(series_path):
+
+                    # os.walk does not guarantee directory order. Sorting it
+                    # makes sample order, cache fingerprints and debug indices
+                    # reproducible across filesystems.
+                    nested_dirs.sort()
 
                     for filename in sorted(files):
 
@@ -832,8 +1164,8 @@ def load_samples(root_dir):
                         )
 
                 if not found_images:
-                    # Empty series folders are ignored rather than becoming
-                    # artificial series with zero observations.
+                    # Empty child folders are ignored rather than becoming
+                    # artificial series proxies with zero observations.
                     continue
 
     if not samples:
@@ -875,7 +1207,7 @@ def load_samples(root_dir):
         sum(label == 1 for label in patient_to_label.values()),
     )
     print(f"  Images: {len(samples)}")
-    print(f"  Series: {len(set(sample[3] for sample in samples))}")
+    print(f"  Series proxies: {len(set(sample[3] for sample in samples))}")
 
     return samples
 
@@ -919,119 +1251,338 @@ def sha256_file(path):
 
 
 def locate_monai_bundle_root():
-    """
-    Find the extracted bundle directory containing models/model.pt.
+    """Locate the requested bundle root without accepting an unrelated model.
 
-    The normal location is:
+    Preferred layout::
 
         MONAI_BUNDLE_DIR/
             ventricular_short_axis_3label/
-                models/model.pt
-                configs/train.json
+                models/model.ts
+                configs/metadata.json
 
-    A recursive fallback is included because bundle download behavior can vary
-    slightly between MONAI versions and storage sources.
+    ``models/model.pt`` may also be present for the reconstruction fallback.
+    Older MONAI download utilities can produce a slightly different nesting
+    layout, so a deterministic recursive search is retained. A candidate is
+    accepted only when the requested bundle slug occurs in its path.
     """
 
     direct_root = MONAI_BUNDLE_DIR / MONAI_BUNDLE_NAME
-    direct_model = direct_root / "models" / "model.pt"
 
-    if direct_model.is_file():
+    if any(
+        (direct_root / relative_path).is_file()
+        for relative_path in (
+            Path("models/model.ts"),
+            Path("models/model.pt"),
+        )
+    ):
         return direct_root
 
     if MONAI_BUNDLE_DIR.exists():
-        for model_path in MONAI_BUNDLE_DIR.rglob("model.pt"):
-            candidate_root = model_path.parent.parent
+        candidate_artifacts = []
 
-            if (
-                candidate_root.name == MONAI_BUNDLE_NAME
-                or (candidate_root / "configs" / "train.json").is_file()
-            ):
+        # Prefer the official TorchScript artifact when several old layouts
+        # coexist, then fall back to the state-dict checkpoint.
+        for filename in ("model.ts", "model.pt"):
+            candidate_artifacts.extend(
+                sorted(MONAI_BUNDLE_DIR.rglob(filename))
+            )
+
+        for artifact_path in candidate_artifacts:
+            if artifact_path.parent.name != "models":
+                continue
+
+            candidate_root = artifact_path.parent.parent
+
+            if MONAI_BUNDLE_NAME in candidate_root.parts:
                 return candidate_root
 
     return direct_root
 
 
-def ensure_monai_bundle():
-    """
-    Ensure that the pinned pretrained MONAI bundle is available locally.
+def validate_monai_bundle_metadata(bundle_root):
+    """Validate official metadata against the pinned model assumptions.
 
-    The bundle is downloaded only when model.pt is absent. A clear error is
-    raised when automatic download is disabled or fails.
+    The normal download requests metadata.json explicitly. A manually supplied
+    fallback can omit it, but that weakens provenance; therefore a missing file
+    emits a warning rather than silently pretending that the version was
+    verified. Present metadata must match the pinned version and I/O contract.
     """
+
+    metadata_path = bundle_root / "configs" / "metadata.json"
+
+    if not metadata_path.is_file():
+        print(
+            "WARNING: MONAI metadata.json is missing. Artifact SHA-256 and "
+            "runtime output shape can still be checked, but the declared "
+            "bundle version and I/O metadata cannot be verified."
+        )
+        return
+
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"Could not parse MONAI bundle metadata: {metadata_path}"
+        ) from exc
+
+    version = str(metadata.get("version", ""))
+    if version != MONAI_BUNDLE_VERSION:
+        raise RuntimeError(
+            "MONAI bundle version mismatch: "
+            f"expected {MONAI_BUNDLE_VERSION}, metadata reports {version!r}."
+        )
+
+    network_format = metadata.get("network_data_format", {})
+    input_image = network_format.get("inputs", {}).get("image", {})
+    output_pred = network_format.get("outputs", {}).get("pred", {})
+
+    declared_input_channels = input_image.get("num_channels")
+    declared_input_shape = input_image.get("spatial_shape")
+    declared_output_channels = output_pred.get("num_channels")
+    declared_output_shape = output_pred.get("spatial_shape")
+
+    if declared_input_channels not in (None, 1):
+        raise RuntimeError(
+            "Unexpected MONAI metadata input-channel count: "
+            f"{declared_input_channels}."
+        )
+    if declared_input_shape not in (None, [256, 256], (256, 256)):
+        raise RuntimeError(
+            "Unexpected MONAI metadata input spatial shape: "
+            f"{declared_input_shape}."
+        )
+    if declared_output_channels not in (None, 4):
+        raise RuntimeError(
+            "Unexpected MONAI metadata output-channel count: "
+            f"{declared_output_channels}."
+        )
+    if declared_output_shape not in (None, [256, 256], (256, 256)):
+        raise RuntimeError(
+            "Unexpected MONAI metadata output spatial shape: "
+            f"{declared_output_shape}."
+        )
+
+
+def validate_monai_train_config(bundle_root):
+    """Check that fallback reconstruction matches the official train config."""
+
+    train_path = bundle_root / "configs" / "train.json"
+
+    if not train_path.is_file():
+        raise FileNotFoundError(
+            "MONAI fallback reconstruction requires configs/train.json so the "
+            f"hard-coded architecture can be checked: {train_path}"
+        )
+
+    try:
+        train_config = json.loads(train_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"Could not parse MONAI train configuration: {train_path}"
+        ) from exc
+
+    network_def = train_config.get("network_def", {})
+    expected = {
+        "spatial_dims": 2,
+        "in_channels": 1,
+        "out_channels": 4,
+        "channels": [16, 32, 64, 128, 256],
+        "strides": [2, 2, 2, 2],
+        "num_res_units": 2,
+    }
+
+    for key, expected_value in expected.items():
+        actual_value = network_def.get(key)
+        if actual_value != expected_value:
+            raise RuntimeError(
+                "MONAI train.json architecture mismatch for "
+                f"{key!r}: expected {expected_value!r}, got {actual_value!r}."
+            )
+
+
+def verify_monai_artifact_sha256(path, expected_sha256, artifact_label):
+    """Verify a pinned MONAI artifact before it influences extracted features."""
+
+    if not VERIFY_MONAI_ARTIFACT_SHA256:
+        return None
+
+    if not expected_sha256:
+        raise RuntimeError(
+            f"SHA-256 verification is enabled but no digest is configured for "
+            f"{artifact_label}."
+        )
+
+    actual_sha256 = sha256_file(path)
+
+    if actual_sha256.lower() != expected_sha256.lower():
+        raise RuntimeError(
+            f"{artifact_label} SHA-256 mismatch. Expected "
+            f"{expected_sha256}, got {actual_sha256}. Delete the local file "
+            "and download the pinned artifact again."
+        )
+
+    return actual_sha256
+
+
+def ensure_monai_bundle(required_relative_paths=None):
+    """Ensure selected files from the immutable MONAI bundle are local.
+
+    The ordinary path requests only the official TorchScript model and metadata,
+    avoiding both a MONAI import and an unnecessary duplicate checkpoint
+    download. The state dict and train configuration are downloaded later only
+    if fallback reconstruction is actually needed.
+
+    ``huggingface_hub.snapshot_download`` is pinned to ``MONAI_HF_REVISION`` and
+    receives ``allow_patterns`` so unrelated repository files are not fetched.
+    """
+
+    if required_relative_paths is None:
+        required_relative_paths = (
+            "models/model.ts",
+            "configs/metadata.json",
+        )
+
+    required_relative_paths = tuple(
+        dict.fromkeys(str(path) for path in required_relative_paths)
+    )
 
     bundle_root = locate_monai_bundle_root()
-    model_path = bundle_root / "models" / "model.pt"
+    missing = [
+        relative_path
+        for relative_path in required_relative_paths
+        if not (bundle_root / relative_path).is_file()
+    ]
 
-    if model_path.is_file():
-        print(f"Using cached MONAI checkpoint: {model_path}")
+    if not missing:
+        validate_monai_bundle_metadata(bundle_root)
+        print(f"Using cached pinned MONAI bundle files: {bundle_root}")
         return bundle_root
 
     if not AUTO_DOWNLOAD_MONAI_BUNDLE:
+        formatted = "\n  - ".join(missing)
         raise FileNotFoundError(
-            "The MONAI checkpoint was not found and automatic download is "
-            "disabled. Expected a bundle containing models/model.pt under: "
-            f"{MONAI_BUNDLE_DIR}"
+            "Required pinned MONAI bundle files are missing and automatic "
+            f"download is disabled under {bundle_root}:\n  - {formatted}"
         )
 
-    # Import the heavy MONAI downloader only when the checkpoint is absent.
-    # This path is normally executed only on the first run.
     try:
-        from monai.bundle.scripts import download as download_monai_bundle
+        from huggingface_hub import snapshot_download
     except ImportError as exc:
         raise ImportError(
-            "The MONAI checkpoint is missing and the bundle downloader could "
-            "not be imported. Install the downloader dependency with: "
-            "pip install monai==1.6.0 huggingface_hub"
+            "Pinned MONAI files are missing. Install the lightweight download "
+            "dependency with: pip install huggingface_hub"
         ) from exc
 
-    MONAI_BUNDLE_DIR.mkdir(parents=True, exist_ok=True)
+    bundle_root.mkdir(parents=True, exist_ok=True)
 
     print(
-        "MONAI checkpoint not found locally. Downloading bundle once: "
-        f"{MONAI_BUNDLE_NAME} version {MONAI_BUNDLE_VERSION}..."
+        "Downloading missing MONAI bundle files from the pinned repository "
+        f"revision {MONAI_HF_REVISION[:8]}: {', '.join(missing)}"
     )
 
     try:
-        download_monai_bundle(
-            name=MONAI_BUNDLE_NAME,
-            version=MONAI_BUNDLE_VERSION,
-            bundle_dir=str(MONAI_BUNDLE_DIR),
-            source=MONAI_DOWNLOAD_SOURCE,
-            progress=True,
+        snapshot_download(
+            repo_id=MONAI_HF_REPO_ID,
+            revision=MONAI_HF_REVISION,
+            local_dir=str(bundle_root),
+            allow_patterns=list(required_relative_paths),
         )
     except Exception as exc:
         raise RuntimeError(
-            "Automatic MONAI bundle download failed. Verify internet access "
-            "and install the optional downloader dependency with: "
-            "pip install huggingface_hub. The equivalent CLI command is: "
-            "python -m monai.bundle download "
-            f"--name {MONAI_BUNDLE_NAME} "
-            f"--version {MONAI_BUNDLE_VERSION} "
-            f"--bundle_dir \"{MONAI_BUNDLE_DIR}\" "
-            f"--source {MONAI_DOWNLOAD_SOURCE}"
+            "Automatic pinned MONAI download failed. Verify internet access "
+            f"and repository availability for {MONAI_HF_REPO_ID} at revision "
+            f"{MONAI_HF_REVISION}. For offline execution, copy the requested "
+            f"files manually under {bundle_root}."
         ) from exc
 
-    bundle_root = locate_monai_bundle_root()
-    model_path = bundle_root / "models" / "model.pt"
+    still_missing = [
+        relative_path
+        for relative_path in required_relative_paths
+        if not (bundle_root / relative_path).is_file()
+    ]
 
-    if not model_path.is_file():
+    if still_missing:
+        formatted = "\n  - ".join(still_missing)
         raise FileNotFoundError(
-            "MONAI reported a completed bundle download, but model.pt could "
-            f"not be located under {MONAI_BUNDLE_DIR}."
+            "The pinned download call completed, but required MONAI files "
+            f"remain missing under {bundle_root}:\n  - {formatted}"
         )
 
-    print(f"MONAI bundle cached for future runs: {model_path}")
+    validate_monai_bundle_metadata(bundle_root)
+    print(f"Pinned MONAI files cached for future runs: {bundle_root}")
     return bundle_root
+
+
+def load_and_validate_torchscript_segmenter(path, source_description):
+    """Load TorchScript and validate its fixed inference contract immediately."""
+
+    global MONAI_RUNTIME_SOURCE, MONAI_RUNTIME_ARTIFACT_PATH
+
+    network = torch.jit.load(
+        str(path),
+        map_location=DEVICE,
+    )
+    network.eval()
+
+    try:
+        network.requires_grad_(False)
+    except (AttributeError, RuntimeError):
+        # Some TorchScript module types do not expose this mutator. Inference is
+        # still protected globally by torch.inference_mode in the caller path.
+        pass
+
+    example_input = torch.zeros(
+        1,
+        1,
+        MONAI_INPUT_SIZE,
+        MONAI_INPUT_SIZE,
+        device=DEVICE,
+        dtype=torch.float32,
+    )
+
+    with torch.inference_mode():
+        example_output = network(example_input)
+
+    if not isinstance(example_output, torch.Tensor):
+        raise RuntimeError(
+            f"{source_description} returned {type(example_output)} instead of "
+            "a tensor."
+        )
+
+    expected_shape = (
+        1,
+        4,
+        MONAI_INPUT_SIZE,
+        MONAI_INPUT_SIZE,
+    )
+
+    if tuple(example_output.shape) != expected_shape:
+        raise RuntimeError(
+            f"{source_description} output shape mismatch: expected "
+            f"{expected_shape}, got {tuple(example_output.shape)}."
+        )
+
+    if not torch.isfinite(example_output).all():
+        raise RuntimeError(
+            f"{source_description} produced non-finite values on a zero-input "
+            "sanity check."
+        )
+
+    MONAI_RUNTIME_SOURCE = str(source_description)
+    MONAI_RUNTIME_ARTIFACT_PATH = str(Path(path).resolve())
+
+    print(f"Loaded and validated {source_description}: {path}")
+    return network
 
 
 def load_checkpoint_state_dict(path):
     """
     Load an official PyTorch checkpoint as weights only.
 
-    weights_only=True reduces the risk associated with arbitrary pickle object
-    loading. The fallback exists for older PyTorch releases that do not expose
-    the weights_only argument.
+    weights_only=True prevents arbitrary objects from being reconstructed from
+    the checkpoint. This script deliberately refuses an old PyTorch release that
+    lacks the argument instead of silently falling back to unrestricted pickle
+    loading. Upgrade PyTorch if this call is unsupported.
     """
 
     try:
@@ -1040,11 +1591,12 @@ def load_checkpoint_state_dict(path):
             map_location="cpu",
             weights_only=True,
         )
-    except TypeError:
-        checkpoint = torch.load(
-            path,
-            map_location="cpu",
-        )
+    except TypeError as exc:
+        raise RuntimeError(
+            "This PyTorch version does not support torch.load(..., "
+            "weights_only=True). Upgrade PyTorch rather than loading the "
+            "checkpoint through unrestricted pickle deserialization."
+        ) from exc
 
     if isinstance(checkpoint, dict):
         # MONAI bundles commonly save the network through CheckpointSaver with
@@ -1072,33 +1624,58 @@ def load_checkpoint_state_dict(path):
 
 
 def build_monai_segmenter():
+    """Load the pinned ventricular segmenter without a normal MONAI import.
+
+    Loading order when ``FORCE_REBUILD_MONAI_TORCHSCRIPT=False``:
+
+        1. The official pinned bundle artifact ``models/model.ts``.
+        2. A previously generated local fallback TorchScript cache, but only if
+           the official artifact cannot be executed by the current PyTorch.
+        3. Reconstruction from the pinned ``models/model.pt`` state dict.
+
+    Step 1 is the deterministic normal path for both first and later runs. It
+    avoids importing MONAI entirely. Step 3 is retained only for compatibility
+    recovery and validates the hard-coded architecture against train.json before
+    strict weight loading and local TorchScript export.
     """
-    Load the pretrained MONAI ventricular segmenter with a fast-start cache.
 
-    NORMAL RUNS
-    ------------
-    If MONAI_TORCHSCRIPT_PATH already exists, load it directly with
-    torch.jit.load(). No MONAI import is performed.
-
-    FIRST RUN ONLY
-    --------------
-    If the TorchScript cache does not exist:
-
-        1. Ensure the official MONAI bundle/checkpoint is present.
-        2. Import MONAI UNet lazily.
-        3. Build the exact official network architecture.
-        4. Load the pretrained checkpoint.
-        5. Trace and validate the network on the fixed 256x256 input used by
-           this pipeline.
-        6. Save a TorchScript model for all future runs.
-
-    This keeps the same pretrained segmentation network while avoiding the
-    expensive ``from monai.networks.nets import UNet`` import after the cache
-    has been created once.
-    """
+    official_failure = None
 
     # =========================================================
-    # FAST PATH: NO MONAI IMPORT
+    # NORMAL PATH: OFFICIAL model.ts, NO MONAI IMPORT
+    # =========================================================
+
+    if not FORCE_REBUILD_MONAI_TORCHSCRIPT:
+        bundle_root = ensure_monai_bundle(
+            (
+                "models/model.ts",
+                "configs/metadata.json",
+            )
+        )
+        official_torchscript_path = bundle_root / "models" / "model.ts"
+
+        verify_monai_artifact_sha256(
+            official_torchscript_path,
+            MONAI_OFFICIAL_TORCHSCRIPT_SHA256,
+            "Official MONAI models/model.ts",
+        )
+
+        try:
+            return load_and_validate_torchscript_segmenter(
+                official_torchscript_path,
+                "official pinned MONAI TorchScript segmenter",
+            )
+        except Exception as exc:
+            official_failure = exc
+            print(
+                "WARNING: the official pinned model.ts passed file provenance "
+                "checks but could not be executed by this PyTorch build. "
+                "A previously reconstructed local cache will be tried next. "
+                f"Reason: {exc}"
+            )
+
+    # =========================================================
+    # OPTIONAL LOCAL FALLBACK CACHE: NO MONAI IMPORT
     # =========================================================
 
     if (
@@ -1106,55 +1683,54 @@ def build_monai_segmenter():
         and not FORCE_REBUILD_MONAI_TORCHSCRIPT
     ):
         try:
-            network = torch.jit.load(
-                str(MONAI_TORCHSCRIPT_PATH),
-                map_location=DEVICE,
+            return load_and_validate_torchscript_segmenter(
+                MONAI_TORCHSCRIPT_PATH,
+                "locally reconstructed MONAI TorchScript cache",
             )
-            network.eval()
-
-            print(
-                "Loaded cached MONAI TorchScript segmenter (no MONAI import): "
-                f"{MONAI_TORCHSCRIPT_PATH}"
-            )
-
-            return network
-
         except Exception as exc:
             print(
-                "Cached MONAI TorchScript model could not be loaded. "
-                "It will be rebuilt once from the official checkpoint. "
+                "WARNING: local fallback TorchScript cache could not be used; "
+                "strict reconstruction from model.pt will be attempted. "
                 f"Reason: {exc}"
             )
 
     # =========================================================
-    # FIRST-RUN / REBUILD PATH
+    # EXCEPTIONAL FALLBACK: model.pt + LAZY MONAI IMPORT
     # =========================================================
 
-    bundle_root = ensure_monai_bundle()
+    bundle_root = ensure_monai_bundle(
+        (
+            "models/model.pt",
+            "configs/train.json",
+            "configs/metadata.json",
+        )
+    )
     model_path = bundle_root / "models" / "model.pt"
 
-    if VERIFY_MONAI_CHECKPOINT_SHA256 and MONAI_MODEL_SHA256:
-        actual_hash = sha256_file(model_path)
-
-        if actual_hash.lower() != MONAI_MODEL_SHA256.lower():
-            raise RuntimeError(
-                "MONAI model.pt SHA-256 mismatch. "
-                f"Expected {MONAI_MODEL_SHA256}, got {actual_hash}."
-            )
+    verify_monai_artifact_sha256(
+        model_path,
+        MONAI_MODEL_SHA256,
+        "Official MONAI models/model.pt",
+    )
+    validate_monai_train_config(bundle_root)
 
     print(
-        "TorchScript cache not found. Importing MONAI once to build the "
-        "pretrained segmenter..."
+        "Reconstructing the pinned MONAI UNet from model.pt. This exceptional "
+        "fallback imports MONAI once and creates a validated local TorchScript "
+        "cache."
     )
 
     try:
-        # Deliberately lazy. This expensive import happens only when the
-        # TorchScript cache must be created or rebuilt.
         from monai.networks.nets import UNet as MONAIUNet
     except ImportError as exc:
+        reason = (
+            f" Official model.ts failure: {official_failure}"
+            if official_failure is not None
+            else ""
+        )
         raise ImportError(
-            "MONAI is required only to create the segmentation cache the first "
-            "time. Install it with: pip install monai==1.6.0 huggingface_hub"
+            "Fallback reconstruction requires MONAI. Install it with: "
+            f"pip install monai==1.6.0.{reason}"
         ) from exc
 
     network = MONAIUNet(
@@ -1168,13 +1744,14 @@ def build_monai_segmenter():
 
     state_dict = load_checkpoint_state_dict(model_path)
 
-    # strict=True guarantees that architecture and checkpoint keys match.
+    # strict=True fails on missing/unexpected keys instead of silently running a
+    # partially initialized segmentation network.
     network.load_state_dict(state_dict, strict=True)
     network.eval()
     network.requires_grad_(False)
 
-    # Trace on CPU using the exact fixed spatial input used throughout this
-    # pipeline. Keeping export on CPU avoids CUDA-specific serialization.
+    # Trace on CPU using the exact fixed spatial input used by this pipeline.
+    # CPU export avoids serializing a device-specific CUDA graph.
     example_input = torch.zeros(
         1,
         1,
@@ -1184,10 +1761,6 @@ def build_monai_segmenter():
     )
 
     network = network.cpu()
-
-    print(
-        "Creating MONAI TorchScript cache. This is done only once..."
-    )
 
     with torch.inference_mode():
         reference_output = network(example_input)
@@ -1200,7 +1773,18 @@ def build_monai_segmenter():
 
         traced_output = traced_network(example_input)
 
-    # Verify that tracing preserved the numerical output before saving it.
+    if tuple(reference_output.shape) != (
+        1,
+        4,
+        MONAI_INPUT_SIZE,
+        MONAI_INPUT_SIZE,
+    ):
+        raise RuntimeError(
+            "Reconstructed MONAI network produced an unexpected output shape: "
+            f"{tuple(reference_output.shape)}."
+        )
+
+    # Verify that tracing preserved numerical output before the graph is saved.
     if not torch.allclose(
         reference_output,
         traced_output,
@@ -1211,11 +1795,11 @@ def build_monai_segmenter():
             (reference_output - traced_output).abs().max().item()
         )
         raise RuntimeError(
-            "TorchScript validation failed: traced MONAI output differs from "
-            f"the original network (max abs difference={max_difference:.6g})."
+            "Fallback TorchScript validation failed: traced output differs "
+            "from the reconstructed network (max abs difference="
+            f"{max_difference:.6g})."
         )
 
-    # Freeze inference-only graph where supported.
     try:
         traced_network = torch.jit.freeze(traced_network.eval())
     except Exception:
@@ -1225,25 +1809,17 @@ def build_monai_segmenter():
         parents=True,
         exist_ok=True,
     )
-
     traced_network.save(str(MONAI_TORCHSCRIPT_PATH))
 
     print(
-        "Saved MONAI TorchScript cache for future fast starts: "
+        "Saved validated fallback MONAI TorchScript cache: "
         f"{MONAI_TORCHSCRIPT_PATH}"
     )
 
-    # Use the cached representation immediately, including on the first run.
-    network = torch.jit.load(
-        str(MONAI_TORCHSCRIPT_PATH),
-        map_location=DEVICE,
+    return load_and_validate_torchscript_segmenter(
+        MONAI_TORCHSCRIPT_PATH,
+        "newly reconstructed MONAI TorchScript cache",
     )
-    network.eval()
-
-    return network
-
-
-monai_segmenter = build_monai_segmenter()
 
 
 # =============================
@@ -1252,7 +1828,11 @@ monai_segmenter = build_monai_segmenter()
 # =============================
 
 @torch.inference_mode()
-def predict_monai_heart_masks(monai_images, classifier_size):
+def predict_monai_heart_masks(
+    monai_images,
+    classifier_size,
+    monai_segmenter,
+):
     """
     Predict cardiac probability maps and mask-quality indicators.
 
@@ -1281,6 +1861,11 @@ def predict_monai_heart_masks(monai_images, classifier_size):
         peak_probability:
             Maximum non-background cardiac probability in each image.
 
+        mean_foreground_probability:
+            Mean non-background probability over pixels assigned by argmax to a
+            cardiac class. This is recorded for QC but is not treated as proof
+            of anatomical correctness and is not currently part of the gate.
+
     =========================================================================
     OUTPUT INTERPRETATION
     =========================================================================
@@ -1304,7 +1889,10 @@ def predict_monai_heart_masks(monai_images, classifier_size):
             f"{tuple(logits.shape)}."
         )
 
-    class_probabilities = torch.softmax(logits, dim=1)
+    # Softmax is intentionally evaluated in float32 even when CUDA AMP is
+    # enabled, because probability/gating calculations are more numerically
+    # stable than in float16.
+    class_probabilities = torch.softmax(logits.float(), dim=1)
 
     heart_probability = class_probabilities[:, 1:, :, :].sum(
         dim=1,
@@ -1321,6 +1909,12 @@ def predict_monai_heart_masks(monai_images, classifier_size):
 
     area_ratio = hard_mask_256.mean(dim=(1, 2, 3))
     peak_probability = heart_probability.amax(dim=(1, 2, 3))
+
+    foreground_pixel_count = hard_mask_256.sum(dim=(1, 2, 3))
+    mean_foreground_probability = (
+        (heart_probability * hard_mask_256).sum(dim=(1, 2, 3))
+        / foreground_pixel_count.clamp_min(1.0)
+    )
 
     valid_mask = (
         (area_ratio >= MONAI_MIN_HEART_AREA_RATIO)
@@ -1364,6 +1958,7 @@ def predict_monai_heart_masks(monai_images, classifier_size):
         valid_mask,
         area_ratio,
         peak_probability,
+        mean_foreground_probability,
     )
 
 
@@ -1383,7 +1978,7 @@ def apply_confidence_gated_soft_roi(images, roi_probability, valid_mask):
 
     For an invalid segmentation, the original full image is returned. This is
     critical because the pretrained model is intended for short-axis MRI and
-    may not generalize to every series in the CAD JPEG release.
+    may not generalize to every image type in the CAD JPEG release.
     """
 
     if images.ndim != 4 or images.shape[1] != 3:
@@ -1446,8 +2041,11 @@ def debug_visualization(
     valid_masks,
     area_ratios,
     peak_probabilities,
-    batch_idx,
-    max_show=2,
+    mean_foreground_probabilities,
+    labels,
+    patient_ids,
+    series_ids,
+    sample_indices,
 ):
     """
     Save MONAI segmentation and ROI sanity-check figures.
@@ -1464,10 +2062,13 @@ def debug_visualization(
         - mask plausibility status
         - predicted cardiac area ratio
         - peak cardiac probability
+        - mean foreground confidence
         - ROI intensity standard deviation
 
-    Visual review is mandatory before treating the pretrained masks as valid on
-    this heterogeneous CAD dataset.
+    Examples are selected deterministically across patients in both classes.
+    Visual review is mandatory before treating the pretrained masks as useful
+    ROI proposals on this heterogeneous dataset. It still does not constitute a
+    quantitative segmentation validation because no ground-truth masks exist.
     """
 
     images = images.detach().cpu()
@@ -1478,10 +2079,13 @@ def debug_visualization(
     valid_masks = valid_masks.detach().cpu()
     area_ratios = area_ratios.detach().cpu()
     peak_probabilities = peak_probabilities.detach().cpu()
+    mean_foreground_probabilities = (
+        mean_foreground_probabilities.detach().cpu()
+    )
 
-    os.makedirs("debug_output", exist_ok=True)
+    DEBUG_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    for i in range(min(max_show, images.shape[0])):
+    for i in range(images.shape[0]):
 
         fig, axes = plt.subplots(1, 4, figsize=(16, 4))
 
@@ -1501,7 +2105,8 @@ def debug_visualization(
         )
         axes[1].set_title(
             "MONAI P(heart)\n"
-            f"peak={peak_probabilities[i]:.3f}"
+            f"peak={peak_probabilities[i]:.3f}, "
+            f"mean_fg={mean_foreground_probabilities[i]:.3f}"
         )
         axes[1].axis("off")
 
@@ -1527,8 +2132,14 @@ def debug_visualization(
 
         plt.tight_layout()
 
+        safe_series = str(series_ids[i]).replace("/", "__").replace("\\", "__")
+        output_name = (
+            f"label{int(labels[i])}_{patient_ids[i]}_{safe_series}_"
+            f"sample{int(sample_indices[i])}.png"
+        )
+
         plt.savefig(
-            f"debug_output/batch{batch_idx}_img{i}.png",
+            DEBUG_OUTPUT_DIR / output_name,
             dpi=150,
         )
 
@@ -1564,11 +2175,11 @@ class FeatureExtractor(nn.Module):
 
         super().__init__()
 
-        weights = models.EfficientNet_B0_Weights.DEFAULT
+        weights = models.EfficientNet_B0_Weights[
+            EFFICIENTNET_WEIGHTS_NAME
+        ]
 
-        self.model = models.efficientnet_b0(
-            weights=weights,
-        )
+        self.model = models.efficientnet_b0(weights=weights)
 
         self.model.classifier = nn.Identity()
 
@@ -1576,10 +2187,6 @@ class FeatureExtractor(nn.Module):
 
         return self.model(x)
 
-
-feature_extractor = FeatureExtractor().to(DEVICE)
-feature_extractor.eval()
-feature_extractor.requires_grad_(False)
 
 
 # =============================
@@ -1589,7 +2196,7 @@ feature_extractor.requires_grad_(False)
 
 def _normalize_quality_weights(scores, minimum_weight=SLICE_QUALITY_MIN_WEIGHT):
     """
-    Convert a heuristic per-slice score into bounded weights within ONE series.
+    Convert a heuristic per-slice score into bounded weights within ONE series proxy.
 
     Why weights instead of deleting slices?
     ---------------------------------------
@@ -1619,14 +2226,59 @@ def _normalize_quality_weights(scores, minimum_weight=SLICE_QUALITY_MIN_WEIGHT):
 
     weights = minimum_weight + (1.0 - minimum_weight) * normalized
 
-    # Mean=1 means the absolute magnitude of weights does not change the
-    # effective sample-size scale for the classifier.
+    # Mean=1 is only a convenient local convention. The downstream hierarchy
+    # renormalizes weights inside each series proxy, so this common scale cancels
+    # and is not relied upon to define Logistic Regression regularization.
     weights /= max(weights.mean(), 1e-8)
 
     return weights
 
 
-def extract_features(dataset, debug=False):
+def choose_debug_sample_indices(samples, samples_per_class):
+    """Choose deterministic QC examples across patients in both classes.
+
+    One middle-position image is selected from evenly spaced patients in each
+    class. This is substantially more representative than saving the first
+    batches of a dataset sorted as Normal -> Sick and Directory_* order.
+    """
+
+    by_class_patient = {}
+
+    for index, (_, label, patient_id, _) in enumerate(samples):
+        by_class_patient.setdefault(int(label), {})
+        by_class_patient[int(label)].setdefault(str(patient_id), []).append(index)
+
+    selected = set()
+
+    for label in sorted(by_class_patient):
+        patient_map = by_class_patient[label]
+        patient_names = sorted(patient_map)
+
+        if not patient_names:
+            continue
+
+        n_select = min(samples_per_class, len(patient_names))
+        positions = np.linspace(
+            0,
+            len(patient_names) - 1,
+            num=n_select,
+            dtype=int,
+        )
+
+        for position in np.unique(positions):
+            patient_id = patient_names[int(position)]
+            patient_indices = patient_map[patient_id]
+            selected.add(patient_indices[len(patient_indices) // 2])
+
+    return selected
+
+
+def extract_features(
+    dataset,
+    monai_segmenter,
+    feature_extractor,
+    debug=False,
+):
     """
     Run the frozen image-processing pipeline and return one embedding per slice.
 
@@ -1637,11 +2289,11 @@ def extract_features(dataset, debug=False):
           ↓
         MONAI-compatible 256×256 canvas
           ↓
-        MONAI ventricular segmentation
+        optional MONAI ventricular segmentation
           ↓
-        confidence gate
+        confidence gate when MONAI ROI is enabled
           ↓
-        soft cardiac ROI / full-image fallback
+        soft cardiac ROI / full-image fallback, or full-image ablation
           ↓
         EfficientNet-B0
           ↓
@@ -1649,10 +2301,13 @@ def extract_features(dataset, debug=False):
           ↓
         optional series-local quality weight (default = 1)
 
-    No class labels are used to generate features or quality weights.
+    Class labels are never inputs to MONAI, EfficientNet, ROI gating or quality
+    weighting. They are carried as metadata for class-balanced debug selection,
+    QC summaries, supervised fitting and stratified evaluation.
 
-    This function intentionally keeps ALL readable slices. The previous
-    implementation selected slices above the per-series median standard
+    This function retains every slice that is successfully decoded. An
+    unreadable discovered file raises an explicit error instead of being silently
+    skipped. The previous implementation selected slices above the per-series median standard
     deviation. That is a brittle hard filter because high standard deviation can
     also reflect noise, artefact, ROI size or extracardiac anatomy.
 
@@ -1668,19 +2323,29 @@ def extract_features(dataset, debug=False):
         patient_ids:
             [N] patient identifiers.
         series_ids:
-            [N] series identifiers.
+            [N] folder-defined series-proxy identifiers.
         quality_weights:
-            [N] non-negative slice weights, normalized within each series.
+            [N] non-negative slice weights, normalized within each series proxy.
         monai_valid:
             [N] boolean segmentation-gate result.
+        area_ratios, peak_probabilities, mean_foreground_probabilities:
+            [N] MONAI QC signals. They are descriptive diagnostics, not
+            segmentation-accuracy metrics.
+        slice_scores:
+            [N] ROI/full-image standard deviation used only by the optional
+            heuristic weighting ablation.
+        decoded_pixel_hashes:
+            [N] exact decoded-grayscale-pixel SHA-256 strings used only for
+            duplicate auditing.
     """
 
     loader = DataLoader(
         dataset,
         batch_size=BATCH_SIZE,
         shuffle=False,
-        num_workers=0,
+        num_workers=DATALOADER_NUM_WORKERS,
         pin_memory=(DEVICE == "cuda"),
+        persistent_workers=(DATALOADER_NUM_WORKERS > 0),
     )
 
     all_features = []
@@ -1689,6 +2354,21 @@ def extract_features(dataset, debug=False):
     all_series = []
     all_scores = []
     all_monai_valid = []
+    all_area_ratios = []
+    all_peak_probabilities = []
+    all_mean_foreground_probabilities = []
+    all_decoded_pixel_hashes = []
+
+    debug_indices = (
+        choose_debug_sample_indices(
+            dataset.samples,
+            DEBUG_SAMPLES_PER_CLASS,
+        )
+        if debug and USE_MONAI_ROI
+        else set()
+    )
+
+    autocast_enabled = USE_CUDA_AMP and DEVICE == "cuda"
 
     with torch.inference_mode():
 
@@ -1700,31 +2380,78 @@ def extract_features(dataset, debug=False):
                 labels,
                 patient_ids,
                 series_ids,
+                sample_indices,
+                decoded_pixel_hashes,
             ) = batch
 
             images = images.to(DEVICE, non_blocking=True)
             monai_images = monai_images.to(DEVICE, non_blocking=True)
 
-            (
-                roi_probability,
-                hard_mask,
-                valid_mask,
-                area_ratio,
-                peak_probability,
-            ) = predict_monai_heart_masks(
-                monai_images,
-                classifier_size=images.shape[-2:],
-            )
+            if USE_MONAI_ROI:
+                if monai_segmenter is None:
+                    raise RuntimeError(
+                        "USE_MONAI_ROI=True but no MONAI segmenter was supplied."
+                    )
 
-            roi_images = apply_confidence_gated_soft_roi(
-                images,
-                roi_probability,
-                valid_mask,
-            )
+                with torch.autocast(
+                    device_type="cuda",
+                    dtype=torch.float16,
+                    enabled=autocast_enabled,
+                ):
+                    (
+                        roi_probability,
+                        hard_mask,
+                        valid_mask,
+                        area_ratio,
+                        peak_probability,
+                        mean_foreground_probability,
+                    ) = predict_monai_heart_masks(
+                        monai_images,
+                        classifier_size=images.shape[-2:],
+                        monai_segmenter=monai_segmenter,
+                    )
 
-            efficientnet_inputs = normalize_for_efficientnet(roi_images)
+                    roi_images = apply_confidence_gated_soft_roi(
+                        images,
+                        roi_probability,
+                        valid_mask,
+                    )
+            else:
+                batch_size = images.shape[0]
+                roi_probability = torch.ones(
+                    batch_size,
+                    1,
+                    *images.shape[-2:],
+                    device=images.device,
+                    dtype=images.dtype,
+                )
+                hard_mask = roi_probability.clone()
+                valid_mask = torch.zeros(
+                    batch_size,
+                    device=images.device,
+                    dtype=torch.bool,
+                )
+                area_ratio = torch.full(
+                    (batch_size,),
+                    float("nan"),
+                    device=images.device,
+                )
+                peak_probability = torch.full_like(area_ratio, float("nan"))
+                mean_foreground_probability = torch.full_like(
+                    area_ratio,
+                    float("nan"),
+                )
+                roi_images = images
 
-            features = feature_extractor(efficientnet_inputs)
+            with torch.autocast(
+                device_type="cuda",
+                dtype=torch.float16,
+                enabled=autocast_enabled,
+            ):
+                efficientnet_inputs = normalize_for_efficientnet(roi_images)
+                features = feature_extractor(efficientnet_inputs)
+
+            features = features.float()
 
             # ---------------------------------------------------------
             # Slice-quality signal
@@ -1739,18 +2466,31 @@ def extract_features(dataset, debug=False):
                 dim=(1, 2, 3),
             )
 
-            if debug and batch_idx < DEBUG_MAX_BATCHES:
-                debug_visualization(
-                    images,
-                    roi_probability,
-                    hard_mask,
-                    roi_images,
-                    scores,
-                    valid_mask,
-                    area_ratio,
-                    peak_probability,
-                    batch_idx,
-                )
+            if debug_indices:
+                selected_positions = [
+                    position
+                    for position, sample_index in enumerate(
+                        sample_indices.tolist()
+                    )
+                    if int(sample_index) in debug_indices
+                ]
+
+                if selected_positions:
+                    debug_visualization(
+                        images[selected_positions],
+                        roi_probability[selected_positions],
+                        hard_mask[selected_positions],
+                        roi_images[selected_positions],
+                        scores[selected_positions],
+                        valid_mask[selected_positions],
+                        area_ratio[selected_positions],
+                        peak_probability[selected_positions],
+                        mean_foreground_probability[selected_positions],
+                        labels[selected_positions],
+                        [patient_ids[i] for i in selected_positions],
+                        [series_ids[i] for i in selected_positions],
+                        sample_indices[selected_positions],
+                    )
 
             all_features.append(features.cpu().numpy())
             all_labels.extend(labels.numpy().tolist())
@@ -1758,6 +2498,14 @@ def extract_features(dataset, debug=False):
             all_series.extend(list(series_ids))
             all_scores.extend(scores.cpu().numpy().tolist())
             all_monai_valid.extend(valid_mask.cpu().numpy().tolist())
+            all_area_ratios.extend(area_ratio.cpu().numpy().tolist())
+            all_peak_probabilities.extend(
+                peak_probability.cpu().numpy().tolist()
+            )
+            all_mean_foreground_probabilities.extend(
+                mean_foreground_probability.cpu().numpy().tolist()
+            )
+            all_decoded_pixel_hashes.extend(list(decoded_pixel_hashes))
 
     if not all_features:
         raise RuntimeError("No slice features were extracted.")
@@ -1768,6 +2516,16 @@ def extract_features(dataset, debug=False):
     series_ids = np.asarray(all_series)
     scores = np.asarray(all_scores, dtype=np.float32)
     monai_valid = np.asarray(all_monai_valid, dtype=bool)
+    area_ratios = np.asarray(all_area_ratios, dtype=np.float32)
+    peak_probabilities = np.asarray(
+        all_peak_probabilities,
+        dtype=np.float32,
+    )
+    mean_foreground_probabilities = np.asarray(
+        all_mean_foreground_probabilities,
+        dtype=np.float32,
+    )
+    decoded_pixel_hashes = np.asarray(all_decoded_pixel_hashes)
 
     if not (
         len(features)
@@ -1776,6 +2534,10 @@ def extract_features(dataset, debug=False):
         == len(series_ids)
         == len(scores)
         == len(monai_valid)
+        == len(area_ratios)
+        == len(peak_probabilities)
+        == len(mean_foreground_probabilities)
+        == len(decoded_pixel_hashes)
     ):
         raise RuntimeError(
             "Feature extraction produced arrays with inconsistent lengths."
@@ -1786,7 +2548,7 @@ def extract_features(dataset, debug=False):
     # -------------------------------------------------------------
     # Equal slice weights are the default because standard deviation is only a
     # heuristic. If explicitly enabled, normalization is performed independently
-    # inside each series so scanners/exports with different contrast do not get a
+    # inside each series proxy so scanners/exports with different contrast do not get a
     # global advantage merely because of their intensity distribution.
     if USE_SLICE_QUALITY_WEIGHTS:
         quality_weights = np.zeros(len(scores), dtype=np.float64)
@@ -1799,7 +2561,7 @@ def extract_features(dataset, debug=False):
     else:
         quality_weights = np.ones(len(scores), dtype=np.float64)
 
-    # Every patient must still have at least one series and one slice.
+    # Every patient must still have at least one series proxy and one slice.
     if set(patient_ids.tolist()) != set(
         patient_ids[quality_weights > 0].tolist()
     ):
@@ -1807,12 +2569,15 @@ def extract_features(dataset, debug=False):
             "At least one patient received no positive slice weight."
         )
 
-    valid_rate = float(monai_valid.mean())
+    valid_rate = float(monai_valid.mean()) if USE_MONAI_ROI else float("nan")
 
-    print(
-        "MONAI plausible-mask rate: "
-        f"{int(monai_valid.sum())}/{len(monai_valid)} ({valid_rate:.2%})"
-    )
+    if USE_MONAI_ROI:
+        print(
+            "MONAI plausible-mask rate: "
+            f"{int(monai_valid.sum())}/{len(monai_valid)} ({valid_rate:.2%})"
+        )
+    else:
+        print("MONAI ROI disabled: full-image EfficientNet ablation is active.")
     print(
         "All extracted slices retained; "
         f"quality weighting={'enabled' if USE_SLICE_QUALITY_WEIGHTS else 'disabled'}; "
@@ -1826,6 +2591,11 @@ def extract_features(dataset, debug=False):
         series_ids,
         quality_weights,
         monai_valid,
+        area_ratios,
+        peak_probabilities,
+        mean_foreground_probabilities,
+        scores,
+        decoded_pixel_hashes,
     )
 
 
@@ -1836,20 +2606,20 @@ def extract_features(dataset, debug=False):
 
 def weighted_log_odds_fusion(probabilities, weights=None):
     """
-    Fuse probabilities in log-odds space, optionally weighted.
+    Fuse probability-like model outputs in log-odds space, optionally weighted.
 
     Mathematical form:
 
         logit(p_fused) = Σ w_i * logit(p_i) / Σ w_i
 
     This is preferable to multiplying probabilities directly because the
-    number of slices/series does not automatically force the fused result
+    number of slices/series proxies does not automatically force the fused result
     toward 0 or 1.
 
     LIMITATION:
-    The individual Logistic Regression probabilities are not guaranteed to be
-    perfectly calibrated. Therefore this fusion should be described as a
-    probabilistic aggregation rule, not as a formally calibrated posterior.
+    The individual Logistic Regression ``predict_proba`` outputs are not
+    guaranteed to be calibrated on new clinical data. Therefore the fused value
+    is an aggregation score on a 0-to-1 scale, not a validated CAD posterior.
     """
 
     probabilities = np.asarray(probabilities, dtype=np.float64)
@@ -1864,6 +2634,11 @@ def weighted_log_odds_fusion(probabilities, weights=None):
 
     if probabilities.shape != weights.shape:
         raise ValueError("probabilities and weights must have the same shape.")
+
+    if not np.all(np.isfinite(probabilities)):
+        raise ValueError("probability-like inputs must be finite.")
+    if not np.all(np.isfinite(weights)):
+        raise ValueError("fusion weights must be finite.")
 
     if np.any(weights < 0) or not np.any(weights > 0):
         raise ValueError("weights must be non-negative and not all zero.")
@@ -1893,22 +2668,23 @@ def aggregate_patients(
 
         slice probabilities
               ↓
-        weighted series probability
+        weighted series-proxy score
               ↓
-        equal-weight series probabilities
+        equal-weight series-proxy scores
               ↓
-        patient probability
+        patient score
 
     WHY TWO LEVELS?
     ---------------
-    A patient may have different numbers of images in different series. If all
-    slices were fused directly, a long series would dominate the patient merely
+    A patient may have different numbers of images in different folder
+    proxies. If all slices were fused directly, a long proxy would dominate the
+    patient merely
     because it contains more frames.
 
     The revised strategy therefore:
-        1. weights slices by within-series quality;
-        2. gives each series one fused probability;
-        3. gives each series equal influence at patient level.
+        1. weights slices by within-proxy quality;
+        2. gives each series proxy one fused score;
+        3. gives each series proxy equal influence at patient level.
 
     This is still a hand-designed fusion rule. For a stronger publication,
     compare it prospectively with a learned attention-pooling model.
@@ -1982,8 +2758,9 @@ def aggregate_patients(
 
             series_probability_values.append(series_probability)
 
-        # Equal weighting of series prevents one acquisition type from
-        # dominating simply because it contains more frames.
+        # Equal weighting of folder proxies prevents one long child folder from
+        # dominating simply because it contains more frames. It does not prove
+        # that the proxies correspond to distinct acquisition types.
         patient_probability = weighted_log_odds_fusion(
             np.asarray(series_probability_values, dtype=np.float64)
         )
@@ -2010,30 +2787,34 @@ def compute_hierarchical_training_weights(
 
     Desired influence structure:
 
-        class -> patient -> series -> slice
+        class -> patient -> series proxy -> slice
 
-    For slice i belonging to series s of patient p and class c:
+    For slice i belonging to series proxy s of patient p and class c:
 
         w_i = (1 / N_patients_in_class_c)
               * (1 / N_series_for_patient_p)
               * (q_i / sum(q_j for j in series_s))
 
-    where q_i is the optional within-series quality weight. If quality weighting
-    is disabled, q_i = 1 and all slices inside a series share that series' total
+    where q_i is the optional within-proxy quality weight. If quality weighting
+    is disabled, q_i = 1 and all slices inside a proxy share that proxy's total
     training influence equally.
 
     This gives two important invariances:
 
         1. A patient with more exported JPEGs does not dominate training.
-        2. A patient with one very long series does not let that series dominate
-           over the patient's shorter series.
+        2. A patient with one very long proxy does not let that proxy dominate
+           over the patient's shorter proxies.
 
     The class factor gives Normal and Sick equal total nominal weight even when
     the number of Directory_* patients differs between classes.
 
-    The returned vector is finally rescaled to mean 1. Rescaling does not alter
-    relative influence; it only keeps numerical magnitudes convenient for
-    scikit-learn.
+    GLOBAL WEIGHT SCALE MATTERS FOR REGULARIZED LOGISTIC REGRESSION
+    ----------------------------------------------------------------
+    Multiplying every sample weight by the same constant leaves weighted means
+    unchanged, but it changes the data-loss/regularization balance of a model
+    fitted with fixed ``C``. Therefore the final total weight is set to the
+    number of unique training patients, making the effective regularization
+    invariant to how many JPEG slices happen to be exported.
     """
 
     labels = np.asarray(labels, dtype=np.int64)
@@ -2052,6 +2833,9 @@ def compute_hierarchical_training_weights(
 
     if len(quality_weights) != len(labels):
         raise ValueError("quality_weights length does not match labels.")
+
+    if not np.all(np.isfinite(quality_weights)):
+        raise ValueError("quality_weights must contain only finite values.")
 
     if np.any(quality_weights < 0):
         raise ValueError("quality_weights must be non-negative.")
@@ -2075,7 +2859,7 @@ def compute_hierarchical_training_weights(
         previous_patient = series_to_patient.get(series_id)
         if previous_patient is not None and previous_patient != patient_id:
             raise RuntimeError(
-                f"Series {series_id} is assigned to more than one patient."
+                f"Series proxy {series_id} is assigned to more than one patient."
             )
         series_to_patient[series_id] = patient_id
         patient_to_series.setdefault(patient_id, set()).add(series_id)
@@ -2099,6 +2883,17 @@ def compute_hierarchical_training_weights(
             + float(quality_weight)
         )
 
+    zero_weight_series = sorted(
+        series_id
+        for series_id, total in series_quality_sum.items()
+        if total <= 0.0
+    )
+    if zero_weight_series:
+        raise RuntimeError(
+            "Every series proxy must have positive total slice weight. "
+            f"Invalid series: {zero_weight_series[:10]}"
+        )
+
     weights = np.empty(len(labels), dtype=np.float64)
 
     for index, (label, patient_id, series_id) in enumerate(
@@ -2111,7 +2906,7 @@ def compute_hierarchical_training_weights(
         n_patient_series = len(patient_to_series[patient_id])
         if n_patient_series <= 0:
             raise RuntimeError(
-                f"Patient {patient_id} unexpectedly has no series."
+                f"Patient {patient_id} unexpectedly has no series proxy."
             )
 
         normalized_slice_quality = (
@@ -2128,9 +2923,168 @@ def compute_hierarchical_training_weights(
     if not np.any(weights > 0):
         raise RuntimeError("All computed training weights are zero.")
 
-    weights *= len(weights) / max(weights.sum(), 1e-12)
+    n_training_patients = len(patient_to_label)
+    weights *= n_training_patients / max(weights.sum(), 1e-12)
 
     return weights
+
+
+def aggregate_patient_embeddings(
+    features,
+    labels,
+    patient_ids,
+    series_ids,
+    quality_weights,
+):
+    """Pool frozen slice embeddings to exactly one embedding per patient.
+
+    Hierarchy:
+
+        slice embeddings --weighted mean within series proxy--> series embedding
+        series embeddings --------equal mean across proxies----> patient embedding
+
+    This is the recommended default because the supervised classifier is fitted
+    on one observation per validated Directory_* patient. Equal series-proxy
+    weighting prevents a folder containing many JPEG frames from dominating.
+    The series unit remains an operational folder proxy, not a DICOM UID.
+    """
+
+    features = np.asarray(features, dtype=np.float32)
+    labels = np.asarray(labels, dtype=np.int64)
+    patient_ids = np.asarray(patient_ids)
+    series_ids = np.asarray(series_ids)
+    quality_weights = np.asarray(quality_weights, dtype=np.float64)
+
+    if not np.all(np.isfinite(features)):
+        raise ValueError("Patient-pooling features must be finite.")
+    if not np.all(np.isfinite(quality_weights)):
+        raise ValueError("Patient-pooling weights must be finite.")
+
+    if not (
+        len(features)
+        == len(labels)
+        == len(patient_ids)
+        == len(series_ids)
+        == len(quality_weights)
+    ):
+        raise ValueError("Patient-embedding arrays must have equal lengths.")
+
+    patient_to_label = {}
+    patient_to_series_indices = {}
+
+    for index, (label, patient_id, series_id) in enumerate(
+        zip(labels, patient_ids, series_ids)
+    ):
+        patient_id = str(patient_id)
+        series_id = str(series_id)
+        label = int(label)
+
+        previous = patient_to_label.get(patient_id)
+        if previous is not None and previous != label:
+            raise RuntimeError(
+                f"Patient {patient_id} has inconsistent labels."
+            )
+
+        patient_to_label[patient_id] = label
+        patient_to_series_indices.setdefault(patient_id, {})
+        patient_to_series_indices[patient_id].setdefault(series_id, []).append(
+            index
+        )
+
+    pooled_embeddings = []
+    pooled_labels = []
+    pooled_patient_ids = []
+
+    for patient_id in sorted(patient_to_series_indices):
+        series_embeddings = []
+
+        for series_id in sorted(patient_to_series_indices[patient_id]):
+            indices = np.asarray(
+                patient_to_series_indices[patient_id][series_id],
+                dtype=np.int64,
+            )
+            weights = quality_weights[indices]
+
+            if np.any(weights < 0) or not np.any(weights > 0):
+                raise RuntimeError(
+                    f"Series proxy {series_id} has invalid slice weights."
+                )
+
+            series_embedding = np.average(
+                features[indices],
+                axis=0,
+                weights=weights,
+            )
+            series_embeddings.append(series_embedding)
+
+        patient_embedding = np.mean(
+            np.stack(series_embeddings, axis=0),
+            axis=0,
+        ).astype(np.float32, copy=False)
+
+        pooled_embeddings.append(patient_embedding)
+        pooled_labels.append(patient_to_label[patient_id])
+        pooled_patient_ids.append(patient_id)
+
+    return (
+        np.stack(pooled_embeddings, axis=0),
+        np.asarray(pooled_labels, dtype=np.int64),
+        np.asarray(pooled_patient_ids),
+    )
+
+
+def compute_balanced_patient_weights(labels):
+    """Give each class equal total weight while keeping total mass = patients."""
+
+    labels = np.asarray(labels, dtype=np.int64)
+    counts = np.bincount(labels, minlength=2)
+
+    if int(counts.min()) <= 0:
+        raise RuntimeError("Training fold must contain both classes.")
+
+    n_patients = len(labels)
+    weights = np.asarray(
+        [n_patients / (2.0 * counts[int(label)]) for label in labels],
+        dtype=np.float64,
+    )
+
+    return weights
+
+
+def build_classifier():
+    """Create a fresh fold-local preprocessing/classification pipeline.
+
+    For the recommended patient-embedding strategy, PCA is optionally fitted
+    inside the training fold. For the legacy slice strategy it is omitted to
+    avoid an expensive dense PCA over tens of thousands of correlated slices.
+    """
+
+    steps = [("scaler", StandardScaler())]
+
+    if CLASSIFICATION_STRATEGY == "patient_embedding" and USE_PATIENT_PCA:
+        steps.append(
+            (
+                "pca",
+                PCA(
+                    n_components=PATIENT_PCA_EXPLAINED_VARIANCE,
+                    svd_solver="full",
+                ),
+            )
+        )
+
+    steps.append(
+        (
+            "logreg",
+            LogisticRegression(
+                C=LOGISTIC_C,
+                max_iter=LOGISTIC_MAX_ITER,
+                solver="liblinear",
+                random_state=RANDOM_SEED,
+            ),
+        )
+    )
+
+    return Pipeline(steps=steps)
 
 
 # =============================
@@ -2147,9 +3101,14 @@ def compute_hierarchical_training_weights(
 # at runtime; the paper's 1,224-participant cohort count must not be substituted
 # for that folder-derived sample size.
 #
-# For a research paper, a stronger default is:
+# For this small Directory_* cohort, one defensible exploratory default is:
 #
 #   StratifiedKFold(n_splits=5) ON THE PATIENT TABLE
+#
+# Five folds still leave only a few validation patients per fold. Fold-specific
+# AUCs are therefore highly quantized and unstable; the pooled OOF result and its
+# broad uncertainty interval are more informative, but external validation is
+# still essential.
 #
 # where every row of that table is one validated Directory_* patient.
 # Stratification tries to preserve the Normal/Sick proportion. Slices are not
@@ -2171,7 +3130,7 @@ def compute_hierarchical_training_weights(
 def bootstrap_patient_auc_ci(
     labels,
     probabilities,
-    n_bootstrap=2000,
+    n_bootstrap=BOOTSTRAP_REPLICATES,
     confidence=0.95,
     random_state=RANDOM_SEED,
 ):
@@ -2247,371 +3206,880 @@ def print_fold_summary(
     )
 
 
-# -------------------------------------------------------------
-# Load the complete dataset ONCE.
-# -------------------------------------------------------------
-#
-# Feature extraction is label-independent and expensive. We therefore extract
-# the frozen MONAI/EfficientNet embeddings once and reuse them in each fold.
-#
-# This does NOT let the Logistic Regression see validation labels.
-# The scaler and classifier are still fitted separately inside each fold.
-# -------------------------------------------------------------
+# =============================
+# FEATURE CACHE + OUTPUT HELPERS
+# =============================
 
-samples = load_samples(DATASET_PATH)
+def feature_cache_fingerprint(samples, dataset_root):
+    """Hash file metadata plus every setting that changes frozen embeddings."""
 
-all_dataset = MRIDataset(
+    root = Path(dataset_root).resolve()
+    digest = hashlib.sha256()
+
+    settings = {
+        "schema": FEATURE_CACHE_SCHEMA_VERSION,
+        "batch_size": BATCH_SIZE,
+        "img_size": IMG_SIZE,
+        "monai_input_size": MONAI_INPUT_SIZE,
+        "use_monai_roi": USE_MONAI_ROI,
+        "monai_bundle": MONAI_BUNDLE_NAME,
+        "monai_bundle_version": MONAI_BUNDLE_VERSION,
+        "monai_hf_repo_id": MONAI_HF_REPO_ID,
+        "monai_hf_revision": MONAI_HF_REVISION,
+        "monai_official_torchscript_sha256": (
+            MONAI_OFFICIAL_TORCHSCRIPT_SHA256
+        ),
+        "monai_model_sha256": MONAI_MODEL_SHA256,
+        "verify_monai_artifact_sha256": VERIFY_MONAI_ARTIFACT_SHA256,
+        "force_rebuild_monai_torchscript": (
+            FORCE_REBUILD_MONAI_TORCHSCRIPT
+        ),
+        "roi_dilation": MONAI_ROI_DILATION_KERNEL,
+        "background_weight": MONAI_BACKGROUND_WEIGHT,
+        "min_area": MONAI_MIN_HEART_AREA_RATIO,
+        "max_area": MONAI_MAX_HEART_AREA_RATIO,
+        "min_peak": MONAI_MIN_PEAK_HEART_PROBABILITY,
+        "efficientnet_weights": EFFICIENTNET_WEIGHTS_NAME,
+        "efficientnet_mean": EFFICIENTNET_MEAN,
+        "efficientnet_std": EFFICIENTNET_STD,
+        "quality_weights_enabled": USE_SLICE_QUALITY_WEIGHTS,
+        "quality_min_weight": SLICE_QUALITY_MIN_WEIGHT,
+        "use_cuda_amp": USE_CUDA_AMP,
+        "device_type": DEVICE,
+        "numpy_version": np.__version__,
+        "torch_version": torch.__version__,
+        "torchvision_version": torchvision.__version__,
+        "opencv_version": cv2.__version__,
+    }
+    digest.update(
+        json.dumps(settings, sort_keys=True).encode("utf-8")
+    )
+
+    for image_path, label, patient_id, series_id in samples:
+        path = Path(image_path)
+        stat = path.stat()
+
+        try:
+            relative = path.resolve().relative_to(root)
+        except ValueError:
+            relative = path.resolve()
+
+        record = (
+            f"{relative.as_posix()}|{stat.st_size}|{stat.st_mtime_ns}|"
+            f"{int(label)}|{patient_id}|{series_id}\n"
+        )
+        digest.update(record.encode("utf-8"))
+
+    return digest.hexdigest()
+
+
+def _cache_array_paths(cache_dir):
+    names = [
+        "features",
+        "labels",
+        "patient_ids",
+        "series_ids",
+        "quality_weights",
+        "monai_valid",
+        "area_ratios",
+        "peak_probabilities",
+        "mean_foreground_probabilities",
+        "slice_scores",
+        "decoded_pixel_hashes",
+    ]
+    return {name: cache_dir / f"{name}.npy" for name in names}
+
+
+def load_feature_cache(cache_dir, expected_fingerprint):
+    """Load a complete cache only when its metadata and arrays all match."""
+
+    metadata_path = cache_dir / "metadata.json"
+    paths = _cache_array_paths(cache_dir)
+
+    if not metadata_path.is_file() or not all(
+        path.is_file() for path in paths.values()
+    ):
+        return None
+
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    if metadata.get("fingerprint") != expected_fingerprint:
+        return None
+
+    print(f"Loading frozen-feature cache: {cache_dir}")
+
+    return tuple(
+        np.load(paths[name], allow_pickle=False)
+        for name in [
+            "features",
+            "labels",
+            "patient_ids",
+            "series_ids",
+            "quality_weights",
+            "monai_valid",
+            "area_ratios",
+            "peak_probabilities",
+            "mean_foreground_probabilities",
+            "slice_scores",
+            "decoded_pixel_hashes",
+        ]
+    )
+
+
+def save_feature_cache(cache_dir, fingerprint, arrays):
+    """Save arrays first and write metadata last as the completion marker."""
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    paths = _cache_array_paths(cache_dir)
+    names = [
+        "features",
+        "labels",
+        "patient_ids",
+        "series_ids",
+        "quality_weights",
+        "monai_valid",
+        "area_ratios",
+        "peak_probabilities",
+        "mean_foreground_probabilities",
+        "slice_scores",
+        "decoded_pixel_hashes",
+    ]
+
+    if len(arrays) != len(names):
+        raise ValueError(
+            f"Expected {len(names)} feature-cache arrays, got {len(arrays)}."
+        )
+
+    for name, array in zip(names, arrays):
+        np.save(paths[name], np.asarray(array), allow_pickle=False)
+
+    metadata = {
+        "fingerprint": fingerprint,
+        "schema": FEATURE_CACHE_SCHEMA_VERSION,
+        "n_slices": int(len(arrays[0])),
+        "feature_dimension": int(arrays[0].shape[1]),
+    }
+    (cache_dir / "metadata.json").write_text(
+        json.dumps(metadata, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    print(f"Saved frozen-feature cache: {cache_dir}")
+
+
+def audit_exact_decoded_pixel_duplicates(
+    output_path,
     samples,
-    transform,
-)
+    decoded_pixel_hashes,
+):
+    """Audit exact decoded-pixel copies without changing patient identity.
 
-(
+    The hash is calculated from the decoded uint8 grayscale matrix and its
+    shape before normalization. Therefore it catches exact pixel equality even
+    when JPEG metadata differs, but it does not catch perceptually similar or
+    slightly re-encoded images. A duplicate that spans two Directory_* patients
+    can leak image content across patient-level folds; a duplicate spanning both
+    labels is an even stronger indication of dataset/export contamination.
+
+    The function only reports or optionally aborts. It never merges patients or
+    changes ``patient_id = Directory_*``.
+    """
+
+    if len(samples) != len(decoded_pixel_hashes):
+        raise ValueError(
+            "Duplicate-audit hashes must align one-to-one with samples."
+        )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    hash_to_indices = {}
+    for index, pixel_hash in enumerate(decoded_pixel_hashes):
+        hash_to_indices.setdefault(str(pixel_hash), []).append(index)
+
+    duplicate_groups = [
+        (pixel_hash, indices)
+        for pixel_hash, indices in sorted(hash_to_indices.items())
+        if len(indices) > 1
+    ]
+
+    fieldnames = [
+        "group_id",
+        "decoded_pixel_sha256",
+        "n_images",
+        "n_patients",
+        "n_labels",
+        "cross_patient",
+        "cross_label",
+        "image_path",
+        "label",
+        "patient_id",
+        "series_id",
+    ]
+
+    rows = []
+    cross_patient_groups = 0
+    cross_label_groups = 0
+    cross_patient_images = 0
+    affected_cross_patient_ids = set()
+
+    for group_number, (pixel_hash, indices) in enumerate(
+        duplicate_groups,
+        start=1,
+    ):
+        patients = {str(samples[index][2]) for index in indices}
+        labels = {int(samples[index][1]) for index in indices}
+        cross_patient = len(patients) > 1
+        cross_label = len(labels) > 1
+
+        if cross_patient:
+            cross_patient_groups += 1
+            cross_patient_images += len(indices)
+            affected_cross_patient_ids.update(patients)
+        if cross_label:
+            cross_label_groups += 1
+
+        for index in indices:
+            image_path, label, patient_id, series_id = samples[index]
+            rows.append(
+                {
+                    "group_id": group_number,
+                    "decoded_pixel_sha256": pixel_hash,
+                    "n_images": len(indices),
+                    "n_patients": len(patients),
+                    "n_labels": len(labels),
+                    "cross_patient": int(cross_patient),
+                    "cross_label": int(cross_label),
+                    "image_path": str(image_path),
+                    "label": int(label),
+                    "patient_id": str(patient_id),
+                    "series_id": str(series_id),
+                }
+            )
+
+    with open(output_path, "w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    summary = {
+        "enabled": True,
+        "definition": "exact decoded uint8 grayscale pixels plus shape",
+        "duplicate_groups": int(len(duplicate_groups)),
+        "duplicate_images": int(sum(len(indices) for _, indices in duplicate_groups)),
+        "cross_patient_duplicate_groups": int(cross_patient_groups),
+        "cross_patient_duplicate_images": int(cross_patient_images),
+        "cross_label_duplicate_groups": int(cross_label_groups),
+        "affected_cross_patient_ids": sorted(affected_cross_patient_ids),
+        "csv_path": str(output_path),
+    }
+
+    print(
+        "Exact decoded-pixel duplicate audit: "
+        f"groups={summary['duplicate_groups']}, "
+        f"cross-patient groups={cross_patient_groups}, "
+        f"cross-label groups={cross_label_groups}"
+    )
+
+    if cross_patient_groups:
+        print(
+            "WARNING: exact decoded-pixel copies occur across Directory_* "
+            "patients. A patient-only split does not by itself prevent that "
+            "visual-content leakage. Inspect the duplicate CSV before "
+            "reporting publication results."
+        )
+
+    if cross_label_groups:
+        print(
+            "WARNING: at least one exact decoded-pixel duplicate group spans "
+            "both Normal and Sick labels. This requires dataset-level review."
+        )
+
+    if cross_patient_groups and FAIL_ON_CROSS_PATIENT_EXACT_DUPLICATES:
+        raise RuntimeError(
+            "Cross-patient exact decoded-pixel duplicates were found. "
+            f"See {output_path}. The strict duplicate policy is enabled."
+        )
+
+    return summary
+
+
+def write_monai_qc_summary(
+    output_path,
+    labels,
+    patient_ids,
+    series_ids,
+    monai_valid,
+    area_ratios,
+    peak_probabilities,
+    mean_foreground_probabilities,
+):
+    """Save patient-level MONAI gate diagnostics without claiming Dice accuracy."""
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    rows = []
+    for patient_id in sorted(set(map(str, patient_ids))):
+        indices = np.flatnonzero(patient_ids == patient_id)
+        label_values = np.unique(labels[indices])
+
+        if len(label_values) != 1:
+            raise RuntimeError(
+                f"Patient {patient_id} has inconsistent QC labels."
+            )
+
+        valid_values = monai_valid[indices]
+        rows.append(
+            {
+                "patient_id": patient_id,
+                "label": int(label_values[0]),
+                "n_slices": int(len(indices)),
+                "n_series_proxies": int(len(np.unique(series_ids[indices]))),
+                "plausible_masks": int(valid_values.sum()),
+                "plausible_mask_rate": (
+                    float(valid_values.mean()) if USE_MONAI_ROI else ""
+                ),
+                "median_area_ratio": (
+                    float(np.nanmedian(area_ratios[indices]))
+                    if USE_MONAI_ROI
+                    else ""
+                ),
+                "median_peak_probability": (
+                    float(np.nanmedian(peak_probabilities[indices]))
+                    if USE_MONAI_ROI
+                    else ""
+                ),
+                "median_mean_foreground_probability": (
+                    float(
+                        np.nanmedian(
+                            mean_foreground_probabilities[indices]
+                        )
+                    )
+                    if USE_MONAI_ROI
+                    else ""
+                ),
+            }
+        )
+
+    with open(output_path, "w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    if USE_MONAI_ROI:
+        for label, class_name in ((0, "Normal"), (1, "Sick")):
+            indices = np.flatnonzero(labels == label)
+            rate = float(monai_valid[indices].mean())
+            print(
+                f"MONAI plausible-mask rate in {class_name}: "
+                f"{int(monai_valid[indices].sum())}/{len(indices)} "
+                f"({rate:.2%})"
+            )
+
+
+def run_patient_level_cross_validation(
     X_all,
     y_all,
     patient_all,
     series_all,
     quality_weights_all,
-    monai_valid_all,
-) = extract_features(
-    all_dataset,
-    debug=DEBUG_VISUALIZATION,
-)
-
-# -------------------------------------------------------------
-# Build ONE patient-level label table.
-# -------------------------------------------------------------
-
-patient_labels = {}
-
-for label, patient_id in zip(y_all, patient_all):
-
-    patient_id = str(patient_id)
-    label = int(label)
-
-    previous = patient_labels.get(patient_id)
-
-    if previous is not None and previous != label:
-        raise RuntimeError(
-            f"Patient {patient_id} occurs with conflicting labels."
-        )
-
-    patient_labels[patient_id] = label
-
-all_patient_ids = np.asarray(sorted(patient_labels))
-all_patient_labels = np.asarray(
-    [patient_labels[patient_id] for patient_id in all_patient_ids],
-    dtype=np.int64,
-)
-
-if np.unique(all_patient_labels).size != 2:
-    raise RuntimeError(
-        "The dataset must contain both Normal and Sick patients."
-    )
-
-print("\nFinal patient-level dataset")
-print(f"  Patients: {len(all_patient_ids)}")
-print(
-    "  Normal:",
-    int(np.sum(all_patient_labels == 0)),
-)
-print(
-    "  Sick:",
-    int(np.sum(all_patient_labels == 1)),
-)
-print(f"  Slice embeddings: {len(X_all)}")
-
-if len(all_patient_ids) < 100:
-    print(
-        "WARNING: fewer than 100 Directory_* patient units were discovered. "
-        "Fold AUCs can be highly variable; emphasize pooled OOF performance, "
-        "confidence intervals and external validation rather than a single "
-        "fold or a single holdout split."
-    )
-
-# -------------------------------------------------------------
-# Map each slice to its patient-level fold.
-# -------------------------------------------------------------
-#
-# StratifiedKFold is run on the patient table, not on individual slices.
-# This is important: if we passed every image as a separate sample, a patient
-# with 100 slices could appear in both train and validation.
-# -------------------------------------------------------------
-
-N_SPLITS = 5
-CV_RANDOM_STATE = RANDOM_SEED
-
-if len(all_patient_ids) < N_SPLITS:
-    raise RuntimeError(
-        f"Need at least {N_SPLITS} patients for {N_SPLITS}-fold CV."
-    )
-
-class_patient_counts = np.bincount(all_patient_labels, minlength=2)
-
-if int(class_patient_counts.min()) < N_SPLITS:
-    raise RuntimeError(
-        f"{N_SPLITS}-fold stratified CV requires at least {N_SPLITS} "
-        "Directory_* patients in EACH class. Found "
-        f"Normal={int(class_patient_counts[0])}, "
-        f"Sick={int(class_patient_counts[1])}."
-    )
-
-cv = StratifiedKFold(
-    n_splits=N_SPLITS,
-    shuffle=True,
-    random_state=CV_RANDOM_STATE,
-)
-
-# OOF patient predictions are stored here. Each patient should be assigned
-# exactly once by the cross-validation procedure.
-oof_probability_by_patient = {}
-oof_label_by_patient = {}
-
-# -------------------------------------------------------------
-# IMPORTANT:
-# We need a slice mask for every fold because X_all contains individual slices
-# while CV splits are defined on patient IDs.
-# -------------------------------------------------------------
-
-for fold_index, (train_patient_idx, valid_patient_idx) in enumerate(
-    cv.split(
-        all_patient_ids,
-        all_patient_labels,
-    ),
-    start=1,
 ):
+    """Return one out-of-fold score per Directory_* patient."""
 
-    train_patient_fold = set(
-        all_patient_ids[train_patient_idx].tolist()
-    )
-
-    valid_patient_fold = set(
-        all_patient_ids[valid_patient_idx].tolist()
-    )
-
-    # Explicit leakage guard.
-    overlap = train_patient_fold.intersection(valid_patient_fold)
-
-    if overlap:
-        raise RuntimeError(
-            f"Patient leakage detected in fold {fold_index}: "
-            f"{sorted(overlap)}"
-        )
-
-    train_slice_mask = np.isin(
-        patient_all,
-        list(train_patient_fold),
-    )
-
-    valid_slice_mask = np.isin(
-        patient_all,
-        list(valid_patient_fold),
-    )
-
-    X_train = X_all[train_slice_mask]
-    y_train = y_all[train_slice_mask]
-    patient_train = patient_all[train_slice_mask]
-    series_train = series_all[train_slice_mask]
-    quality_train = quality_weights_all[train_slice_mask]
-
-    X_valid = X_all[valid_slice_mask]
-    y_valid = y_all[valid_slice_mask]
-    patient_valid = patient_all[valid_slice_mask]
-    series_valid = series_all[valid_slice_mask]
-    quality_valid = quality_weights_all[valid_slice_mask]
-
-    print_fold_summary(
-        fold_index,
-        y_train,
-        y_valid,
-        patient_train,
-        patient_valid,
-    )
-
-    # ---------------------------------------------------------
-    # TRAINING WEIGHTS
-    # ---------------------------------------------------------
-    #
-    # Each class receives equal total nominal weight; inside a class, every
-    # patient receives equal total influence; inside a patient, every series
-    # receives equal total influence. Optional slice-quality weights redistribute
-    # influence only WITHIN a series.
-    # ---------------------------------------------------------
-
-    training_sample_weights = compute_hierarchical_training_weights(
-        y_train,
-        patient_train,
-        series_train,
-        quality_weights=quality_train,
-    )
-
-    # ---------------------------------------------------------
-    # SCALER + CLASSIFIER
-    # ---------------------------------------------------------
-    #
-    # StandardScaler is FIT ONLY on the training fold and receives the same
-    # hierarchical sample weights as Logistic Regression. This prevents both
-    # validation leakage AND slice-count imbalance from influencing the fitted
-    # mean/variance.
-    #
-    # Logistic Regression is intentionally kept simple because the primary
-    # objective here is to test the imaging representation and patient-level
-    # aggregation, not to overfit a high-capacity classifier to ~1,000 patients.
-    # ---------------------------------------------------------
-
-    classifier = Pipeline(
-        steps=[
-            (
-                "scaler",
-                StandardScaler(),
-            ),
-            (
-                "logreg",
-                LogisticRegression(
-                    C=1.0,
-                    max_iter=2000,
-                    solver="liblinear",
-                ),
-            ),
-        ]
-    )
-
-    classifier.fit(
-        X_train,
-        y_train,
-        # IMPORTANT: StandardScaler must be weighted too. Otherwise a patient
-        # with many slices would still dominate the training-fold mean/variance
-        # even though Logistic Regression itself is patient/series balanced.
-        scaler__sample_weight=training_sample_weights,
-        logreg__sample_weight=training_sample_weights,
-    )
-
-    # ---------------------------------------------------------
-    # PATIENT-LEVEL VALIDATION
-    # ---------------------------------------------------------
-
-    (
-        patient_probabilities,
-        patient_ground_truth,
-        evaluated_patient_ids,
-    ) = aggregate_patients(
-        X_valid,
-        y_valid,
-        patient_valid,
-        series_valid,
-        quality_valid,
-        classifier,
-    )
-
-    if len(evaluated_patient_ids) != len(valid_patient_fold):
-        raise RuntimeError(
-            f"Fold {fold_index}: some validation patients have no prediction."
-        )
-
-    # Every patient must be assigned exactly once.
-    for patient_id, label, probability in zip(
-        evaluated_patient_ids,
-        patient_ground_truth,
-        patient_probabilities,
-    ):
-
+    patient_labels = {}
+    for label, patient_id in zip(y_all, patient_all):
         patient_id = str(patient_id)
+        label = int(label)
+        previous = patient_labels.get(patient_id)
 
-        if patient_id in oof_probability_by_patient:
+        if previous is not None and previous != label:
             raise RuntimeError(
-                f"Patient {patient_id} received more than one OOF prediction."
+                f"Patient {patient_id} occurs with conflicting labels."
+            )
+        patient_labels[patient_id] = label
+
+    all_patient_ids = np.asarray(sorted(patient_labels))
+    all_patient_labels = np.asarray(
+        [patient_labels[patient_id] for patient_id in all_patient_ids],
+        dtype=np.int64,
+    )
+
+    if np.unique(all_patient_labels).size != 2:
+        raise RuntimeError("The dataset must contain both classes.")
+
+    class_patient_counts = np.bincount(all_patient_labels, minlength=2)
+    if int(class_patient_counts.min()) < N_SPLITS:
+        raise RuntimeError(
+            f"{N_SPLITS}-fold stratified CV requires at least {N_SPLITS} "
+            "Directory_* patients in each class. Found "
+            f"Normal={int(class_patient_counts[0])}, "
+            f"Sick={int(class_patient_counts[1])}."
+        )
+
+    print("\nFinal patient-level dataset")
+    print(f"  Patients: {len(all_patient_ids)}")
+    print(f"  Normal: {int(class_patient_counts[0])}")
+    print(f"  Sick: {int(class_patient_counts[1])}")
+    print(f"  Slice embeddings: {len(X_all)}")
+    print(f"  Classification strategy: {CLASSIFICATION_STRATEGY}")
+
+    if len(all_patient_ids) < 100:
+        print(
+            "WARNING: fewer than 100 Directory_* patient units were found. "
+            "The effective labeled sample size is the patient count, not the "
+            "slice count; expect wide uncertainty and split sensitivity."
+        )
+
+    if CLASSIFICATION_STRATEGY == "patient_embedding":
+        (
+            patient_embeddings,
+            embedding_labels,
+            embedding_patient_ids,
+        ) = aggregate_patient_embeddings(
+            X_all,
+            y_all,
+            patient_all,
+            series_all,
+            quality_weights_all,
+        )
+
+        if not np.array_equal(embedding_patient_ids, all_patient_ids):
+            raise RuntimeError(
+                "Pooled patient embedding order does not match patient table."
+            )
+        if not np.array_equal(embedding_labels, all_patient_labels):
+            raise RuntimeError(
+                "Pooled patient labels do not match patient table."
+            )
+    else:
+        patient_embeddings = None
+
+    cv = StratifiedKFold(
+        n_splits=N_SPLITS,
+        shuffle=True,
+        random_state=CV_RANDOM_STATE,
+    )
+
+    oof_score_by_patient = {}
+    oof_label_by_patient = {}
+    oof_fold_by_patient = {}
+    fold_aucs = []
+
+    for fold_index, (train_idx, valid_idx) in enumerate(
+        cv.split(all_patient_ids, all_patient_labels),
+        start=1,
+    ):
+        train_patients = set(all_patient_ids[train_idx].tolist())
+        valid_patients = set(all_patient_ids[valid_idx].tolist())
+
+        overlap = train_patients.intersection(valid_patients)
+        if overlap:
+            raise RuntimeError(
+                f"Patient leakage in fold {fold_index}: {sorted(overlap)}"
             )
 
-        oof_probability_by_patient[patient_id] = float(probability)
-        oof_label_by_patient[patient_id] = int(label)
+        if CLASSIFICATION_STRATEGY == "patient_embedding":
+            X_train = patient_embeddings[train_idx]
+            y_train = all_patient_labels[train_idx]
+            X_valid = patient_embeddings[valid_idx]
+            y_valid_patient = all_patient_labels[valid_idx]
+            evaluated_patient_ids = all_patient_ids[valid_idx]
 
-    if np.unique(patient_ground_truth).size == 2:
-        fold_auc = roc_auc_score(
+            print(f"\n========== FOLD {fold_index} ==========")
+            print(
+                f"Train patients: {len(train_idx)} "
+                f"(Normal={int(np.sum(y_train == 0))}, "
+                f"Sick={int(np.sum(y_train == 1))})"
+            )
+            print(
+                f"Validation patients: {len(valid_idx)} "
+                f"(Normal={int(np.sum(y_valid_patient == 0))}, "
+                f"Sick={int(np.sum(y_valid_patient == 1))})"
+            )
+
+            training_weights = compute_balanced_patient_weights(y_train)
+            classifier = build_classifier()
+            classifier.fit(
+                X_train,
+                y_train,
+                # One row already equals one patient, so the unsupervised
+                # scaler gives every training patient equal influence. Class
+                # balancing is applied only to the supervised classifier. PCA
+                # is likewise unweighted because sklearn PCA has no sample-
+                # weight argument.
+                scaler__sample_weight=np.ones(len(y_train), dtype=np.float64),
+                logreg__sample_weight=training_weights,
+            )
+            patient_scores = classifier.predict_proba(X_valid)[:, 1]
+            patient_ground_truth = y_valid_patient
+
+        else:
+            train_slice_mask = np.isin(patient_all, list(train_patients))
+            valid_slice_mask = np.isin(patient_all, list(valid_patients))
+
+            if np.any(train_slice_mask & valid_slice_mask):
+                raise RuntimeError("Slice masks overlap across CV partitions.")
+            if not np.all(train_slice_mask | valid_slice_mask):
+                raise RuntimeError("Some slices were not assigned to a fold side.")
+
+            X_train = X_all[train_slice_mask]
+            y_train = y_all[train_slice_mask]
+            patient_train = patient_all[train_slice_mask]
+            series_train = series_all[train_slice_mask]
+            quality_train = quality_weights_all[train_slice_mask]
+
+            X_valid = X_all[valid_slice_mask]
+            y_valid = y_all[valid_slice_mask]
+            patient_valid = patient_all[valid_slice_mask]
+            series_valid = series_all[valid_slice_mask]
+            quality_valid = quality_weights_all[valid_slice_mask]
+
+            print_fold_summary(
+                fold_index,
+                y_train,
+                y_valid,
+                patient_train,
+                patient_valid,
+            )
+
+            training_weights = compute_hierarchical_training_weights(
+                y_train,
+                patient_train,
+                series_train,
+                quality_weights=quality_train,
+            )
+            classifier = build_classifier()
+            classifier.fit(
+                X_train,
+                y_train,
+                scaler__sample_weight=training_weights,
+                logreg__sample_weight=training_weights,
+            )
+
+            (
+                patient_scores,
+                patient_ground_truth,
+                evaluated_patient_ids,
+            ) = aggregate_patients(
+                X_valid,
+                y_valid,
+                patient_valid,
+                series_valid,
+                quality_valid,
+                classifier,
+            )
+
+            if set(map(str, evaluated_patient_ids)) != valid_patients:
+                raise RuntimeError(
+                    f"Fold {fold_index}: validation patient set mismatch."
+                )
+
+        for patient_id, label, score in zip(
+            evaluated_patient_ids,
             patient_ground_truth,
-            patient_probabilities,
-        )
+            patient_scores,
+        ):
+            patient_id = str(patient_id)
+            if patient_id in oof_score_by_patient:
+                raise RuntimeError(
+                    f"Patient {patient_id} received multiple OOF scores."
+                )
+            oof_score_by_patient[patient_id] = float(score)
+            oof_label_by_patient[patient_id] = int(label)
+            oof_fold_by_patient[patient_id] = int(fold_index)
+
+        fold_auc = roc_auc_score(patient_ground_truth, patient_scores)
+        fold_aucs.append(float(fold_auc))
         print(f"Fold {fold_index} patient-level AUC: {fold_auc:.4f}")
-    else:
-        print(
-            f"Fold {fold_index}: validation fold contains only one class; "
-            "fold-specific AUC is undefined."
+
+    if set(oof_score_by_patient) != set(all_patient_ids.tolist()):
+        missing = sorted(
+            set(all_patient_ids.tolist()) - set(oof_score_by_patient)
+        )
+        raise RuntimeError(
+            f"Patients missing OOF predictions: {missing}"
         )
 
-# =============================================================
-# FINAL OUT-OF-FOLD PATIENT-LEVEL EVALUATION
-# =============================================================
-
-if set(oof_probability_by_patient) != set(all_patient_ids.tolist()):
-    missing = sorted(
-        set(all_patient_ids.tolist())
-        - set(oof_probability_by_patient)
+    evaluated_patient_ids = np.asarray(sorted(oof_score_by_patient))
+    patient_scores = np.asarray(
+        [oof_score_by_patient[p] for p in evaluated_patient_ids],
+        dtype=np.float64,
     )
-    raise RuntimeError(
-        "Some patients did not receive an out-of-fold prediction: "
-        f"{missing}"
+    patient_ground_truth = np.asarray(
+        [oof_label_by_patient[p] for p in evaluated_patient_ids],
+        dtype=np.int64,
     )
-
-evaluated_patient_ids = np.asarray(
-    sorted(oof_probability_by_patient)
-)
-
-patient_probabilities = np.asarray(
-    [
-        oof_probability_by_patient[patient_id]
-        for patient_id in evaluated_patient_ids
-    ],
-    dtype=np.float64,
-)
-
-patient_ground_truth = np.asarray(
-    [
-        oof_label_by_patient[patient_id]
-        for patient_id in evaluated_patient_ids
-    ],
-    dtype=np.int64,
-)
-
-# The pooled OOF AUC is the main performance number. It uses one prediction
-# per patient and therefore does not let patients with more slices contribute
-# multiple times to the ROC curve.
-if np.unique(patient_ground_truth).size != 2:
-    raise RuntimeError(
-        "Pooled patient-level ROC-AUC requires both Normal and Sick patients."
+    patient_folds = np.asarray(
+        [oof_fold_by_patient[p] for p in evaluated_patient_ids],
+        dtype=np.int64,
     )
 
-auc = roc_auc_score(
-    patient_ground_truth,
-    patient_probabilities,
-)
+    return (
+        evaluated_patient_ids,
+        patient_ground_truth,
+        patient_scores,
+        patient_folds,
+        fold_aucs,
+    )
 
-auc_ci_lower, auc_ci_upper = bootstrap_patient_auc_ci(
-    patient_ground_truth,
-    patient_probabilities,
-)
 
-print("\n============================================================")
-print("FINAL OUT-OF-FOLD PATIENT-LEVEL RESULT")
-print("============================================================")
-print(f"Patients evaluated: {len(evaluated_patient_ids)}")
-print(f"Patient-level OOF AUC: {auc:.6f}")
-print(
-    "Patient-level bootstrap 95% CI: "
-    f"[{auc_ci_lower:.6f}, {auc_ci_upper:.6f}]"
-)
-
-print("\nPATIENT-LEVEL OOF PREDICTIONS:")
-
-for patient_id, label, probability in zip(
-    evaluated_patient_ids,
-    patient_ground_truth,
-    patient_probabilities,
+def write_oof_predictions(
+    output_path,
+    patient_ids,
+    labels,
+    scores,
+    folds,
 ):
-    print(
-        f"  {patient_id}: "
-        f"true_label={int(label)}, "
-        f"CAD_probability={float(probability):.6f}"
+    """Write one transparent out-of-fold result row per Directory_* patient."""
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", newline="", encoding="utf-8") as file:
+        writer = csv.writer(file)
+        writer.writerow(
+            [
+                "patient_id",
+                "true_label",
+                "oof_fold",
+                "uncalibrated_cad_score",
+            ]
+        )
+        for row in zip(patient_ids, labels, folds, scores):
+            writer.writerow(
+                [str(row[0]), int(row[1]), int(row[2]), float(row[3])]
+            )
+
+
+def collect_run_metadata():
+    """Capture configuration, software versions and available model hashes."""
+
+    bundle_root = locate_monai_bundle_root()
+    official_torchscript_path = bundle_root / "models" / "model.ts"
+    checkpoint_path = bundle_root / "models" / "model.pt"
+
+    metadata = {
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "numpy": np.__version__,
+        "torch": torch.__version__,
+        "torchvision": torchvision.__version__,
+        "scikit_learn": sklearn.__version__,
+        "opencv": cv2.__version__,
+        "device": DEVICE,
+        "classification_strategy": CLASSIFICATION_STRATEGY,
+        "run_name": RUN_NAME,
+        "run_configuration_tag": RUN_CONFIGURATION_TAG,
+        "output_directory": str(OUTPUT_DIR),
+        "patient_definition": "Directory_*",
+        "series_definition": "immediate child folder proxy; not DICOM UID",
+        "n_splits": N_SPLITS,
+        "cv_random_state": CV_RANDOM_STATE,
+        "logistic_c": LOGISTIC_C,
+        "use_patient_pca": USE_PATIENT_PCA,
+        "patient_pca_explained_variance": PATIENT_PCA_EXPLAINED_VARIANCE,
+        "use_monai_roi": USE_MONAI_ROI,
+        "monai_bundle_name": MONAI_BUNDLE_NAME,
+        "monai_bundle_version": MONAI_BUNDLE_VERSION,
+        "monai_hf_repo_id": MONAI_HF_REPO_ID,
+        "monai_hf_revision": MONAI_HF_REVISION,
+        "verify_monai_artifact_sha256": VERIFY_MONAI_ARTIFACT_SHA256,
+        "monai_expected_model_ts_sha256": (
+            MONAI_OFFICIAL_TORCHSCRIPT_SHA256
+        ),
+        "monai_expected_model_pt_sha256": MONAI_MODEL_SHA256,
+        "monai_runtime_source": MONAI_RUNTIME_SOURCE,
+        "monai_runtime_artifact_path": MONAI_RUNTIME_ARTIFACT_PATH,
+        "efficientnet_weights": EFFICIENTNET_WEIGHTS_NAME,
+        "use_slice_quality_weights": USE_SLICE_QUALITY_WEIGHTS,
+        "audit_exact_decoded_pixel_duplicates": (
+            AUDIT_EXACT_DECODED_PIXEL_DUPLICATES
+        ),
+        "fail_on_cross_patient_exact_duplicates": (
+            FAIL_ON_CROSS_PATIENT_EXACT_DUPLICATES
+        ),
+        "feature_cache_schema": FEATURE_CACHE_SCHEMA_VERSION,
+    }
+
+    if official_torchscript_path.is_file():
+        metadata["monai_actual_model_ts_sha256"] = sha256_file(
+            official_torchscript_path
+        )
+    else:
+        metadata["monai_actual_model_ts_sha256"] = None
+
+    if checkpoint_path.is_file():
+        metadata["monai_actual_model_pt_sha256"] = sha256_file(
+            checkpoint_path
+        )
+    else:
+        metadata["monai_actual_model_pt_sha256"] = None
+
+    if MONAI_TORCHSCRIPT_PATH.is_file():
+        metadata["monai_fallback_torchscript_sha256"] = sha256_file(
+            MONAI_TORCHSCRIPT_PATH
+        )
+    else:
+        metadata["monai_fallback_torchscript_sha256"] = None
+
+    return metadata
+
+
+def main():
+    """Run the complete pipeline with hard-coded configuration above."""
+
+    validate_configuration()
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    samples = load_samples(DATASET_PATH)
+    fingerprint = feature_cache_fingerprint(samples, DATASET_PATH)
+    cache_dir = FEATURE_CACHE_ROOT / fingerprint[:16]
+
+    extracted = None
+    if USE_FEATURE_CACHE and not FORCE_REBUILD_FEATURE_CACHE:
+        extracted = load_feature_cache(cache_dir, fingerprint)
+
+    if extracted is None:
+        all_dataset = MRIDataset(samples, transform)
+
+        monai_segmenter = (
+            build_monai_segmenter() if USE_MONAI_ROI else None
+        )
+        feature_extractor = FeatureExtractor().to(DEVICE)
+        feature_extractor.eval()
+        feature_extractor.requires_grad_(False)
+
+        extracted = extract_features(
+            all_dataset,
+            monai_segmenter=monai_segmenter,
+            feature_extractor=feature_extractor,
+            debug=DEBUG_VISUALIZATION,
+        )
+
+        if USE_FEATURE_CACHE:
+            save_feature_cache(cache_dir, fingerprint, extracted)
+
+    (
+        X_all,
+        y_all,
+        patient_all,
+        series_all,
+        quality_weights_all,
+        monai_valid_all,
+        area_ratios_all,
+        peak_probabilities_all,
+        mean_foreground_probabilities_all,
+        slice_scores_all,
+        decoded_pixel_hashes_all,
+    ) = extracted
+
+    del slice_scores_all  # retained in cache for reproducible quality ablations
+
+    if AUDIT_EXACT_DECODED_PIXEL_DUPLICATES:
+        duplicate_audit_summary = audit_exact_decoded_pixel_duplicates(
+            OUTPUT_DIR / "exact_decoded_pixel_duplicate_groups.csv",
+            samples,
+            decoded_pixel_hashes_all,
+        )
+    else:
+        duplicate_audit_summary = {
+            "enabled": False,
+            "duplicate_groups": None,
+            "cross_patient_duplicate_groups": None,
+            "cross_label_duplicate_groups": None,
+        }
+
+    write_monai_qc_summary(
+        OUTPUT_DIR / "monai_qc_by_patient.csv",
+        y_all,
+        patient_all,
+        series_all,
+        monai_valid_all,
+        area_ratios_all,
+        peak_probabilities_all,
+        mean_foreground_probabilities_all,
     )
 
-print("\nDone!")
+    (
+        evaluated_patient_ids,
+        patient_ground_truth,
+        patient_scores,
+        patient_folds,
+        fold_aucs,
+    ) = run_patient_level_cross_validation(
+        X_all,
+        y_all,
+        patient_all,
+        series_all,
+        quality_weights_all,
+    )
+
+    auc = roc_auc_score(patient_ground_truth, patient_scores)
+    auc_ci_lower, auc_ci_upper = bootstrap_patient_auc_ci(
+        patient_ground_truth,
+        patient_scores,
+    )
+
+    write_oof_predictions(
+        OUTPUT_DIR / "patient_oof_predictions.csv",
+        evaluated_patient_ids,
+        patient_ground_truth,
+        patient_scores,
+        patient_folds,
+    )
+
+    summary = collect_run_metadata()
+    summary.update(
+        {
+            "patients_evaluated": int(len(evaluated_patient_ids)),
+            "normal_patients": int(np.sum(patient_ground_truth == 0)),
+            "sick_patients": int(np.sum(patient_ground_truth == 1)),
+            "patient_oof_auc": float(auc),
+            "patient_oof_auc_ci_95": [
+                float(auc_ci_lower),
+                float(auc_ci_upper),
+            ],
+            "fold_aucs": [float(value) for value in fold_aucs],
+            "feature_cache_fingerprint": fingerprint,
+            "exact_duplicate_audit": duplicate_audit_summary,
+        }
+    )
+    (OUTPUT_DIR / "run_summary.json").write_text(
+        json.dumps(summary, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+    print("\n============================================================")
+    print("FINAL OUT-OF-FOLD PATIENT-LEVEL RESULT")
+    print("============================================================")
+    print(f"Patients evaluated: {len(evaluated_patient_ids)}")
+    print(f"Patient-level OOF AUC: {auc:.6f}")
+    print(
+        "Patient-level bootstrap 95% CI: "
+        f"[{auc_ci_lower:.6f}, {auc_ci_upper:.6f}]"
+    )
+    print(
+        "Scores are model outputs from Logistic Regression and are not "
+        "claimed to be externally calibrated clinical probabilities."
+    )
+
+    print("\nPATIENT-LEVEL OOF SCORES:")
+    for patient_id, label, fold, score in zip(
+        evaluated_patient_ids,
+        patient_ground_truth,
+        patient_folds,
+        patient_scores,
+    ):
+        print(
+            f"  {patient_id}: true_label={int(label)}, "
+            f"fold={int(fold)}, uncalibrated_CAD_score={float(score):.6f}"
+        )
+
+    print(f"\nOutputs saved under: {OUTPUT_DIR}")
+    print("Done!")
+
+
+if __name__ == "__main__":
+    main()
 
 # =============================================================
 # RECOMMENDED NEXT EXPERIMENTS
@@ -2623,9 +4091,9 @@ print("\nDone!")
 # 1. Ablation: full image vs MONAI ROI.
 # 2. Ablation: equal slice weights (default) vs the optional quality heuristic.
 # 3. Ablation: mean probability vs log-odds fusion.
-# 4. Compare slice-classifier + fusion against hierarchical EMBEDDING pooling
-#    followed by a classifier trained directly at patient level. This removes
-#    slice-level pseudo-replication and is an especially important baseline.
+# 4. The recommended default already uses hierarchical embedding pooling.
+#    Report the legacy slice-classifier/fusion strategy only as an ablation and
+#    discuss its repeated-label/pseudo-replication limitation explicitly.
 # 5. Compare Logistic Regression vs linear SVM.
 # 6. Compare frozen ImageNet EfficientNet-B0 with a cardiac-MRI-pretrained
 #    encoder if an appropriate public checkpoint is available.
@@ -2635,10 +4103,14 @@ print("\nDone!")
 #    final publication split; cross-patient duplicates can leak visual content
 #    even when patient IDs themselves never cross folds.
 # 9. Tune ROI-gate thresholds, classifier C, calibration or decision thresholds
-#    only inside training data (nested CV if tuned quantitatively).
-# 10. Report sensitivity, specificity, PPV, NPV and confidence intervals using
+#    only inside training data (nested patient-level CV if tuned quantitatively).
+# 10. Compare the class-specific MONAI gate rates. A large Normal/Sick difference
+#     may indicate protocol/export confounding rather than anatomical usefulness.
+# 11. Report sensitivity, specificity, PPV, NPV and confidence intervals using
 #     a threshold selected without looking at the validation fold.
-# 11. Perform external validation on an independent hospital dataset if possible.
+# 12. Perform external validation on an independent hospital dataset if possible.
+# 13. Audit image dimensions, borders, compression and acquisition/export style
+#     by class; the model must not be allowed to classify dataset provenance.
 #
 # MOST IMPORTANT:
 # The MONAI segmenter is designed for 2D short-axis cardiac MR images. The
@@ -2653,4 +4125,5 @@ print("\nDone!")
 # families and both long- and short-axis planes were used. This domain mismatch
 # is one of the most important limitations of the pipeline and should be
 # discussed in any manuscript.
+
 
