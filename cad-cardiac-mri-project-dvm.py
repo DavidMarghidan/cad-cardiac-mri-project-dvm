@@ -312,6 +312,11 @@ import os
 import platform
 # Records operating-system and Python runtime information for reproducibility.
 
+import time
+# High-resolution wall-clock timing used by the console progress messages.
+# ``time.perf_counter`` is monotonic and is appropriate for measuring stage,
+# model-loading, cache, fold, and end-to-end execution durations.
+
 from pathlib import Path
 # Object-oriented path manipulation.
 # Used to manage the MONAI bundle directory and checkpoint files safely.
@@ -488,6 +493,17 @@ DATALOADER_NUM_WORKERS = 0
 # Zero is the safest cross-platform default, especially on Windows notebooks.
 # Because execution is protected by ``if __name__ == "__main__"``, this can be
 # increased after testing local RAM, storage throughput and multiprocessing.
+
+ENABLE_DETAILED_PROGRESS_PRINTS = True
+# When True, the pipeline prints clear substage messages, measured durations,
+# throughput, and an estimated remaining time during frozen feature extraction.
+# Set False only when a minimal console log is preferred. Main stage start/end
+# messages are still printed so long-running execution never appears frozen.
+
+PROGRESS_PRINT_EVERY_N_BATCHES = 25
+# Minimum interval between detailed feature-extraction status messages. The
+# effective interval is increased automatically for very large datasets so the
+# console receives at most roughly twenty periodic extraction updates.
 
 USE_FEATURE_CACHE = True
 FORCE_REBUILD_FEATURE_CACHE = False
@@ -730,6 +746,135 @@ else:
         DEBUG_OUTPUT_DIR = Path.cwd() / "debug_output"
 
 
+
+# =============================
+# EXECUTION STATUS + TIMING HELPERS
+# =============================
+
+PIPELINE_STAGE_COUNT = 16
+# The number matches the explicitly documented stages inside ``main``.
+
+
+def _synchronize_timing_device():
+    """Synchronize CUDA before reading a timer when GPU work may be pending."""
+
+    # CUDA kernels are normally asynchronous relative to Python. Without an
+    # explicit synchronization, a timer can stop before the GPU has completed
+    # the operation being measured. CPU execution requires no synchronization.
+    if DEVICE == "cuda":
+        torch.cuda.synchronize()
+
+
+def _format_elapsed_time(seconds):
+    """Format a duration for readable live console output."""
+
+    seconds = max(0.0, float(seconds))
+
+    if seconds < 1.0:
+        return f"{seconds * 1000.0:.0f} ms"
+
+    if seconds < 60.0:
+        return f"{seconds:.2f} s"
+
+    minutes, remaining_seconds = divmod(seconds, 60.0)
+
+    if minutes < 60.0:
+        return f"{int(minutes)} min {remaining_seconds:.1f} s"
+
+    hours, remaining_minutes = divmod(minutes, 60.0)
+    return (
+        f"{int(hours)} h {int(remaining_minutes)} min "
+        f"{remaining_seconds:.1f} s"
+    )
+
+
+def _print_stage_start(stage_number, title, expected_workload):
+    """Print a visible stage header and return a high-resolution start time."""
+
+    print("\n" + "=" * 78, flush=True)
+    print(
+        f"[PIPELINE {stage_number:02d}/{PIPELINE_STAGE_COUNT:02d}] "
+        f"START: {title}",
+        flush=True,
+    )
+    print(
+        f"[PIPELINE {stage_number:02d}/{PIPELINE_STAGE_COUNT:02d}] "
+        f"Expected workload: {expected_workload}",
+        flush=True,
+    )
+    print("=" * 78, flush=True)
+
+    _synchronize_timing_device()
+    return time.perf_counter()
+
+
+def _print_stage_complete(stage_number, title, started_at, details=None):
+    """Print measured stage duration and return it in seconds."""
+
+    _synchronize_timing_device()
+    elapsed = time.perf_counter() - started_at
+
+    print(
+        f"[PIPELINE {stage_number:02d}/{PIPELINE_STAGE_COUNT:02d}] "
+        f"COMPLETED: {title} in {_format_elapsed_time(elapsed)}",
+        flush=True,
+    )
+
+    if details:
+        print(
+            f"[PIPELINE {stage_number:02d}/{PIPELINE_STAGE_COUNT:02d}] "
+            f"{details}",
+            flush=True,
+        )
+
+    return float(elapsed)
+
+
+def _print_stage_skipped(stage_number, title, reason):
+    """Print an explicit message when a stage is safely bypassed."""
+
+    print("\n" + "=" * 78, flush=True)
+    print(
+        f"[PIPELINE {stage_number:02d}/{PIPELINE_STAGE_COUNT:02d}] "
+        f"SKIPPED: {title}",
+        flush=True,
+    )
+    print(
+        f"[PIPELINE {stage_number:02d}/{PIPELINE_STAGE_COUNT:02d}] "
+        f"Reason: {reason}",
+        flush=True,
+    )
+    print("=" * 78, flush=True)
+
+
+def _print_detail(message):
+    """Print a flushed substage message when detailed logging is enabled."""
+
+    if ENABLE_DETAILED_PROGRESS_PRINTS:
+        print(f"[DETAIL] {message}", flush=True)
+
+
+def _print_timing_summary(stage_durations, total_elapsed):
+    """Print one compact end-of-run timing table in execution order."""
+
+    print("\n" + "-" * 78, flush=True)
+    print("EXECUTION TIMING SUMMARY", flush=True)
+    print("-" * 78, flush=True)
+
+    for stage_key, duration in stage_durations.items():
+        print(
+            f"  {stage_key:<52} {_format_elapsed_time(duration):>20}",
+            flush=True,
+        )
+
+    print("-" * 78, flush=True)
+    print(
+        f"  {'TOTAL PIPELINE RUNTIME':<52} "
+        f"{_format_elapsed_time(total_elapsed):>20}",
+        flush=True,
+    )
+    print("-" * 78, flush=True)
+
 # =============================
 # CONFIGURATION VALIDATION
 # =============================
@@ -815,6 +960,11 @@ def validate_configuration():
 
     if DATALOADER_NUM_WORKERS < 0:
         raise ValueError("DATALOADER_NUM_WORKERS cannot be negative.")
+
+    if PROGRESS_PRINT_EVERY_N_BATCHES <= 0:
+        raise ValueError(
+            "PROGRESS_PRINT_EVERY_N_BATCHES must be a positive integer."
+        )
 
     # Parse the debug selector now so an invalid value is detected before
     # the expensive extraction loop starts. The function returns a normalized
@@ -1247,6 +1397,17 @@ def load_samples(root_dir):
         (image_path, binary_label, patient_id, series_id)
     """
 
+    discovery_started_at = time.perf_counter()
+    print(
+        f"[DATA] Starting dataset discovery under: {root_dir}",
+        flush=True,
+    )
+    print(
+        "[DATA] This stage scans folders and filenames only; JPEG pixels are "
+        "decoded later during feature extraction.",
+        flush=True,
+    )
+
     # ``samples`` preserves one row per discovered image. The two maps/sets
     # below enforce global patient identity and label consistency independently
     # of how many series folders or images each patient contains.
@@ -1257,6 +1418,14 @@ def load_samples(root_dir):
     # Stage 1: traverse the two expected top-level class directories in a
     # fixed order. Sorting at every lower level makes discovery deterministic.
     for class_name in ["Normal", "Sick"]:
+
+        class_started_at = time.perf_counter()
+        class_start_images = len(samples)
+        class_start_patients = len(discovered_patients)
+        print(
+            f"[DATA] Scanning class folder: {class_name}",
+            flush=True,
+        )
 
         label = 0 if class_name == "Normal" else 1
         class_path = os.path.join(root_dir, class_name)
@@ -1275,6 +1444,7 @@ def load_samples(root_dir):
             if not os.path.isdir(patient_path):
                 continue
 
+            # TEMP - Only for test
             if (directory.lower() != "directory_1" and directory.lower() != "directory_17"
                     and directory.lower() != "directory_2" and directory.lower() != "directory_18"
             ):
@@ -1372,6 +1542,15 @@ def load_samples(root_dir):
                     # artificial series proxies with zero observations.
                     continue
 
+        class_elapsed = time.perf_counter() - class_started_at
+        print(
+            f"[DATA] Finished {class_name}: "
+            f"patients_added={len(discovered_patients) - class_start_patients}, "
+            f"images_added={len(samples) - class_start_images}, "
+            f"elapsed={_format_elapsed_time(class_elapsed)}",
+            flush=True,
+        )
+
     # Stage 3: perform cohort-level existence checks after traversal. Empty
     # datasets or an incorrect root path must never continue into model loading.
     if not samples:
@@ -1418,6 +1597,11 @@ def load_samples(root_dir):
     )
     print(f"  Images: {len(samples)}")
     print(f"  Series proxies: {len(set(sample[3] for sample in samples))}")
+    print(
+        "[DATA] Dataset discovery completed in "
+        f"{_format_elapsed_time(time.perf_counter() - discovery_started_at)}",
+        flush=True,
+    )
 
     return samples
 
@@ -1658,6 +1842,11 @@ def ensure_monai_bundle(required_relative_paths=None):
     receives ``allow_patterns`` so unrelated repository files are not fetched.
     """
 
+    ensure_started_at = time.perf_counter()
+    _print_detail(
+        "Checking whether the pinned MONAI bundle files are already present."
+    )
+
     # Normalize the requested file list first. The ordinary execution path
     # intentionally requests only model.ts and metadata.json.
     if required_relative_paths is None:
@@ -1673,6 +1862,7 @@ def ensure_monai_bundle(required_relative_paths=None):
     # Resolve a local candidate and identify exactly which requested files
     # are absent before deciding whether network access is necessary.
     bundle_root = locate_monai_bundle_root()
+    _print_detail(f"MONAI bundle root resolved to: {bundle_root}")
     missing = [
         relative_path
         for relative_path in required_relative_paths
@@ -1681,7 +1871,12 @@ def ensure_monai_bundle(required_relative_paths=None):
 
     if not missing:
         validate_monai_bundle_metadata(bundle_root)
-        print(f"Using cached pinned MONAI bundle files: {bundle_root}")
+        elapsed = time.perf_counter() - ensure_started_at
+        print(
+            f"[MODEL][MONAI] Required pinned files are already cached at "
+            f"{bundle_root} (check completed in {_format_elapsed_time(elapsed)}).",
+            flush=True,
+        )
         return bundle_root
 
     if not AUTO_DOWNLOAD_MONAI_BUNDLE:
@@ -1702,9 +1897,16 @@ def ensure_monai_bundle(required_relative_paths=None):
     bundle_root.mkdir(parents=True, exist_ok=True)
 
     print(
-        "Downloading missing MONAI bundle files from the pinned repository "
-        f"revision {MONAI_HF_REVISION[:8]}: {', '.join(missing)}"
+        "[MODEL][MONAI] Downloading missing bundle files from the pinned "
+        f"repository revision {MONAI_HF_REVISION[:8]}: {', '.join(missing)}",
+        flush=True,
     )
+    print(
+        "[MODEL][MONAI] This can be slow on the first run and depends on the "
+        "network connection. Later runs should reuse the local files.",
+        flush=True,
+    )
+    download_started_at = time.perf_counter()
 
     try:
         snapshot_download(
@@ -1721,6 +1923,12 @@ def ensure_monai_bundle(required_relative_paths=None):
             f"files manually under {bundle_root}."
         ) from exc
 
+    print(
+        "[MODEL][MONAI] Download call completed in "
+        f"{_format_elapsed_time(time.perf_counter() - download_started_at)}.",
+        flush=True,
+    )
+
     still_missing = [
         relative_path
         for relative_path in required_relative_paths
@@ -1735,7 +1943,12 @@ def ensure_monai_bundle(required_relative_paths=None):
         )
 
     validate_monai_bundle_metadata(bundle_root)
-    print(f"Pinned MONAI files cached for future runs: {bundle_root}")
+    elapsed = time.perf_counter() - ensure_started_at
+    print(
+        f"[MODEL][MONAI] Pinned files are ready and cached at {bundle_root}. "
+        f"Total preparation time: {_format_elapsed_time(elapsed)}",
+        flush=True,
+    )
     return bundle_root
 
 
@@ -1743,6 +1956,17 @@ def load_and_validate_torchscript_segmenter(path, source_description):
     """Load TorchScript and validate its fixed inference contract immediately."""
 
     global MONAI_RUNTIME_SOURCE, MONAI_RUNTIME_ARTIFACT_PATH
+
+    load_started_at = time.perf_counter()
+    print(
+        f"[MODEL][MONAI] Loading {source_description} from: {path}",
+        flush=True,
+    )
+    print(
+        f"[MODEL][MONAI] Target device: {DEVICE}. A zero-input inference "
+        "sanity check will run immediately after loading.",
+        flush=True,
+    )
 
     # Load directly onto the selected runtime device. The subsequent zero-
     # input test validates executability, output type, shape, and finite values.
@@ -1768,6 +1992,7 @@ def load_and_validate_torchscript_segmenter(path, source_description):
         dtype=torch.float32,
     )
 
+    _print_detail("Running MONAI zero-input shape/finite-value validation.")
     with torch.inference_mode():
         example_output = network(example_input)
 
@@ -1799,7 +2024,13 @@ def load_and_validate_torchscript_segmenter(path, source_description):
     MONAI_RUNTIME_SOURCE = str(source_description)
     MONAI_RUNTIME_ARTIFACT_PATH = str(Path(path).resolve())
 
-    print(f"Loaded and validated {source_description}: {path}")
+    _synchronize_timing_device()
+    elapsed = time.perf_counter() - load_started_at
+    print(
+        f"[MODEL][MONAI] Loaded and validated {source_description} in "
+        f"{_format_elapsed_time(elapsed)}; output_shape={tuple(example_output.shape)}.",
+        flush=True,
+    )
     return network
 
 
@@ -1869,6 +2100,17 @@ def build_monai_segmenter():
     strict weight loading and local TorchScript export.
     """
 
+    build_started_at = time.perf_counter()
+    print(
+        "[MODEL][MONAI] Preparing the pretrained ventricular segmenter.",
+        flush=True,
+    )
+    print(
+        "[MODEL][MONAI] Preferred path: verified official model.ts without "
+        "importing the MONAI Python package.",
+        flush=True,
+    )
+
     # Preserve the original official-artifact failure so a later fallback
     # error can report useful context without hiding the primary problem.
     official_failure = None
@@ -1893,10 +2135,17 @@ def build_monai_segmenter():
         )
 
         try:
-            return load_and_validate_torchscript_segmenter(
+            network = load_and_validate_torchscript_segmenter(
                 official_torchscript_path,
                 "official pinned MONAI TorchScript segmenter",
             )
+            print(
+                "[MODEL][MONAI] Segmenter preparation completed through the "
+                f"preferred official path in "
+                f"{_format_elapsed_time(time.perf_counter() - build_started_at)}.",
+                flush=True,
+            )
+            return network
         except Exception as exc:
             official_failure = exc
             print(
@@ -1915,10 +2164,17 @@ def build_monai_segmenter():
         and not FORCE_REBUILD_MONAI_TORCHSCRIPT
     ):
         try:
-            return load_and_validate_torchscript_segmenter(
+            network = load_and_validate_torchscript_segmenter(
                 MONAI_TORCHSCRIPT_PATH,
                 "locally reconstructed MONAI TorchScript cache",
             )
+            print(
+                "[MODEL][MONAI] Segmenter preparation completed through the "
+                f"local fallback cache in "
+                f"{_format_elapsed_time(time.perf_counter() - build_started_at)}.",
+                flush=True,
+            )
+            return network
         except Exception as exc:
             print(
                 "WARNING: local fallback TorchScript cache could not be used; "
@@ -1952,6 +2208,12 @@ def build_monai_segmenter():
         "cache."
     )
 
+    monai_import_started_at = time.perf_counter()
+    print(
+        "[MODEL][MONAI] Importing monai.networks.nets.UNet for the exceptional "
+        "fallback. This import can take noticeably longer on some systems.",
+        flush=True,
+    )
     try:
         from monai.networks.nets import UNet as MONAIUNet
     except ImportError as exc:
@@ -1965,6 +2227,12 @@ def build_monai_segmenter():
             f"pip install monai==1.6.0.{reason}"
         ) from exc
 
+    print(
+        "[MODEL][MONAI] MONAI import completed in "
+        f"{_format_elapsed_time(time.perf_counter() - monai_import_started_at)}.",
+        flush=True,
+    )
+
     network = MONAIUNet(
         spatial_dims=2,
         in_channels=1,
@@ -1974,7 +2242,13 @@ def build_monai_segmenter():
         num_res_units=2,
     )
 
+    checkpoint_started_at = time.perf_counter()
+    _print_detail(f"Loading MONAI fallback state dictionary: {model_path}")
     state_dict = load_checkpoint_state_dict(model_path)
+    _print_detail(
+        "MONAI fallback checkpoint loaded in "
+        f"{_format_elapsed_time(time.perf_counter() - checkpoint_started_at)}."
+    )
 
     # strict=True fails on missing/unexpected keys instead of silently running a
     # partially initialized segmentation network.
@@ -1994,6 +2268,13 @@ def build_monai_segmenter():
 
     network = network.cpu()
 
+    trace_started_at = time.perf_counter()
+    print(
+        "[MODEL][MONAI] Tracing and validating the reconstructed network. "
+        "This is a one-time fallback cost when the resulting cache is reused.",
+        flush=True,
+    )
+
     with torch.inference_mode():
         reference_output = network(example_input)
 
@@ -2004,6 +2285,12 @@ def build_monai_segmenter():
         )
 
         traced_output = traced_network(example_input)
+
+    print(
+        "[MODEL][MONAI] Trace creation and first validation inference completed "
+        f"in {_format_elapsed_time(time.perf_counter() - trace_started_at)}.",
+        flush=True,
+    )
 
     if tuple(reference_output.shape) != (
         1,
@@ -2048,10 +2335,16 @@ def build_monai_segmenter():
         f"{MONAI_TORCHSCRIPT_PATH}"
     )
 
-    return load_and_validate_torchscript_segmenter(
+    network = load_and_validate_torchscript_segmenter(
         MONAI_TORCHSCRIPT_PATH,
         "newly reconstructed MONAI TorchScript cache",
     )
+    print(
+        "[MODEL][MONAI] Exceptional fallback preparation completed in "
+        f"{_format_elapsed_time(time.perf_counter() - build_started_at)}.",
+        flush=True,
+    )
+    return network
 
 
 # =============================
@@ -2440,6 +2733,18 @@ class FeatureExtractor(nn.Module):
 
         super().__init__()
 
+        initialization_started_at = time.perf_counter()
+        print(
+            f"[MODEL][EfficientNet] Loading EfficientNet-B0 weights "
+            f"{EFFICIENTNET_WEIGHTS_NAME}.",
+            flush=True,
+        )
+        print(
+            "[MODEL][EfficientNet] The first run may download the ImageNet "
+            "checkpoint; later runs should use the torchvision cache.",
+            flush=True,
+        )
+
         weights = models.EfficientNet_B0_Weights[
             EFFICIENTNET_WEIGHTS_NAME
         ]
@@ -2449,6 +2754,13 @@ class FeatureExtractor(nn.Module):
         # Replace only the final classifier. The convolutional backbone and
         # global pooling remain intact, so forward() returns a 1280-D vector.
         self.model.classifier = nn.Identity()
+
+        print(
+            "[MODEL][EfficientNet] Backbone initialized and ImageNet "
+            f"classifier removed in "
+            f"{_format_elapsed_time(time.perf_counter() - initialization_started_at)}.",
+            flush=True,
+        )
 
     def forward(self, x):
 
@@ -2644,6 +2956,36 @@ def extract_features(
         persistent_workers=(DATALOADER_NUM_WORKERS > 0),
     )
 
+    total_slices = len(dataset)
+    total_batches = len(loader)
+    progress_interval = max(
+        1,
+        PROGRESS_PRINT_EVERY_N_BATCHES,
+        total_batches // 20,
+    )
+    extraction_started_at = time.perf_counter()
+    processed_slices = 0
+
+    print(
+        "[EXTRACTION] Starting frozen image feature extraction.",
+        flush=True,
+    )
+    print(
+        f"[EXTRACTION] slices={total_slices}, batches={total_batches}, "
+        f"batch_size={BATCH_SIZE}, device={DEVICE}, "
+        f"MONAI_ROI={USE_MONAI_ROI}, "
+        f"CUDA_AMP={USE_CUDA_AMP and DEVICE == 'cuda'}",
+        flush=True,
+    )
+    print(
+        "[EXTRACTION] This is normally the longest stage on a cache miss. "
+        "Progress, throughput, and ETA will be printed periodically.",
+        flush=True,
+    )
+    _print_detail(
+        f"Periodic extraction update interval: every {progress_interval} batch(es)."
+    )
+
     # ------------------------------------------------------------------
     # Extraction stage 2: allocate append-only collectors.
     # ------------------------------------------------------------------
@@ -2685,7 +3027,15 @@ def extract_features(
         # ----------------------------------------------------------------
         # ``batch_idx`` is retained for traceability even though sample identity
         # is carried by the stable ``sample_indices`` tensor.
-        for batch_idx, batch in enumerate(tqdm(loader)):
+        for batch_idx, batch in enumerate(
+            tqdm(
+                loader,
+                desc="MONAI + EfficientNet",
+                unit="batch",
+                dynamic_ncols=True,
+            )
+        ):
+            batch_started_at = time.perf_counter()
 
             (
                 images,
@@ -2845,6 +3195,51 @@ def extract_features(
             )
             all_decoded_pixel_hashes.extend(list(decoded_pixel_hashes))
 
+            processed_slices += int(len(labels))
+            completed_batches = batch_idx + 1
+
+            if (
+                completed_batches == 1
+                or completed_batches % progress_interval == 0
+                or completed_batches == total_batches
+            ):
+                _synchronize_timing_device()
+                elapsed = time.perf_counter() - extraction_started_at
+                batch_elapsed = time.perf_counter() - batch_started_at
+                slices_per_second = (
+                    processed_slices / elapsed if elapsed > 0 else float("nan")
+                )
+                remaining_slices = max(0, total_slices - processed_slices)
+                eta_seconds = (
+                    remaining_slices / slices_per_second
+                    if slices_per_second > 0
+                    else float("nan")
+                )
+                percentage = (
+                    100.0 * processed_slices / max(total_slices, 1)
+                )
+                eta_text = (
+                    _format_elapsed_time(eta_seconds)
+                    if np.isfinite(eta_seconds)
+                    else "unknown"
+                )
+                print(
+                    f"[EXTRACTION] {processed_slices}/{total_slices} slices "
+                    f"({percentage:.1f}%) | batch {completed_batches}/{total_batches} "
+                    f"| elapsed={_format_elapsed_time(elapsed)} "
+                    f"| rate={slices_per_second:.2f} slices/s "
+                    f"| ETA={eta_text} "
+                    f"| latest_batch={_format_elapsed_time(batch_elapsed)}",
+                    flush=True,
+                )
+
+                if completed_batches == 1:
+                    print(
+                        "[EXTRACTION] The first batch can be slower because "
+                        "models, CUDA kernels, and memory buffers warm up.",
+                        flush=True,
+                    )
+
     # ------------------------------------------------------------------
     # Extraction stage 10: finalize batch collectors into NumPy arrays.
     # ------------------------------------------------------------------
@@ -2932,6 +3327,15 @@ def extract_features(
         "All extracted slices retained; "
         f"quality weighting={'enabled' if USE_SLICE_QUALITY_WEIGHTS else 'disabled'}; "
         f"mean weight={quality_weights.mean():.3f}"
+    )
+
+    _synchronize_timing_device()
+    extraction_elapsed = time.perf_counter() - extraction_started_at
+    print(
+        "[EXTRACTION] Frozen feature extraction completed in "
+        f"{_format_elapsed_time(extraction_elapsed)}; "
+        f"feature_matrix_shape={features.shape}.",
+        flush=True,
     )
 
     return (
@@ -3518,6 +3922,13 @@ def bootstrap_patient_auc_ci(
     validation and does not capture every source of model-selection uncertainty.
     """
 
+    bootstrap_started_at = time.perf_counter()
+    print(
+        f"[BOOTSTRAP] Starting {n_bootstrap} stratified patient-level "
+        f"replicates for a {confidence:.1%} AUC confidence interval.",
+        flush=True,
+    )
+
     # Work at the patient-row level. Each element must correspond to one
     # unique Directory_* patient's OOF prediction.
     labels = np.asarray(labels, dtype=np.int64)
@@ -3550,6 +3961,13 @@ def bootstrap_patient_auc_ci(
     alpha = 1.0 - confidence
     lower = float(np.quantile(bootstrap_aucs, alpha / 2.0))
     upper = float(np.quantile(bootstrap_aucs, 1.0 - alpha / 2.0))
+
+    print(
+        "[BOOTSTRAP] Completed in "
+        f"{_format_elapsed_time(time.perf_counter() - bootstrap_started_at)}; "
+        f"interval=[{lower:.6f}, {upper:.6f}].",
+        flush=True,
+    )
 
     return lower, upper
 
@@ -3593,6 +4011,13 @@ def print_fold_summary(
 
 def feature_cache_fingerprint(samples, dataset_root):
     """Hash file metadata plus every setting that changes frozen embeddings."""
+
+    fingerprint_started_at = time.perf_counter()
+    total_files = len(samples)
+    progress_step = max(1, total_files // 10)
+    _print_detail(
+        f"Building the feature-cache fingerprint from {total_files} image files."
+    )
 
     # The fingerprint combines extraction semantics with the discovered file
     # inventory. Classifier-only settings are deliberately excluded because they
@@ -3639,7 +4064,10 @@ def feature_cache_fingerprint(samples, dataset_root):
         json.dumps(settings, sort_keys=True).encode("utf-8")
     )
 
-    for image_path, label, patient_id, series_id in samples:
+    for file_index, (image_path, label, patient_id, series_id) in enumerate(
+        samples,
+        start=1,
+    ):
         path = Path(image_path)
         stat = path.stat()
 
@@ -3654,7 +4082,28 @@ def feature_cache_fingerprint(samples, dataset_root):
         )
         digest.update(record.encode("utf-8"))
 
-    return digest.hexdigest()
+        if (
+            ENABLE_DETAILED_PROGRESS_PRINTS
+            and (
+                file_index == 1
+                or file_index % progress_step == 0
+                or file_index == total_files
+            )
+        ):
+            percentage = 100.0 * file_index / max(total_files, 1)
+            print(
+                f"[CACHE FINGERPRINT] {file_index}/{total_files} files "
+                f"({percentage:.0f}%)",
+                flush=True,
+            )
+
+    fingerprint = digest.hexdigest()
+    _print_detail(
+        "Feature-cache fingerprint completed in "
+        f"{_format_elapsed_time(time.perf_counter() - fingerprint_started_at)}: "
+        f"{fingerprint[:16]}..."
+    )
+    return fingerprint
 
 
 # Centralizing cache filenames prevents load/save order drift. The returned
@@ -3680,49 +4129,91 @@ def _cache_array_paths(cache_dir):
 def load_feature_cache(cache_dir, expected_fingerprint):
     """Load a complete cache only when its metadata and arrays all match."""
 
-    # Metadata is the cache completion marker. A directory containing only a
-    # subset of arrays is treated as invalid and extraction is rerun.
     metadata_path = cache_dir / "metadata.json"
     paths = _cache_array_paths(cache_dir)
 
     if not metadata_path.is_file() or not all(
         path.is_file() for path in paths.values()
     ):
+        _print_detail(
+            f"No complete feature cache was found at: {cache_dir}"
+        )
         return None
 
     try:
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
+        print(
+            f"[CACHE] Ignoring unreadable cache metadata: {metadata_path}",
+            flush=True,
+        )
         return None
 
     if metadata.get("fingerprint") != expected_fingerprint:
+        print(
+            "[CACHE] Existing cache fingerprint does not match the current "
+            "dataset/extraction configuration; fresh extraction is required.",
+            flush=True,
+        )
         return None
 
-    print(f"Loading frozen-feature cache: {cache_dir}")
+    ordered_names = [
+        "features",
+        "labels",
+        "patient_ids",
+        "series_ids",
+        "quality_weights",
+        "monai_valid",
+        "area_ratios",
+        "peak_probabilities",
+        "mean_foreground_probabilities",
+        "slice_scores",
+        "decoded_pixel_hashes",
+    ]
 
-    return tuple(
-        np.load(paths[name], allow_pickle=False)
-        for name in [
-            "features",
-            "labels",
-            "patient_ids",
-            "series_ids",
-            "quality_weights",
-            "monai_valid",
-            "area_ratios",
-            "peak_probabilities",
-            "mean_foreground_probabilities",
-            "slice_scores",
-            "decoded_pixel_hashes",
-        ]
+    load_started_at = time.perf_counter()
+    print(f"[CACHE] Loading frozen-feature cache: {cache_dir}", flush=True)
+    print(
+        "[CACHE] A cache hit bypasses MONAI and EfficientNet inference, which "
+        "is normally the longest part of the pipeline.",
+        flush=True,
     )
+
+    arrays = []
+    total_bytes = 0
+
+    for name in ordered_names:
+        array_started_at = time.perf_counter()
+        array = np.load(paths[name], allow_pickle=False)
+        arrays.append(array)
+        total_bytes += int(array.nbytes)
+        _print_detail(
+            f"Loaded cache array {name}: shape={array.shape}, dtype={array.dtype}, "
+            f"size={array.nbytes / (1024 ** 2):.2f} MiB, "
+            f"elapsed={_format_elapsed_time(time.perf_counter() - array_started_at)}"
+        )
+
+    elapsed = time.perf_counter() - load_started_at
+    print(
+        f"[CACHE] Cache load completed in {_format_elapsed_time(elapsed)}; "
+        f"total_array_size={total_bytes / (1024 ** 2):.2f} MiB.",
+        flush=True,
+    )
+
+    return tuple(arrays)
 
 
 def save_feature_cache(cache_dir, fingerprint, arrays):
     """Save arrays first and write metadata last as the completion marker."""
 
-    # Create the cache directory, write every array, then write metadata last.
-    # This ordering reduces the risk of accepting an interrupted partial cache.
+    save_started_at = time.perf_counter()
+    print(f"[CACHE] Saving frozen-feature cache to: {cache_dir}", flush=True)
+    print(
+        "[CACHE] Cache writing can take several seconds for a large feature "
+        "matrix, but it avoids repeating neural-network inference later.",
+        flush=True,
+    )
+
     cache_dir.mkdir(parents=True, exist_ok=True)
     paths = _cache_array_paths(cache_dir)
     names = [
@@ -3744,8 +4235,19 @@ def save_feature_cache(cache_dir, fingerprint, arrays):
             f"Expected {len(names)} feature-cache arrays, got {len(arrays)}."
         )
 
+    total_bytes = 0
+
     for name, array in zip(names, arrays):
-        np.save(paths[name], np.asarray(array), allow_pickle=False)
+        array_to_save = np.asarray(array)
+        array_started_at = time.perf_counter()
+        np.save(paths[name], array_to_save, allow_pickle=False)
+        total_bytes += int(array_to_save.nbytes)
+        _print_detail(
+            f"Saved cache array {name}: shape={array_to_save.shape}, "
+            f"dtype={array_to_save.dtype}, "
+            f"size={array_to_save.nbytes / (1024 ** 2):.2f} MiB, "
+            f"elapsed={_format_elapsed_time(time.perf_counter() - array_started_at)}"
+        )
 
     metadata = {
         "fingerprint": fingerprint,
@@ -3757,7 +4259,13 @@ def save_feature_cache(cache_dir, fingerprint, arrays):
         json.dumps(metadata, indent=2, sort_keys=True),
         encoding="utf-8",
     )
-    print(f"Saved frozen-feature cache: {cache_dir}")
+
+    elapsed = time.perf_counter() - save_started_at
+    print(
+        f"[CACHE] Frozen-feature cache saved in {_format_elapsed_time(elapsed)}; "
+        f"total_array_size={total_bytes / (1024 ** 2):.2f} MiB.",
+        flush=True,
+    )
 
 
 def audit_exact_decoded_pixel_duplicates(
@@ -3986,6 +4494,13 @@ def run_patient_level_cross_validation(
 ):
     """Return one out-of-fold score per Directory_* patient."""
 
+    cv_started_at = time.perf_counter()
+    print(
+        f"[CV] Starting patient-level stratified {N_SPLITS}-fold "
+        f"cross-validation using strategy={CLASSIFICATION_STRATEGY!r}.",
+        flush=True,
+    )
+
     # Evaluation stage 1: construct the authoritative one-row-per-patient
     # label table from slice metadata and reject any conflicting labels.
     patient_labels = {}
@@ -4036,6 +4551,12 @@ def run_patient_level_cross_validation(
     # recommended branch. Pooling is label-free and uses all slices of a patient,
     # but each patient is later assigned wholly to one fold.
     if CLASSIFICATION_STRATEGY == "patient_embedding":
+        pooling_started_at = time.perf_counter()
+        print(
+            "[CV] Pooling slice embeddings into one vector per patient "
+            "(slice -> series proxy -> patient).",
+            flush=True,
+        )
         (
             patient_embeddings,
             embedding_labels,
@@ -4046,6 +4567,13 @@ def run_patient_level_cross_validation(
             patient_all,
             series_all,
             quality_weights_all,
+        )
+
+        print(
+            "[CV] Patient embedding pooling completed in "
+            f"{_format_elapsed_time(time.perf_counter() - pooling_started_at)}; "
+            f"matrix_shape={patient_embeddings.shape}.",
+            flush=True,
         )
 
         if not np.array_equal(embedding_patient_ids, all_patient_ids):
@@ -4078,6 +4606,12 @@ def run_patient_level_cross_validation(
         cv.split(all_patient_ids, all_patient_labels),
         start=1,
     ):
+        fold_started_at = time.perf_counter()
+        print(
+            f"\n[CV] Starting fold {fold_index}/{N_SPLITS}.",
+            flush=True,
+        )
+
         # Convert index arrays to explicit patient sets and verify disjointness
         # before selecting any patient embeddings or slice rows.
         train_patients = set(all_patient_ids[train_idx].tolist())
@@ -4113,6 +4647,13 @@ def run_patient_level_cross_validation(
 
             training_weights = compute_balanced_patient_weights(y_train)
             classifier = build_classifier()
+            fit_started_at = time.perf_counter()
+            print(
+                f"[CV][FOLD {fold_index}] Fitting scaler"
+                f"{' + PCA' if USE_PATIENT_PCA else ''} + Logistic "
+                f"Regression on X_train={X_train.shape}.",
+                flush=True,
+            )
             classifier.fit(
                 X_train,
                 y_train,
@@ -4124,8 +4665,20 @@ def run_patient_level_cross_validation(
                 scaler__sample_weight=np.ones(len(y_train), dtype=np.float64),
                 logreg__sample_weight=training_weights,
             )
+            print(
+                f"[CV][FOLD {fold_index}] Model fit completed in "
+                f"{_format_elapsed_time(time.perf_counter() - fit_started_at)}.",
+                flush=True,
+            )
+            prediction_started_at = time.perf_counter()
             patient_scores = classifier.predict_proba(X_valid)[:, 1]
             patient_ground_truth = y_valid_patient
+            print(
+                f"[CV][FOLD {fold_index}] Predicted {len(patient_scores)} "
+                f"validation patients in "
+                f"{_format_elapsed_time(time.perf_counter() - prediction_started_at)}.",
+                flush=True,
+            )
 
         else:
             train_slice_mask = np.isin(patient_all, list(train_patients))
@@ -4163,13 +4716,27 @@ def run_patient_level_cross_validation(
                 quality_weights=quality_train,
             )
             classifier = build_classifier()
+            fit_started_at = time.perf_counter()
+            print(
+                f"[CV][FOLD {fold_index}] Fitting the legacy slice-level "
+                f"classifier on X_train={X_train.shape}. This branch can be "
+                "slower than patient-embedding classification.",
+                flush=True,
+            )
             classifier.fit(
                 X_train,
                 y_train,
                 scaler__sample_weight=training_weights,
                 logreg__sample_weight=training_weights,
             )
+            print(
+                f"[CV][FOLD {fold_index}] Legacy slice classifier fit "
+                f"completed in "
+                f"{_format_elapsed_time(time.perf_counter() - fit_started_at)}.",
+                flush=True,
+            )
 
+            prediction_started_at = time.perf_counter()
             (
                 patient_scores,
                 patient_ground_truth,
@@ -4181,6 +4748,13 @@ def run_patient_level_cross_validation(
                 series_valid,
                 quality_valid,
                 classifier,
+            )
+
+            print(
+                f"[CV][FOLD {fold_index}] Slice prediction and hierarchical "
+                f"fusion completed in "
+                f"{_format_elapsed_time(time.perf_counter() - prediction_started_at)}.",
+                flush=True,
             )
 
             if set(map(str, evaluated_patient_ids)) != valid_patients:
@@ -4207,6 +4781,11 @@ def run_patient_level_cross_validation(
         fold_auc = roc_auc_score(patient_ground_truth, patient_scores)
         fold_aucs.append(float(fold_auc))
         print(f"Fold {fold_index} patient-level AUC: {fold_auc:.4f}")
+        print(
+            f"[CV] Fold {fold_index}/{N_SPLITS} completed in "
+            f"{_format_elapsed_time(time.perf_counter() - fold_started_at)}.",
+            flush=True,
+        )
 
     if set(oof_score_by_patient) != set(all_patient_ids.tolist()):
         missing = sorted(
@@ -4230,6 +4809,13 @@ def run_patient_level_cross_validation(
     patient_folds = np.asarray(
         [oof_fold_by_patient[p] for p in evaluated_patient_ids],
         dtype=np.int64,
+    )
+
+    print(
+        "[CV] All folds completed in "
+        f"{_format_elapsed_time(time.perf_counter() - cv_started_at)}; "
+        f"OOF patients={len(evaluated_patient_ids)}.",
+        flush=True,
     )
 
     return (
@@ -4351,6 +4937,37 @@ def collect_run_metadata():
 def main():
     """Run the complete pipeline with hard-coded configuration above."""
 
+    pipeline_started_at = time.perf_counter()
+    stage_durations = {}
+
+    print("\n" + "#" * 78, flush=True)
+    print("CAD CARDIAC MRI PATIENT-LEVEL PIPELINE", flush=True)
+    print("#" * 78, flush=True)
+    print(f"[PIPELINE] Dataset path: {DATASET_PATH}", flush=True)
+    print(f"[PIPELINE] Output directory: {OUTPUT_DIR}", flush=True)
+    print(f"[PIPELINE] Device: {DEVICE}", flush=True)
+    if DEVICE == "cuda":
+        print(
+            f"[PIPELINE] CUDA device: {torch.cuda.get_device_name(0)}",
+            flush=True,
+        )
+    print(
+        f"[PIPELINE] Strategy={CLASSIFICATION_STRATEGY}, "
+        f"folds={N_SPLITS}, batch_size={BATCH_SIZE}, "
+        f"workers={DATALOADER_NUM_WORKERS}",
+        flush=True,
+    )
+    print(
+        f"[PIPELINE] MONAI_ROI={USE_MONAI_ROI}, "
+        f"feature_cache={USE_FEATURE_CACHE}, "
+        f"force_cache_rebuild={FORCE_REBUILD_FEATURE_CACHE}",
+        flush=True,
+    )
+    print(
+        "[PIPELINE] Patient definition remains fixed: patient_id = Directory_*.",
+        flush=True,
+    )
+
     # ======================================================================
     # MAIN STAGE 1 -- VALIDATE THE COMPLETE RUN CONFIGURATION
     # ======================================================================
@@ -4364,7 +4981,18 @@ def main():
     # Output:
     #     no returned value; success means the configuration is internally
     #     coherent, while any invalid setting raises an explicit exception.
+    stage_started_at = _print_stage_start(
+        1,
+        "Validate the complete run configuration",
+        "Usually very fast; pure validation with no dataset scan or model inference.",
+    )
     validate_configuration()
+    stage_durations["01 Configuration validation"] = _print_stage_complete(
+        1,
+        "Validate the complete run configuration",
+        stage_started_at,
+        "All configuration checks passed.",
+    )
 
     # ======================================================================
     # MAIN STAGE 2 -- CREATE THE CONFIGURATION-SPECIFIC OUTPUT DIRECTORY
@@ -4373,7 +5001,18 @@ def main():
     # from different ablations are written to separate directories. ``parents``
     # creates missing upper directories and ``exist_ok`` allows a repeated run
     # to reuse the same destination without deleting existing files.
+    stage_started_at = _print_stage_start(
+        2,
+        "Create the configuration-specific output directory",
+        "Usually immediate; one filesystem directory creation/check.",
+    )
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    stage_durations["02 Output directory"] = _print_stage_complete(
+        2,
+        "Create the configuration-specific output directory",
+        stage_started_at,
+        f"Output path ready: {OUTPUT_DIR}",
+    )
 
     # ======================================================================
     # MAIN STAGE 3 -- DISCOVER IMAGES AND BUILD THE SLICE METADATA TABLE
@@ -4387,7 +5026,18 @@ def main():
     #     (image_path, binary_label, patient_id, series_id)
     #
     # No JPEG is decoded and no neural network is loaded in this stage.
+    stage_started_at = _print_stage_start(
+        3,
+        "Discover images and build the slice metadata table",
+        "Usually short to moderate; depends on filesystem speed and folder count.",
+    )
     samples = load_samples(DATASET_PATH)
+    stage_durations["03 Dataset discovery"] = _print_stage_complete(
+        3,
+        "Discover images and build the slice metadata table",
+        stage_started_at,
+        f"Discovered {len(samples)} image rows.",
+    )
 
     # ======================================================================
     # MAIN STAGE 4 -- COMPUTE THE FROZEN-FEATURE CACHE IDENTITY
@@ -4401,8 +5051,19 @@ def main():
     # cache rather than silently reusing incompatible features. The first 16
     # hexadecimal characters provide a compact directory name, while the full
     # digest remains stored in cache/run metadata.
+    stage_started_at = _print_stage_start(
+        4,
+        "Compute the frozen-feature cache identity",
+        "Moderate for very large cohorts because file metadata is read for every image.",
+    )
     fingerprint = feature_cache_fingerprint(samples, DATASET_PATH)
     cache_dir = FEATURE_CACHE_ROOT / fingerprint[:16]
+    stage_durations["04 Cache fingerprint"] = _print_stage_complete(
+        4,
+        "Compute the frozen-feature cache identity",
+        stage_started_at,
+        f"Fingerprint={fingerprint[:16]}..., cache_dir={cache_dir}",
+    )
 
     # ======================================================================
     # MAIN STAGE 5 -- TRY TO REUSE A COMPLETE, MATCHING FEATURE CACHE
@@ -4416,36 +5077,100 @@ def main():
     #
     # ``extracted`` remains None when any condition fails, which routes execution
     # to fresh model inference below.
+    stage_started_at = _print_stage_start(
+        5,
+        "Check for and load a matching frozen-feature cache",
+        "Fast for a cache miss; moderate for a hit when large NumPy arrays are read.",
+    )
     extracted = None
     if USE_FEATURE_CACHE and not FORCE_REBUILD_FEATURE_CACHE:
         extracted = load_feature_cache(cache_dir, fingerprint)
+    elif not USE_FEATURE_CACHE:
+        print("[CACHE] Feature caching is disabled by configuration.", flush=True)
+    else:
+        print(
+            "[CACHE] FORCE_REBUILD_FEATURE_CACHE=True; existing cache is "
+            "intentionally ignored.",
+            flush=True,
+        )
+
+    cache_status = "HIT" if extracted is not None else "MISS"
+    stage_durations["05 Cache lookup/load"] = _print_stage_complete(
+        5,
+        "Check for and load a matching frozen-feature cache",
+        stage_started_at,
+        f"Cache status: {cache_status}.",
+    )
 
     # ======================================================================
     # MAIN STAGE 6 -- BUILD DATASET/MODELS AND EXTRACT FROZEN SLICE FEATURES
     # ======================================================================
     # This block executes only when a valid feature cache was not loaded.
     if extracted is None:
+        stage_started_at = _print_stage_start(
+            6,
+            "Build models and extract frozen slice features",
+            "Potentially very long. First run may download models; every slice "
+            "passes through MONAI and EfficientNet when ROI mode is enabled.",
+        )
 
         # 6A. Create the lazy PyTorch Dataset.
         #     The object stores paths/metadata; individual JPEGs are decoded and
         #     converted to aligned 256×256 and 224×224 tensors on demand.
+        dataset_started_at = time.perf_counter()
+        print(
+            "[STAGE 6A] Creating the lazy MRIDataset object.",
+            flush=True,
+        )
         all_dataset = MRIDataset(samples, transform)
+        print(
+            f"[STAGE 6A] Dataset object ready in "
+            f"{_format_elapsed_time(time.perf_counter() - dataset_started_at)}; "
+            f"slices={len(all_dataset)}.",
+            flush=True,
+        )
 
         # 6B. Load the pinned MONAI segmenter only when ROI mode is enabled.
         #     Normal execution uses the verified official model.ts directly.
         #     Setting USE_MONAI_ROI=False deliberately skips all MONAI loading
         #     and creates the required full-image ablation.
-        monai_segmenter = (
-            build_monai_segmenter() if USE_MONAI_ROI else None
-        )
+        if USE_MONAI_ROI:
+            print(
+                "[STAGE 6B] Loading/preparing the MONAI ventricular segmenter.",
+                flush=True,
+            )
+            monai_started_at = time.perf_counter()
+            monai_segmenter = build_monai_segmenter()
+            print(
+                f"[STAGE 6B] MONAI segmenter ready in "
+                f"{_format_elapsed_time(time.perf_counter() - monai_started_at)}.",
+                flush=True,
+            )
+        else:
+            monai_segmenter = None
+            print(
+                "[STAGE 6B] MONAI ROI is disabled; segmenter loading is skipped.",
+                flush=True,
+            )
 
         # 6C. Initialize the explicitly pinned ImageNet EfficientNet-B0 encoder.
         #     The final ImageNet classifier is removed by FeatureExtractor.
         #     eval() disables training behavior, and requires_grad_(False)
         #     prevents accidental gradient computation or parameter updates.
+        efficientnet_started_at = time.perf_counter()
+        print(
+            "[STAGE 6C] Initializing and moving EfficientNet-B0 to the runtime device.",
+            flush=True,
+        )
         feature_extractor = FeatureExtractor().to(DEVICE)
         feature_extractor.eval()
         feature_extractor.requires_grad_(False)
+        _synchronize_timing_device()
+        print(
+            f"[STAGE 6C] EfficientNet-B0 ready in "
+            f"{_format_elapsed_time(time.perf_counter() - efficientnet_started_at)}.",
+            flush=True,
+        )
 
         # 6D. Process every decoded slice in deterministic DataLoader order:
         #       JPEG decode and exact-pixel hash
@@ -4458,6 +5183,11 @@ def main():
         #         -> QC values and optional within-series quality weight.
         #
         # Labels travel only as metadata and are not inputs to either network.
+        print(
+            "[STAGE 6D] Starting per-slice preprocessing, MONAI ROI, and "
+            "EfficientNet embedding extraction.",
+            flush=True,
+        )
         extracted = extract_features(
             all_dataset,
             monai_segmenter=monai_segmenter,
@@ -4469,7 +5199,32 @@ def main():
         #     written last as a completion marker, so a partially interrupted
         #     cache is not accepted by ``load_feature_cache``.
         if USE_FEATURE_CACHE:
+            print(
+                "[STAGE 6E] Persisting frozen features for future executions.",
+                flush=True,
+            )
             save_feature_cache(cache_dir, fingerprint, extracted)
+        else:
+            print(
+                "[STAGE 6E] Feature cache writing skipped because caching is disabled.",
+                flush=True,
+            )
+
+        stage_durations["06 Model loading and feature extraction"] = (
+            _print_stage_complete(
+                6,
+                "Build models and extract frozen slice features",
+                stage_started_at,
+                f"Extracted feature rows: {len(extracted[0])}.",
+            )
+        )
+    else:
+        stage_durations["06 Model loading and feature extraction"] = 0.0
+        _print_stage_skipped(
+            6,
+            "Build models and extract frozen slice features",
+            "A complete matching frozen-feature cache was loaded successfully.",
+        )
 
     # ======================================================================
     # MAIN STAGE 7 -- UNPACK THE ALIGNED SLICE-LEVEL EXTRACTION ARRAYS
@@ -4490,6 +5245,11 @@ def main():
     #
     # Their one-to-one alignment is checked inside ``extract_features`` or is
     # inherited from a cache that was produced by the same function.
+    stage_started_at = _print_stage_start(
+        7,
+        "Unpack and verify aligned slice-level arrays",
+        "Usually immediate; tuple unpacking and lightweight shape reporting.",
+    )
     (
         X_all,
         y_all,
@@ -4508,6 +5268,12 @@ def main():
     # It remains saved in the cache so a later predeclared quality-weighting
     # ablation can be reproduced without rerunning the frozen neural networks.
     del slice_scores_all  # retained in cache for reproducible quality ablations
+    stage_durations["07 Unpack extraction arrays"] = _print_stage_complete(
+        7,
+        "Unpack and verify aligned slice-level arrays",
+        stage_started_at,
+        f"Feature matrix shape: {X_all.shape}; labels: {y_all.shape}.",
+    )
 
     # ======================================================================
     # MAIN STAGE 8 -- AUDIT EXACT DECODED-PIXEL DUPLICATES
@@ -4518,6 +5284,11 @@ def main():
     #
     # Cross-patient equality matters because patient-level splitting alone cannot
     # prevent the same visual content from appearing in training and validation.
+    stage_started_at = _print_stage_start(
+        8,
+        "Audit exact decoded-pixel duplicates",
+        "Usually short to moderate; groups one hash per image and writes a CSV.",
+    )
     if AUDIT_EXACT_DECODED_PIXEL_DUPLICATES:
         duplicate_audit_summary = audit_exact_decoded_pixel_duplicates(
             OUTPUT_DIR / "exact_decoded_pixel_duplicate_groups.csv",
@@ -4533,6 +5304,18 @@ def main():
             "cross_patient_duplicate_groups": None,
             "cross_label_duplicate_groups": None,
         }
+        print("[DUPLICATE AUDIT] Disabled by configuration.", flush=True)
+
+    stage_durations["08 Exact duplicate audit"] = _print_stage_complete(
+        8,
+        "Audit exact decoded-pixel duplicates",
+        stage_started_at,
+        (
+            f"Duplicate groups: {duplicate_audit_summary.get('duplicate_groups')}"
+            if duplicate_audit_summary.get("enabled")
+            else "Audit was disabled."
+        ),
+    )
 
     # ======================================================================
     # MAIN STAGE 9 -- WRITE PATIENT-LEVEL MONAI QUALITY-CONTROL SUMMARIES
@@ -4541,6 +5324,11 @@ def main():
     # containing slice count, series-proxy count, plausible-mask count/rate, and
     # median diagnostics. These are QC descriptors only; without ground-truth
     # masks they must not be interpreted as Dice or segmentation accuracy.
+    stage_started_at = _print_stage_start(
+        9,
+        "Write patient-level MONAI quality-control summaries",
+        "Usually fast; aggregates existing slice-level QC arrays and writes one CSV.",
+    )
     write_monai_qc_summary(
         OUTPUT_DIR / "monai_qc_by_patient.csv",
         y_all,
@@ -4551,6 +5339,12 @@ def main():
         peak_probabilities_all,
         mean_foreground_probabilities_all,
     )
+    stage_durations["09 MONAI QC summary"] = _print_stage_complete(
+        9,
+        "Write patient-level MONAI quality-control summaries",
+        stage_started_at,
+        f"QC CSV: {OUTPUT_DIR / 'monai_qc_by_patient.csv'}",
+    )
 
     # ======================================================================
     # MAIN STAGE 10 -- RUN DIRECTORY_*-LEVEL STRATIFIED CROSS-VALIDATION
@@ -4560,6 +5354,12 @@ def main():
     # scaler, optional PCA, and Logistic Regression are fitted on training
     # patients only. The function returns exactly one out-of-fold score per
     # Directory_* patient plus the fold-specific AUC values.
+    stage_started_at = _print_stage_start(
+        10,
+        "Run Directory_*-level stratified cross-validation",
+        "Usually short for patient embeddings; can be longer for the legacy "
+        "slice-level strategy. Every fold is timed separately.",
+    )
     (
         evaluated_patient_ids,
         patient_ground_truth,
@@ -4573,13 +5373,25 @@ def main():
         series_all,
         quality_weights_all,
     )
+    stage_durations["10 Patient-level cross-validation"] = _print_stage_complete(
+        10,
+        "Run Directory_*-level stratified cross-validation",
+        stage_started_at,
+        f"Generated OOF scores for {len(evaluated_patient_ids)} patients.",
+    )
 
     # ======================================================================
     # MAIN STAGE 11 -- CALCULATE THE POOLED OOF AUC AND PATIENT BOOTSTRAP CI
     # ======================================================================
     # The primary ranking metric is computed from the complete set of held-out
     # patient predictions, not from training predictions or individual slices.
+    stage_started_at = _print_stage_start(
+        11,
+        "Calculate pooled OOF AUC and bootstrap confidence interval",
+        f"Usually short to moderate; runs {BOOTSTRAP_REPLICATES} patient-level replicates.",
+    )
     auc = roc_auc_score(patient_ground_truth, patient_scores)
+    print(f"[METRICS] Pooled OOF AUC computed: {auc:.6f}", flush=True)
 
     # The bootstrap resamples Normal and Sick patient rows separately with
     # replacement, guaranteeing that each replicate contains both classes. The
@@ -4589,18 +5401,35 @@ def main():
         patient_ground_truth,
         patient_scores,
     )
+    stage_durations["11 AUC and bootstrap CI"] = _print_stage_complete(
+        11,
+        "Calculate pooled OOF AUC and bootstrap confidence interval",
+        stage_started_at,
+        f"AUC={auc:.6f}, 95% CI=[{auc_ci_lower:.6f}, {auc_ci_upper:.6f}]",
+    )
 
     # ======================================================================
     # MAIN STAGE 12 -- SAVE ONE TRANSPARENT OOF ROW PER PATIENT
     # ======================================================================
     # This CSV is the auditable basis for the pooled AUC. It records patient ID,
     # true label, held-out fold, and the uncalibrated positive-class model score.
+    stage_started_at = _print_stage_start(
+        12,
+        "Save one auditable OOF prediction row per patient",
+        "Usually immediate; writes a small CSV with one row per Directory_* patient.",
+    )
     write_oof_predictions(
         OUTPUT_DIR / "patient_oof_predictions.csv",
         evaluated_patient_ids,
         patient_ground_truth,
         patient_scores,
         patient_folds,
+    )
+    stage_durations["12 Save OOF predictions"] = _print_stage_complete(
+        12,
+        "Save one auditable OOF prediction row per patient",
+        stage_started_at,
+        f"OOF CSV: {OUTPUT_DIR / 'patient_oof_predictions.csv'}",
     )
 
     # ======================================================================
@@ -4610,6 +5439,11 @@ def main():
     # model provenance, configured hashes, artifact hashes when present, cache
     # schema, and output locations. Evaluation results and duplicate-audit counts
     # are then added to the same JSON object.
+    stage_started_at = _print_stage_start(
+        13,
+        "Collect provenance metadata and save the run summary",
+        "Usually fast; hashing large model artifacts may take several seconds.",
+    )
     summary = collect_run_metadata()
     summary.update(
         {
@@ -4633,6 +5467,12 @@ def main():
         json.dumps(summary, indent=2, sort_keys=True),
         encoding="utf-8",
     )
+    stage_durations["13 Save run metadata"] = _print_stage_complete(
+        13,
+        "Collect provenance metadata and save the run summary",
+        stage_started_at,
+        f"Run summary: {OUTPUT_DIR / 'run_summary.json'}",
+    )
 
     # ======================================================================
     # MAIN STAGE 14 -- PRINT THE PRIMARY PATIENT-LEVEL RESULT
@@ -4640,6 +5480,11 @@ def main():
     # The console summary intentionally repeats the effective patient count and
     # explicitly warns that the scores are not externally calibrated clinical
     # probabilities. The saved CSV/JSON files remain the authoritative records.
+    stage_started_at = _print_stage_start(
+        14,
+        "Print the primary patient-level result",
+        "Immediate; console reporting only.",
+    )
     print("\n============================================================")
     print("FINAL OUT-OF-FOLD PATIENT-LEVEL RESULT")
     print("============================================================")
@@ -4653,12 +5498,22 @@ def main():
         "Scores are model outputs from Logistic Regression and are not "
         "claimed to be externally calibrated clinical probabilities."
     )
+    stage_durations["14 Print primary result"] = _print_stage_complete(
+        14,
+        "Print the primary patient-level result",
+        stage_started_at,
+    )
 
     # ======================================================================
     # MAIN STAGE 15 -- PRINT EVERY PATIENT'S AUDITABLE OOF SCORE
     # ======================================================================
     # Iterating over aligned arrays makes it possible to compare console output
     # directly with patient_oof_predictions.csv. Each patient appears once.
+    stage_started_at = _print_stage_start(
+        15,
+        "Print every patient's auditable OOF score",
+        "Fast for a small cohort; console output grows linearly with patient count.",
+    )
     print("\nPATIENT-LEVEL OOF SCORES:")
     for patient_id, label, fold, score in zip(
         evaluated_patient_ids,
@@ -4671,14 +5526,39 @@ def main():
             f"fold={int(fold)}, uncalibrated_CAD_score={float(score):.6f}"
         )
 
+    stage_durations["15 Print patient scores"] = _print_stage_complete(
+        15,
+        "Print every patient's auditable OOF score",
+        stage_started_at,
+        f"Printed {len(evaluated_patient_ids)} patient rows.",
+    )
+
     # ======================================================================
     # MAIN STAGE 16 -- REPORT THE OUTPUT LOCATION AND NORMAL COMPLETION
     # ======================================================================
     # Reaching this point means validation, extraction/cache loading, audits,
     # cross-validation, metrics, and all principal output writes completed
     # without raising an exception.
-    print(f"\nOutputs saved under: {OUTPUT_DIR}")
-    print("Done!")
+    stage_started_at = _print_stage_start(
+        16,
+        "Report output location and finalize execution",
+        "Immediate; final console messages and timing summary.",
+    )
+    print(f"\nOutputs saved under: {OUTPUT_DIR}", flush=True)
+    stage_durations["16 Finalize execution"] = _print_stage_complete(
+        16,
+        "Report output location and finalize execution",
+        stage_started_at,
+    )
+
+    total_elapsed = time.perf_counter() - pipeline_started_at
+    _print_timing_summary(stage_durations, total_elapsed)
+    print(
+        f"[PIPELINE] Completed successfully in "
+        f"{_format_elapsed_time(total_elapsed)}.",
+        flush=True,
+    )
+    print("Done!", flush=True)
 
 
 # The execution guard is essential on platforms that use process spawning
