@@ -1275,8 +1275,13 @@ def load_samples(root_dir):
             if not os.path.isdir(patient_path):
                 continue
 
-            if not directory.lower().startswith("directory_"):
+            if (directory.lower() != "directory_1" and directory.lower() != "directory_17"
+                    # and directory.lower() != "directory_2" and directory.lower() != "directory_18"
+            ):
                 continue
+
+            # if not directory.lower().startswith("directory_"):
+            #     continue
 
             # The user-validated patient unit is Directory_* itself.
             # Do NOT derive a patient from SR_*, series names, filenames or
