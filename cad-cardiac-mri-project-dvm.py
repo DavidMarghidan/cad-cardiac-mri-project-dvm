@@ -462,7 +462,7 @@ CLASSIFICATION_STRATEGY = "patient_embedding"
 #       series and patient scores. This remains useful as a declared ablation,
 #       but it does not remove within-patient pseudo-replication from fitting.
 
-N_SPLITS = 5
+N_SPLITS = 2
 CV_RANDOM_STATE = RANDOM_SEED
 LOGISTIC_C = 1.0
 LOGISTIC_MAX_ITER = 2000
@@ -1276,7 +1276,7 @@ def load_samples(root_dir):
                 continue
 
             if (directory.lower() != "directory_1" and directory.lower() != "directory_17"
-                    # and directory.lower() != "directory_2" and directory.lower() != "directory_18"
+                    and directory.lower() != "directory_2" and directory.lower() != "directory_18"
             ):
                 continue
 
