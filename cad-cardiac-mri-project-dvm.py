@@ -150,6 +150,93 @@
 #   slice Logistic Regression → series log-odds fusion → patient log-odds fusion
 #
 # ============================================================================
+# DETAILED DATA CONTRACT AND SHAPE TRACE
+# ============================================================================
+#
+# The pipeline passes a small number of clearly defined objects from one stage
+# to the next. Keeping these contracts explicit makes it easier to debug shape,
+# grouping, leakage, and caching errors:
+#
+#   A. ``samples`` -- Python list created by ``load_samples``
+#
+#      Each element is:
+#
+#          (image_path, label, patient_id, series_id)
+#
+#      where ``patient_id`` is always Directory_* and ``series_id`` is a
+#      patient-scoped folder proxy such as Directory_24/SR_3. The label is
+#      metadata only during frozen image processing; it is never supplied to
+#      MONAI or EfficientNet.
+#
+#   B. One ``MRIDataset`` item -- tensors plus immutable metadata
+#
+#          classification_image : [3, 224, 224], float, initially in [0,1]
+#          monai_image          : [1, 256, 256], float, in [0,1]
+#          label                : scalar 0 or 1
+#          patient_id           : Directory_* string
+#          series_id            : patient-scoped folder-proxy string
+#          sample_index         : deterministic position in ``samples``
+#          decoded_pixel_hash   : exact decoded-pixel SHA-256 string
+#
+#   C. One DataLoader batch -- the same objects with a leading batch dimension
+#
+#          images       : [B, 3, 224, 224]
+#          monai_images : [B, 1, 256, 256]
+#
+#   D. MONAI outputs -- used only when ``USE_MONAI_ROI=True``
+#
+#          logits                  : [B, 4, 256, 256]
+#          heart probability       : [B, 1, 256, 256]
+#          aligned ROI probability : [B, 1, 224, 224]
+#          valid_mask              : [B], one plausibility decision per slice
+#
+#      A failed plausibility check does not delete the slice. It selects the
+#      unmodified full image for that slice.
+#
+#   E. EfficientNet output
+#
+#          slice embedding : [B, 1280]
+#
+#      The 1000-class ImageNet head is removed. These vectors are frozen image
+#      descriptors, not CAD predictions.
+#
+#   F. Cached extraction arrays -- one row per decoded JPEG slice
+#
+#      Features, labels, patient IDs, series IDs, optional quality weights,
+#      MONAI QC values, slice scores, and decoded-pixel hashes are stored with
+#      one-to-one row alignment. Changing any feature-affecting setting changes
+#      the cache fingerprint.
+#
+#   G. Recommended supervised input
+#
+#      Slice embeddings are pooled within each series proxy, then equally across
+#      all series proxies of one Directory_* patient. The classifier therefore
+#      receives exactly one vector and one label per patient.
+#
+#   H. Evaluation output
+#
+#      Every Directory_* patient receives exactly one out-of-fold score and one
+#      fold identifier. Pooled ROC-AUC and a stratified patient bootstrap
+#      confidence interval are calculated from those patient rows.
+#
+# TRAINED VERSUS FROZEN COMPONENTS
+# --------------------------------
+#
+#   Frozen / inference-only:
+#       - MONAI ventricular segmenter
+#       - ImageNet EfficientNet-B0 encoder
+#       - deterministic image preprocessing and pooling rules
+#
+#   Fitted separately inside every training fold:
+#       - StandardScaler
+#       - optional PCA
+#       - Logistic Regression
+#
+# This distinction is central to leakage control. Validation-patient labels and
+# embeddings are never used to fit fold-local preprocessing or classification.
+#
+# ============================================================================
+# ============================================================================
 # WHY THIS PIPELINE?
 # ============================================================================
 #
@@ -477,10 +564,10 @@ MONAI_MODEL_SHA256 = (
 MONAI_ROI_DILATION_KERNEL = 31
 # Expands the predicted ventricular structures to retain a margin around the
 # myocardium. Must be an odd positive integer so output size remains unchanged.
-# 17  → extindere mică
-# 31  → extindere moderată
-# 41  → extindere mare
-# 51  → foarte mare
+# 17  → small spatial expansion
+# 31  → moderate spatial expansion (current setting)
+# 41  → large spatial expansion
+# 51  → very large spatial expansion
 
 MONAI_BACKGROUND_WEIGHT = 0.15
 # Soft ROI background retention.
@@ -488,11 +575,11 @@ MONAI_BACKGROUND_WEIGHT = 0.15
 # A value of 0 would remove all pixels outside the predicted cardiac region.
 # That is risky under domain shift. A value of 0.15 keeps 15% of the original
 # background signal while emphasizing the predicted heart region.
-# 0.00 = exterior complet eliminat
-# 0.15 = exterior foarte atenuat       ← actual
-# 0.30 = păstrează destul context
-# 0.40 = păstrează mult context
-# 1.00 = practic fără ROI
+# 0.00 = background completely removed
+# 0.15 = background strongly attenuated  ← current setting
+# 0.30 = retains a moderate amount of context
+# 0.40 = retains substantial context
+# 1.00 = effectively no ROI attenuation
 
 MONAI_MIN_HEART_AREA_RATIO = 0.003
 MONAI_MAX_HEART_AREA_RATIO = 0.50
@@ -647,8 +734,19 @@ else:
 # CONFIGURATION VALIDATION
 # =============================
 
+# This validation function is intentionally called before dataset scanning,
+# model loading, downloading, GPU allocation, or feature extraction. A malformed
+# setting should fail immediately, before the pipeline spends time or creates
+# cache/output files that could later be mistaken for a valid experiment.
 def validate_configuration():
     """Fail early for settings that would create invalid or ambiguous runs."""
+
+
+    # ------------------------------------------------------------------
+    # 1. Validate the top-level supervised-learning strategy.
+    # ------------------------------------------------------------------
+    # Only named, reviewed strategies are accepted. Rejecting arbitrary strings
+    # prevents a typo from silently selecting an unintended branch later.
 
     valid_strategies = {
         "patient_embedding",
@@ -661,6 +759,11 @@ def validate_configuration():
             f"{sorted(valid_strategies)}, got {CLASSIFICATION_STRATEGY!r}."
         )
 
+    # ------------------------------------------------------------------
+    # 2. Validate ROI geometry and probability-gate settings.
+    # ------------------------------------------------------------------
+    # The dilation kernel must be odd because max-pooling uses symmetric
+    # padding of ``kernel // 2`` and is expected to preserve H×W dimensions.
     if MONAI_ROI_DILATION_KERNEL <= 0 or MONAI_ROI_DILATION_KERNEL % 2 == 0:
         raise ValueError(
             "MONAI_ROI_DILATION_KERNEL must be a positive odd integer."
@@ -681,6 +784,11 @@ def validate_configuration():
             "MONAI_MIN_PEAK_HEART_PROBABILITY must lie in [0,1]."
         )
 
+    # ------------------------------------------------------------------
+    # 3. Validate the spatial contracts of both pretrained networks.
+    # ------------------------------------------------------------------
+    # The reviewed preprocessing, mask alignment, and feature-cache semantics
+    # assume MONAI 256×256 input and EfficientNet 224×224 input.
     if IMG_SIZE <= 0 or MONAI_INPUT_SIZE <= 0:
         raise ValueError("Image sizes must be strictly positive.")
 
@@ -697,14 +805,27 @@ def validate_configuration():
             "256x256 input. Keep MONAI_INPUT_SIZE=256."
         )
 
+    # ------------------------------------------------------------------
+    # 4. Validate execution controls that affect batching and data loading.
+    # ------------------------------------------------------------------
+    # These checks prevent impossible DataLoader configurations. Batch size
+    # affects throughput and memory consumption, but not the patient grouping.
     if BATCH_SIZE <= 0:
         raise ValueError("BATCH_SIZE must be strictly positive.")
 
     if DATALOADER_NUM_WORKERS < 0:
         raise ValueError("DATALOADER_NUM_WORKERS cannot be negative.")
 
+    # Parse the debug selector now so an invalid value is detected before
+    # the expensive extraction loop starts. The function returns a normalized
+    # percentage, but validation needs only to prove that parsing succeeds.
     _parse_debug_indices(DEBUG_INDICES)
 
+    # ------------------------------------------------------------------
+    # 5. Validate optional heuristic weighting and duplicate-audit policies.
+    # ------------------------------------------------------------------
+    # A positive lower bound guarantees that enabling the heuristic does not
+    # silently delete a slice by assigning it exactly zero influence.
     if not 0.0 < SLICE_QUALITY_MIN_WEIGHT <= 1.0:
         raise ValueError(
             "SLICE_QUALITY_MIN_WEIGHT must lie in (0,1]."
@@ -719,6 +840,11 @@ def validate_configuration():
             "enabled."
         )
 
+    # ------------------------------------------------------------------
+    # 6. Validate model provenance identifiers before any network is loaded.
+    # ------------------------------------------------------------------
+    # SHA-256 strings must be syntactically valid hexadecimal digests. The
+    # actual file content is checked later, after the artifact is located.
     if VERIFY_MONAI_ARTIFACT_SHA256:
         for digest_name, digest_value in (
             (
@@ -741,6 +867,11 @@ def validate_configuration():
             "MONAI_HF_REPO_ID and MONAI_HF_REVISION must be non-empty."
         )
 
+    # ------------------------------------------------------------------
+    # 7. Validate the explicitly pinned EfficientNet checkpoint enum.
+    # ------------------------------------------------------------------
+    # Using a named enum rather than ``DEFAULT`` prevents a future torchvision
+    # release from silently substituting a different pretrained checkpoint.
     if EFFICIENTNET_WEIGHTS_NAME not in (
         models.EfficientNet_B0_Weights.__members__
     ):
@@ -749,6 +880,11 @@ def validate_configuration():
             f"{EFFICIENTNET_WEIGHTS_NAME!r}."
         )
 
+    # ------------------------------------------------------------------
+    # 8. Validate fold-local classifier and uncertainty settings.
+    # ------------------------------------------------------------------
+    # These are basic syntactic checks. Class-specific patient counts are only
+    # known after dataset discovery and are checked inside cross-validation.
     if N_SPLITS < 2:
         raise ValueError("N_SPLITS must be at least 2.")
 
@@ -783,14 +919,22 @@ def scale_intensity_0_1(image):
     A constant image is converted to zeros to avoid division by zero.
     """
 
+    # Convert before subtraction/division. Performing these operations on
+    # uint8 could wrap negative values and would not preserve fractional output.
     image = image.astype(np.float32)
 
+    # Compute the dynamic range independently for this JPEG. MRI JPEG
+    # exports do not preserve a shared physical intensity unit across images.
     minimum = float(image.min())
     maximum = float(image.max())
 
+    # A constant image has zero dynamic range. Returning an all-zero array
+    # is deterministic and avoids a division-by-zero NaN propagation.
     if maximum <= minimum:
         return np.zeros_like(image, dtype=np.float32)
 
+    # Linear min-max scaling maps the darkest pixel to 0 and the brightest
+    # pixel to 1 while preserving within-image intensity ordering.
     return (image - minimum) / (maximum - minimum)
 
 
@@ -813,16 +957,22 @@ def zero_pad_to_monai_canvas(image):
     bundle preprocessing and should be reported if oversized inputs occur.
     """
 
+    # Step 1: enforce the grayscale two-dimensional input contract. This
+    # catches accidental H×W×C input before any geometry calculation.
     if image.ndim != 2:
         raise ValueError(
             f"Expected a 2D grayscale image, received shape {image.shape}."
         )
 
+    # Step 2: read native geometry. These dimensions determine whether
+    # downscaling is necessary; smaller images are never enlarged here.
     height, width = image.shape
 
     if height <= 0 or width <= 0:
         raise ValueError(f"Invalid image dimensions: {image.shape}.")
 
+    # Step 3: choose one isotropic scale factor for both axes. The leading
+    # 1.0 caps the factor, so the function can downscale but cannot upsample.
     scale = min(
         1.0,
         MONAI_INPUT_SIZE / height,
@@ -832,6 +982,8 @@ def zero_pad_to_monai_canvas(image):
     resized_height = max(1, int(round(height * scale)))
     resized_width = max(1, int(round(width * scale)))
 
+    # Step 4: resize only when at least one dimension exceeds the canvas.
+    # INTER_AREA is appropriate for downsampling and reduces aliasing.
     if resized_height != height or resized_width != width:
         resized = cv2.resize(
             image,
@@ -841,14 +993,20 @@ def zero_pad_to_monai_canvas(image):
     else:
         resized = image
 
+    # Step 5: allocate the fixed MONAI canvas. Zero corresponds to the
+    # minimum of the already normalized intensity range and acts as padding.
     canvas = np.zeros(
         (MONAI_INPUT_SIZE, MONAI_INPUT_SIZE),
         dtype=np.float32,
     )
 
+    # Step 6: compute centered integer offsets. An odd unused margin leaves
+    # one extra padding pixel on the bottom or right, which is deterministic.
     top = (MONAI_INPUT_SIZE - resized_height) // 2
     left = (MONAI_INPUT_SIZE - resized_width) // 2
 
+    # Step 7: copy the complete resized field of view into the centered
+    # region. No cropping is performed by this helper.
     canvas[
         top:top + resized_height,
         left:left + resized_width,
@@ -928,6 +1086,10 @@ class MRIDataset(Dataset):
 
     def __init__(self, samples, transform=None):
 
+
+        # Store only lightweight paths and metadata. JPEG decoding is deferred
+        # to ``__getitem__`` so DataLoader controls when each image is read.
+
         self.samples = samples
         # List containing:
         #   (image_path, binary_label, patient_id, series_id)
@@ -939,9 +1101,18 @@ class MRIDataset(Dataset):
 
     def __len__(self):
 
+
+        # DataLoader uses this exact count to determine epoch/batch coverage.
+        # Because ``shuffle=False`` during extraction, indices remain aligned
+        # with ``samples`` and with deterministic debug selection.
+
         return len(self.samples)
 
     def __getitem__(self, idx):
+
+
+        # Resolve the immutable metadata row first. The class label and grouping
+        # identifiers are returned unchanged; they do not influence pixels.
 
         img_path, label, patient_id, series_id = self.samples[idx]
 
@@ -959,6 +1130,9 @@ class MRIDataset(Dataset):
         # Hash the decoded uint8 matrix BEFORE any normalization or resizing.
         # Shape is included so two byte streams with different geometry cannot
         # collide merely because their flattened bytes happen to match.
+        # The duplicate hash is deliberately computed on decoded pixels rather
+        # than JPEG file bytes. Two JPEG containers with different metadata but
+        # exactly identical decoded matrices therefore receive the same hash.
         pixel_digest = hashlib.sha256()
         pixel_digest.update(
             np.asarray(image.shape, dtype=np.int32).tobytes()
@@ -998,6 +1172,9 @@ class MRIDataset(Dataset):
             axis=-1,
         )
 
+        # Convert HWC NumPy layout to CHW tensor layout. No ImageNet
+        # normalization is applied here because ROI weighting must operate on
+        # interpretable [0,1] intensities first.
         if self.transform:
             classification_image = self.transform(classification_image)
         else:
@@ -1005,6 +1182,9 @@ class MRIDataset(Dataset):
                 classification_image
             ).permute(2, 0, 1)
 
+        # Return every tensor and metadata field in a fixed order. The default
+        # PyTorch collate function stacks tensors and keeps strings as lists,
+        # which is exactly what ``extract_features`` expects.
         return (
             classification_image,
             monai_image,
@@ -1067,10 +1247,15 @@ def load_samples(root_dir):
         (image_path, binary_label, patient_id, series_id)
     """
 
+    # ``samples`` preserves one row per discovered image. The two maps/sets
+    # below enforce global patient identity and label consistency independently
+    # of how many series folders or images each patient contains.
     samples = []
     discovered_patients = set()
     patient_to_class = {}
 
+    # Stage 1: traverse the two expected top-level class directories in a
+    # fixed order. Sorting at every lower level makes discovery deterministic.
     for class_name in ["Normal", "Sick"]:
 
         label = 0 if class_name == "Normal" else 1
@@ -1081,6 +1266,8 @@ def load_samples(root_dir):
                 f"Missing expected class directory: {class_path}"
             )
 
+        # Stage 2: inspect immediate children of the class directory. Only
+        # Directory_* folders are eligible to become computational patients.
         for directory in sorted(os.listdir(class_path)):
 
             patient_path = os.path.join(class_path, directory)
@@ -1104,6 +1291,9 @@ def load_samples(root_dir):
                     "globally unique when it is used as patient_id."
                 )
 
+            # Record the globally unique patient-to-class relation before any
+            # image rows are appended. This makes a cross-class collision fail
+            # deterministically at the first conflicting folder.
             patient_to_class[patient_id] = class_name
             discovered_patients.add(patient_id)
 
@@ -1177,6 +1367,8 @@ def load_samples(root_dir):
                     # artificial series proxies with zero observations.
                     continue
 
+    # Stage 3: perform cohort-level existence checks after traversal. Empty
+    # datasets or an incorrect root path must never continue into model loading.
     if not samples:
         raise RuntimeError(
             f"No MRI images were discovered under dataset path: {root_dir}"
@@ -1188,6 +1380,8 @@ def load_samples(root_dir):
             "Verify the dataset path and folder structure."
         )
 
+    # Stage 4: verify the final image-level table. This second check ensures
+    # that every appended row for one patient carries the same binary label.
     # -------------------------------------------------------------
     # Sanity checks that should fail early rather than silently
     # contaminating a publication experiment.
@@ -1205,6 +1399,8 @@ def load_samples(root_dir):
 
         patient_to_label[patient_id] = label
 
+    # Stage 5: print counts at the patient, image, and folder-proxy levels.
+    # The patient count is the effective labeled sample size used by evaluation.
     print("Dataset discovery summary")
     print(f"  Patients: {len(patient_to_label)}")
     print(
@@ -1245,6 +1441,8 @@ transform = transforms.Compose([
 def sha256_file(path):
     """Calculate a file's SHA-256 digest without loading it fully into memory."""
 
+    # Stream the artifact in 1 MiB chunks. This keeps memory usage bounded
+    # even for a large checkpoint and produces the same digest as one-shot read.
     digest = hashlib.sha256()
 
     with open(path, "rb") as file:
@@ -1275,6 +1473,8 @@ def locate_monai_bundle_root():
     accepted only when the requested bundle slug occurs in its path.
     """
 
+    # First try the canonical layout because it is unambiguous and avoids a
+    # potentially expensive recursive search through old bundle directories.
     direct_root = MONAI_BUNDLE_DIR / MONAI_BUNDLE_NAME
 
     if any(
@@ -1286,6 +1486,8 @@ def locate_monai_bundle_root():
     ):
         return direct_root
 
+    # If the canonical location is absent, search deterministic legacy
+    # layouts. Candidate paths still must contain the requested bundle slug.
     if MONAI_BUNDLE_DIR.exists():
         candidate_artifacts = []
 
@@ -1317,6 +1519,8 @@ def validate_monai_bundle_metadata(bundle_root):
     verified. Present metadata must match the pinned version and I/O contract.
     """
 
+    # Metadata validation checks declared provenance and tensor contracts;
+    # it does not replace cryptographic verification of the model file itself.
     metadata_path = bundle_root / "configs" / "metadata.json"
 
     if not metadata_path.is_file():
@@ -1375,6 +1579,8 @@ def validate_monai_bundle_metadata(bundle_root):
 def validate_monai_train_config(bundle_root):
     """Check that fallback reconstruction matches the official train config."""
 
+    # The fallback architecture is hard-coded below, so train.json is used
+    # as an independent contract check before official weights are loaded.
     train_path = bundle_root / "configs" / "train.json"
 
     if not train_path.is_file():
@@ -1421,6 +1627,8 @@ def verify_monai_artifact_sha256(path, expected_sha256, artifact_label):
             f"{artifact_label}."
         )
 
+    # Calculate the digest immediately before use. A cached filename alone
+    # is not sufficient evidence that the intended bytes are present.
     actual_sha256 = sha256_file(path)
 
     if actual_sha256.lower() != expected_sha256.lower():
@@ -1445,6 +1653,8 @@ def ensure_monai_bundle(required_relative_paths=None):
     receives ``allow_patterns`` so unrelated repository files are not fetched.
     """
 
+    # Normalize the requested file list first. The ordinary execution path
+    # intentionally requests only model.ts and metadata.json.
     if required_relative_paths is None:
         required_relative_paths = (
             "models/model.ts",
@@ -1455,6 +1665,8 @@ def ensure_monai_bundle(required_relative_paths=None):
         dict.fromkeys(str(path) for path in required_relative_paths)
     )
 
+    # Resolve a local candidate and identify exactly which requested files
+    # are absent before deciding whether network access is necessary.
     bundle_root = locate_monai_bundle_root()
     missing = [
         relative_path
@@ -1527,6 +1739,8 @@ def load_and_validate_torchscript_segmenter(path, source_description):
 
     global MONAI_RUNTIME_SOURCE, MONAI_RUNTIME_ARTIFACT_PATH
 
+    # Load directly onto the selected runtime device. The subsequent zero-
+    # input test validates executability, output type, shape, and finite values.
     network = torch.jit.load(
         str(path),
         map_location=DEVICE,
@@ -1594,6 +1808,8 @@ def load_checkpoint_state_dict(path):
     loading. Upgrade PyTorch if this call is unsupported.
     """
 
+    # Use restricted ``weights_only`` deserialization. A checkpoint is data,
+    # not trusted executable Python, and unrestricted pickle loading is refused.
     try:
         checkpoint = torch.load(
             path,
@@ -1648,6 +1864,8 @@ def build_monai_segmenter():
     strict weight loading and local TorchScript export.
     """
 
+    # Preserve the original official-artifact failure so a later fallback
+    # error can report useful context without hiding the primary problem.
     official_failure = None
 
     # =========================================================
@@ -1890,6 +2108,9 @@ def predict_monai_heart_masks(
     it is trusted. Invalid masks trigger a full-image fallback later.
     """
 
+    # Step 1: run frozen segmentation inference. ``torch.inference_mode``
+    # disables autograd bookkeeping and guarantees this function cannot train
+    # or update the MONAI network.
     logits = monai_segmenter(monai_images)
 
     if logits.ndim != 4 or logits.shape[1] != 4:
@@ -1901,13 +2122,19 @@ def predict_monai_heart_masks(
     # Softmax is intentionally evaluated in float32 even when CUDA AMP is
     # enabled, because probability/gating calculations are more numerically
     # stable than in float16.
+    # Step 2: convert mutually exclusive class logits to probabilities.
+    # Float32 is used for the softmax and all gate statistics even under AMP.
     class_probabilities = torch.softmax(logits.float(), dim=1)
 
+    # Step 3: combine all three foreground anatomy classes into one soft
+    # cardiac probability. Background channel 0 is intentionally excluded.
     heart_probability = class_probabilities[:, 1:, :, :].sum(
         dim=1,
         keepdim=True,
     ).clamp(0.0, 1.0)
 
+    # Step 4: derive a hard class assignment only for plausibility/QC. The
+    # soft probability, not this binary mask, controls ROI intensity weighting.
     class_map = torch.argmax(
         class_probabilities,
         dim=1,
@@ -1916,6 +2143,8 @@ def predict_monai_heart_masks(
 
     hard_mask_256 = (class_map > 0).float()
 
+    # Step 5: calculate per-slice diagnostics on the original 256×256 mask.
+    # These metrics describe the model output; they are not accuracy estimates.
     area_ratio = hard_mask_256.mean(dim=(1, 2, 3))
     peak_probability = heart_probability.amax(dim=(1, 2, 3))
 
@@ -1925,6 +2154,8 @@ def predict_monai_heart_masks(
         / foreground_pixel_count.clamp_min(1.0)
     )
 
+    # Step 6: apply the predeclared plausibility gate independently to every
+    # slice. The result is a Boolean selector for ROI versus full-image fallback.
     valid_mask = (
         (area_ratio >= MONAI_MIN_HEART_AREA_RATIO)
         & (area_ratio <= MONAI_MAX_HEART_AREA_RATIO)
@@ -1934,6 +2165,8 @@ def predict_monai_heart_masks(
     # Max pooling expands the ROI around the predicted ventricles and
     # myocardium. This prevents a narrow segmentation from cutting away nearby
     # diagnostically useful cardiac tissue.
+    # Step 7: dilate both soft and hard masks with stride-one max pooling.
+    # The operation adds a contextual margin around the predicted ventricles.
     roi_probability_256 = F.max_pool2d(
         heart_probability,
         kernel_size=MONAI_ROI_DILATION_KERNEL,
@@ -1948,6 +2181,8 @@ def predict_monai_heart_masks(
         padding=MONAI_ROI_DILATION_KERNEL // 2,
     )
 
+    # Step 8: map masks from MONAI coordinates to the aligned 224×224
+    # EfficientNet canvas. Bilinear interpolation preserves a smooth soft map.
     roi_probability = F.interpolate(
         roi_probability_256,
         size=classifier_size,
@@ -1990,6 +2225,8 @@ def apply_confidence_gated_soft_roi(images, roi_probability, valid_mask):
     may not generalize to every image type in the CAD JPEG release.
     """
 
+    # Step 1: validate image and mask tensor contracts before relying on
+    # broadcasting. Shape errors here usually indicate preprocessing mismatch.
     if images.ndim != 4 or images.shape[1] != 3:
         raise ValueError(
             f"Expected classifier images [B,3,H,W], got {tuple(images.shape)}."
@@ -2003,15 +2240,22 @@ def apply_confidence_gated_soft_roi(images, roi_probability, valid_mask):
 
     roi_probability = roi_probability.clamp(0.0, 1.0)
 
+    # Step 2: transform probability into an attenuation field. A pixel with
+    # P(heart)=0 retains ``MONAI_BACKGROUND_WEIGHT`` of its intensity, while a
+    # pixel with P(heart)=1 retains its full intensity.
     roi_weight = (
         MONAI_BACKGROUND_WEIGHT
         + (1.0 - MONAI_BACKGROUND_WEIGHT) * roi_probability
     )
 
+    # Step 3: replicate the one-channel spatial weight over the three
+    # identical grayscale channels expected by EfficientNet.
     roi_weight = roi_weight.repeat(1, 3, 1, 1)
 
     weighted_images = images * roi_weight
 
+    # Step 4: reshape the per-slice gate so it broadcasts over channel and
+    # spatial dimensions without mixing decisions between batch elements.
     valid_mask = valid_mask.view(-1, 1, 1, 1)
 
     # torch.where applies the decision independently to every slice in a batch.
@@ -2026,6 +2270,8 @@ def normalize_for_efficientnet(images):
     intentionally completed before this step.
     """
 
+    # Construct per-channel constants on the same device and with the same
+    # dtype as the input, avoiding implicit CPU/GPU copies or dtype promotion.
     mean = torch.tensor(
         EFFICIENTNET_MEAN,
         device=images.device,
@@ -2183,6 +2429,10 @@ class FeatureExtractor(nn.Module):
 
     def __init__(self):
 
+
+        # Resolve the exact pretrained-weight enum configured for this run. The
+        # enum also documents the matching ImageNet normalization constants.
+
         super().__init__()
 
         weights = models.EfficientNet_B0_Weights[
@@ -2191,9 +2441,15 @@ class FeatureExtractor(nn.Module):
 
         self.model = models.efficientnet_b0(weights=weights)
 
+        # Replace only the final classifier. The convolutional backbone and
+        # global pooling remain intact, so forward() returns a 1280-D vector.
         self.model.classifier = nn.Identity()
 
     def forward(self, x):
+
+
+        # No additional trainable layer is introduced here. Input tensors pass
+        # directly through the frozen EfficientNet feature encoder.
 
         return self.model(x)
 
@@ -2369,6 +2625,11 @@ def extract_features(
             duplicate auditing.
     """
 
+    # ------------------------------------------------------------------
+    # Extraction stage 1: build a deterministic, non-shuffled DataLoader.
+    # ------------------------------------------------------------------
+    # Stable ordering is required because every returned array must stay aligned
+    # with ``dataset.samples`` and its decoded-pixel duplicate hashes.
     loader = DataLoader(
         dataset,
         batch_size=BATCH_SIZE,
@@ -2378,6 +2639,11 @@ def extract_features(
         persistent_workers=(DATALOADER_NUM_WORKERS > 0),
     )
 
+    # ------------------------------------------------------------------
+    # Extraction stage 2: allocate append-only collectors.
+    # ------------------------------------------------------------------
+    # Features are accumulated batch-wise to avoid preallocating a potentially
+    # very large matrix before the first successful model inference.
     all_features = []
     all_labels = []
     all_patients = []
@@ -2389,6 +2655,11 @@ def extract_features(
     all_mean_foreground_probabilities = []
     all_decoded_pixel_hashes = []
 
+    # ------------------------------------------------------------------
+    # Extraction stage 3: precompute deterministic qualitative-QC indices.
+    # ------------------------------------------------------------------
+    # Debug selection is based on global sample indices, not batch positions, so
+    # changing batch size does not change which images are visualized.
     debug_indices = (
         choose_debug_sample_indices(
             dataset.samples,
@@ -2398,10 +2669,17 @@ def extract_features(
         else set()
     )
 
+    # Mixed precision is enabled only on CUDA. CPU execution remains
+    # float32 because the chosen autocast device type below is explicitly CUDA.
     autocast_enabled = USE_CUDA_AMP and DEVICE == "cuda"
 
     with torch.inference_mode():
 
+        # ----------------------------------------------------------------
+        # Extraction stage 4: process every discovered slice exactly once.
+        # ----------------------------------------------------------------
+        # ``batch_idx`` is retained for traceability even though sample identity
+        # is carried by the stable ``sample_indices`` tensor.
         for batch_idx, batch in enumerate(tqdm(loader)):
 
             (
@@ -2414,9 +2692,16 @@ def extract_features(
                 decoded_pixel_hashes,
             ) = batch
 
+            # Move only tensors to the runtime device. Patient/series strings and
+            # decoded hashes stay on the host because networks do not consume them.
             images = images.to(DEVICE, non_blocking=True)
             monai_images = monai_images.to(DEVICE, non_blocking=True)
 
+            # -------------------------------------------------------------
+            # Extraction stage 5: create the classifier image for this batch.
+            # -------------------------------------------------------------
+            # ROI mode runs MONAI, evaluates plausibility, and chooses soft ROI
+            # or full-image fallback per slice. Ablation mode bypasses MONAI.
             if USE_MONAI_ROI:
                 if monai_segmenter is None:
                     raise RuntimeError(
@@ -2473,6 +2758,11 @@ def extract_features(
                 )
                 roi_images = images
 
+            # -------------------------------------------------------------
+            # Extraction stage 6: normalize and encode every retained image.
+            # -------------------------------------------------------------
+            # ROI weighting occurs before normalization. EfficientNet returns one
+            # frozen 1280-D embedding per input slice.
             with torch.autocast(
                 device_type="cuda",
                 dtype=torch.float16,
@@ -2491,11 +2781,20 @@ def extract_features(
             #
             # We calculate it before ImageNet normalization because the [0,1]
             # intensity scale is easier to interpret.
+            # -------------------------------------------------------------
+            # Extraction stage 7: calculate the optional heuristic score.
+            # -------------------------------------------------------------
+            # This statistic is always recorded for reproducibility, even when it
+            # is not used to alter slice influence.
             scores = torch.std(
                 roi_images,
                 dim=(1, 2, 3),
             )
 
+            # -------------------------------------------------------------
+            # Extraction stage 8: save selected qualitative ROI figures.
+            # -------------------------------------------------------------
+            # Selection and plotting do not feed back into model inputs or labels.
             if debug_indices:
                 selected_positions = [
                     position
@@ -2522,6 +2821,10 @@ def extract_features(
                         sample_indices[selected_positions],
                     )
 
+            # -------------------------------------------------------------
+            # Extraction stage 9: return tensors to CPU and append aligned rows.
+            # -------------------------------------------------------------
+            # Every collector receives exactly one entry per batch element.
             all_features.append(features.cpu().numpy())
             all_labels.extend(labels.numpy().tolist())
             all_patients.extend(list(patient_ids))
@@ -2537,6 +2840,11 @@ def extract_features(
             )
             all_decoded_pixel_hashes.extend(list(decoded_pixel_hashes))
 
+    # ------------------------------------------------------------------
+    # Extraction stage 10: finalize batch collectors into NumPy arrays.
+    # ------------------------------------------------------------------
+    # A hard failure is preferable to returning empty arrays that might create
+    # misleading downstream output files.
     if not all_features:
         raise RuntimeError("No slice features were extracted.")
 
@@ -2557,6 +2865,8 @@ def extract_features(
     )
     decoded_pixel_hashes = np.asarray(all_decoded_pixel_hashes)
 
+    # Verify one-to-one row alignment across features, grouping metadata,
+    # QC diagnostics, heuristic scores, and duplicate hashes.
     if not (
         len(features)
         == len(labels)
@@ -2580,6 +2890,11 @@ def extract_features(
     # heuristic. If explicitly enabled, normalization is performed independently
     # inside each series proxy so scanners/exports with different contrast do not get a
     # global advantage merely because of their intensity distribution.
+    # ------------------------------------------------------------------
+    # Extraction stage 11: derive final per-slice influence weights.
+    # ------------------------------------------------------------------
+    # Equal weights are the reviewed default. The optional heuristic is
+    # normalized separately within each patient-scoped series proxy.
     if USE_SLICE_QUALITY_WEIGHTS:
         quality_weights = np.zeros(len(scores), dtype=np.float64)
 
@@ -2652,6 +2967,8 @@ def weighted_log_odds_fusion(probabilities, weights=None):
     is an aggregation score on a 0-to-1 scale, not a validated CAD posterior.
     """
 
+    # Convert inputs to stable float64 NumPy arrays before clipping and
+    # logarithms. Fusion is a lightweight CPU operation, independent of GPU AMP.
     probabilities = np.asarray(probabilities, dtype=np.float64)
 
     if probabilities.size == 0:
@@ -2729,8 +3046,12 @@ def aggregate_patients(
     ):
         raise ValueError("All aggregation arrays must have the same length.")
 
+    # Stage 1: obtain one positive-class model score per validation slice.
+    # These scores are produced by a classifier fitted only on training patients.
     slice_probabilities = clf.predict_proba(features)[:, 1]
 
+    # Stage 2: build a nested patient -> series -> slice-evidence structure
+    # while rechecking that each patient has one consistent ground-truth label.
     patient_series_probabilities = {}
     patient_labels = {}
 
@@ -2769,6 +3090,8 @@ def aggregate_patients(
             "weights"
         ].append(float(quality_weight))
 
+    # Stage 3: reduce each nested structure in two levels. First fuse slices
+    # inside a series proxy; then fuse one score per proxy at patient level.
     fused_patient_probabilities = []
     fused_patient_labels = []
     fused_patient_ids = []
@@ -2847,6 +3170,8 @@ def compute_hierarchical_training_weights(
     invariant to how many JPEG slices happen to be exported.
     """
 
+    # Normalize all metadata arrays before building the class/patient/series
+    # hierarchy. No ordering assumption is required for the weight calculation.
     labels = np.asarray(labels, dtype=np.int64)
     patient_ids = np.asarray(patient_ids)
     series_ids = np.asarray(series_ids)
@@ -2870,6 +3195,8 @@ def compute_hierarchical_training_weights(
     if np.any(quality_weights < 0):
         raise ValueError("quality_weights must be non-negative.")
 
+    # Build explicit maps that enforce: one label per patient, one patient
+    # per series-proxy identifier, and a known set of proxies per patient.
     patient_to_label = {}
     patient_to_series = {}
     series_to_patient = {}
@@ -2924,6 +3251,8 @@ def compute_hierarchical_training_weights(
             f"Invalid series: {zero_weight_series[:10]}"
         )
 
+    # Allocate the final slice-weight vector only after all hierarchy and
+    # positive-total checks have succeeded.
     weights = np.empty(len(labels), dtype=np.float64)
 
     for index, (label, patient_id, series_id) in enumerate(
@@ -2979,6 +3308,8 @@ def aggregate_patient_embeddings(
     The series unit remains an operational folder proxy, not a DICOM UID.
     """
 
+    # Convert all inputs to predictable NumPy dtypes and verify finiteness
+    # before any weighted mean can hide an invalid value.
     features = np.asarray(features, dtype=np.float32)
     labels = np.asarray(labels, dtype=np.int64)
     patient_ids = np.asarray(patient_ids)
@@ -3021,6 +3352,8 @@ def aggregate_patient_embeddings(
             index
         )
 
+    # Pool in deterministic sorted patient/series order so the returned
+    # patient table can be compared directly with the CV patient table.
     pooled_embeddings = []
     pooled_labels = []
     pooled_patient_ids = []
@@ -3067,6 +3400,8 @@ def compute_balanced_patient_weights(labels):
     """Give each class equal total weight while keeping total mass = patients."""
 
     labels = np.asarray(labels, dtype=np.int64)
+    # Count patient rows, not slices. Each class will receive half of the
+    # total supervised weight mass inside the current training fold.
     counts = np.bincount(labels, minlength=2)
 
     if int(counts.min()) <= 0:
@@ -3089,8 +3424,13 @@ def build_classifier():
     avoid an expensive dense PCA over tens of thousands of correlated slices.
     """
 
+    # Start with fold-local standardization. The scaler is fitted anew for
+    # every fold and therefore never sees validation-patient embeddings.
     steps = [("scaler", StandardScaler())]
 
+    # PCA is available only for the one-row-per-patient strategy. Fitting a
+    # dense PCA to tens of thousands of correlated slice rows is intentionally
+    # avoided in the legacy branch.
     if CLASSIFICATION_STRATEGY == "patient_embedding" and USE_PATIENT_PCA:
         steps.append(
             (
@@ -3173,6 +3513,8 @@ def bootstrap_patient_auc_ci(
     validation and does not capture every source of model-selection uncertainty.
     """
 
+    # Work at the patient-row level. Each element must correspond to one
+    # unique Directory_* patient's OOF prediction.
     labels = np.asarray(labels, dtype=np.int64)
     probabilities = np.asarray(probabilities, dtype=np.float64)
 
@@ -3185,6 +3527,8 @@ def bootstrap_patient_auc_ci(
     if len(class0) == 0 or len(class1) == 0:
         raise ValueError("Bootstrap AUC requires both classes.")
 
+    # Use a local random generator so bootstrap reproducibility does not
+    # depend on unrelated NumPy random calls elsewhere in the program.
     rng = np.random.default_rng(random_state)
     bootstrap_aucs = np.empty(n_bootstrap, dtype=np.float64)
 
@@ -3214,6 +3558,8 @@ def print_fold_summary(
 ):
     """Print patient-level rather than slice-level fold statistics."""
 
+    # Collapse repeated slice rows to patient dictionaries before printing.
+    # This prevents large series from inflating the displayed fold sample size.
     train_patient_labels = {}
     valid_patient_labels = {}
 
@@ -3243,6 +3589,9 @@ def print_fold_summary(
 def feature_cache_fingerprint(samples, dataset_root):
     """Hash file metadata plus every setting that changes frozen embeddings."""
 
+    # The fingerprint combines extraction semantics with the discovered file
+    # inventory. Classifier-only settings are deliberately excluded because they
+    # do not change frozen slice embeddings.
     root = Path(dataset_root).resolve()
     digest = hashlib.sha256()
 
@@ -3303,6 +3652,9 @@ def feature_cache_fingerprint(samples, dataset_root):
     return digest.hexdigest()
 
 
+# Centralizing cache filenames prevents load/save order drift. The returned
+# dictionary is used by both functions, so one renamed array cannot be silently
+# written under one name and read under another.
 def _cache_array_paths(cache_dir):
     names = [
         "features",
@@ -3323,6 +3675,8 @@ def _cache_array_paths(cache_dir):
 def load_feature_cache(cache_dir, expected_fingerprint):
     """Load a complete cache only when its metadata and arrays all match."""
 
+    # Metadata is the cache completion marker. A directory containing only a
+    # subset of arrays is treated as invalid and extraction is rerun.
     metadata_path = cache_dir / "metadata.json"
     paths = _cache_array_paths(cache_dir)
 
@@ -3362,6 +3716,8 @@ def load_feature_cache(cache_dir, expected_fingerprint):
 def save_feature_cache(cache_dir, fingerprint, arrays):
     """Save arrays first and write metadata last as the completion marker."""
 
+    # Create the cache directory, write every array, then write metadata last.
+    # This ordering reduces the risk of accepting an interrupted partial cache.
     cache_dir.mkdir(parents=True, exist_ok=True)
     paths = _cache_array_paths(cache_dir)
     names = [
@@ -3417,6 +3773,8 @@ def audit_exact_decoded_pixel_duplicates(
     changes ``patient_id = Directory_*``.
     """
 
+    # Row alignment is essential: every decoded hash must refer to the same
+    # image metadata row at the corresponding ``samples`` index.
     if len(samples) != len(decoded_pixel_hashes):
         raise ValueError(
             "Duplicate-audit hashes must align one-to-one with samples."
@@ -3424,6 +3782,8 @@ def audit_exact_decoded_pixel_duplicates(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Group sample indices by exact decoded-pixel digest. This operation does
+    # not alter samples, patient IDs, folds, or feature arrays.
     hash_to_indices = {}
     for index, pixel_hash in enumerate(decoded_pixel_hashes):
         hash_to_indices.setdefault(str(pixel_hash), []).append(index)
@@ -3448,6 +3808,8 @@ def audit_exact_decoded_pixel_duplicates(
         "series_id",
     ]
 
+    # Build one CSV row per image in every duplicate group and aggregate
+    # high-level counts for warnings and run_summary.json.
     rows = []
     cross_patient_groups = 0
     cross_label_groups = 0
@@ -3549,6 +3911,8 @@ def write_monai_qc_summary(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Aggregate slice-level MONAI gate signals to one descriptive QC row per
+    # patient. Median statistics reduce sensitivity to one extreme slice.
     rows = []
     for patient_id in sorted(set(map(str, patient_ids))):
         indices = np.flatnonzero(patient_ids == patient_id)
@@ -3617,6 +3981,8 @@ def run_patient_level_cross_validation(
 ):
     """Return one out-of-fold score per Directory_* patient."""
 
+    # Evaluation stage 1: construct the authoritative one-row-per-patient
+    # label table from slice metadata and reject any conflicting labels.
     patient_labels = {}
     for label, patient_id in zip(y_all, patient_all):
         patient_id = str(patient_id)
@@ -3661,6 +4027,9 @@ def run_patient_level_cross_validation(
             "slice count; expect wide uncertainty and split sensitivity."
         )
 
+    # Evaluation stage 2: precompute deterministic patient embeddings for the
+    # recommended branch. Pooling is label-free and uses all slices of a patient,
+    # but each patient is later assigned wholly to one fold.
     if CLASSIFICATION_STRATEGY == "patient_embedding":
         (
             patient_embeddings,
@@ -3685,6 +4054,8 @@ def run_patient_level_cross_validation(
     else:
         patient_embeddings = None
 
+    # Evaluation stage 3: define patient-level folds. Stratification preserves
+    # class proportions as closely as possible; no slice enters the splitter.
     cv = StratifiedKFold(
         n_splits=N_SPLITS,
         shuffle=True,
@@ -3696,10 +4067,14 @@ def run_patient_level_cross_validation(
     oof_fold_by_patient = {}
     fold_aucs = []
 
+    # Evaluation stage 4: fit a completely fresh scaler/PCA/classifier in
+    # every fold and generate scores only for that fold's held-out patients.
     for fold_index, (train_idx, valid_idx) in enumerate(
         cv.split(all_patient_ids, all_patient_labels),
         start=1,
     ):
+        # Convert index arrays to explicit patient sets and verify disjointness
+        # before selecting any patient embeddings or slice rows.
         train_patients = set(all_patient_ids[train_idx].tolist())
         valid_patients = set(all_patient_ids[valid_idx].tolist())
 
@@ -3709,6 +4084,9 @@ def run_patient_level_cross_validation(
                 f"Patient leakage in fold {fold_index}: {sorted(overlap)}"
             )
 
+        # Branch A (recommended): one training and one validation row per
+        # patient. Branch B (legacy): select all slices by patient membership,
+        # fit with hierarchical weights, then fuse validation slice scores.
         if CLASSIFICATION_STRATEGY == "patient_embedding":
             X_train = patient_embeddings[train_idx]
             y_train = all_patient_labels[train_idx]
@@ -3805,6 +4183,8 @@ def run_patient_level_cross_validation(
                     f"Fold {fold_index}: validation patient set mismatch."
                 )
 
+        # Register exactly one OOF score per evaluated patient. Duplicate
+        # insertion is treated as an implementation error and stops the run.
         for patient_id, label, score in zip(
             evaluated_patient_ids,
             patient_ground_truth,
@@ -3831,6 +4211,8 @@ def run_patient_level_cross_validation(
             f"Patients missing OOF predictions: {missing}"
         )
 
+    # Evaluation stage 5: rebuild the complete OOF patient table in stable
+    # sorted order after proving that every discovered patient appears once.
     evaluated_patient_ids = np.asarray(sorted(oof_score_by_patient))
     patient_scores = np.asarray(
         [oof_score_by_patient[p] for p in evaluated_patient_ids],
@@ -3863,6 +4245,8 @@ def write_oof_predictions(
 ):
     """Write one transparent out-of-fold result row per Directory_* patient."""
 
+    # Create a machine-readable table whose unit is explicitly one patient.
+    # The score column is named uncalibrated to prevent clinical overinterpretation.
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", newline="", encoding="utf-8") as file:
         writer = csv.writer(file)
@@ -3883,6 +4267,8 @@ def write_oof_predictions(
 def collect_run_metadata():
     """Capture configuration, software versions and available model hashes."""
 
+    # Record both configured expectations and artifacts actually present at
+    # the end of the run. This supports later provenance and cache investigations.
     bundle_root = locate_monai_bundle_root()
     official_torchscript_path = bundle_root / "models" / "model.ts"
     checkpoint_path = bundle_root / "models" / "model.pt"
@@ -3960,27 +4346,113 @@ def collect_run_metadata():
 def main():
     """Run the complete pipeline with hard-coded configuration above."""
 
+    # ======================================================================
+    # MAIN STAGE 1 -- VALIDATE THE COMPLETE RUN CONFIGURATION
+    # ======================================================================
+    # This call checks strategy names, tensor-size assumptions, ROI parameters,
+    # checkpoint identifiers, duplicate-audit dependencies, CV settings, and
+    # classifier hyperparameters. It must happen before any expensive I/O,
+    # download, model initialization, GPU work, or output generation.
+    #
+    # Input:
+    #     module-level constants defined in CONFIGURATION.
+    # Output:
+    #     no returned value; success means the configuration is internally
+    #     coherent, while any invalid setting raises an explicit exception.
     validate_configuration()
+
+    # ======================================================================
+    # MAIN STAGE 2 -- CREATE THE CONFIGURATION-SPECIFIC OUTPUT DIRECTORY
+    # ======================================================================
+    # RUN_NAME contains a deterministic hash of analysis settings, so results
+    # from different ablations are written to separate directories. ``parents``
+    # creates missing upper directories and ``exist_ok`` allows a repeated run
+    # to reuse the same destination without deleting existing files.
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    # ======================================================================
+    # MAIN STAGE 3 -- DISCOVER IMAGES AND BUILD THE SLICE METADATA TABLE
+    # ======================================================================
+    # ``load_samples`` walks Normal/ and Sick/, accepts Directory_* as the
+    # validated patient unit, assigns child folders as patient-scoped series
+    # proxies, and returns one metadata tuple per image. It also rejects missing
+    # class directories, empty datasets, and patient/label inconsistencies.
+    #
+    # Output row:
+    #     (image_path, binary_label, patient_id, series_id)
+    #
+    # No JPEG is decoded and no neural network is loaded in this stage.
     samples = load_samples(DATASET_PATH)
+
+    # ======================================================================
+    # MAIN STAGE 4 -- COMPUTE THE FROZEN-FEATURE CACHE IDENTITY
+    # ======================================================================
+    # The fingerprint combines:
+    #   - every discovered file's relative path, size, modification timestamp,
+    #     label, patient ID, and series-proxy ID;
+    #   - all settings and software versions that can change frozen embeddings.
+    #
+    # Consequently, a changed dataset or extraction setting points to a new
+    # cache rather than silently reusing incompatible features. The first 16
+    # hexadecimal characters provide a compact directory name, while the full
+    # digest remains stored in cache/run metadata.
     fingerprint = feature_cache_fingerprint(samples, DATASET_PATH)
     cache_dir = FEATURE_CACHE_ROOT / fingerprint[:16]
 
+    # ======================================================================
+    # MAIN STAGE 5 -- TRY TO REUSE A COMPLETE, MATCHING FEATURE CACHE
+    # ======================================================================
+    # Feature extraction is the expensive stage because every slice may pass
+    # through MONAI and EfficientNet. Reusing it is safe only when:
+    #   1. caching is enabled;
+    #   2. a forced rebuild was not requested;
+    #   3. metadata contains the exact expected full fingerprint;
+    #   4. every required NumPy array is present.
+    #
+    # ``extracted`` remains None when any condition fails, which routes execution
+    # to fresh model inference below.
     extracted = None
     if USE_FEATURE_CACHE and not FORCE_REBUILD_FEATURE_CACHE:
         extracted = load_feature_cache(cache_dir, fingerprint)
 
+    # ======================================================================
+    # MAIN STAGE 6 -- BUILD DATASET/MODELS AND EXTRACT FROZEN SLICE FEATURES
+    # ======================================================================
+    # This block executes only when a valid feature cache was not loaded.
     if extracted is None:
+
+        # 6A. Create the lazy PyTorch Dataset.
+        #     The object stores paths/metadata; individual JPEGs are decoded and
+        #     converted to aligned 256×256 and 224×224 tensors on demand.
         all_dataset = MRIDataset(samples, transform)
 
+        # 6B. Load the pinned MONAI segmenter only when ROI mode is enabled.
+        #     Normal execution uses the verified official model.ts directly.
+        #     Setting USE_MONAI_ROI=False deliberately skips all MONAI loading
+        #     and creates the required full-image ablation.
         monai_segmenter = (
             build_monai_segmenter() if USE_MONAI_ROI else None
         )
+
+        # 6C. Initialize the explicitly pinned ImageNet EfficientNet-B0 encoder.
+        #     The final ImageNet classifier is removed by FeatureExtractor.
+        #     eval() disables training behavior, and requires_grad_(False)
+        #     prevents accidental gradient computation or parameter updates.
         feature_extractor = FeatureExtractor().to(DEVICE)
         feature_extractor.eval()
         feature_extractor.requires_grad_(False)
 
+        # 6D. Process every decoded slice in deterministic DataLoader order:
+        #       JPEG decode and exact-pixel hash
+        #         -> per-image [0,1] scaling
+        #         -> centered 256×256 MONAI canvas
+        #         -> optional MONAI probability map and plausibility gate
+        #         -> soft ROI or unchanged full-image fallback
+        #         -> ImageNet normalization
+        #         -> frozen 1280-D EfficientNet embedding
+        #         -> QC values and optional within-series quality weight.
+        #
+        # Labels travel only as metadata and are not inputs to either network.
         extracted = extract_features(
             all_dataset,
             monai_segmenter=monai_segmenter,
@@ -3988,9 +4460,31 @@ def main():
             debug=DEBUG_VISUALIZATION,
         )
 
+        # 6E. Persist the aligned extraction arrays for future runs. Metadata is
+        #     written last as a completion marker, so a partially interrupted
+        #     cache is not accepted by ``load_feature_cache``.
         if USE_FEATURE_CACHE:
             save_feature_cache(cache_dir, fingerprint, extracted)
 
+    # ======================================================================
+    # MAIN STAGE 7 -- UNPACK THE ALIGNED SLICE-LEVEL EXTRACTION ARRAYS
+    # ======================================================================
+    # Every array below has exactly one row/value per successfully decoded image:
+    #
+    #   X_all                              [N,1280] frozen embeddings
+    #   y_all                              [N] patient labels repeated as metadata
+    #   patient_all                        [N] Directory_* identifiers
+    #   series_all                         [N] folder-defined series proxies
+    #   quality_weights_all                [N] equal/default or heuristic weights
+    #   monai_valid_all                    [N] ROI-gate Boolean decisions
+    #   area_ratios_all                    [N] hard-mask area ratios
+    #   peak_probabilities_all             [N] peak P(heart)
+    #   mean_foreground_probabilities_all  [N] descriptive foreground confidence
+    #   slice_scores_all                   [N] ROI/full-image intensity std
+    #   decoded_pixel_hashes_all           [N] exact decoded-pixel hashes
+    #
+    # Their one-to-one alignment is checked inside ``extract_features`` or is
+    # inherited from a cache that was produced by the same function.
     (
         X_all,
         y_all,
@@ -4005,8 +4499,20 @@ def main():
         decoded_pixel_hashes_all,
     ) = extracted
 
+    # The raw heuristic score is no longer needed in the current execution path.
+    # It remains saved in the cache so a later predeclared quality-weighting
+    # ablation can be reproduced without rerunning the frozen neural networks.
     del slice_scores_all  # retained in cache for reproducible quality ablations
 
+    # ======================================================================
+    # MAIN STAGE 8 -- AUDIT EXACT DECODED-PIXEL DUPLICATES
+    # ======================================================================
+    # The audit groups images whose decoded uint8 grayscale matrix and shape are
+    # exactly identical. It reports within-patient, cross-patient, and cross-label
+    # groups without changing patient identity or deleting images.
+    #
+    # Cross-patient equality matters because patient-level splitting alone cannot
+    # prevent the same visual content from appearing in training and validation.
     if AUDIT_EXACT_DECODED_PIXEL_DUPLICATES:
         duplicate_audit_summary = audit_exact_decoded_pixel_duplicates(
             OUTPUT_DIR / "exact_decoded_pixel_duplicate_groups.csv",
@@ -4014,6 +4520,8 @@ def main():
             decoded_pixel_hashes_all,
         )
     else:
+        # Preserve a stable summary schema even when the optional audit is off.
+        # Explicit None values distinguish "not measured" from a measured zero.
         duplicate_audit_summary = {
             "enabled": False,
             "duplicate_groups": None,
@@ -4021,6 +4529,13 @@ def main():
             "cross_label_duplicate_groups": None,
         }
 
+    # ======================================================================
+    # MAIN STAGE 9 -- WRITE PATIENT-LEVEL MONAI QUALITY-CONTROL SUMMARIES
+    # ======================================================================
+    # Slice-level gate values are aggregated by Directory_* patient into a CSV
+    # containing slice count, series-proxy count, plausible-mask count/rate, and
+    # median diagnostics. These are QC descriptors only; without ground-truth
+    # masks they must not be interpreted as Dice or segmentation accuracy.
     write_monai_qc_summary(
         OUTPUT_DIR / "monai_qc_by_patient.csv",
         y_all,
@@ -4032,6 +4547,14 @@ def main():
         mean_foreground_probabilities_all,
     )
 
+    # ======================================================================
+    # MAIN STAGE 10 -- RUN DIRECTORY_*-LEVEL STRATIFIED CROSS-VALIDATION
+    # ======================================================================
+    # The splitter receives a table with one row per patient. All slices and all
+    # series proxies of a patient inherit the same fold. For each fold, a fresh
+    # scaler, optional PCA, and Logistic Regression are fitted on training
+    # patients only. The function returns exactly one out-of-fold score per
+    # Directory_* patient plus the fold-specific AUC values.
     (
         evaluated_patient_ids,
         patient_ground_truth,
@@ -4046,12 +4569,27 @@ def main():
         quality_weights_all,
     )
 
+    # ======================================================================
+    # MAIN STAGE 11 -- CALCULATE THE POOLED OOF AUC AND PATIENT BOOTSTRAP CI
+    # ======================================================================
+    # The primary ranking metric is computed from the complete set of held-out
+    # patient predictions, not from training predictions or individual slices.
     auc = roc_auc_score(patient_ground_truth, patient_scores)
+
+    # The bootstrap resamples Normal and Sick patient rows separately with
+    # replacement, guaranteeing that each replicate contains both classes. The
+    # interval quantifies sampling variability of these OOF rows but does not
+    # replace independent external validation.
     auc_ci_lower, auc_ci_upper = bootstrap_patient_auc_ci(
         patient_ground_truth,
         patient_scores,
     )
 
+    # ======================================================================
+    # MAIN STAGE 12 -- SAVE ONE TRANSPARENT OOF ROW PER PATIENT
+    # ======================================================================
+    # This CSV is the auditable basis for the pooled AUC. It records patient ID,
+    # true label, held-out fold, and the uncalibrated positive-class model score.
     write_oof_predictions(
         OUTPUT_DIR / "patient_oof_predictions.csv",
         evaluated_patient_ids,
@@ -4060,6 +4598,13 @@ def main():
         patient_folds,
     )
 
+    # ======================================================================
+    # MAIN STAGE 13 -- ASSEMBLE AND SAVE COMPLETE RUN METADATA
+    # ======================================================================
+    # ``collect_run_metadata`` records software versions, device, strategy,
+    # model provenance, configured hashes, artifact hashes when present, cache
+    # schema, and output locations. Evaluation results and duplicate-audit counts
+    # are then added to the same JSON object.
     summary = collect_run_metadata()
     summary.update(
         {
@@ -4076,11 +4621,20 @@ def main():
             "exact_duplicate_audit": duplicate_audit_summary,
         }
     )
+
+    # JSON is human-readable, machine-readable, UTF-8 encoded, and key-sorted to
+    # make differences between runs easier to inspect in version control.
     (OUTPUT_DIR / "run_summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True),
         encoding="utf-8",
     )
 
+    # ======================================================================
+    # MAIN STAGE 14 -- PRINT THE PRIMARY PATIENT-LEVEL RESULT
+    # ======================================================================
+    # The console summary intentionally repeats the effective patient count and
+    # explicitly warns that the scores are not externally calibrated clinical
+    # probabilities. The saved CSV/JSON files remain the authoritative records.
     print("\n============================================================")
     print("FINAL OUT-OF-FOLD PATIENT-LEVEL RESULT")
     print("============================================================")
@@ -4095,6 +4649,11 @@ def main():
         "claimed to be externally calibrated clinical probabilities."
     )
 
+    # ======================================================================
+    # MAIN STAGE 15 -- PRINT EVERY PATIENT'S AUDITABLE OOF SCORE
+    # ======================================================================
+    # Iterating over aligned arrays makes it possible to compare console output
+    # directly with patient_oof_predictions.csv. Each patient appears once.
     print("\nPATIENT-LEVEL OOF SCORES:")
     for patient_id, label, fold, score in zip(
         evaluated_patient_ids,
@@ -4107,10 +4666,21 @@ def main():
             f"fold={int(fold)}, uncalibrated_CAD_score={float(score):.6f}"
         )
 
+    # ======================================================================
+    # MAIN STAGE 16 -- REPORT THE OUTPUT LOCATION AND NORMAL COMPLETION
+    # ======================================================================
+    # Reaching this point means validation, extraction/cache loading, audits,
+    # cross-validation, metrics, and all principal output writes completed
+    # without raising an exception.
     print(f"\nOutputs saved under: {OUTPUT_DIR}")
     print("Done!")
 
 
+# The execution guard is essential on platforms that use process spawning
+# (notably Windows). It prevents DataLoader worker processes from recursively
+# rerunning the full script when this file is imported. It also permits the
+# functions/classes to be imported for tests without automatically starting the
+# expensive experiment.
 if __name__ == "__main__":
     main()
 
@@ -4158,5 +4728,3 @@ if __name__ == "__main__":
 # families and both long- and short-axis planes were used. This domain mismatch
 # is one of the most important limitations of the pipeline and should be
 # discussed in any manuscript.
-
-
