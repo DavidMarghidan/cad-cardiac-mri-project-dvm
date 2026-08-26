@@ -275,7 +275,7 @@ def debug_visualization(imgs, masks, roi_imgs, scores, batch_idx, max_show=1):
     roi_imgs = roi_imgs.cpu()
     scores = scores.cpu()
 
-    os.makedirs("debug_output", exist_ok=True)
+    os.makedirs("../debug_output", exist_ok=True)
 
     for i in range(min(max_show, imgs.shape[0])):
         fig, ax = plt.subplots(1, 3, figsize=(12, 4))

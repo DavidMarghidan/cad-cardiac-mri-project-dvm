@@ -1,2 +1,6 @@
 /pretrained_models
 /debug_output
+/cad_patient_pipeline_outputs
+/.idea
+/.vs
+/__pycache__

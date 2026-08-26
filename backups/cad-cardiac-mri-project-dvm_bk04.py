@@ -720,7 +720,7 @@ def debug_visualization(
     roi_imgs = roi_imgs.cpu()
     scores = scores.cpu()
 
-    os.makedirs("debug_output", exist_ok=True)
+    os.makedirs("../debug_output", exist_ok=True)
 
     for i in range(min(max_show, imgs.shape[0])):
 
