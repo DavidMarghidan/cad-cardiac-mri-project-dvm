@@ -467,7 +467,7 @@ CLASSIFICATION_STRATEGY = "patient_embedding"
 #       series and patient scores. This remains useful as a declared ablation,
 #       but it does not remove within-patient pseudo-replication from fitting.
 
-N_SPLITS = 2
+N_SPLITS = 5
 CV_RANDOM_STATE = RANDOM_SEED
 LOGISTIC_C = 1.0
 LOGISTIC_MAX_ITER = 2000
@@ -1444,14 +1444,14 @@ def load_samples(root_dir):
             if not os.path.isdir(patient_path):
                 continue
 
-            # TEMP - Only for test
-            if (directory.lower() != "directory_1" and directory.lower() != "directory_17"
-                    and directory.lower() != "directory_2" and directory.lower() != "directory_18"
-            ):
-                continue
-
-            # if not directory.lower().startswith("directory_"):
+            # # TEMP - Only for test
+            # if (directory.lower() != "directory_1" and directory.lower() != "directory_17"
+            #         and directory.lower() != "directory_2" and directory.lower() != "directory_18"
+            # ):
             #     continue
+
+            if not directory.lower().startswith("directory_"):
+                continue
 
             # The user-validated patient unit is Directory_* itself.
             # Do NOT derive a patient from SR_*, series names, filenames or
