@@ -392,14 +392,12 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 # ROC-AUC evaluation metric for binary patient-level ranking.
 
-from sklearn.metrics import accuracy_score, confusion_matrix, f1_score
 from sklearn.model_selection import StratifiedKFold
 # Cross-validation is defined on a table containing exactly one row per
 # Directory_* patient. Because slices are mapped to folds only AFTER patients
 # are split, an additional group variable is unnecessary here.
 
 from sklearn.pipeline import Pipeline
-from sklearn.svm import LinearSVC
 # Bundles feature standardization and Logistic Regression so the scaler is fit
 # ONLY on the training patients of each fold.
 
@@ -509,14 +507,7 @@ PROGRESS_PRINT_EVERY_N_BATCHES = 25
 
 USE_FEATURE_CACHE = True
 FORCE_REBUILD_FEATURE_CACHE = False
-FEATURE_CACHE_SCHEMA_VERSION = "2026-08-29-master-experiments-v1"
-
-# One controlled run executes the principal ablations below. Frozen neural
-# embeddings are extracted once per slice and both FULL and MONAI-ROI
-# representations are cached for downstream patient-level experiments.
-RUN_MASTER_EXPERIMENTS = True
-MASTER_DECISION_THRESHOLD = 0.50
-MASTER_SLICE_DROPOUT_RATES = (0.0, 0.10, 0.25, 0.50)
+FEATURE_CACHE_SCHEMA_VERSION = "2026-08-22-v4"
 # Frozen MONAI/EfficientNet extraction is the expensive stage. A cache keyed by
 # dataset file metadata and all feature-affecting settings avoids repeating it.
 # Increment FEATURE_CACHE_SCHEMA_VERSION after changing extraction semantics.
@@ -719,8 +710,7 @@ _run_identity = {
     "pca_variance": PATIENT_PCA_EXPLAINED_VARIANCE,
     "img_size": IMG_SIZE,
     "monai_input_size": MONAI_INPUT_SIZE,
-    "master_dual_full_roi": True,
-        "use_monai_roi_legacy_setting": USE_MONAI_ROI,
+    "use_monai_roi": USE_MONAI_ROI,
     "monai_bundle": MONAI_BUNDLE_NAME,
     "monai_bundle_version": MONAI_BUNDLE_VERSION,
     "monai_hf_revision": MONAI_HF_REVISION,
@@ -762,8 +752,7 @@ else:
 # =============================
 
 PIPELINE_STAGE_COUNT = 16
-# The master experiment matrix occupies stages 10–16; earlier stages retain
-# the existing dataset/model/QC/cache workflow.
+# The number matches the explicitly documented stages inside ``main``.
 
 
 def _synchronize_timing_device():
@@ -3003,7 +2992,6 @@ def extract_features(
     # Features are accumulated batch-wise to avoid preallocating a potentially
     # very large matrix before the first successful model inference.
     all_features = []
-    all_full_features = []
     all_labels = []
     all_patients = []
     all_series = []
@@ -3130,20 +3118,14 @@ def extract_features(
             # -------------------------------------------------------------
             # ROI weighting occurs before normalization. EfficientNet returns one
             # frozen 1280-D embedding per input slice.
-            # The master experiment cache deliberately encodes BOTH inputs in
-            # the same extraction pass. This makes Full Image vs MONAI ROI a
-            # controlled ablation without changing patient folds or metadata.
             with torch.autocast(
                 device_type="cuda",
                 dtype=torch.float16,
                 enabled=autocast_enabled,
             ):
-                full_efficientnet_inputs = normalize_for_efficientnet(images)
-                roi_efficientnet_inputs = normalize_for_efficientnet(roi_images)
-                full_features = feature_extractor(full_efficientnet_inputs)
-                features = feature_extractor(roi_efficientnet_inputs)
+                efficientnet_inputs = normalize_for_efficientnet(roi_images)
+                features = feature_extractor(efficientnet_inputs)
 
-            full_features = full_features.float()
             features = features.float()
 
             # ---------------------------------------------------------
@@ -3199,7 +3181,6 @@ def extract_features(
             # -------------------------------------------------------------
             # Every collector receives exactly one entry per batch element.
             all_features.append(features.cpu().numpy())
-            all_full_features.append(full_features.cpu().numpy())
             all_labels.extend(labels.numpy().tolist())
             all_patients.extend(list(patient_ids))
             all_series.extend(list(series_ids))
@@ -3268,7 +3249,6 @@ def extract_features(
         raise RuntimeError("No slice features were extracted.")
 
     features = np.vstack(all_features)
-    full_features = np.vstack(all_full_features)
     labels = np.asarray(all_labels, dtype=np.int64)
     patient_ids = np.asarray(all_patients)
     series_ids = np.asarray(all_series)
@@ -3289,7 +3269,6 @@ def extract_features(
     # QC diagnostics, heuristic scores, and duplicate hashes.
     if not (
         len(features)
-        == len(full_features)
         == len(labels)
         == len(patient_ids)
         == len(series_ids)
@@ -3361,7 +3340,6 @@ def extract_features(
 
     return (
         features,
-        full_features,
         labels,
         patient_ids,
         series_ids,
@@ -3440,7 +3418,6 @@ def aggregate_patients(
     series_ids,
     quality_weights,
     clf,
-    fusion_method="log_odds",
 ):
     """
     Aggregate slice predictions hierarchically:
@@ -3536,26 +3513,10 @@ def aggregate_patients(
 
             series_data = patient_series_probabilities[patient_id][series_id]
 
-            if fusion_method == "log_odds":
-                series_probability = weighted_log_odds_fusion(
-                    series_data["probabilities"],
-                    series_data["weights"],
-                )
-            elif fusion_method == "mean_probability":
-                probabilities = np.asarray(
-                    series_data["probabilities"], dtype=np.float64
-                )
-                weights = np.asarray(
-                    series_data["weights"], dtype=np.float64
-                )
-                series_probability = float(
-                    np.average(probabilities, weights=weights)
-                )
-            else:
-                raise ValueError(
-                    f"Unknown fusion_method={fusion_method!r}. "
-                    "Use 'log_odds' or 'mean_probability'."
-                )
+            series_probability = weighted_log_odds_fusion(
+                series_data["probabilities"],
+                series_data["weights"],
+            )
 
             series_probability_values.append(series_probability)
 
@@ -4151,7 +4112,6 @@ def feature_cache_fingerprint(samples, dataset_root):
 def _cache_array_paths(cache_dir):
     names = [
         "features",
-        "full_features",
         "labels",
         "patient_ids",
         "series_ids",
@@ -4199,7 +4159,6 @@ def load_feature_cache(cache_dir, expected_fingerprint):
 
     ordered_names = [
         "features",
-        "full_features",
         "labels",
         "patient_ids",
         "series_ids",
@@ -4259,7 +4218,6 @@ def save_feature_cache(cache_dir, fingerprint, arrays):
     paths = _cache_array_paths(cache_dir)
     names = [
         "features",
-        "full_features",
         "labels",
         "patient_ids",
         "series_ids",
@@ -4295,8 +4253,7 @@ def save_feature_cache(cache_dir, fingerprint, arrays):
         "fingerprint": fingerprint,
         "schema": FEATURE_CACHE_SCHEMA_VERSION,
         "n_slices": int(len(arrays[0])),
-        "feature_dimension_roi": int(arrays[0].shape[1]),
-        "feature_dimension_full": int(arrays[1].shape[1]),
+        "feature_dimension": int(arrays[0].shape[1]),
     }
     (cache_dir / "metadata.json").write_text(
         json.dumps(metadata, indent=2, sort_keys=True),
@@ -4870,365 +4827,6 @@ def run_patient_level_cross_validation(
     )
 
 
-
-def _patient_metrics_extended(labels, scores, threshold=MASTER_DECISION_THRESHOLD):
-    """Calculate patient-level publication metrics from one OOF score per patient."""
-    labels = np.asarray(labels, dtype=np.int64)
-    scores = np.asarray(scores, dtype=np.float64)
-    if len(labels) != len(scores):
-        raise ValueError("labels and scores must have the same length.")
-    auc = float(roc_auc_score(labels, scores))
-    predictions = (scores >= threshold).astype(np.int64)
-    tn, fp, fn, tp = confusion_matrix(labels, predictions, labels=[0, 1]).ravel()
-    return {
-        "auroc": auc,
-        "accuracy": float(accuracy_score(labels, predictions)),
-        "sensitivity": float(tp / max(tp + fn, 1)),
-        "specificity": float(tn / max(tn + fp, 1)),
-        "ppv": float(tp / max(tp + fp, 1)),
-        "npv": float(tn / max(tn + fn, 1)),
-        "f1": float(f1_score(labels, predictions, zero_division=0)),
-        "threshold": float(threshold),
-        "tp": int(tp), "tn": int(tn), "fp": int(fp), "fn": int(fn),
-    }
-
-
-def _run_master_cv_variant(
-    X_slice,
-    y_slice,
-    patient_slice,
-    series_slice,
-    quality_slice,
-    folds,
-    representation,
-    classifier_kind="logistic",
-    strategy="patient_embedding",
-    fusion_method="log_odds",
-):
-    """Run one controlled variant using fixed patient folds and return OOF rows."""
-    patient_slice = np.asarray(patient_slice).astype(str)
-    y_slice = np.asarray(y_slice, dtype=np.int64)
-    quality_slice = np.asarray(quality_slice, dtype=np.float64)
-
-    label_by_patient = {}
-    for label, patient in zip(y_slice, patient_slice):
-        previous = label_by_patient.get(patient)
-        if previous is not None and previous != int(label):
-            raise RuntimeError(f"Patient {patient} has conflicting labels.")
-        label_by_patient[patient] = int(label)
-
-    patient_ids = np.asarray(sorted(label_by_patient))
-    patient_labels = np.asarray(
-        [label_by_patient[p] for p in patient_ids], dtype=np.int64
-    )
-
-    if strategy == "patient_embedding":
-        patient_X, pooled_labels, pooled_ids = aggregate_patient_embeddings(
-            X_slice,
-            y_slice,
-            patient_slice,
-            series_slice,
-            quality_slice,
-        )
-        if not np.array_equal(patient_ids.astype(str), pooled_ids.astype(str)):
-            raise RuntimeError("Patient ordering mismatch during master pooling.")
-        if not np.array_equal(patient_labels, pooled_labels):
-            raise RuntimeError("Patient labels mismatch during master pooling.")
-
-    index_by_patient = {p: i for i, p in enumerate(patient_ids.astype(str))}
-    slice_indices_by_patient = {
-        p: np.flatnonzero(patient_slice == p) for p in patient_ids.astype(str)
-    }
-    oof_scores = {}
-    oof_folds = {}
-
-    for fold_data in folds:
-        fold_index = int(fold_data["fold"])
-        train_patients = set(fold_data["train_patients"])
-        valid_patients = set(fold_data["valid_patients"])
-        if train_patients & valid_patients:
-            raise RuntimeError(f"Master fold {fold_index} has patient overlap.")
-
-        if strategy == "patient_embedding":
-            train_idx = np.asarray([index_by_patient[p] for p in sorted(train_patients)])
-            valid_idx = np.asarray([index_by_patient[p] for p in sorted(valid_patients)])
-            X_train, X_valid = patient_X[train_idx], patient_X[valid_idx]
-            y_train, y_valid = patient_labels[train_idx], patient_labels[valid_idx]
-            weights = compute_balanced_patient_weights(y_train)
-
-            steps = [("scaler", StandardScaler())]
-            if USE_PATIENT_PCA:
-                steps.append(("pca", PCA(
-                    n_components=PATIENT_PCA_EXPLAINED_VARIANCE,
-                    svd_solver="full",
-                )))
-            if classifier_kind == "logistic":
-                clf = LogisticRegression(
-                    C=LOGISTIC_C,
-                    max_iter=LOGISTIC_MAX_ITER,
-                    solver="liblinear",
-                    random_state=RANDOM_SEED,
-                )
-                steps.append(("classifier", clf))
-                model = Pipeline(steps)
-                model.fit(X_train, y_train, classifier__sample_weight=weights)
-            elif classifier_kind == "linear_svm":
-                svm = LinearSVC(C=LOGISTIC_C, random_state=RANDOM_SEED)
-                model = Pipeline(steps + [("classifier", svm)])
-                model.fit(X_train, y_train, classifier__sample_weight=weights)
-            else:
-                raise ValueError(f"Unknown classifier_kind={classifier_kind!r}.")
-
-            if classifier_kind == "linear_svm":
-                raw_scores = model.decision_function(X_valid)
-                scores = 1.0 / (1.0 + np.exp(-np.clip(raw_scores, -50, 50)))
-            else:
-                scores = model.predict_proba(X_valid)[:, 1]
-            valid_ids = patient_ids[valid_idx].astype(str)
-        else:
-            train_idx = np.concatenate([slice_indices_by_patient[p] for p in sorted(train_patients)])
-            valid_idx = np.concatenate([slice_indices_by_patient[p] for p in sorted(valid_patients)])
-            X_train, X_valid = X_slice[train_idx], X_slice[valid_idx]
-            y_train = y_slice[train_idx]
-            weights = compute_hierarchical_training_weights(
-                y_train,
-                patient_slice[train_idx],
-                series_slice[train_idx],
-                quality_weights=quality_slice[train_idx],
-            )
-            clf = LogisticRegression(
-                C=LOGISTIC_C,
-                max_iter=LOGISTIC_MAX_ITER,
-                solver="liblinear",
-                random_state=RANDOM_SEED,
-            )
-            model = Pipeline([("scaler", StandardScaler()), ("logreg", clf)])
-            model.fit(
-                X_train,
-                y_train,
-                scaler__sample_weight=weights,
-                logreg__sample_weight=weights,
-            )
-            slice_scores = model.predict_proba(X_valid)[:, 1]
-            valid_patient = patient_slice[valid_idx]
-            valid_series = series_slice[valid_idx]
-            valid_quality = quality_slice[valid_idx]
-            valid_y = y_slice[valid_idx]
-            patient_score, patient_y, valid_ids = aggregate_patients(
-                X_valid,
-                valid_y,
-                valid_patient,
-                valid_series,
-                valid_quality,
-                model,
-                fusion_method=fusion_method,
-            )
-            scores = patient_score
-
-        if len(valid_ids) != len(scores):
-            raise RuntimeError("Master CV returned misaligned patient scores.")
-        for pid, score in zip(valid_ids, scores):
-            pid = str(pid)
-            if pid in oof_scores:
-                raise RuntimeError(f"Patient {pid} received multiple master OOF scores.")
-            oof_scores[pid] = float(score)
-            oof_folds[pid] = fold_index
-
-    ordered_ids = np.asarray(sorted(oof_scores))
-    ordered_labels = np.asarray([label_by_patient[p] for p in ordered_ids], dtype=np.int64)
-    ordered_scores = np.asarray([oof_scores[p] for p in ordered_ids], dtype=np.float64)
-    ordered_folds = np.asarray([oof_folds[p] for p in ordered_ids], dtype=np.int64)
-    return ordered_ids, ordered_labels, ordered_scores, ordered_folds
-
-
-def run_master_experiment_matrix(
-    X_full,
-    X_roi,
-    y_slice,
-    patient_slice,
-    series_slice,
-    quality_slice,
-    raw_slice_scores,
-    folds,
-):
-    """Run the principal controlled ablations in one process and return a flat result table."""
-    print("\n" + "=" * 100, flush=True)
-    print("MASTER EXPERIMENT MATRIX — ONE CONTROLLED RUN", flush=True)
-    print("=" * 100, flush=True)
-    print("Fixed patient folds: YES", flush=True)
-    print("Patient-level evaluation: YES", flush=True)
-    print("Decision threshold: 0.50 (predeclared; not optimized on OOF)", flush=True)
-
-    results = []
-    oof_records = []
-
-    def execute(experiment, variant, X, quality, strategy="patient_embedding",
-                classifier_kind="logistic", fusion_method="log_odds", notes="",
-                y_local=None, patient_local=None, series_local=None):
-        print(f"\n[MASTER] {experiment} :: {variant}", flush=True)
-        y_used = y_slice if y_local is None else y_local
-        patient_used = patient_slice if patient_local is None else patient_local
-        series_used = series_slice if series_local is None else series_local
-        ids, labels, scores, folds_out = _run_master_cv_variant(
-            X, y_used, patient_used, series_used, quality, folds,
-            representation=variant,
-            classifier_kind=classifier_kind,
-            strategy=strategy,
-            fusion_method=fusion_method,
-        )
-        metrics = _patient_metrics_extended(labels, scores)
-        ci_low, ci_high = bootstrap_patient_auc_ci(labels, scores)
-        row = {
-            "experiment": experiment,
-            "variant": variant,
-            "n_patients": int(len(ids)),
-            **metrics,
-            "auroc_ci95_lower": float(ci_low),
-            "auroc_ci95_upper": float(ci_high),
-            "notes": notes,
-        }
-        results.append(row)
-        for pid, label, fold, score in zip(ids, labels, folds_out, scores):
-            oof_records.append({
-                "experiment": experiment,
-                "variant": variant,
-                "patient_id": str(pid),
-                "true_label": int(label),
-                "fold": int(fold),
-                "score": float(score),
-            })
-        print(
-            f"[MASTER] AUROC={row['auroc']:.6f} "
-            f"95%CI=[{row['auroc_ci95_lower']:.6f}, {row['auroc_ci95_upper']:.6f}] "
-            f"Sens={row['sensitivity']:.4f} Spec={row['specificity']:.4f}",
-            flush=True,
-        )
-
-    # E0/E1: representation ablation.
-    execute("E0_BASELINE", "MONAI_ROI__HIERARCHICAL__LOGISTIC", X_roi,
-            np.ones_like(quality_slice), notes="Predeclared primary patient-level model.")
-    execute("E1_ROI_ABLATION", "FULL_IMAGE__HIERARCHICAL__LOGISTIC", X_full,
-            np.ones_like(quality_slice), notes="Only image representation changes.")
-    execute("E1_ROI_ABLATION", "MONAI_ROI__HIERARCHICAL__LOGISTIC", X_roi,
-            np.ones_like(quality_slice), notes="Only image representation changes.")
-
-    # E2: weighting ablation. Raw slice std is transformed within each series only.
-    quality_ablation = np.ones_like(quality_slice, dtype=np.float64)
-    by_series = {}
-    for i, sid in enumerate(np.asarray(series_slice).astype(str)):
-        by_series.setdefault(sid, []).append(i)
-    for sid, inds in by_series.items():
-        q = _normalize_quality_weights(np.asarray(raw_slice_scores)[inds])
-        quality_ablation[np.asarray(inds, dtype=np.int64)] = q
-    execute("E2_SLICE_WEIGHTING", "EQUAL_WEIGHTS", X_roi,
-            np.ones_like(quality_slice), notes="All slices receive equal influence.")
-    execute("E2_SLICE_WEIGHTING", "QUALITY_HEURISTIC", X_roi,
-            quality_ablation, notes="Label-independent series-local intensity-STD heuristic.")
-
-    # E4: hierarchical embedding vs legacy slice classifier.
-    execute("E4_POOLING", "HIERARCHICAL_EMBEDDING", X_roi,
-            np.ones_like(quality_slice), notes="Recommended patient-level embedding strategy.")
-    execute("E4_POOLING", "LEGACY_SLICE_CLASSIFIER_LOGODDS", X_roi,
-            quality_ablation, strategy="legacy", fusion_method="log_odds",
-            notes="Ablation only; repeated slice labels create pseudo-replication risk.")
-
-    # E5: classifier comparison.
-    execute("E5_CLASSIFIER", "LOGISTIC_REGRESSION", X_roi,
-            np.ones_like(quality_slice), classifier_kind="logistic")
-    execute("E5_CLASSIFIER", "LINEAR_SVM", X_roi,
-            np.ones_like(quality_slice), classifier_kind="linear_svm",
-            notes="Decision function transformed monotonically to 0–1 for threshold metrics; AUROC is invariant to this transform.")
-
-    # E3: probability fusion belongs to the legacy slice-score branch.
-    execute("E3_FUSION", "MEAN_PROBABILITY", X_roi,
-            quality_ablation, strategy="legacy", fusion_method="mean_probability",
-            notes="Legacy slice classifier; patient-level evaluation only.")
-    execute("E3_FUSION", "LOG_ODDS", X_roi,
-            quality_ablation, strategy="legacy", fusion_method="log_odds",
-            notes="Legacy slice classifier; patient-level evaluation only.")
-
-    # E6: dropout robustness on the ROI representation. One fixed random seed is used.
-    rng = np.random.default_rng(RANDOM_SEED)
-    for rate in MASTER_SLICE_DROPOUT_RATES:
-        keep = np.ones(len(X_roi), dtype=bool)
-        if rate > 0:
-            for patient in np.unique(np.asarray(patient_slice).astype(str)):
-                inds = np.flatnonzero(np.asarray(patient_slice).astype(str) == patient)
-                n_drop = int(np.floor(len(inds) * rate))
-                if n_drop > 0:
-                    keep[rng.choice(inds, size=n_drop, replace=False)] = False
-        execute(
-            "E6_ROBUSTNESS",
-            f"SLICE_DROPOUT_{rate:.0%}",
-            X_roi[keep],
-            quality_slice[keep],
-            notes="Random within-patient slice dropout; no labels used for selection.",
-            y_local=np.asarray(y_slice)[keep],
-            patient_local=np.asarray(patient_slice)[keep],
-            series_local=np.asarray(series_slice)[keep],
-        )
-
-    return results, oof_records, quality_ablation
-
-
-def save_master_experiment_outputs(output_dir, results, oof_records, gate_rates, metadata_extra=None):
-    """Persist master results as CSV/JSON and print the final comparison table."""
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    summary_path = output_dir / "master_experiment_summary.csv"
-    oof_path = output_dir / "master_experiment_oof_predictions.csv"
-    gate_path = output_dir / "master_monai_gate_rates.csv"
-    json_path = output_dir / "master_experiment_summary.json"
-
-    if results:
-        fields = list(results[0].keys())
-        with open(summary_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fields)
-            writer.writeheader(); writer.writerows(results)
-
-    if oof_records:
-        fields = list(oof_records[0].keys())
-        with open(oof_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fields)
-            writer.writeheader(); writer.writerows(oof_records)
-
-    if gate_rates:
-        fields = list(gate_rates[0].keys())
-        with open(gate_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fields)
-            writer.writeheader(); writer.writerows(gate_rates)
-
-    payload = {
-        "results": results,
-        "n_variants": len(results),
-        "master_decision_threshold": MASTER_DECISION_THRESHOLD,
-        "master_slice_dropout_rates": list(MASTER_SLICE_DROPOUT_RATES),
-        "gate_rates": gate_rates,
-    }
-    if metadata_extra:
-        payload.update(metadata_extra)
-    json_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-
-    print("\n" + "=" * 120, flush=True)
-    print("FINAL MASTER EXPERIMENT COMPARISON", flush=True)
-    print("=" * 120, flush=True)
-    print(f"{'Experiment':<22} {'Variant':<40} {'AUROC':>8} {'95% CI':>21} {'Sens':>8} {'Spec':>8} {'F1':>8}", flush=True)
-    print("-" * 120, flush=True)
-    for r in results:
-        ci = f"[{r['auroc_ci95_lower']:.3f}, {r['auroc_ci95_upper']:.3f}]"
-        print(
-            f"{r['experiment']:<22} {r['variant'][:40]:<40} "
-            f"{r['auroc']:>8.4f} {ci:>21} {r['sensitivity']:>8.4f} "
-            f"{r['specificity']:>8.4f} {r['f1']:>8.4f}",
-            flush=True,
-        )
-    print("-" * 120, flush=True)
-    print(f"[MASTER] Summary: {summary_path}", flush=True)
-    print(f"[MASTER] OOF predictions: {oof_path}", flush=True)
-    print(f"[MASTER] Gate-rate audit: {gate_path}", flush=True)
-    print(f"[MASTER] JSON: {json_path}", flush=True)
-
 def write_oof_predictions(
     output_path,
     patient_ids,
@@ -5310,9 +4908,6 @@ def collect_run_metadata():
             FAIL_ON_CROSS_PATIENT_EXACT_DUPLICATES
         ),
         "feature_cache_schema": FEATURE_CACHE_SCHEMA_VERSION,
-        "master_experiments_enabled": RUN_MASTER_EXPERIMENTS,
-        "master_decision_threshold": MASTER_DECISION_THRESHOLD,
-        "master_slice_dropout_rates": MASTER_SLICE_DROPOUT_RATES,
     }
 
     if official_torchscript_path.is_file():
@@ -5657,7 +5252,6 @@ def main():
     )
     (
         X_all,
-        X_full_all,
         y_all,
         patient_all,
         series_all,
@@ -5670,13 +5264,15 @@ def main():
         decoded_pixel_hashes_all,
     ) = extracted
 
-    # Keep slice_scores_all: the master quality-weighting ablation is derived
-    # from this label-independent signal without re-running MONAI/EfficientNet.
+    # The raw heuristic score is no longer needed in the current execution path.
+    # It remains saved in the cache so a later predeclared quality-weighting
+    # ablation can be reproduced without rerunning the frozen neural networks.
+    del slice_scores_all  # retained in cache for reproducible quality ablations
     stage_durations["07 Unpack extraction arrays"] = _print_stage_complete(
         7,
         "Unpack and verify aligned slice-level arrays",
         stage_started_at,
-        f"ROI features: {X_all.shape}; full-image features: {X_full_all.shape}; labels: {y_all.shape}.",
+        f"Feature matrix shape: {X_all.shape}; labels: {y_all.shape}.",
     )
 
     # ======================================================================
@@ -5751,219 +5347,215 @@ def main():
     )
 
     # ======================================================================
-    # MAIN STAGES 10–16 -- ONE MASTER EXPERIMENT RUN
+    # MAIN STAGE 10 -- RUN DIRECTORY_*-LEVEL STRATIFIED CROSS-VALIDATION
     # ======================================================================
-    # The master matrix reuses one fixed set of patient-level folds for every
-    # variant. The expensive frozen extraction has already produced both ROI and
-    # full-image embeddings in the same pass. All downstream classifiers are
-    # fitted fold-locally.
+    # The splitter receives a table with one row per patient. All slices and all
+    # series proxies of a patient inherit the same fold. For each fold, a fresh
+    # scaler, optional PCA, and Logistic Regression are fitted on training
+    # patients only. The function returns exactly one out-of-fold score per
+    # Directory_* patient plus the fold-specific AUC values.
     stage_started_at = _print_stage_start(
         10,
-        "Run the master patient-level experiment matrix",
-        "Controlled ablations: ROI, weighting, fusion, pooling, classifier, robustness.",
+        "Run Directory_*-level stratified cross-validation",
+        "Usually short for patient embeddings; can be longer for the legacy "
+        "slice-level strategy. Every fold is timed separately.",
     )
-
-    # Build the authoritative patient folds once. No experiment is allowed to
-    # generate a new random split, because paired comparisons must use identical
-    # held-out patients.
-    patient_label_map = {}
-    for label, patient in zip(y_all, patient_all):
-        patient = str(patient)
-        if patient in patient_label_map and patient_label_map[patient] != int(label):
-            raise RuntimeError(f"Patient {patient} has conflicting labels.")
-        patient_label_map[patient] = int(label)
-    patient_ids_master = np.asarray(sorted(patient_label_map))
-    patient_labels_master = np.asarray(
-        [patient_label_map[p] for p in patient_ids_master], dtype=np.int64
+    (
+        evaluated_patient_ids,
+        patient_ground_truth,
+        patient_scores,
+        patient_folds,
+        fold_aucs,
+    ) = run_patient_level_cross_validation(
+        X_all,
+        y_all,
+        patient_all,
+        series_all,
+        quality_weights_all,
     )
-    master_cv = StratifiedKFold(
-        n_splits=N_SPLITS,
-        shuffle=True,
-        random_state=CV_RANDOM_STATE,
-    )
-    master_folds = []
-    for fold_index, (train_idx, valid_idx) in enumerate(
-        master_cv.split(patient_ids_master, patient_labels_master),
-        start=1,
-    ):
-        master_folds.append({
-            "fold": fold_index,
-            "train_patients": set(patient_ids_master[train_idx].astype(str)),
-            "valid_patients": set(patient_ids_master[valid_idx].astype(str)),
-        })
-
-    master_results, master_oof, master_quality_weights = run_master_experiment_matrix(
-        X_full=X_full_all,
-        X_roi=X_all,
-        y_slice=y_all,
-        patient_slice=patient_all,
-        series_slice=series_all,
-        quality_slice=quality_weights_all,
-        raw_slice_scores=slice_scores_all,
-        folds=master_folds,
-    )
-
-    # Gate-rate audit is retained separately for interpretation of ROI failures.
-    gate_rates = []
-    for label, class_name in ((0, "Normal"), (1, "Sick")):
-        mask = np.asarray(y_all) == label
-        gate_rates.append({
-            "class": class_name,
-            "label": label,
-            "n_slices": int(mask.sum()),
-            "gate_rate": float(np.asarray(monai_valid_all)[mask].mean()),
-        })
-
-    master_metadata = {
-        "patient_definition": "Directory_*",
-        "n_patients": int(len(patient_ids_master)),
-        "n_slices": int(len(y_all)),
-        "n_master_variants": int(len(master_results)),
-        "feature_cache_fingerprint": fingerprint,
-        "exact_duplicate_audit": duplicate_audit_summary,
-        "primary_variant": "E0_BASELINE / MONAI_ROI__HIERARCHICAL__LOGISTIC",
-        "threshold_policy": "0.50 predeclared; not optimized on OOF predictions",
-        "legacy_strategy_note": "Legacy slice classifier is an ablation only because repeated slices per patient create pseudo-replication risk.",
-    }
-    save_master_experiment_outputs(
-        OUTPUT_DIR,
-        master_results,
-        master_oof,
-        gate_rates,
-        metadata_extra=master_metadata,
-    )
-
-    stage_durations["10 Master experiment matrix"] = _print_stage_complete(
+    stage_durations["10 Patient-level cross-validation"] = _print_stage_complete(
         10,
-        "Run the master patient-level experiment matrix",
+        "Run Directory_*-level stratified cross-validation",
         stage_started_at,
-        f"Completed {len(master_results)} result variants using {len(patient_ids_master)} patients.",
+        f"Generated OOF scores for {len(evaluated_patient_ids)} patients.",
     )
 
-    # Stage 11: save the original primary OOF table as a compatibility artifact.
+    # ======================================================================
+    # MAIN STAGE 11 -- CALCULATE THE POOLED OOF AUC AND PATIENT BOOTSTRAP CI
+    # ======================================================================
+    # The primary ranking metric is computed from the complete set of held-out
+    # patient predictions, not from training predictions or individual slices.
     stage_started_at = _print_stage_start(
         11,
-        "Save compatibility OOF output for the predeclared primary model",
-        "Immediate; reuses the E0 master OOF rows.",
+        "Calculate pooled OOF AUC and bootstrap confidence interval",
+        f"Usually short to moderate; runs {BOOTSTRAP_REPLICATES} patient-level replicates.",
     )
-    e0_rows = [
-        row for row in master_oof
-        if row["experiment"] == "E0_BASELINE"
-        and row["variant"] == "MONAI_ROI__HIERARCHICAL__LOGISTIC"
-    ]
-    e0_rows.sort(key=lambda row: row["patient_id"])
-    write_oof_predictions(
-        OUTPUT_DIR / "patient_oof_predictions.csv",
-        np.asarray([r["patient_id"] for r in e0_rows]),
-        np.asarray([r["true_label"] for r in e0_rows], dtype=np.int64),
-        np.asarray([r["score"] for r in e0_rows], dtype=np.float64),
-        np.asarray([r["fold"] for r in e0_rows], dtype=np.int64),
+    auc = roc_auc_score(patient_ground_truth, patient_scores)
+    print(f"[METRICS] Pooled OOF AUC computed: {auc:.6f}", flush=True)
+
+    # The bootstrap resamples Normal and Sick patient rows separately with
+    # replacement, guaranteeing that each replicate contains both classes. The
+    # interval quantifies sampling variability of these OOF rows but does not
+    # replace independent external validation.
+    auc_ci_lower, auc_ci_upper = bootstrap_patient_auc_ci(
+        patient_ground_truth,
+        patient_scores,
     )
-    stage_durations["11 Save primary OOF predictions"] = _print_stage_complete(
+    stage_durations["11 AUC and bootstrap CI"] = _print_stage_complete(
         11,
-        "Save compatibility OOF output for the predeclared primary model",
+        "Calculate pooled OOF AUC and bootstrap confidence interval",
         stage_started_at,
+        f"AUC={auc:.6f}, 95% CI=[{auc_ci_lower:.6f}, {auc_ci_upper:.6f}]",
     )
 
-    # Stage 12: write the enriched run metadata.
+    # ======================================================================
+    # MAIN STAGE 12 -- SAVE ONE TRANSPARENT OOF ROW PER PATIENT
+    # ======================================================================
+    # This CSV is the auditable basis for the pooled AUC. It records patient ID,
+    # true label, held-out fold, and the uncalibrated positive-class model score.
     stage_started_at = _print_stage_start(
         12,
-        "Save master run metadata",
-        "Immediate; machine-readable provenance and experiment configuration.",
+        "Save one auditable OOF prediction row per patient",
+        "Usually immediate; writes a small CSV with one row per Directory_* patient.",
+    )
+    write_oof_predictions(
+        OUTPUT_DIR / "patient_oof_predictions.csv",
+        evaluated_patient_ids,
+        patient_ground_truth,
+        patient_scores,
+        patient_folds,
+    )
+    stage_durations["12 Save OOF predictions"] = _print_stage_complete(
+        12,
+        "Save one auditable OOF prediction row per patient",
+        stage_started_at,
+        f"OOF CSV: {OUTPUT_DIR / 'patient_oof_predictions.csv'}",
+    )
+
+    # ======================================================================
+    # MAIN STAGE 13 -- ASSEMBLE AND SAVE COMPLETE RUN METADATA
+    # ======================================================================
+    # ``collect_run_metadata`` records software versions, device, strategy,
+    # model provenance, configured hashes, artifact hashes when present, cache
+    # schema, and output locations. Evaluation results and duplicate-audit counts
+    # are then added to the same JSON object.
+    stage_started_at = _print_stage_start(
+        13,
+        "Collect provenance metadata and save the run summary",
+        "Usually fast; hashing large model artifacts may take several seconds.",
     )
     summary = collect_run_metadata()
-    summary.update(master_metadata)
-    summary["master_experiment_results"] = master_results
+    summary.update(
+        {
+            "patients_evaluated": int(len(evaluated_patient_ids)),
+            "normal_patients": int(np.sum(patient_ground_truth == 0)),
+            "sick_patients": int(np.sum(patient_ground_truth == 1)),
+            "patient_oof_auc": float(auc),
+            "patient_oof_auc_ci_95": [
+                float(auc_ci_lower),
+                float(auc_ci_upper),
+            ],
+            "fold_aucs": [float(value) for value in fold_aucs],
+            "feature_cache_fingerprint": fingerprint,
+            "exact_duplicate_audit": duplicate_audit_summary,
+        }
+    )
+
+    # JSON is human-readable, machine-readable, UTF-8 encoded, and key-sorted to
+    # make differences between runs easier to inspect in version control.
     (OUTPUT_DIR / "run_summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True),
         encoding="utf-8",
     )
-    stage_durations["12 Save master metadata"] = _print_stage_complete(
-        12,
-        "Save master run metadata",
+    stage_durations["13 Save run metadata"] = _print_stage_complete(
+        13,
+        "Collect provenance metadata and save the run summary",
         stage_started_at,
         f"Run summary: {OUTPUT_DIR / 'run_summary.json'}",
     )
 
-    # Stage 13: print primary result from the master table.
+    # ======================================================================
+    # MAIN STAGE 14 -- PRINT THE PRIMARY PATIENT-LEVEL RESULT
+    # ======================================================================
+    # The console summary intentionally repeats the effective patient count and
+    # explicitly warns that the scores are not externally calibrated clinical
+    # probabilities. The saved CSV/JSON files remain the authoritative records.
     stage_started_at = _print_stage_start(
-        13,
-        "Print predeclared primary result",
+        14,
+        "Print the primary patient-level result",
         "Immediate; console reporting only.",
     )
-    primary = next(
-        r for r in master_results
-        if r["experiment"] == "E0_BASELINE"
-        and r["variant"] == "MONAI_ROI__HIERARCHICAL__LOGISTIC"
-    )
-    print("\n============================================================", flush=True)
-    print("PRIMARY PATIENT-LEVEL RESULT", flush=True)
-    print("============================================================", flush=True)
-    print(f"Patients evaluated: {primary['n_patients']}", flush=True)
-    print(f"AUROC: {primary['auroc']:.6f}", flush=True)
+    print("\n============================================================")
+    print("FINAL OUT-OF-FOLD PATIENT-LEVEL RESULT")
+    print("============================================================")
+    print(f"Patients evaluated: {len(evaluated_patient_ids)}")
+    print(f"Patient-level OOF AUC: {auc:.6f}")
     print(
-        f"95% CI: [{primary['auroc_ci95_lower']:.6f}, {primary['auroc_ci95_upper']:.6f}]",
-        flush=True,
+        "Patient-level bootstrap 95% CI: "
+        f"[{auc_ci_lower:.6f}, {auc_ci_upper:.6f}]"
     )
-    print(f"Sensitivity: {primary['sensitivity']:.6f}", flush=True)
-    print(f"Specificity: {primary['specificity']:.6f}", flush=True)
-    print(f"PPV: {primary['ppv']:.6f}", flush=True)
-    print(f"NPV: {primary['npv']:.6f}", flush=True)
-    print(f"F1: {primary['f1']:.6f}", flush=True)
-    stage_durations["13 Print primary result"] = _print_stage_complete(
-        13,
-        "Print predeclared primary result",
+    print(
+        "Scores are model outputs from Logistic Regression and are not "
+        "claimed to be externally calibrated clinical probabilities."
+    )
+    stage_durations["14 Print primary result"] = _print_stage_complete(
+        14,
+        "Print the primary patient-level result",
         stage_started_at,
     )
 
-    # Stage 14: final patient-level primary OOF scores.
-    stage_started_at = _print_stage_start(
-        14,
-        "Print primary patient OOF scores",
-        "Fast; one row per Directory_* patient.",
-    )
-    print("\nPRIMARY PATIENT-LEVEL OOF SCORES:", flush=True)
-    for row in e0_rows:
-        print(
-            f"  {row['patient_id']}: true_label={row['true_label']}, "
-            f"fold={row['fold']}, score={row['score']:.6f}",
-            flush=True,
-        )
-    stage_durations["14 Print primary patient scores"] = _print_stage_complete(
-        14,
-        "Print primary patient OOF scores",
-        stage_started_at,
-        f"Printed {len(e0_rows)} patient rows.",
-    )
-
-    # Stage 15: report the output package.
+    # ======================================================================
+    # MAIN STAGE 15 -- PRINT EVERY PATIENT'S AUDITABLE OOF SCORE
+    # ======================================================================
+    # Iterating over aligned arrays makes it possible to compare console output
+    # directly with patient_oof_predictions.csv. Each patient appears once.
     stage_started_at = _print_stage_start(
         15,
-        "Report master experiment outputs",
-        "Immediate; output paths only.",
+        "Print every patient's auditable OOF score",
+        "Fast for a small cohort; console output grows linearly with patient count.",
+    )
+    print("\nPATIENT-LEVEL OOF SCORES:")
+    for patient_id, label, fold, score in zip(
+        evaluated_patient_ids,
+        patient_ground_truth,
+        patient_folds,
+        patient_scores,
+    ):
+        print(
+            f"  {patient_id}: true_label={int(label)}, "
+            f"fold={int(fold)}, uncalibrated_CAD_score={float(score):.6f}"
+        )
+
+    stage_durations["15 Print patient scores"] = _print_stage_complete(
+        15,
+        "Print every patient's auditable OOF score",
+        stage_started_at,
+        f"Printed {len(evaluated_patient_ids)} patient rows.",
+    )
+
+    # ======================================================================
+    # MAIN STAGE 16 -- REPORT THE OUTPUT LOCATION AND NORMAL COMPLETION
+    # ======================================================================
+    # Reaching this point means validation, extraction/cache loading, audits,
+    # cross-validation, metrics, and all principal output writes completed
+    # without raising an exception.
+    stage_started_at = _print_stage_start(
+        16,
+        "Report output location and finalize execution",
+        "Immediate; final console messages and timing summary.",
     )
     print(f"\nOutputs saved under: {OUTPUT_DIR}", flush=True)
-    stage_durations["15 Report outputs"] = _print_stage_complete(
-        15,
-        "Report master experiment outputs",
+    stage_durations["16 Finalize execution"] = _print_stage_complete(
+        16,
+        "Report output location and finalize execution",
         stage_started_at,
     )
 
-    # Stage 16: final timing.
-    stage_started_at = _print_stage_start(
-        16,
-        "Finalize master experiment run",
-        "Immediate; final timing summary.",
-    )
     total_elapsed = time.perf_counter() - pipeline_started_at
-    stage_durations["16 Finalize execution"] = _print_stage_complete(
-        16,
-        "Finalize master experiment run",
-        stage_started_at,
-    )
     _print_timing_summary(stage_durations, total_elapsed)
     print(
-        f"[PIPELINE] Completed successfully in {_format_elapsed_time(total_elapsed)}.",
+        f"[PIPELINE] Completed successfully in "
+        f"{_format_elapsed_time(total_elapsed)}.",
         flush=True,
     )
     print("Done!", flush=True)
@@ -5976,4 +5568,43 @@ def main():
 # expensive experiment.
 if __name__ == "__main__":
     main()
+
+# =============================================================
+# RECOMMENDED NEXT EXPERIMENTS
+# =============================================================
+#
+# For a publication-quality study, do not report only this one AUC. The next
+# experiments should be:
+#
+# 1. Ablation: full image vs MONAI ROI.
+# 2. Ablation: equal slice weights (default) vs the optional quality heuristic.
+# 3. Ablation: mean probability vs log-odds fusion.
+# 4. The recommended default already uses hierarchical embedding pooling.
+#    Report the legacy slice-classifier/fusion strategy only as an ablation and
+#    discuss its repeated-label/pseudo-replication limitation explicitly.
+# 5. Compare Logistic Regression vs linear SVM.
+# 6. Compare frozen ImageNet EfficientNet-B0 with a cardiac-MRI-pretrained
+#    encoder if an appropriate public checkpoint is available.
+# 7. Evaluate each sequence/view separately only if sequence/view identity can
+#    be recovered reliably from the released files.
+# 8. Audit exact/near-duplicate images ACROSS Directory_* patients before any
+#    final publication split; cross-patient duplicates can leak visual content
+#    even when patient IDs themselves never cross folds.
+# 9. Tune ROI-gate thresholds, classifier C, calibration or decision thresholds
+#    only inside training data (nested patient-level CV if tuned quantitatively).
+# 10. Compare the class-specific MONAI gate rates. A large Normal/Sick difference
+#     may indicate protocol/export confounding rather than anatomical usefulness.
+# 11. Report sensitivity, specificity, PPV, NPV and confidence intervals using
+#     a threshold selected without looking at the validation fold.
+# 12. Perform external validation on an independent hospital dataset if possible.
+# 13. Audit image dimensions, borders, compression and acquisition/export style
+#     by class; the model must not be allowed to classify dataset provenance.
+#
+# MOST IMPORTANT:
+# The MONAI segmenter is designed for 2D short-axis cardiac MR images. The
+# published CAD dataset contains heterogeneous CMR acquisitions including
+# LGE, Perfusion, T2-weighted and SSFP, with long- and short-axis views.
+# Therefore the segmentation mask should NOT be presented as valid anatomy
+# segmentation for every image in the dataset. The confidence gate and
+# fallback are safeguards, not proof of anatomical correctness.
 
