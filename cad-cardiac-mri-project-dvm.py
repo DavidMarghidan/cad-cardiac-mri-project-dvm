@@ -5607,9 +5607,4 @@ if __name__ == "__main__":
 # Therefore the segmentation mask should NOT be presented as valid anatomy
 # segmentation for every image in the dataset. The confidence gate and
 # fallback are safeguards, not proof of anatomical correctness.
-#
-# The Scientific Reports dataset paper reports 63,648 images and 1,224
-# participants (722 healthy, 502 CAD), and explicitly states that four sequence
-# families and both long- and short-axis planes were used. This domain mismatch
-# is one of the most important limitations of the pipeline and should be
-# discussed in any manuscript.
+
