@@ -60,17 +60,22 @@
 #      padding followed by separate MONAI min-max and classifier robust scaling
 #  18. Fixed-content geometry: the longest retained side is always 240 pixels
 #      inside a centered 256x256 canvas, including controlled upsampling
-#  19. A standardized primary baseline plus narrow-border, corner, padding,
-#      fixed-center, strict-ROI and outside-ventricular-box controls
+#  19. A standardized development baseline plus a locked strict-ROI primary
+#      candidate and narrow-border, corner, padding, fixed-center and
+#      outside-ventricular-box controls
 #  20. Separate MONAI inference and QC on original versus standardized canvases
 #  21. Folder-independent fixed-chunk pooling and decomposed structural controls
 #      for slice count, series count, series length, geometry and file size
 #  22. Conservative C selection: the smallest C within a predeclared inner-AUC
 #      tolerance of the best candidate is chosen
-#  23. Repeated nested patient-level CV for the baseline, localization candidates
-#      and major shortcut controls rather than only one favorable split
+#  23. Repeated nested patient-level CV for the locked candidate, direct
+#      localization comparators, pooling/deduplication variants and major
+#      shortcut controls rather than only one favorable split
 #  24. A 1,000-replicate patient-label permutation test that repeats the full
-#      nested fitting path for the primary baseline
+#      nested fitting path directly for the locked A12 primary candidate
+#  25. Same-seed paired repeated-CV deltas for A12 versus each key comparator
+#  26. Soft-mask-only, hard-mask-only and MONAI-box-only morphology controls
+#  27. Exact within-patient deduplication and blinded pHash/series review files
 #
 # IMPORTANT METHODOLOGICAL CHANGES:
 # The original version used one 80/20 split and discarded roughly half of the
@@ -94,8 +99,9 @@
 #     outer-training cohort through duplicate-aware inner CV;
 #   - uses one authoritative outer-fold manifest for every experiment;
 #   - preserves the original min-max/full-canvas pipeline as a historical
-#     reference, while making the label-blind standardized ROI branch the new
-#     primary baseline after shortcut controls exposed export confounding;
+#     reference and B1 as the standardized development baseline, while locking
+#     A12 (zero-background ROI plus fixed-center fallback) as the primary
+#     candidate after the prior Kaggle audit;
 #   - makes standardized content scale fixed rather than native-size-dependent;
 #   - keeps MONAI on a min-max intensity view while EfficientNet receives a
 #     robustly scaled view of exactly the same retained crop and geometry;
@@ -103,10 +109,15 @@
 #     padding, MONAI-independent fixed-center, strict-ROI and outside-box controls;
 #   - decomposes broad provenance into separate count, folder-length, geometry
 #     and file-size controls;
-#   - repeats selected candidate and shortcut-control nested CV analyses across
-#     50 deterministic outer splits;
-#   - repeats the complete patient-level fitting path after 1,000 patient-label
-#     permutations to obtain an empirical null AUC distribution;
+#   - repeats the locked candidate, direct comparators and shortcut controls
+#     across 50 deterministic outer splits and calculates same-seed paired
+#     delta-AUC distributions;
+#   - repeats the complete A12 patient-level fitting path after 1,000
+#     patient-label permutations to obtain an empirical null AUC distribution;
+#   - tests whether A12 depends on folder-proxy pooling, repeated exact exports,
+#     or MONAI mask/box morphology without MRI intensities;
+#   - writes blinded pHash review panels and a blinded series/view annotation
+#     template while keeping labels in separate key files;
 #   - saves OOF predictions, fold assignments, paired comparisons, duplicate
 #     audits, provenance/standardization controls and original/standardized
 #     MONAI QC summaries.
@@ -373,11 +384,11 @@
 # MULTI-EXPERIMENT EXTENSION
 # ============================================================================
 #
-# The detailed flow above describes the CURRENT STANDARDIZED BASELINE B1. The
-# original suite is retained for historical comparison, the first twelve
-# deconfounding experiments remain available, and ten second-stage experiments
-# are added after the Kaggle audit showed residual geometry/provenance signal.
-# The complete default registry now contains 38 experiments:
+# The detailed flow above describes the standardized development branch B1.
+# A12 is now the locked primary candidate. The original suite is retained for
+# historical comparison, the deconfounding and second-stage experiments remain
+# available, and five candidate-validation experiments are added after the
+# latest Kaggle audit. The complete default registry now contains 43 experiments:
 #
 #   ORIGINAL / HISTORICAL SUITE
 #   B0  Original MONAI ROI + hierarchical pooling + Logistic Regression + PCA
@@ -396,7 +407,7 @@
 #   R1/R2/R3  Deterministic 10%/25%/50% within-series slice dropout
 #
 #   DECONFOUNDING EXTENSION
-#   B1  Label-blind standardized MONAI ROI (new primary baseline)
+#   B1  Label-blind standardized MONAI ROI (development baseline)
 #   A9  Standardized full image
 #   C5  Standardized outer 5% only
 #   C6  Standardized outer 10% only
@@ -419,14 +430,21 @@
 #   C19 Native-geometry-only control
 #   C20 File-size/compression-proxy-only control
 #
+#   PRIMARY-CANDIDATE VALIDATION EXTENSION
+#   A14 A12 pixels with folder-independent fixed-chunk pooling
+#   A15 A12 after exact within-patient decoded-pixel deduplication
+#   C21 Standardized soft MONAI probability-map-only control
+#   C22 Standardized hard MONAI mask-only control
+#   C23 Standardized MONAI bounding-box-geometry-only control
+#
 # Every enabled experiment uses the SAME duplicate-aware outer patient-fold
 # manifest. Classifier C and the decision threshold are selected only from each
 # outer-training cohort through inner patient-level OOF predictions. Linear-SVM
 # margins are calibrated by a sigmoid fitted only to inner OOF training scores.
-# The primary baseline, the fixed-center and strict-ROI candidates, and the
-# principal shortcut controls are rerun across 50 outer-split seeds. The primary
-# baseline also receives 1,000 patient-label permutations. No favorable split or
-# permutation is selected.
+# A12, its direct localization/pooling/deduplication comparators, and the
+# principal shortcut/mask-only controls are rerun across 50 identical outer-split
+# seeds. Same-seed delta-AUC distributions are saved. A12 also receives 1,000
+# patient-label permutations. No favorable split or permutation is selected.
 #
 # A single script launch does NOT mean one classifier represents every ablation.
 # It means the expensive operations are shared correctly:
@@ -457,6 +475,9 @@
 #   manifests/patient_fold_manifest.csv
 #   audits/exact_decoded_pixel_duplicate_groups.csv
 #   audits/perceptual_near_duplicate_patient_pairs.csv
+#   audits/phash_review_panels/*.png
+#   audits/series_annotation_template.csv
+#   audits/series_annotation_label_key.csv
 #   audits/monai_qc_by_patient.csv
 #   audits/monai_gate_class_comparison.json
 #   audits/patient_provenance_features.csv
@@ -477,7 +498,11 @@
 #   stability/<experiment_id>/patient_score_stability.csv
 #   stability/<experiment_id>/repeated_nested_cv_summary.json
 #   stability/repeated_nested_cv_summary.json
-#   permutation/patient_label_permutation_auc.csv
+#   stability/repeated_nested_cv_paired_deltas.csv
+#   stability/repeated_nested_cv_paired_comparisons.csv
+#   stability/repeated_nested_cv_paired_comparisons.json
+#   permutation/<experiment_id>/patient_label_permutation_auc.csv
+#   permutation/<experiment_id>/patient_label_permutation_summary.json
 #   permutation/patient_label_permutation_summary.json
 #
 # All ordinary print() messages, tqdm progress and tracebacks are duplicated to
@@ -698,6 +723,11 @@ class ExperimentConfig:
     slice_dropout_rate: float = 0.0
     # Optional deterministic robustness perturbation applied before pooling.
     # At least one slice is retained in every series proxy.
+    deduplicate_exact_within_patient: bool = False
+    # When True, repeated decoded-pixel copies are collapsed inside each
+    # Directory_* patient before weighting and pooling. A deterministic
+    # canonical row is retained for each (patient_id, decoded-pixel SHA-256)
+    # group, so the experiment does not redefine patient identity or use labels.
     role: str = "ablation"
     enabled: bool = True
 
@@ -707,7 +737,14 @@ class ExperimentConfig:
 # as None to run every configuration whose enabled field is True.
 EXPERIMENTS_TO_RUN = None
 
-BASELINE_EXPERIMENT_ID = "B1_STANDARDIZED_ROI_HIER_LR_PCA"
+PRIMARY_CANDIDATE_EXPERIMENT_ID = (
+    "A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA"
+)
+DEVELOPMENT_BASELINE_EXPERIMENT_ID = "B1_STANDARDIZED_ROI_HIER_LR_PCA"
+BASELINE_EXPERIMENT_ID = PRIMARY_CANDIDATE_EXPERIMENT_ID
+# The strict zero-background ROI with fixed-center fallback is now the locked
+# primary candidate for all final baseline-relative tables. B1 remains enabled
+# as the earlier standardized development baseline and is never deleted.
 
 EXPERIMENT_REGISTRY = (
     ExperimentConfig(
@@ -925,7 +962,7 @@ EXPERIMENT_REGISTRY = (
         classifier_type="logistic_regression",
         use_pca=True,
         tune_c=True,
-        role="baseline",
+        role="development_baseline",
     ),
     ExperimentConfig(
         experiment_id="A9_STANDARDIZED_FULL_HIER_LR_PCA",
@@ -1158,6 +1195,7 @@ EXPERIMENT_REGISTRY = (
         classifier_type="logistic_regression",
         use_pca=True,
         tune_c=True,
+        role="baseline",
     ),
     ExperimentConfig(
         experiment_id="A13_STANDARDIZED_ROI_FIXED_CHUNK_LR_PCA",
@@ -1173,6 +1211,38 @@ EXPERIMENT_REGISTRY = (
         classifier_type="logistic_regression",
         use_pca=True,
         tune_c=True,
+    ),
+    ExperimentConfig(
+        experiment_id="A14_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_FIXED_CHUNK_LR_PCA",
+        description=(
+            "Primary-candidate pixels with folder-independent fixed-size chunk "
+            "pooling. This isolates the effect of SR_*/series* proxy boundaries "
+            "while keeping the strict ROI/fallback representation unchanged."
+        ),
+        feature_mode="standardized_roi_zero_bg_center_fallback",
+        strategy="patient_embedding",
+        pooling_strategy="fixed_chunk",
+        weighting_mode="equal",
+        classifier_type="logistic_regression",
+        use_pca=True,
+        tune_c=True,
+    ),
+    ExperimentConfig(
+        experiment_id="A15_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_DEDUP_HIER_LR_PCA",
+        description=(
+            "Primary-candidate pixels after deterministic exact decoded-pixel "
+            "deduplication inside each Directory_* patient. Hierarchical pooling "
+            "is otherwise unchanged, so repeated identical exports cannot receive "
+            "multiple nominal contributions."
+        ),
+        feature_mode="standardized_roi_zero_bg_center_fallback",
+        strategy="patient_embedding",
+        pooling_strategy="hierarchical",
+        weighting_mode="equal",
+        classifier_type="logistic_regression",
+        use_pca=True,
+        tune_c=True,
+        deduplicate_exact_within_patient=True,
     ),
     ExperimentConfig(
         experiment_id="C16_N_SLICES_ONLY_LR",
@@ -1237,6 +1307,54 @@ EXPERIMENT_REGISTRY = (
         weighting_mode="not_applicable",
         classifier_type="logistic_regression",
         use_pca=False,
+        tune_c=True,
+        role="negative_control",
+    ),
+    ExperimentConfig(
+        experiment_id="C21_STANDARDIZED_SOFT_MONAI_MASK_ONLY_HIER_LR_PCA",
+        description=(
+            "Negative control encoding only the standardized dilated soft MONAI "
+            "probability map for gate-valid slices; invalid slices are all zero. "
+            "It tests whether mask shape/confidence alone predicts the class."
+        ),
+        feature_mode="standardized_soft_monai_mask_only",
+        strategy="patient_embedding",
+        pooling_strategy="hierarchical",
+        weighting_mode="equal",
+        classifier_type="logistic_regression",
+        use_pca=True,
+        tune_c=True,
+        role="negative_control",
+    ),
+    ExperimentConfig(
+        experiment_id="C22_STANDARDIZED_HARD_MONAI_MASK_ONLY_HIER_LR_PCA",
+        description=(
+            "Negative control encoding only the standardized dilated hard MONAI "
+            "mask for gate-valid slices; invalid slices are all zero. It removes "
+            "MRI intensities while preserving mask morphology and position."
+        ),
+        feature_mode="standardized_hard_monai_mask_only",
+        strategy="patient_embedding",
+        pooling_strategy="hierarchical",
+        weighting_mode="equal",
+        classifier_type="logistic_regression",
+        use_pca=True,
+        tune_c=True,
+        role="negative_control",
+    ),
+    ExperimentConfig(
+        experiment_id="C23_STANDARDIZED_MONAI_BBOX_MASK_ONLY_HIER_LR_PCA",
+        description=(
+            "Negative control encoding only a binary rectangle around each valid "
+            "standardized MONAI hard-mask bounding box; invalid slices are zero. "
+            "It tests whether ROI location and extent alone encode the label."
+        ),
+        feature_mode="standardized_monai_bbox_mask_only",
+        strategy="patient_embedding",
+        pooling_strategy="hierarchical",
+        weighting_mode="equal",
+        classifier_type="logistic_regression",
+        use_pca=True,
         tune_c=True,
         role="negative_control",
     ),
@@ -1337,6 +1455,66 @@ PRIMARY_ABLATION_COMPARISONS = (
         "B1_STANDARDIZED_ROI_HIER_LR_PCA",
         "A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA",
         "Does strict zero-background ROI with fixed-center fallback improve the standardized soft ROI?",
+    ),
+    (
+        "PRIMARY_CANDIDATE_VS_FIXED_CENTER_60",
+        "C14_STANDARDIZED_FIXED_CENTER60_HIER_LR_PCA",
+        "A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA",
+        "Does the locked strict-ROI candidate outperform a simple MONAI-independent fixed 60 percent center crop?",
+    ),
+    (
+        "PRIMARY_CANDIDATE_VS_STANDARDIZED_FULL_IMAGE",
+        "A9_STANDARDIZED_FULL_HIER_LR_PCA",
+        "A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA",
+        "Does the locked strict-ROI candidate outperform the fully standardized image?",
+    ),
+    (
+        "PRIMARY_CANDIDATE_VS_OUTSIDE_LARGE_BOUNDING_BOX",
+        "C10_STANDARDIZED_OUTSIDE_LARGE_BBOX_HIER_LR_PCA",
+        "A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA",
+        "Does the locked strict-ROI candidate outperform signal outside the enlarged MONAI ventricular bounding box?",
+    ),
+    (
+        "PRIMARY_CANDIDATE_VS_ZERO_BACKGROUND_FULL_FALLBACK",
+        "A10_STANDARDIZED_ROI_ZERO_BG_HIER_LR_PCA",
+        "A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA",
+        "Does fixed-center fallback improve strict zero-background ROI relative to full-image fallback?",
+    ),
+    (
+        "PRIMARY_CANDIDATE_VS_MONAI_BOUNDING_BOX_CROP",
+        "A11_STANDARDIZED_ROI_BBOX_HIER_LR_PCA",
+        "A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA",
+        "Does soft strict ROI with fixed-center fallback outperform a hard MONAI bounding-box crop?",
+    ),
+    (
+        "PRIMARY_CANDIDATE_HIERARCHICAL_VS_FIXED_CHUNK_POOLING",
+        "A14_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_FIXED_CHUNK_LR_PCA",
+        "A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA",
+        "With identical primary-candidate pixels, does folder-defined hierarchical pooling outperform fixed-size folder-independent chunks?",
+    ),
+    (
+        "PRIMARY_CANDIDATE_VS_EXACT_WITHIN_PATIENT_DEDUPLICATION",
+        "A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA",
+        "A15_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_DEDUP_HIER_LR_PCA",
+        "How does collapsing exact repeated pixel exports within each patient change the locked primary candidate?",
+    ),
+    (
+        "PRIMARY_CANDIDATE_VS_SOFT_MONAI_MASK_ONLY",
+        "C21_STANDARDIZED_SOFT_MONAI_MASK_ONLY_HIER_LR_PCA",
+        "A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA",
+        "Does MRI intensity inside the strict ROI add information beyond the soft MONAI probability-map shape and confidence?",
+    ),
+    (
+        "PRIMARY_CANDIDATE_VS_HARD_MONAI_MASK_ONLY",
+        "C22_STANDARDIZED_HARD_MONAI_MASK_ONLY_HIER_LR_PCA",
+        "A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA",
+        "Does MRI intensity add information beyond dilated hard-mask morphology and position?",
+    ),
+    (
+        "PRIMARY_CANDIDATE_VS_MONAI_BBOX_MASK_ONLY",
+        "C23_STANDARDIZED_MONAI_BBOX_MASK_ONLY_HIER_LR_PCA",
+        "A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA",
+        "Does MRI intensity add information beyond MONAI bounding-box location and extent?",
     ),
     (
         "STANDARDIZED_HIERARCHICAL_VS_FIXED_CHUNK_POOLING",
@@ -1480,13 +1658,13 @@ PROGRESS_PRINT_EVERY_N_BATCHES = 25
 
 USE_FEATURE_CACHE = True
 FORCE_REBUILD_FEATURE_CACHE = False
-FEATURE_CACHE_SCHEMA_VERSION = "2026-08-31-geometry-standardized-v4"
+FEATURE_CACHE_SCHEMA_VERSION = "2026-09-01-primary-candidate-validation-v5"
 EFFICIENTNET_FEATURE_DIM = 1280
 FEATURE_MODES_PER_ENCODER_CALL = 4
 # Several image variants can be concatenated along the batch dimension and
 # encoded by one EfficientNet call. Four modes at a time is a conservative T4
 # default: it reduces Python/kernel-launch overhead without materializing all
-# all eighteen views simultaneously. Lower this value if GPU memory is insufficient.
+# all twenty-one views simultaneously. Lower this value if GPU memory is insufficient.
 
 SLICE_QUALITY_MIN_WEIGHT = 0.25
 # The quality signal remains a non-clinical heuristic. It is computed once from
@@ -1555,23 +1733,99 @@ RUN_REPEATED_NESTED_CV_STABILITY = True
 REPEATED_NESTED_CV_REPEATS = 50
 REPEATED_NESTED_CV_RANDOM_STATE = RANDOM_SEED + 20_000
 STABILITY_EXPERIMENT_IDS = (
-    BASELINE_EXPERIMENT_ID,
+    DEVELOPMENT_BASELINE_EXPERIMENT_ID,
+    "A9_STANDARDIZED_FULL_HIER_LR_PCA",
+    "A10_STANDARDIZED_ROI_ZERO_BG_HIER_LR_PCA",
+    "A11_STANDARDIZED_ROI_BBOX_HIER_LR_PCA",
     "C14_STANDARDIZED_FIXED_CENTER60_HIER_LR_PCA",
-    "A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA",
+    PRIMARY_CANDIDATE_EXPERIMENT_ID,
+    "A14_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_FIXED_CHUNK_LR_PCA",
+    "A15_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_DEDUP_HIER_LR_PCA",
     "C10_STANDARDIZED_OUTSIDE_LARGE_BBOX_HIER_LR_PCA",
     "C5_STANDARDIZED_BORDER05_HIER_LR_PCA",
     "C6_STANDARDIZED_BORDER10_HIER_LR_PCA",
     "C7_DETECTED_PADDING_MASK_HIER_LR_PCA",
+    "C21_STANDARDIZED_SOFT_MONAI_MASK_ONLY_HIER_LR_PCA",
+    "C22_STANDARDIZED_HARD_MONAI_MASK_ONLY_HIER_LR_PCA",
+    "C23_STANDARDIZED_MONAI_BBOX_MASK_ONLY_HIER_LR_PCA",
+)
+
+# All comparisons below use the exact same outer split seeds. The first model
+# is the reference and the second is the changed configuration, so a positive
+# delta means the SECOND named configuration performed better on that repeat.
+# Most rows place A12 second; the deduplication row intentionally places A15
+# second because it asks whether collapsing repeats improves the locked model.
+REPEATED_STABILITY_COMPARISONS = (
+    (
+        "A12_VS_FIXED_CENTER_60",
+        "C14_STANDARDIZED_FIXED_CENTER60_HIER_LR_PCA",
+        PRIMARY_CANDIDATE_EXPERIMENT_ID,
+        "Strict MONAI ROI versus a simple fixed central crop.",
+    ),
+    (
+        "A12_VS_STANDARDIZED_FULL_IMAGE",
+        "A9_STANDARDIZED_FULL_HIER_LR_PCA",
+        PRIMARY_CANDIDATE_EXPERIMENT_ID,
+        "Strict MONAI ROI versus the standardized full image.",
+    ),
+    (
+        "A12_VS_OUTSIDE_LARGE_BBOX",
+        "C10_STANDARDIZED_OUTSIDE_LARGE_BBOX_HIER_LR_PCA",
+        PRIMARY_CANDIDATE_EXPERIMENT_ID,
+        "Strict ROI versus pixels outside the enlarged ventricular box.",
+    ),
+    (
+        "A12_VS_ZERO_BG_FULL_FALLBACK",
+        "A10_STANDARDIZED_ROI_ZERO_BG_HIER_LR_PCA",
+        PRIMARY_CANDIDATE_EXPERIMENT_ID,
+        "Fixed-center fallback versus full-image fallback.",
+    ),
+    (
+        "A12_VS_MONAI_BBOX_CROP",
+        "A11_STANDARDIZED_ROI_BBOX_HIER_LR_PCA",
+        PRIMARY_CANDIDATE_EXPERIMENT_ID,
+        "Soft strict ROI versus hard MONAI bounding-box crop.",
+    ),
+    (
+        "A12_HIERARCHICAL_VS_FIXED_CHUNK",
+        "A14_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_FIXED_CHUNK_LR_PCA",
+        PRIMARY_CANDIDATE_EXPERIMENT_ID,
+        "Identical pixels with hierarchical versus folder-independent chunks.",
+    ),
+    (
+        "A12_VS_EXACT_DEDUP",
+        PRIMARY_CANDIDATE_EXPERIMENT_ID,
+        "A15_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_DEDUP_HIER_LR_PCA",
+        "Effect of collapsing exact repeated exports within patients.",
+    ),
+    (
+        "A12_VS_SOFT_MASK_ONLY",
+        "C21_STANDARDIZED_SOFT_MONAI_MASK_ONLY_HIER_LR_PCA",
+        PRIMARY_CANDIDATE_EXPERIMENT_ID,
+        "MRI intensities versus soft-mask morphology/confidence only.",
+    ),
+    (
+        "A12_VS_HARD_MASK_ONLY",
+        "C22_STANDARDIZED_HARD_MONAI_MASK_ONLY_HIER_LR_PCA",
+        PRIMARY_CANDIDATE_EXPERIMENT_ID,
+        "MRI intensities versus hard-mask morphology only.",
+    ),
+    (
+        "A12_VS_BBOX_MASK_ONLY",
+        "C23_STANDARDIZED_MONAI_BBOX_MASK_ONLY_HIER_LR_PCA",
+        PRIMARY_CANDIDATE_EXPERIMENT_ID,
+        "MRI intensities versus MONAI bounding-box geometry only.",
+    ),
 )
 
 RUN_PATIENT_LABEL_PERMUTATION_TEST = True
 LABEL_PERMUTATION_REPLICATES = 1000
 LABEL_PERMUTATION_RANDOM_STATE = RANDOM_SEED + 40_000
-PERMUTATION_EXPERIMENT_ID = BASELINE_EXPERIMENT_ID
-# Stability analysis is repeated for the primary standardized model, the main
-# localization candidates, and the most important shortcut controls. Label
-# permutation remains focused on the primary baseline. Both analyses reuse
-# cached frozen features and never rerun MONAI or EfficientNet.
+PERMUTATION_EXPERIMENT_IDS = (PRIMARY_CANDIDATE_EXPERIMENT_ID,)
+# Stability analysis now includes the locked primary candidate, matched pooling
+# and deduplication variants, direct localization comparators, and mask-only
+# controls. Label permutation is performed directly on A12 rather than only on
+# the earlier B1 development baseline. All analyses reuse frozen features.
 
 AUDIT_EXACT_DECODED_PIXEL_DUPLICATES = True
 AUDIT_PERCEPTUAL_NEAR_DUPLICATES = True
@@ -1774,7 +2028,10 @@ _selected_experiments_for_identity = [
 
 _suite_identity = {
     "experiments": _selected_experiments_for_identity,
+    "primary_candidate_experiment_id": PRIMARY_CANDIDATE_EXPERIMENT_ID,
+    "development_baseline_experiment_id": DEVELOPMENT_BASELINE_EXPERIMENT_ID,
     "primary_ablation_comparisons": PRIMARY_ABLATION_COMPARISONS,
+    "repeated_stability_comparisons": REPEATED_STABILITY_COMPARISONS,
     "random_seed": RANDOM_SEED,
     "cv_random_state": CV_RANDOM_STATE,
     "inner_cv_random_state": INNER_CV_RANDOM_STATE,
@@ -1864,7 +2121,7 @@ _suite_identity = {
     ),
     "label_permutation_replicates": LABEL_PERMUTATION_REPLICATES,
     "label_permutation_random_state": LABEL_PERMUTATION_RANDOM_STATE,
-    "permutation_experiment_id": PERMUTATION_EXPERIMENT_ID,
+    "permutation_experiment_ids": PERMUTATION_EXPERIMENT_IDS,
 }
 
 SUITE_CONFIGURATION_TAG = hashlib.sha256(
@@ -2085,6 +2342,50 @@ def validate_configuration():
             f"{BASELINE_EXPERIMENT_ID!r}."
         )
 
+    repeated_comparison_names = [
+        row[0] for row in REPEATED_STABILITY_COMPARISONS
+    ]
+    if len(repeated_comparison_names) != len(set(repeated_comparison_names)):
+        raise ValueError(
+            "Repeated-stability comparison names must be unique."
+        )
+    for comparison_name, reference_id, comparison_id, _ in (
+        REPEATED_STABILITY_COMPARISONS
+    ):
+        if reference_id not in known_experiment_ids:
+            raise ValueError(
+                f"{comparison_name}: unknown repeated-CV reference "
+                f"{reference_id!r}."
+            )
+        if comparison_id not in known_experiment_ids:
+            raise ValueError(
+                f"{comparison_name}: unknown repeated-CV comparison "
+                f"{comparison_id!r}."
+            )
+        if reference_id == comparison_id:
+            raise ValueError(
+                f"{comparison_name}: repeated-CV models must differ."
+            )
+        if RUN_REPEATED_NESTED_CV_STABILITY and (
+            reference_id not in STABILITY_EXPERIMENT_IDS
+            or comparison_id not in STABILITY_EXPERIMENT_IDS
+        ):
+            raise ValueError(
+                f"{comparison_name}: both models must be present in "
+                "STABILITY_EXPERIMENT_IDS."
+            )
+
+    if not PERMUTATION_EXPERIMENT_IDS:
+        raise ValueError(
+            "PERMUTATION_EXPERIMENT_IDS must contain at least one experiment."
+        )
+    if len(PERMUTATION_EXPERIMENT_IDS) != len(
+        set(PERMUTATION_EXPERIMENT_IDS)
+    ):
+        raise ValueError(
+            "PERMUTATION_EXPERIMENT_IDS must not contain duplicates."
+        )
+
     if RUN_REPEATED_NESTED_CV_STABILITY or RUN_PATIENT_LABEL_PERMUTATION_TEST:
         enabled_by_id = {
             experiment.experiment_id: experiment for experiment in experiments
@@ -2093,7 +2394,7 @@ def validate_configuration():
         if RUN_REPEATED_NESTED_CV_STABILITY:
             requested_analysis_ids.update(STABILITY_EXPERIMENT_IDS)
         if RUN_PATIENT_LABEL_PERMUTATION_TEST:
-            requested_analysis_ids.add(PERMUTATION_EXPERIMENT_ID)
+            requested_analysis_ids.update(PERMUTATION_EXPERIMENT_IDS)
 
         for analysis_experiment_id in sorted(requested_analysis_ids):
             if analysis_experiment_id not in enabled_by_id:
@@ -2134,6 +2435,9 @@ def validate_configuration():
         "standardized_roi_zero_bg_center_fallback",
         "standardized_roi_bbox",
         "standardized_outside_large_bbox",
+        "standardized_soft_monai_mask_only",
+        "standardized_hard_monai_mask_only",
+        "standardized_monai_bbox_mask_only",
         "provenance_only",
         "monai_qc_only",
         "standardization_qc_only",
@@ -2217,6 +2521,15 @@ def validate_configuration():
             raise ValueError(
                 f"{experiment.experiment_id}: slice dropout is reviewed only "
                 "for image-based patient-embedding experiments."
+            )
+
+        if experiment.deduplicate_exact_within_patient and (
+            experiment.strategy != "patient_embedding"
+        ):
+            raise ValueError(
+                f"{experiment.experiment_id}: exact within-patient "
+                "deduplication is reviewed only for patient-embedding "
+                "experiments."
             )
 
         if experiment.strategy == "slice_probability_fusion":
@@ -4966,6 +5279,9 @@ def required_efficientnet_feature_modes(experiments):
         "standardized_roi_zero_bg_center_fallback",
         "standardized_roi_bbox",
         "standardized_outside_large_bbox",
+        "standardized_soft_monai_mask_only",
+        "standardized_hard_monai_mask_only",
+        "standardized_monai_bbox_mask_only",
     )
     requested = {
         experiment.feature_mode
@@ -5498,6 +5814,77 @@ def create_outside_monai_bounding_box_images(
     return output
 
 
+def create_soft_monai_mask_only_images(roi_probability, valid_mask):
+    """Encode only the standardized soft MONAI map as a three-channel image.
+
+    MRI intensities are deliberately excluded. Gate-valid slices retain the
+    dilated soft probability map; gate-invalid slices become all zero so the
+    control cannot receive the full image through a fallback branch. A high
+    patient-level AUC would indicate that mask shape, position, extent, or
+    confidence alone is associated with the released Normal/Sick label.
+    """
+
+    if roi_probability.ndim != 4 or roi_probability.shape[1] != 1:
+        raise ValueError(
+            "Soft MONAI mask-only input must have shape [B,1,H,W]."
+        )
+    selector = valid_mask.view(-1, 1, 1, 1).to(roi_probability.dtype)
+    soft_map = roi_probability.clamp(0.0, 1.0) * selector
+    return soft_map.repeat(1, 3, 1, 1)
+
+
+def create_hard_monai_mask_only_images(hard_mask, valid_mask):
+    """Encode only the dilated standardized hard MONAI mask.
+
+    This control removes both MRI intensity and soft confidence. It preserves
+    only mask morphology and spatial position for gate-valid slices. Invalid
+    slices are all zero, which keeps gate failure from exposing full-image
+    anatomy or export style.
+    """
+
+    if hard_mask.ndim != 4 or hard_mask.shape[1] != 1:
+        raise ValueError(
+            "Hard MONAI mask-only input must have shape [B,1,H,W]."
+        )
+    selector = valid_mask.view(-1, 1, 1, 1).to(hard_mask.dtype)
+    binary_mask = (hard_mask > 0.5).to(hard_mask.dtype) * selector
+    return binary_mask.repeat(1, 3, 1, 1)
+
+
+def create_monai_bbox_mask_only_images(hard_mask, valid_mask):
+    """Encode only MONAI bounding-box geometry as a binary image.
+
+    One filled rectangle is drawn around each gate-valid dilated hard mask. MRI
+    intensities and within-box mask morphology are discarded. The experiment
+    therefore tests whether box location and extent alone encode cohort
+    provenance or class. Invalid/empty masks yield an all-zero image.
+    """
+
+    if hard_mask.ndim != 4 or hard_mask.shape[1] != 1:
+        raise ValueError(
+            "MONAI bounding-box mask input must have shape [B,1,H,W]."
+        )
+
+    batch_size, _, height, width = hard_mask.shape
+    output = torch.zeros(
+        batch_size,
+        3,
+        height,
+        width,
+        device=hard_mask.device,
+        dtype=hard_mask.dtype,
+    )
+    for index in range(batch_size):
+        if not bool(valid_mask[index].item()):
+            continue
+        box = _hard_mask_bounding_box(hard_mask[index, 0])
+        if box is None:
+            continue
+        top, bottom, left, right = box
+        output[index, :, top:bottom, left:right] = 1.0
+    return output
+
+
 def create_outside_monai_mask_images(images, roi_probability):
     """Retain signal outside the dilated soft MONAI probability map.
 
@@ -5547,7 +5934,7 @@ def extract_feature_bank(
     WHY MEMORY-MAPPED FEATURE MATRICES?
     -----------------------------------
     A 63,648 x 1,280 float32 matrix is roughly 311 MiB. This deconfounding
-    suite can create eighteen such representations, so keeping them plus
+    suite can create twenty-one such representations, so keeping them plus
     intermediate tensors in ordinary RAM is unnecessary. Each matrix is
     written incrementally to a NumPy .npy memory map, flushed, and reopened read-
     only after the metadata completion marker is written.
@@ -5577,6 +5964,9 @@ def extract_feature_bank(
         "standardized_roi_zero_bg_center_fallback",
         "standardized_roi_bbox",
         "standardized_outside_large_bbox",
+        "standardized_soft_monai_mask_only",
+        "standardized_hard_monai_mask_only",
+        "standardized_monai_bbox_mask_only",
     }
     need_original_monai = any(
         mode in original_monai_modes for mode in required_modes
@@ -5969,6 +6359,27 @@ def extract_feature_bank(
                         standardized_valid_mask,
                     )
                 )
+            if "standardized_soft_monai_mask_only" in required_modes:
+                variants["standardized_soft_monai_mask_only"] = (
+                    create_soft_monai_mask_only_images(
+                        standardized_roi_probability,
+                        standardized_valid_mask,
+                    )
+                )
+            if "standardized_hard_monai_mask_only" in required_modes:
+                variants["standardized_hard_monai_mask_only"] = (
+                    create_hard_monai_mask_only_images(
+                        standardized_hard_mask,
+                        standardized_valid_mask,
+                    )
+                )
+            if "standardized_monai_bbox_mask_only" in required_modes:
+                variants["standardized_monai_bbox_mask_only"] = (
+                    create_monai_bbox_mask_only_images(
+                        standardized_hard_mask,
+                        standardized_valid_mask,
+                    )
+                )
 
             # -------------------------------------------------------------
             # Feature-bank stage 8: encode requested views in small mode chunks.
@@ -6225,17 +6636,26 @@ def load_or_extract_feature_bank(samples, required_modes, fingerprint, cache_dir
     )
     dataset = MRIDataset(samples, transform)
 
+    # Keep this set synchronized with every representation that consumes a
+    # MONAI probability map, hard mask, gate decision, or bounding box. This is
+    # especially important for preliminary runs that enable only A12 or one of
+    # the mask-only controls; such a run must still load the segmenter even when
+    # B1 is not selected as an incidental MONAI-dependent companion.
+    monai_dependent_modes = {
+        "monai_roi",
+        "outside_heart",
+        "standardized_monai_roi",
+        "standardized_center_crop",
+        "standardized_roi_zero_background",
+        "standardized_roi_zero_bg_center_fallback",
+        "standardized_roi_bbox",
+        "standardized_outside_large_bbox",
+        "standardized_soft_monai_mask_only",
+        "standardized_hard_monai_mask_only",
+        "standardized_monai_bbox_mask_only",
+    }
     need_monai = any(
-        mode in {
-            "monai_roi",
-            "outside_heart",
-            "standardized_monai_roi",
-            "standardized_center_crop",
-            "standardized_roi_zero_background",
-            "standardized_roi_bbox",
-            "standardized_outside_large_bbox",
-        }
-        for mode in required_modes
+        mode in monai_dependent_modes for mode in required_modes
     )
     monai_segmenter = build_monai_segmenter() if need_monai else None
 
@@ -6429,6 +6849,123 @@ def audit_exact_decoded_pixel_duplicates(
 
 def _phash_hamming_distance(first_hash, second_hash):
     return (int(str(first_hash), 16) ^ int(str(second_hash), 16)).bit_count()
+
+
+def _prepare_phash_review_tile(image_path, title, tile_size=384):
+    """Load one candidate image into a square grayscale review tile."""
+
+    image = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
+    if image is None:
+        image = np.zeros((tile_size, tile_size), dtype=np.uint8)
+        cv2.putText(
+            image,
+            "READ FAILED",
+            (20, tile_size // 2),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            255,
+            2,
+            cv2.LINE_AA,
+        )
+    else:
+        height, width = image.shape
+        scale = min(tile_size / max(height, 1), tile_size / max(width, 1))
+        resized_height = max(1, int(round(height * scale)))
+        resized_width = max(1, int(round(width * scale)))
+        interpolation = cv2.INTER_AREA if scale <= 1.0 else cv2.INTER_CUBIC
+        resized = cv2.resize(
+            image,
+            (resized_width, resized_height),
+            interpolation=interpolation,
+        )
+        canvas = np.zeros((tile_size, tile_size), dtype=np.uint8)
+        top = (tile_size - resized_height) // 2
+        left = (tile_size - resized_width) // 2
+        canvas[top:top + resized_height, left:left + resized_width] = resized
+        image = canvas
+
+    header_height = 58
+    tile = np.zeros((tile_size + header_height, tile_size, 3), dtype=np.uint8)
+    tile[header_height:, :, :] = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    cv2.putText(
+        tile,
+        str(title)[:58],
+        (8, 23),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.47,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        tile,
+        Path(str(image_path)).name[:58],
+        (8, 46),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.42,
+        (210, 210, 210),
+        1,
+        cv2.LINE_AA,
+    )
+    return tile
+
+
+def write_phash_review_panels(rows, output_directory):
+    """Create side-by-side panels and blank review fields for pHash candidates."""
+
+    output_directory.mkdir(parents=True, exist_ok=True)
+    for pair_index, row in enumerate(rows, start=1):
+        # Keep outcome labels off the review image so visual duplicate
+        # adjudication can be performed blinded. Labels remain in the CSV for
+        # later merge after the reviewer records a status.
+        title_a = (
+            f"A: {row['patient_id_a']} | pHash={row['example_phash_a']}"
+        )
+        title_b = (
+            f"B: {row['patient_id_b']} | pHash={row['example_phash_b']}"
+        )
+        tile_a = _prepare_phash_review_tile(row["example_image_a"], title_a)
+        tile_b = _prepare_phash_review_tile(row["example_image_b"], title_b)
+        panel = np.concatenate([tile_a, tile_b], axis=1)
+        footer = np.zeros((70, panel.shape[1], 3), dtype=np.uint8)
+        footer_text = (
+            f"distance={row['minimum_phash_hamming_distance']} | "
+            f"candidate_pairs={row['candidate_image_pairs']}"
+        )
+        cv2.putText(
+            footer,
+            footer_text,
+            (10, 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.58,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            footer,
+            "Manual status: confirmed_near_duplicate / generic_template / "
+            "independent / uncertain",
+            (10, 56),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (210, 210, 210),
+            1,
+            cv2.LINE_AA,
+        )
+        panel = np.concatenate([panel, footer], axis=0)
+        safe_a = str(row["patient_id_a"]).replace("/", "_")
+        safe_b = str(row["patient_id_b"]).replace("/", "_")
+        panel_path = output_directory / (
+            f"pair_{pair_index:03d}__{safe_a}__{safe_b}.png"
+        )
+        if not cv2.imwrite(str(panel_path), panel):
+            raise RuntimeError(
+                f"Could not write pHash review panel: {panel_path}"
+            )
+        row["review_panel_path"] = str(panel_path)
+        row["manual_review_status"] = ""
+        row["manual_review_notes"] = ""
 
 
 class _HammingBKTree:
@@ -6660,6 +7197,9 @@ def audit_perceptual_near_duplicate_candidates(
         ),
     )
 
+    review_panel_directory = output_path.parent / "phash_review_panels"
+    write_phash_review_panels(rows, review_panel_directory)
+
     fieldnames = [
         "patient_id_a",
         "patient_id_b",
@@ -6673,6 +7213,9 @@ def audit_perceptual_near_duplicate_candidates(
         "example_image_b",
         "example_phash_a",
         "example_phash_b",
+        "review_panel_path",
+        "manual_review_status",
+        "manual_review_notes",
     ]
     with open(output_path, "w", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(file, fieldnames=fieldnames)
@@ -6707,6 +7250,13 @@ def audit_perceptual_near_duplicate_candidates(
             time.perf_counter() - search_started_at
         ),
         "csv_path": str(output_path),
+        "review_panel_directory": str(review_panel_directory),
+        "manual_review_status_values": [
+            "confirmed_near_duplicate",
+            "generic_template_or_localizer",
+            "independent_image",
+            "uncertain",
+        ],
     }
 
     print(
@@ -7021,6 +7571,89 @@ def write_cohort_manifest(output_path, samples, bank, fold_manifest_rows):
             writer.writerow(row)
 
 
+def write_series_annotation_template(output_path, samples):
+    """Write a blinded-ready manual sequence/view annotation template.
+
+    JPEG folder names are not treated as validated DICOM series identities and
+    this function does not infer sequence or view labels from SR_*/series* names.
+    It records deterministic first, middle, and last image paths for every
+    folder-defined proxy so a radiologist or trained reviewer can annotate the
+    released structure without inspecting model predictions.
+    """
+
+    grouped = defaultdict(list)
+    patient_label = {}
+    for image_path, label, patient_id, series_id in samples:
+        patient_id = str(patient_id)
+        series_id = str(series_id)
+        previous = patient_label.get(patient_id)
+        if previous is not None and int(previous) != int(label):
+            raise RuntimeError(
+                f"Patient {patient_id} has inconsistent series-template labels."
+            )
+        patient_label[patient_id] = int(label)
+        grouped[(patient_id, series_id)].append(str(image_path))
+
+    rows = []
+    for patient_id, series_id in sorted(grouped):
+        paths = sorted(grouped[(patient_id, series_id)])
+        middle_index = len(paths) // 2
+        rows.append(
+            {
+                "patient_id": patient_id,
+                "series_proxy_id": series_id,
+                "n_images": int(len(paths)),
+                "first_image_path": paths[0],
+                "middle_image_path": paths[middle_index],
+                "last_image_path": paths[-1],
+                "sequence_type": "",
+                "view_type": "",
+                "contains_heart": "",
+                "is_localizer": "",
+                "is_derived_export": "",
+                "monai_mask_anatomically_plausible": "",
+                "annotation_confidence": "",
+                "reviewer": "",
+                "notes": "",
+            }
+        )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    # Keep labels in a separate key so the annotation table can be given to a
+    # reviewer without exposing Normal/Sick outcome. The key is merged only
+    # after sequence/view annotation is complete.
+    label_key_path = output_path.with_name(
+        "series_annotation_label_key.csv"
+    )
+    key_rows = [
+        {
+            "patient_id": patient_id,
+            "true_label": int(patient_label[patient_id]),
+        }
+        for patient_id in sorted(patient_label)
+    ]
+    with open(label_key_path, "w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=list(key_rows[0]))
+        writer.writeheader()
+        writer.writerows(key_rows)
+
+    print(
+        f"[SERIES REVIEW] Wrote {len(rows)} blinded folder-proxy rows: "
+        f"{output_path}",
+        flush=True,
+    )
+    print(
+        f"[SERIES REVIEW] Label key kept separately: {label_key_path}",
+        flush=True,
+    )
+    return rows
+
+
 def _patient_indices(patient_ids):
     mapping = defaultdict(list)
     for index, patient_id in enumerate(patient_ids):
@@ -7041,6 +7674,8 @@ def aggregate_patient_provenance_features(bank):
     labels = np.asarray(bank["labels"], dtype=np.int64)
     patient_ids = np.asarray(bank["patient_ids"])
     series_ids = np.asarray(bank["series_ids"])
+    decoded_pixel_hashes = np.asarray(bank["decoded_pixel_hashes"])
+    sample_indices = np.asarray(bank["sample_indices"], dtype=np.int64)
     provenance = np.asarray(bank["provenance_features"], dtype=np.float32)
 
     selected_feature_indices = np.asarray(
@@ -8050,6 +8685,71 @@ def aggregate_legacy_slice_probabilities(
 # =============================
 
 
+def deterministic_exact_within_patient_deduplication_mask(
+    patient_ids,
+    series_ids,
+    decoded_pixel_hashes,
+    sample_indices,
+):
+    """Keep one deterministic row per exact decoded image within a patient.
+
+    Exact duplicates inside one Directory_* cannot leak across outer folds, but
+    repeated exports can still receive repeated influence during series and
+    patient pooling. This helper collapses every
+
+        (patient_id, decoded_pixel_sha256)
+
+    group to one canonical row selected without labels or model scores. The
+    canonical occurrence is the lexicographically smallest series proxy and,
+    within that proxy, the smallest immutable sample index. If the same decoded
+    image appears in several proxy folders, this rule assigns the retained
+    representative to one deterministic proxy rather than counting it several
+    times. Patient identity remains exactly Directory_*.
+    """
+
+    patient_ids = np.asarray(patient_ids).astype(str)
+    series_ids = np.asarray(series_ids).astype(str)
+    decoded_pixel_hashes = np.asarray(decoded_pixel_hashes).astype(str)
+    sample_indices = np.asarray(sample_indices, dtype=np.int64)
+
+    if not (
+        len(patient_ids)
+        == len(series_ids)
+        == len(decoded_pixel_hashes)
+        == len(sample_indices)
+    ):
+        raise ValueError(
+            "Exact-deduplication arrays must have identical lengths."
+        )
+
+    keep = np.zeros(len(patient_ids), dtype=bool)
+    order = np.lexsort(
+        (
+            sample_indices,
+            series_ids,
+            decoded_pixel_hashes,
+            patient_ids,
+        )
+    )
+    seen = set()
+    for index in order.tolist():
+        key = (patient_ids[index], decoded_pixel_hashes[index])
+        if key in seen:
+            continue
+        seen.add(key)
+        keep[index] = True
+
+    original_patients = set(patient_ids.tolist())
+    retained_patients = set(patient_ids[keep].tolist())
+    if retained_patients != original_patients:
+        missing = sorted(original_patients - retained_patients)
+        raise RuntimeError(
+            "Exact within-patient deduplication removed all rows for "
+            f"patients: {missing}."
+        )
+    return keep
+
+
 def deterministic_series_preserving_slice_dropout_mask(
     patient_ids,
     series_ids,
@@ -8123,12 +8823,27 @@ def deterministic_series_preserving_slice_dropout_mask(
     return keep
 
 
+def experiment_preparation_cache_key(experiment):
+    """Return the exact label-blind representation cache key for an experiment."""
+
+    return (
+        experiment.feature_mode,
+        experiment.strategy,
+        experiment.pooling_strategy,
+        experiment.weighting_mode,
+        float(experiment.slice_dropout_rate),
+        bool(experiment.deduplicate_exact_within_patient),
+    )
+
+
 def prepare_experiment_data(experiment, bank, tabular_feature_sets):
     """Build the fixed, label-blind data representation for one experiment."""
 
     labels = np.asarray(bank["labels"], dtype=np.int64)
     patient_ids = np.asarray(bank["patient_ids"])
     series_ids = np.asarray(bank["series_ids"])
+    decoded_pixel_hashes = np.asarray(bank["decoded_pixel_hashes"])
+    sample_indices = np.asarray(bank["sample_indices"], dtype=np.int64)
 
     if experiment.strategy == "patient_tabular":
         X, y, patients, feature_names = tabular_feature_sets[
@@ -8149,6 +8864,34 @@ def prepare_experiment_data(experiment, bank, tabular_feature_sets):
     roi_slice_scores = np.asarray(bank["roi_slice_scores"])
     n_source_slices = int(len(labels))
 
+    # Exact within-patient deduplication is an explicit matched ablation. It is
+    # performed before any slice-dropout robustness perturbation so later masks
+    # operate on the unique retained rows rather than on repeated copies.
+    n_exact_duplicate_rows_removed = 0
+    if experiment.deduplicate_exact_within_patient:
+        exact_keep_mask = deterministic_exact_within_patient_deduplication_mask(
+            patient_ids,
+            series_ids,
+            decoded_pixel_hashes,
+            sample_indices,
+        )
+        n_exact_duplicate_rows_removed = int(
+            len(exact_keep_mask) - int(exact_keep_mask.sum())
+        )
+        features = features[exact_keep_mask]
+        labels = labels[exact_keep_mask]
+        patient_ids = patient_ids[exact_keep_mask]
+        series_ids = series_ids[exact_keep_mask]
+        roi_slice_scores = roi_slice_scores[exact_keep_mask]
+        decoded_pixel_hashes = decoded_pixel_hashes[exact_keep_mask]
+        sample_indices = sample_indices[exact_keep_mask]
+        print(
+            f"[EXACT DEDUP] {experiment.experiment_id}: retained "
+            f"{int(exact_keep_mask.sum())}/{len(exact_keep_mask)} slices; "
+            f"removed={n_exact_duplicate_rows_removed} repeated exact exports.",
+            flush=True,
+        )
+
     # Robustness variants use the same frozen feature bank; only a deterministic
     # subset of aligned rows is retained before weighting and pooling. The mask
     # is generated without labels and is independent of outer-fold assignment.
@@ -8163,6 +8906,8 @@ def prepare_experiment_data(experiment, bank, tabular_feature_sets):
         patient_ids = patient_ids[retention_mask]
         series_ids = series_ids[retention_mask]
         roi_slice_scores = roi_slice_scores[retention_mask]
+        decoded_pixel_hashes = decoded_pixel_hashes[retention_mask]
+        sample_indices = sample_indices[retention_mask]
         print(
             f"[ROBUSTNESS] {experiment.experiment_id}: retained "
             f"{int(retention_mask.sum())}/{len(retention_mask)} slices "
@@ -8195,6 +8940,12 @@ def prepare_experiment_data(experiment, bank, tabular_feature_sets):
                 for index in range(X.shape[1])
             ),
             "slice_dropout_rate": float(experiment.slice_dropout_rate),
+            "deduplicate_exact_within_patient": bool(
+                experiment.deduplicate_exact_within_patient
+            ),
+            "n_exact_duplicate_rows_removed": int(
+                n_exact_duplicate_rows_removed
+            ),
             "n_source_slices": n_source_slices,
             "n_retained_slices": int(len(labels)),
         }
@@ -8217,6 +8968,12 @@ def prepare_experiment_data(experiment, bank, tabular_feature_sets):
                 int(features.shape[1]),
             ),
             "slice_dropout_rate": float(experiment.slice_dropout_rate),
+            "deduplicate_exact_within_patient": bool(
+                experiment.deduplicate_exact_within_patient
+            ),
+            "n_exact_duplicate_rows_removed": int(
+                n_exact_duplicate_rows_removed
+            ),
             "n_source_slices": n_source_slices,
             "n_retained_slices": int(len(labels)),
         }
@@ -8870,7 +9627,9 @@ def run_one_experiment(
         f"weighting={experiment.weighting_mode}, "
         f"classifier={experiment.classifier_type}, PCA={experiment.use_pca}, "
         f"fusion={experiment.fusion_method}, "
-        f"slice_dropout={experiment.slice_dropout_rate:.0%}",
+        f"slice_dropout={experiment.slice_dropout_rate:.0%}, "
+        f"exact_within_patient_dedup="
+        f"{experiment.deduplicate_exact_within_patient}",
         flush=True,
     )
     print("=" * 100, flush=True)
@@ -9147,6 +9906,17 @@ def run_one_experiment(
         "n_patients": int(len(ordered_patients)),
         "normal_patients": int(np.sum(labels == 0)),
         "sick_patients": int(np.sum(labels == 1)),
+        "prepared_data": {
+            "slice_dropout_rate": prepared.get("slice_dropout_rate", 0.0),
+            "deduplicate_exact_within_patient": prepared.get(
+                "deduplicate_exact_within_patient", False
+            ),
+            "n_exact_duplicate_rows_removed": prepared.get(
+                "n_exact_duplicate_rows_removed", 0
+            ),
+            "n_source_slices": prepared.get("n_source_slices"),
+            "n_retained_slices": prepared.get("n_retained_slices"),
+        },
         "metrics": metrics,
         "confidence_intervals": intervals,
         "fold_metrics": fold_rows,
@@ -9190,6 +9960,12 @@ def run_one_experiment(
         "selected_cs": selected_cs,
         "prepared_metadata": {
             "slice_dropout_rate": prepared.get("slice_dropout_rate", 0.0),
+            "deduplicate_exact_within_patient": prepared.get(
+                "deduplicate_exact_within_patient", False
+            ),
+            "n_exact_duplicate_rows_removed": prepared.get(
+                "n_exact_duplicate_rows_removed", 0
+            ),
             "n_source_slices": prepared.get("n_source_slices"),
             "n_retained_slices": prepared.get("n_retained_slices"),
         },
@@ -9540,6 +10316,185 @@ def run_repeated_nested_cv_stability(
         flush=True,
     )
     return summary
+
+
+def compare_repeated_nested_cv_pairs(stability_root, comparisons):
+    """Compare selected experiments on the exact same repeated split seeds.
+
+    Each experiment's repeated_nested_cv_runs.csv contains one AUC/AUPRC row
+    for every predeclared outer-CV random state. Aligning those rows by seed
+    gives a genuinely paired split-sensitivity comparison. The empirical 2.5th
+    and 97.5th percentiles below describe the distribution of per-seed deltas;
+    they are not presented as an independent-sample confidence interval because
+    all repeats reuse the same small cohort.
+    """
+
+    stability_root = Path(stability_root)
+    per_repeat_rows = []
+    summary_rows = []
+
+    def read_runs(experiment_id):
+        path = (
+            stability_root
+            / experiment_id
+            / "repeated_nested_cv_runs.csv"
+        )
+        if not path.is_file():
+            return None, path
+        with open(path, newline="", encoding="utf-8") as file:
+            rows = list(csv.DictReader(file))
+        by_seed = {
+            int(row["outer_cv_random_state"]): {
+                "repeat_index": int(row["repeat_index"]),
+                "auc": float(row["auc"]),
+                "auprc": float(row["auprc"]),
+            }
+            for row in rows
+        }
+        return by_seed, path
+
+    for comparison_name, reference_id, comparison_id, question in comparisons:
+        reference_runs, reference_path = read_runs(reference_id)
+        comparison_runs, comparison_path = read_runs(comparison_id)
+
+        if reference_runs is None or comparison_runs is None:
+            summary_rows.append(
+                {
+                    "comparison_name": comparison_name,
+                    "reference_experiment_id": reference_id,
+                    "comparison_experiment_id": comparison_id,
+                    "scientific_question": question,
+                    "status": "SKIPPED_MISSING_STABILITY_RUNS",
+                    "n_common_repeats": 0,
+                    "delta_auc_mean": "",
+                    "delta_auc_median": "",
+                    "delta_auc_std": "",
+                    "delta_auc_q025": "",
+                    "delta_auc_q25": "",
+                    "delta_auc_q75": "",
+                    "delta_auc_q975": "",
+                    "delta_auc_minimum": "",
+                    "delta_auc_maximum": "",
+                    "comparison_better_fraction": "",
+                    "reference_better_fraction": "",
+                    "tie_fraction": "",
+                    "reference_runs_csv": str(reference_path),
+                    "comparison_runs_csv": str(comparison_path),
+                }
+            )
+            continue
+
+        common_seeds = sorted(set(reference_runs).intersection(comparison_runs))
+        if not common_seeds:
+            raise RuntimeError(
+                f"No common repeated-CV seeds for {comparison_name}."
+            )
+
+        auc_deltas = []
+        for seed in common_seeds:
+            reference_row = reference_runs[seed]
+            comparison_row = comparison_runs[seed]
+            delta_auc = comparison_row["auc"] - reference_row["auc"]
+            delta_auprc = comparison_row["auprc"] - reference_row["auprc"]
+            auc_deltas.append(delta_auc)
+            per_repeat_rows.append(
+                {
+                    "comparison_name": comparison_name,
+                    "reference_experiment_id": reference_id,
+                    "comparison_experiment_id": comparison_id,
+                    "outer_cv_random_state": int(seed),
+                    "reference_repeat_index": int(
+                        reference_row["repeat_index"]
+                    ),
+                    "comparison_repeat_index": int(
+                        comparison_row["repeat_index"]
+                    ),
+                    "reference_auc": float(reference_row["auc"]),
+                    "comparison_auc": float(comparison_row["auc"]),
+                    "delta_auc": float(delta_auc),
+                    "reference_auprc": float(reference_row["auprc"]),
+                    "comparison_auprc": float(comparison_row["auprc"]),
+                    "delta_auprc": float(delta_auprc),
+                }
+            )
+
+        deltas = np.asarray(auc_deltas, dtype=np.float64)
+        summary_rows.append(
+            {
+                "comparison_name": comparison_name,
+                "reference_experiment_id": reference_id,
+                "comparison_experiment_id": comparison_id,
+                "scientific_question": question,
+                "status": "OK",
+                "n_common_repeats": int(len(deltas)),
+                "delta_auc_mean": float(np.mean(deltas)),
+                "delta_auc_median": float(np.median(deltas)),
+                "delta_auc_std": float(np.std(deltas)),
+                "delta_auc_q025": float(np.quantile(deltas, 0.025)),
+                "delta_auc_q25": float(np.quantile(deltas, 0.25)),
+                "delta_auc_q75": float(np.quantile(deltas, 0.75)),
+                "delta_auc_q975": float(np.quantile(deltas, 0.975)),
+                "delta_auc_minimum": float(np.min(deltas)),
+                "delta_auc_maximum": float(np.max(deltas)),
+                "comparison_better_fraction": float(np.mean(deltas > 0.0)),
+                "reference_better_fraction": float(np.mean(deltas < 0.0)),
+                "tie_fraction": float(np.mean(deltas == 0.0)),
+                "reference_runs_csv": str(reference_path),
+                "comparison_runs_csv": str(comparison_path),
+            }
+        )
+
+    per_repeat_path = (
+        stability_root / "repeated_nested_cv_paired_deltas.csv"
+    )
+    summary_path = (
+        stability_root / "repeated_nested_cv_paired_comparisons.csv"
+    )
+    if per_repeat_rows:
+        with open(per_repeat_path, "w", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(
+                file, fieldnames=list(per_repeat_rows[0])
+            )
+            writer.writeheader()
+            writer.writerows(per_repeat_rows)
+    with open(summary_path, "w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=list(summary_rows[0]))
+        writer.writeheader()
+        writer.writerows(summary_rows)
+
+    json_payload = {
+        "status": "OK",
+        "delta_definition": "comparison AUC minus reference AUC on the same seed",
+        "repeats_are_descriptive_not_independent_samples": True,
+        "comparisons": summary_rows,
+        "per_repeat_csv": str(per_repeat_path),
+        "summary_csv": str(summary_path),
+    }
+    (
+        stability_root / "repeated_nested_cv_paired_comparisons.json"
+    ).write_text(
+        json.dumps(json_payload, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+    print("\n[STABILITY] PAIRED REPEATED-CV COMPARISONS", flush=True)
+    for row in summary_rows:
+        if row["status"] != "OK":
+            print(
+                f"[STABILITY][PAIRED] {row['comparison_name']}: "
+                f"{row['status']}",
+                flush=True,
+            )
+            continue
+        print(
+            f"[STABILITY][PAIRED] {row['comparison_name']}: "
+            f"median_delta={row['delta_auc_median']:+.4f}, "
+            f"IQR=[{row['delta_auc_q25']:+.4f}, "
+            f"{row['delta_auc_q75']:+.4f}], "
+            f"comparison_better={row['comparison_better_fraction']:.1%}",
+            flush=True,
+        )
+    return json_payload
 
 
 def run_patient_label_permutation_test(
@@ -9939,6 +10894,12 @@ def result_summary_row(result, comparison_lookup):
         "fusion_method": experiment.fusion_method or "",
         "use_pca": int(experiment.use_pca),
         "slice_dropout_rate": float(experiment.slice_dropout_rate),
+        "deduplicate_exact_within_patient": int(
+            experiment.deduplicate_exact_within_patient
+        ),
+        "n_exact_duplicate_rows_removed": result["prepared_metadata"].get(
+            "n_exact_duplicate_rows_removed", 0
+        ),
         "n_source_slices": result["prepared_metadata"].get(
             "n_source_slices"
         ),
@@ -10161,6 +11122,7 @@ def print_final_comparison(summary_rows, failed_results=None):
 
     current_candidate_ids = {
         BASELINE_EXPERIMENT_ID,
+        DEVELOPMENT_BASELINE_EXPERIMENT_ID,
         "A9_STANDARDIZED_FULL_HIER_LR_PCA",
         "C9_STANDARDIZED_CENTER_CROP_HIER_LR_PCA",
         "C13_STANDARDIZED_FIXED_CENTER50_HIER_LR_PCA",
@@ -10170,6 +11132,8 @@ def print_final_comparison(summary_rows, failed_results=None):
         "A11_STANDARDIZED_ROI_BBOX_HIER_LR_PCA",
         "A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA",
         "A13_STANDARDIZED_ROI_FIXED_CHUNK_LR_PCA",
+        "A14_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_FIXED_CHUNK_LR_PCA",
+        "A15_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_DEDUP_HIER_LR_PCA",
     }
 
     groups = (
@@ -10349,6 +11313,11 @@ def collect_suite_metadata(
     metadata = {
         "suite_name": SUITE_NAME,
         "suite_configuration_tag": SUITE_CONFIGURATION_TAG,
+        "baseline_experiment_id": BASELINE_EXPERIMENT_ID,
+        "primary_candidate_experiment_id": PRIMARY_CANDIDATE_EXPERIMENT_ID,
+        "development_baseline_experiment_id": (
+            DEVELOPMENT_BASELINE_EXPERIMENT_ID
+        ),
         "output_directory": str(OUTPUT_DIR),
         "console_log": str(CONSOLE_LOG_PATH),
         "dataset_path": str(DATASET_PATH),
@@ -10362,6 +11331,20 @@ def collect_suite_metadata(
         "feature_bank_cache_status": cache_status,
         "feature_cache_schema": FEATURE_CACHE_SCHEMA_VERSION,
         "feature_modes_per_encoder_call": FEATURE_MODES_PER_ENCODER_CALL,
+        "repeated_stability_comparisons": [
+            {
+                "comparison_name": comparison_name,
+                "reference_experiment_id": reference_id,
+                "comparison_experiment_id": comparison_id,
+                "scientific_question": scientific_question,
+            }
+            for (
+                comparison_name,
+                reference_id,
+                comparison_id,
+                scientific_question,
+            ) in REPEATED_STABILITY_COMPARISONS
+        ],
         "outer_cv_splits": N_SPLITS,
         "outer_cv_random_state": CV_RANDOM_STATE,
         "inner_cv_splits": INNER_CV_SPLITS,
@@ -10472,6 +11455,10 @@ def write_suite_configuration(output_path, experiments):
         "suite_name": SUITE_NAME,
         "suite_configuration_tag": SUITE_CONFIGURATION_TAG,
         "baseline_experiment_id": BASELINE_EXPERIMENT_ID,
+        "primary_candidate_experiment_id": PRIMARY_CANDIDATE_EXPERIMENT_ID,
+        "development_baseline_experiment_id": (
+            DEVELOPMENT_BASELINE_EXPERIMENT_ID
+        ),
         "experiments": [asdict(experiment) for experiment in experiments],
         "primary_ablation_comparisons": [
             {
@@ -10486,6 +11473,20 @@ def write_suite_configuration(output_path, experiments):
                 comparison_id,
                 scientific_question,
             ) in PRIMARY_ABLATION_COMPARISONS
+        ],
+        "repeated_stability_comparisons": [
+            {
+                "comparison_name": comparison_name,
+                "reference_experiment_id": reference_id,
+                "comparison_experiment_id": comparison_id,
+                "scientific_question": scientific_question,
+            }
+            for (
+                comparison_name,
+                reference_id,
+                comparison_id,
+                scientific_question,
+            ) in REPEATED_STABILITY_COMPARISONS
         ],
         "outer_cv_splits": N_SPLITS,
         "outer_cv_random_state": CV_RANDOM_STATE,
@@ -10584,7 +11585,7 @@ def write_suite_configuration(output_path, experiments):
         },
         "patient_label_permutation_test": {
             "enabled": RUN_PATIENT_LABEL_PERMUTATION_TEST,
-            "experiment_id": PERMUTATION_EXPERIMENT_ID,
+            "experiment_ids": list(PERMUTATION_EXPERIMENT_IDS),
             "replicates": LABEL_PERMUTATION_REPLICATES,
             "random_state": LABEL_PERMUTATION_RANDOM_STATE,
         },
@@ -10831,6 +11832,10 @@ def main():
         bank,
         fold_manifest_rows,
     )
+    write_series_annotation_template(
+        OUTPUT_DIR / "audits" / "series_annotation_template.csv",
+        samples,
+    )
     stage_durations["06 Manifests"] = _print_stage_complete(
         6,
         "Create one duplicate-aware outer-fold and cohort manifest",
@@ -10962,13 +11967,7 @@ def main():
             flush=True,
         )
         experiment_output = OUTPUT_DIR / "experiments" / experiment.experiment_id
-        preparation_key = (
-            experiment.feature_mode,
-            experiment.strategy,
-            experiment.pooling_strategy,
-            experiment.weighting_mode,
-            experiment.slice_dropout_rate,
-        )
+        preparation_key = experiment_preparation_cache_key(experiment)
 
         try:
             if preparation_key not in prepared_cache:
@@ -11090,13 +12089,7 @@ def main():
         for stability_experiment_id in STABILITY_EXPERIMENT_IDS:
             experiment = experiments_by_id[stability_experiment_id]
             result = successful_by_id.get(stability_experiment_id)
-            preparation_key = (
-                experiment.feature_mode,
-                experiment.strategy,
-                experiment.pooling_strategy,
-                experiment.weighting_mode,
-                experiment.slice_dropout_rate,
-            )
+            preparation_key = experiment_preparation_cache_key(experiment)
 
             if result is None:
                 summary = {
@@ -11123,20 +12116,31 @@ def main():
                 )
             stability_summaries[stability_experiment_id] = summary
 
+        stability_paired_summary = compare_repeated_nested_cv_pairs(
+            stability_root,
+            REPEATED_STABILITY_COMPARISONS,
+        )
         stability_summary = {
             "status": "OK",
             "repeats_per_experiment": int(REPEATED_NESTED_CV_REPEATS),
             "experiment_ids": list(STABILITY_EXPERIMENT_IDS),
             "experiment_summaries": stability_summaries,
+            "paired_comparisons": stability_paired_summary,
             "interpretation": (
                 "All configured models and controls are repeated over the same "
-                "predeclared number of outer split seeds. No best split is selected."
+                "predeclared outer split seeds. Direct paired deltas are aligned "
+                "by seed and no best split is selected."
             ),
         }
     else:
+        stability_paired_summary = {
+            "status": "SKIPPED_DISABLED",
+            "comparisons": [],
+        }
         stability_summary = {
             "status": "SKIPPED_DISABLED",
             "experiment_ids": list(STABILITY_EXPERIMENT_IDS),
+            "paired_comparisons": stability_paired_summary,
         }
         print("[STABILITY] SKIPPED by configuration.", flush=True)
 
@@ -11169,64 +12173,87 @@ def main():
         "Run patient-label permutation sanity test",
         "Many lightweight patient-level fits; no neural-network inference.",
     )
-    permutation_summary = {
-        "status": "SKIPPED_DISABLED",
-        "experiment_id": PERMUTATION_EXPERIMENT_ID,
+    permutation_summaries = {}
+    successful_by_id = {
+        result["config"].experiment_id: result
+        for result in successful_results
     }
-    permutation_result = next(
-        (
-            result
-            for result in successful_results
-            if result["config"].experiment_id == PERMUTATION_EXPERIMENT_ID
-        ),
-        None,
-    )
-    permutation_experiment = next(
-        experiment
+    experiments_by_id = {
+        experiment.experiment_id: experiment
         for experiment in experiments
-        if experiment.experiment_id == PERMUTATION_EXPERIMENT_ID
-    )
-    permutation_preparation_key = (
-        permutation_experiment.feature_mode,
-        permutation_experiment.strategy,
-        permutation_experiment.pooling_strategy,
-        permutation_experiment.weighting_mode,
-        permutation_experiment.slice_dropout_rate,
-    )
+    }
 
-    if RUN_PATIENT_LABEL_PERMUTATION_TEST and permutation_result is not None:
-        observed_auc = float(permutation_result["summary"]["metrics"]["auc"])
-        permutation_summary = run_patient_label_permutation_test(
-            experiment=permutation_experiment,
-            prepared=prepared_cache[permutation_preparation_key],
-            base_fold_manifest_rows=fold_manifest_rows,
-            observed_auc=observed_auc,
-            output_dir=OUTPUT_DIR / "permutation",
-        )
-    elif RUN_PATIENT_LABEL_PERMUTATION_TEST:
+    if RUN_PATIENT_LABEL_PERMUTATION_TEST:
+        for permutation_experiment_id in PERMUTATION_EXPERIMENT_IDS:
+            permutation_result = successful_by_id.get(
+                permutation_experiment_id
+            )
+            permutation_experiment = experiments_by_id[
+                permutation_experiment_id
+            ]
+            experiment_output_dir = (
+                OUTPUT_DIR / "permutation" / permutation_experiment_id
+            )
+            experiment_output_dir.mkdir(parents=True, exist_ok=True)
+
+            if permutation_result is None:
+                summary = {
+                    "status": "SKIPPED_EXPERIMENT_FAILED",
+                    "experiment_id": permutation_experiment_id,
+                }
+                (
+                    experiment_output_dir
+                    / "patient_label_permutation_summary.json"
+                ).write_text(
+                    json.dumps(summary, indent=2, sort_keys=True),
+                    encoding="utf-8",
+                )
+                print(
+                    f"[PERMUTATION] SKIPPED {permutation_experiment_id} "
+                    "because its primary experiment failed.",
+                    flush=True,
+                )
+            else:
+                preparation_key = experiment_preparation_cache_key(
+                    permutation_experiment
+                )
+                observed_auc = float(
+                    permutation_result["summary"]["metrics"]["auc"]
+                )
+                summary = run_patient_label_permutation_test(
+                    experiment=permutation_experiment,
+                    prepared=prepared_cache[preparation_key],
+                    base_fold_manifest_rows=fold_manifest_rows,
+                    observed_auc=observed_auc,
+                    output_dir=experiment_output_dir,
+                )
+            permutation_summaries[permutation_experiment_id] = summary
+
         permutation_summary = {
-            "status": "SKIPPED_PRIMARY_EXPERIMENT_FAILED",
-            "experiment_id": PERMUTATION_EXPERIMENT_ID,
+            "status": "OK",
+            "experiment_ids": list(PERMUTATION_EXPERIMENT_IDS),
+            "experiment_summaries": permutation_summaries,
+            "interpretation": (
+                "Each configured patient-embedding model is tested by "
+                "permuting Directory_* labels and rerunning the complete nested "
+                "fitting path. This tests association/implementation sanity, "
+                "not anatomical validity or external generalization."
+            ),
         }
-        (
-            OUTPUT_DIR / "permutation" / "patient_label_permutation_summary.json"
-        ).write_text(
-            json.dumps(permutation_summary, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
-        print(
-            "[PERMUTATION] SKIPPED because the configured primary experiment "
-            "did not complete successfully.",
-            flush=True,
-        )
     else:
-        (
-            OUTPUT_DIR / "permutation" / "patient_label_permutation_summary.json"
-        ).write_text(
-            json.dumps(permutation_summary, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
+        permutation_summary = {
+            "status": "SKIPPED_DISABLED",
+            "experiment_ids": list(PERMUTATION_EXPERIMENT_IDS),
+            "experiment_summaries": {},
+        }
         print("[PERMUTATION] SKIPPED by configuration.", flush=True)
+
+    (
+        OUTPUT_DIR / "permutation" / "patient_label_permutation_summary.json"
+    ).write_text(
+        json.dumps(permutation_summary, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
 
     stage_durations["11 Label permutation"] = _print_stage_complete(
         11,
