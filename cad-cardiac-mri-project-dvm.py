@@ -57,14 +57,20 @@
 #  16. Paired patient-bootstrap comparisons and class-specific provenance /
 #      MONAI-gate negative controls
 #  17. Label-blind removal of only consecutive dark, nearly uniform native
-#      padding followed by robust 1st/99th-percentile intensity scaling
-#  18. A new standardized primary baseline plus narrow-border, corner, detected-
-#      padding, center-crop, strict-ROI and outside-bounding-box controls
-#  19. Separate MONAI inference and QC on original versus standardized canvases
-#  20. Conservative C selection: the smallest C within a predeclared inner-AUC
+#      padding followed by separate MONAI min-max and classifier robust scaling
+#  18. Fixed-content geometry: the longest retained side is always 240 pixels
+#      inside a centered 256x256 canvas, including controlled upsampling
+#  19. A standardized primary baseline plus narrow-border, corner, padding,
+#      fixed-center, strict-ROI and outside-ventricular-box controls
+#  20. Separate MONAI inference and QC on original versus standardized canvases
+#  21. Folder-independent fixed-chunk pooling and decomposed structural controls
+#      for slice count, series count, series length, geometry and file size
+#  22. Conservative C selection: the smallest C within a predeclared inner-AUC
 #      tolerance of the best candidate is chosen
-#  21. Repeated nested patient-level CV to quantify outer-split sensitivity
-#  22. A patient-label permutation test that repeats the full nested fitting path
+#  23. Repeated nested patient-level CV for the baseline, localization candidates
+#      and major shortcut controls rather than only one favorable split
+#  24. A 1,000-replicate patient-label permutation test that repeats the full
+#      nested fitting path for the primary baseline
 #
 # IMPORTANT METHODOLOGICAL CHANGES:
 # The original version used one 80/20 split and discarded roughly half of the
@@ -90,11 +96,17 @@
 #   - preserves the original min-max/full-canvas pipeline as a historical
 #     reference, while making the label-blind standardized ROI branch the new
 #     primary baseline after shortcut controls exposed export confounding;
+#   - makes standardized content scale fixed rather than native-size-dependent;
+#   - keeps MONAI on a min-max intensity view while EfficientNet receives a
+#     robustly scaled view of exactly the same retained crop and geometry;
 #   - evaluates whether apparent performance survives narrow-border, corner,
-#     detected-padding, center-crop, strict-ROI and outside-box controls;
-#   - repeats the primary nested CV across multiple deterministic outer splits;
-#   - repeats the complete patient-level fitting path after patient-label
-#     permutation to obtain an empirical null AUC distribution;
+#     padding, MONAI-independent fixed-center, strict-ROI and outside-box controls;
+#   - decomposes broad provenance into separate count, folder-length, geometry
+#     and file-size controls;
+#   - repeats selected candidate and shortcut-control nested CV analyses across
+#     50 deterministic outer splits;
+#   - repeats the complete patient-level fitting path after 1,000 patient-label
+#     permutations to obtain an empirical null AUC distribution;
 #   - saves OOF predictions, fold assignments, paired comparisons, duplicate
 #     audits, provenance/standardization controls and original/standardized
 #     MONAI QC summaries.
@@ -164,13 +176,17 @@
 # Remove only the accepted native padding; preserve the complete retained field
 # of view and save crop/padding geometry as QC metadata
 #    ↓
-# Robust 1st/99th-percentile intensity scaling to [0,1]
+# Create two intensity views of the SAME retained crop:
+#   - min-max scaling to [0,1] for MONAI
+#   - robust 1st/99th-percentile scaling to [0,1] for EfficientNet
 #    ↓
-# Aspect-ratio-preserving placement in a 256×256 zero-padded canvas
+# Resize the retained content's longest side to exactly 240 pixels (up or down)
+# and center both aligned views in a 256×256 zero-padded canvas
 #    ↓
-# Pinned pretrained MONAI residual U-Net on the standardized canvas
+# Pinned pretrained MONAI residual U-Net on the min-max standardized canvas
 #    ↓
-# Confidence-gated soft ROI or standardized full-image fallback
+# Confidence-gated soft ROI on the robust classifier view or standardized
+# full-image fallback
 #    ↓
 # Custom 256→224 whole-canvas resize + ImageNet mean/std normalization
 #    ↓
@@ -357,9 +373,11 @@
 # MULTI-EXPERIMENT EXTENSION
 # ============================================================================
 #
-# The detailed flow above describes the NEW STANDARDIZED BASELINE B1. The
-# original sixteen experiments are retained unchanged for direct historical
-# comparison, and twelve targeted deconfounding experiments are added:
+# The detailed flow above describes the CURRENT STANDARDIZED BASELINE B1. The
+# original suite is retained for historical comparison, the first twelve
+# deconfounding experiments remain available, and ten second-stage experiments
+# are added after the Kaggle audit showed residual geometry/provenance signal.
+# The complete default registry now contains 38 experiments:
 #
 #   ORIGINAL / HISTORICAL SUITE
 #   B0  Original MONAI ROI + hierarchical pooling + Logistic Regression + PCA
@@ -391,12 +409,24 @@
 #   C11 Standardization geometry/QC features only
 #   C12 Standardized MONAI gate/QC features only
 #
+#   SECOND-STAGE GEOMETRY / STRUCTURE EXTENSION
+#   C13/C14/C15  Fixed 50%/60%/70% center crops independent of MONAI
+#   A12 Strict zero-background ROI with fixed 60% center-crop fallback
+#   A13 Folder-independent fixed-size chunk pooling
+#   C16 Slice-count-only control
+#   C17 Series-proxy-count-only control
+#   C18 Series-proxy-length-only control
+#   C19 Native-geometry-only control
+#   C20 File-size/compression-proxy-only control
+#
 # Every enabled experiment uses the SAME duplicate-aware outer patient-fold
 # manifest. Classifier C and the decision threshold are selected only from each
 # outer-training cohort through inner patient-level OOF predictions. Linear-SVM
 # margins are calibrated by a sigmoid fitted only to inner OOF training scores.
-# The new primary baseline is additionally rerun across multiple outer-split
-# seeds and through patient-label permutation; no favorable split is selected.
+# The primary baseline, the fixed-center and strict-ROI candidates, and the
+# principal shortcut controls are rerun across 50 outer-split seeds. The primary
+# baseline also receives 1,000 patient-label permutations. No favorable split or
+# permutation is selected.
 #
 # A single script launch does NOT mean one classifier represents every ablation.
 # It means the expensive operations are shared correctly:
@@ -442,9 +472,10 @@
 #   comparison/paired_primary_ablation_comparisons.csv
 #   comparison/failed_experiments.csv
 #   comparison/final_report.json
-#   stability/repeated_nested_cv_runs.csv
-#   stability/repeated_nested_cv_oof_predictions.csv
-#   stability/patient_score_stability.csv
+#   stability/<experiment_id>/repeated_nested_cv_runs.csv
+#   stability/<experiment_id>/repeated_nested_cv_oof_predictions.csv
+#   stability/<experiment_id>/patient_score_stability.csv
+#   stability/<experiment_id>/repeated_nested_cv_summary.json
 #   stability/repeated_nested_cv_summary.json
 #   permutation/patient_label_permutation_auc.csv
 #   permutation/patient_label_permutation_summary.json
@@ -883,7 +914,8 @@ EXPERIMENT_REGISTRY = (
         experiment_id="B1_STANDARDIZED_ROI_HIER_LR_PCA",
         description=(
             "Primary deconfounded baseline: label-blind dark-padding removal, "
-            "robust percentile intensity scaling, standardized MONAI ROI, "
+            "fixed-content 240-in-256 geometry, MONAI min-max input separated "
+            "from robust classifier scaling, confidence-gated soft ROI, "
             "hierarchical embedding pooling, PCA and Logistic Regression."
         ),
         feature_mode="standardized_monai_roi",
@@ -942,8 +974,8 @@ EXPERIMENT_REGISTRY = (
     ExperimentConfig(
         experiment_id="C7_DETECTED_PADDING_MASK_HIER_LR_PCA",
         description=(
-            "Negative control using only a binary mask of label-blind detected "
-            "native dark padding plus pipeline-added canvas padding."
+            "Negative control using only the fixed-canvas padding geometry after "
+            "label-blind native dark-padding removal and content-size normalization."
         ),
         feature_mode="detected_padding_mask",
         strategy="patient_embedding",
@@ -1015,9 +1047,9 @@ EXPERIMENT_REGISTRY = (
     ExperimentConfig(
         experiment_id="C10_STANDARDIZED_OUTSIDE_LARGE_BBOX_HIER_LR_PCA",
         description=(
-            "Strict negative control retaining only pixels outside an enlarged "
-            "MONAI bounding box; invalid masks yield a zero image rather than a "
-            "full-image fallback."
+            "Strict control retaining only pixels outside an enlarged MONAI "
+            "ventricular bounding box; invalid masks yield a zero image rather "
+            "than a full-image fallback. This is not a validated outside-heart mask."
         ),
         feature_mode="standardized_outside_large_bbox",
         strategy="patient_embedding",
@@ -1050,6 +1082,156 @@ EXPERIMENT_REGISTRY = (
             "after label-blind standardization."
         ),
         feature_mode="standardized_monai_qc_only",
+        strategy="patient_tabular",
+        pooling_strategy="patient_tabular",
+        weighting_mode="not_applicable",
+        classifier_type="logistic_regression",
+        use_pca=False,
+        tune_c=True,
+        role="negative_control",
+    ),
+    # ------------------------------------------------------------------
+    # SECOND DECONFOUNDING EXTENSION
+    # ------------------------------------------------------------------
+    # The first standardized run showed that a MONAI-area-matched center crop
+    # could outperform the soft ROI and that padding geometry remained
+    # predictive. The following experiments therefore use center crops whose
+    # fractions are fixed independently of MONAI, a stricter zero-background
+    # ROI with fixed-center fallback, folder-independent fixed-chunk pooling,
+    # and single-family provenance controls that identify which structural
+    # variable can classify the released cohort.
+    ExperimentConfig(
+        experiment_id="C13_STANDARDIZED_FIXED_CENTER50_HIER_LR_PCA",
+        description=(
+            "Fixed 50% central crop after label-blind geometry standardization. "
+            "Crop size is independent of MONAI masks, labels and model scores."
+        ),
+        feature_mode="standardized_fixed_center_50",
+        strategy="patient_embedding",
+        pooling_strategy="hierarchical",
+        weighting_mode="equal",
+        classifier_type="logistic_regression",
+        use_pca=True,
+        tune_c=True,
+        role="localization_control",
+    ),
+    ExperimentConfig(
+        experiment_id="C14_STANDARDIZED_FIXED_CENTER60_HIER_LR_PCA",
+        description=(
+            "Fixed 60% central crop after label-blind geometry standardization. "
+            "This is the predeclared simple-localization candidate for stability analysis."
+        ),
+        feature_mode="standardized_fixed_center_60",
+        strategy="patient_embedding",
+        pooling_strategy="hierarchical",
+        weighting_mode="equal",
+        classifier_type="logistic_regression",
+        use_pca=True,
+        tune_c=True,
+        role="localization_control",
+    ),
+    ExperimentConfig(
+        experiment_id="C15_STANDARDIZED_FIXED_CENTER70_HIER_LR_PCA",
+        description=(
+            "Fixed 70% central crop after label-blind geometry standardization. "
+            "It tests whether retaining more central context changes ranking."
+        ),
+        feature_mode="standardized_fixed_center_70",
+        strategy="patient_embedding",
+        pooling_strategy="hierarchical",
+        weighting_mode="equal",
+        classifier_type="logistic_regression",
+        use_pca=True,
+        tune_c=True,
+        role="localization_control",
+    ),
+    ExperimentConfig(
+        experiment_id="A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA",
+        description=(
+            "Zero-background standardized MONAI ROI for valid masks, with a "
+            "fixed 60% center crop rather than the full image when the gate fails."
+        ),
+        feature_mode="standardized_roi_zero_bg_center_fallback",
+        strategy="patient_embedding",
+        pooling_strategy="hierarchical",
+        weighting_mode="equal",
+        classifier_type="logistic_regression",
+        use_pca=True,
+        tune_c=True,
+    ),
+    ExperimentConfig(
+        experiment_id="A13_STANDARDIZED_ROI_FIXED_CHUNK_LR_PCA",
+        description=(
+            "Folder-independent fixed-size chunk pooling over standardized ROI "
+            "slice order. It tests whether SR_*/series* export partitioning itself "
+            "creates the apparent advantage of hierarchical folder pooling."
+        ),
+        feature_mode="standardized_monai_roi",
+        strategy="patient_embedding",
+        pooling_strategy="fixed_chunk",
+        weighting_mode="equal",
+        classifier_type="logistic_regression",
+        use_pca=True,
+        tune_c=True,
+    ),
+    ExperimentConfig(
+        experiment_id="C16_N_SLICES_ONLY_LR",
+        description="Negative control using only the number of exported slices per Directory_* patient.",
+        feature_mode="n_slices_only",
+        strategy="patient_tabular",
+        pooling_strategy="patient_tabular",
+        weighting_mode="not_applicable",
+        classifier_type="logistic_regression",
+        use_pca=False,
+        tune_c=True,
+        role="negative_control",
+    ),
+    ExperimentConfig(
+        experiment_id="C17_N_SERIES_ONLY_LR",
+        description="Negative control using only the number of folder-defined series proxies per patient.",
+        feature_mode="n_series_only",
+        strategy="patient_tabular",
+        pooling_strategy="patient_tabular",
+        weighting_mode="not_applicable",
+        classifier_type="logistic_regression",
+        use_pca=False,
+        tune_c=True,
+        role="negative_control",
+    ),
+    ExperimentConfig(
+        experiment_id="C18_SERIES_LENGTH_ONLY_LR",
+        description="Negative control using only mean and maximum folder-proxy lengths.",
+        feature_mode="series_length_only",
+        strategy="patient_tabular",
+        pooling_strategy="patient_tabular",
+        weighting_mode="not_applicable",
+        classifier_type="logistic_regression",
+        use_pca=False,
+        tune_c=True,
+        role="negative_control",
+    ),
+    ExperimentConfig(
+        experiment_id="C19_NATIVE_GEOMETRY_ONLY_LR",
+        description=(
+            "Negative control using only patient-aggregated native height, width "
+            "and aspect-ratio features; image counts and file size are excluded."
+        ),
+        feature_mode="native_geometry_only",
+        strategy="patient_tabular",
+        pooling_strategy="patient_tabular",
+        weighting_mode="not_applicable",
+        classifier_type="logistic_regression",
+        use_pca=False,
+        tune_c=True,
+        role="negative_control",
+    ),
+    ExperimentConfig(
+        experiment_id="C20_FILE_SIZE_ONLY_LR",
+        description=(
+            "Negative control using only patient-aggregated file-size and bytes-"
+            "per-native-pixel statistics; geometry and image counts are excluded."
+        ),
+        feature_mode="file_size_only",
         strategy="patient_tabular",
         pooling_strategy="patient_tabular",
         weighting_mode="not_applicable",
@@ -1131,6 +1313,36 @@ PRIMARY_ABLATION_COMPARISONS = (
         "B1_STANDARDIZED_ROI_HIER_LR_PCA",
         "C9_STANDARDIZED_CENTER_CROP_HIER_LR_PCA",
         "Does MONAI localization outperform a similarly sized central crop?",
+    ),
+    (
+        "STANDARDIZED_ROI_VS_FIXED_CENTER_50",
+        "B1_STANDARDIZED_ROI_HIER_LR_PCA",
+        "C13_STANDARDIZED_FIXED_CENTER50_HIER_LR_PCA",
+        "Does the standardized ROI outperform a MONAI-independent fixed 50 percent center crop?",
+    ),
+    (
+        "STANDARDIZED_ROI_VS_FIXED_CENTER_60",
+        "B1_STANDARDIZED_ROI_HIER_LR_PCA",
+        "C14_STANDARDIZED_FIXED_CENTER60_HIER_LR_PCA",
+        "Does the standardized ROI outperform a MONAI-independent fixed 60 percent center crop?",
+    ),
+    (
+        "STANDARDIZED_ROI_VS_FIXED_CENTER_70",
+        "B1_STANDARDIZED_ROI_HIER_LR_PCA",
+        "C15_STANDARDIZED_FIXED_CENTER70_HIER_LR_PCA",
+        "Does the standardized ROI outperform a MONAI-independent fixed 70 percent center crop?",
+    ),
+    (
+        "STANDARDIZED_SOFT_ROI_VS_ZERO_BACKGROUND_CENTER_FALLBACK",
+        "B1_STANDARDIZED_ROI_HIER_LR_PCA",
+        "A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA",
+        "Does strict zero-background ROI with fixed-center fallback improve the standardized soft ROI?",
+    ),
+    (
+        "STANDARDIZED_HIERARCHICAL_VS_FIXED_CHUNK_POOLING",
+        "B1_STANDARDIZED_ROI_HIER_LR_PCA",
+        "A13_STANDARDIZED_ROI_FIXED_CHUNK_LR_PCA",
+        "Does folder-defined hierarchical pooling outperform folder-independent fixed-size chunks?",
     ),
     (
         "STANDARDIZED_SOFT_ROI_VS_ZERO_BACKGROUND",
@@ -1268,13 +1480,13 @@ PROGRESS_PRINT_EVERY_N_BATCHES = 25
 
 USE_FEATURE_CACHE = True
 FORCE_REBUILD_FEATURE_CACHE = False
-FEATURE_CACHE_SCHEMA_VERSION = "2026-08-31-deconfounding-v3"
+FEATURE_CACHE_SCHEMA_VERSION = "2026-08-31-geometry-standardized-v4"
 EFFICIENTNET_FEATURE_DIM = 1280
 FEATURE_MODES_PER_ENCODER_CALL = 4
 # Several image variants can be concatenated along the batch dimension and
 # encoded by one EfficientNet call. Four modes at a time is a conservative T4
 # default: it reduces Python/kernel-launch overhead without materializing all
-# fourteen views simultaneously. Lower this value if GPU memory is insufficient.
+# all eighteen views simultaneously. Lower this value if GPU memory is insufficient.
 
 SLICE_QUALITY_MIN_WEIGHT = 0.25
 # The quality signal remains a non-clinical heuristic. It is computed once from
@@ -1287,11 +1499,19 @@ BORDER_WIDTH_FRACTION = 0.15
 STANDARDIZED_BORDER_WIDTH_FRACTIONS = (0.05, 0.10)
 STANDARDIZED_CORNER_WIDTH_FRACTION = 0.15
 CENTER_CROP_FALLBACK_FRACTION = 0.60
+FIXED_CENTER_CROP_FRACTIONS = (0.50, 0.60, 0.70)
+STANDARDIZED_CONTENT_LONG_SIDE = 240
+FIXED_CHUNK_SIZE = 20
 MONAI_BBOX_CONTEXT_FRACTION = 0.15
 OUTSIDE_MONAI_BBOX_CONTEXT_FRACTION = 0.30
-# New controls use narrower borders, isolated corners, an area-matched center
-# crop, and strict MONAI bounding-box views. All fractions are fixed before
-# evaluation and are independent of labels and OOF performance.
+# The standardized branch now resizes the longest retained content dimension
+# to exactly 240 pixels, including upsampling when needed, and centers it in a
+# 256x256 canvas. This removes the previous dependence of pipeline-added
+# padding on native pixel dimensions and on how much dark border was removed.
+# Aspect ratio is still preserved and therefore remains explicitly audited.
+# Fixed 50%, 60%, and 70% center crops are independent of MONAI geometry.
+# FIXED_CHUNK_SIZE supports a folder-independent pooling ablation. All values
+# are fixed before evaluation and are independent of labels and OOF performance.
 
 STANDARDIZATION_LOWER_PERCENTILE = 1.0
 STANDARDIZATION_UPPER_PERCENTILE = 99.0
@@ -1314,11 +1534,17 @@ STANDARDIZATION_FEATURE_NAMES = (
     "robust_lower_intensity_0_1",
     "robust_upper_intensity_0_1",
     "robust_dynamic_range_0_1",
+    "fixed_content_height_fraction_of_canvas",
+    "fixed_content_width_fraction_of_canvas",
+    "fixed_pipeline_padding_fraction",
 )
 # Label-blind standardization removes only consecutive edge rows/columns that
 # are nearly uniform and dark. Safety limits prevent aggressive cropping. The
-# retained image is scaled with robust 1st/99th percentiles before the existing
-# aspect-ratio-preserving 256x256 canvas operation.
+# retained image is converted into two intensity views on the same fixed
+# geometry: min-max scaling for MONAI and robust 1st/99th-percentile scaling for
+# EfficientNet. The longest retained side is always resized to 240 pixels and
+# centered in a 256x256 canvas, so pipeline padding no longer depends on native
+# resolution or on the amount of detected border removal.
 
 C_SELECTION_AUC_TOLERANCE = 0.01
 # Select the smallest (most regularized) C whose inner AUC is within this
@@ -1326,17 +1552,26 @@ C_SELECTION_AUC_TOLERANCE = 0.01
 # differences from repeatedly choosing the least regularized edge of the grid.
 
 RUN_REPEATED_NESTED_CV_STABILITY = True
-REPEATED_NESTED_CV_REPEATS = 10
+REPEATED_NESTED_CV_REPEATS = 50
 REPEATED_NESTED_CV_RANDOM_STATE = RANDOM_SEED + 20_000
-STABILITY_EXPERIMENT_ID = BASELINE_EXPERIMENT_ID
+STABILITY_EXPERIMENT_IDS = (
+    BASELINE_EXPERIMENT_ID,
+    "C14_STANDARDIZED_FIXED_CENTER60_HIER_LR_PCA",
+    "A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA",
+    "C10_STANDARDIZED_OUTSIDE_LARGE_BBOX_HIER_LR_PCA",
+    "C5_STANDARDIZED_BORDER05_HIER_LR_PCA",
+    "C6_STANDARDIZED_BORDER10_HIER_LR_PCA",
+    "C7_DETECTED_PADDING_MASK_HIER_LR_PCA",
+)
 
 RUN_PATIENT_LABEL_PERMUTATION_TEST = True
-LABEL_PERMUTATION_REPLICATES = 200
+LABEL_PERMUTATION_REPLICATES = 1000
 LABEL_PERMUTATION_RANDOM_STATE = RANDOM_SEED + 40_000
 PERMUTATION_EXPERIMENT_ID = BASELINE_EXPERIMENT_ID
-# Stability repeats and label permutation operate only on the selected primary
-# patient-embedding baseline after the shared feature bank is created. They do
-# not rerun MONAI or EfficientNet.
+# Stability analysis is repeated for the primary standardized model, the main
+# localization candidates, and the most important shortcut controls. Label
+# permutation remains focused on the primary baseline. Both analyses reuse
+# cached frozen features and never rerun MONAI or EfficientNet.
 
 AUDIT_EXACT_DECODED_PIXEL_DUPLICATES = True
 AUDIT_PERCEPTUAL_NEAR_DUPLICATES = True
@@ -1576,6 +1811,9 @@ _suite_identity = {
     "standardized_border_width_fractions": STANDARDIZED_BORDER_WIDTH_FRACTIONS,
     "standardized_corner_width_fraction": STANDARDIZED_CORNER_WIDTH_FRACTION,
     "center_crop_fallback_fraction": CENTER_CROP_FALLBACK_FRACTION,
+    "fixed_center_crop_fractions": FIXED_CENTER_CROP_FRACTIONS,
+    "standardized_content_long_side": STANDARDIZED_CONTENT_LONG_SIDE,
+    "fixed_chunk_size": FIXED_CHUNK_SIZE,
     "monai_bbox_context_fraction": MONAI_BBOX_CONTEXT_FRACTION,
     "outside_monai_bbox_context_fraction": (
         OUTSIDE_MONAI_BBOX_CONTEXT_FRACTION
@@ -1620,7 +1858,7 @@ _suite_identity = {
     "run_repeated_nested_cv_stability": RUN_REPEATED_NESTED_CV_STABILITY,
     "repeated_nested_cv_repeats": REPEATED_NESTED_CV_REPEATS,
     "repeated_nested_cv_random_state": REPEATED_NESTED_CV_RANDOM_STATE,
-    "stability_experiment_id": STABILITY_EXPERIMENT_ID,
+    "stability_experiment_ids": STABILITY_EXPERIMENT_IDS,
     "run_patient_label_permutation_test": (
         RUN_PATIENT_LABEL_PERMUTATION_TEST
     ),
@@ -1853,7 +2091,7 @@ def validate_configuration():
         }
         requested_analysis_ids = set()
         if RUN_REPEATED_NESTED_CV_STABILITY:
-            requested_analysis_ids.add(STABILITY_EXPERIMENT_ID)
+            requested_analysis_ids.update(STABILITY_EXPERIMENT_IDS)
         if RUN_PATIENT_LABEL_PERMUTATION_TEST:
             requested_analysis_ids.add(PERMUTATION_EXPERIMENT_ID)
 
@@ -1889,13 +2127,22 @@ def validate_configuration():
         "detected_padding_mask",
         "standardized_corners",
         "standardized_center_crop",
+        "standardized_fixed_center_50",
+        "standardized_fixed_center_60",
+        "standardized_fixed_center_70",
         "standardized_roi_zero_background",
+        "standardized_roi_zero_bg_center_fallback",
         "standardized_roi_bbox",
         "standardized_outside_large_bbox",
         "provenance_only",
         "monai_qc_only",
         "standardization_qc_only",
         "standardized_monai_qc_only",
+        "n_slices_only",
+        "n_series_only",
+        "series_length_only",
+        "native_geometry_only",
+        "file_size_only",
     }
     valid_strategies = {
         "patient_embedding",
@@ -1905,6 +2152,7 @@ def validate_configuration():
     valid_pooling = {
         "hierarchical",
         "flat",
+        "fixed_chunk",
         "probability_fusion",
         "patient_tabular",
     }
@@ -1962,6 +2210,7 @@ def validate_configuration():
                 "standardized_monai_roi",
                 "standardized_full_image",
                 "standardized_roi_zero_background",
+                "standardized_roi_zero_bg_center_fallback",
                 "standardized_roi_bbox",
             }
         ):
@@ -1993,6 +2242,11 @@ def validate_configuration():
                 "monai_qc_only",
                 "standardization_qc_only",
                 "standardized_monai_qc_only",
+                "n_slices_only",
+                "n_series_only",
+                "series_length_only",
+                "native_geometry_only",
+                "file_size_only",
             }:
                 raise ValueError(
                     f"{experiment.experiment_id}: patient_tabular requires a "
@@ -2085,6 +2339,19 @@ def validate_configuration():
         )
     if STANDARDIZATION_MIN_PADDING_RUN < 1:
         raise ValueError("STANDARDIZATION_MIN_PADDING_RUN must be positive.")
+    if not 1 <= STANDARDIZED_CONTENT_LONG_SIDE <= MONAI_INPUT_SIZE:
+        raise ValueError(
+            "STANDARDIZED_CONTENT_LONG_SIDE must lie in [1, MONAI_INPUT_SIZE]."
+        )
+    if FIXED_CHUNK_SIZE <= 0:
+        raise ValueError("FIXED_CHUNK_SIZE must be strictly positive.")
+    if len(FIXED_CENTER_CROP_FRACTIONS) != 3 or any(
+        not 0.0 < float(value) <= 1.0
+        for value in FIXED_CENTER_CROP_FRACTIONS
+    ):
+        raise ValueError(
+            "FIXED_CENTER_CROP_FRACTIONS must contain three values in (0,1]."
+        )
     if C_SELECTION_AUC_TOLERANCE < 0.0:
         raise ValueError("C_SELECTION_AUC_TOLERANCE cannot be negative.")
     if REPEATED_NESTED_CV_REPEATS <= 0:
@@ -2412,19 +2679,144 @@ def zero_pad_binary_mask_to_monai_canvas(mask):
     return np.clip(canvas, 0.0, 1.0)
 
 
+def _fixed_content_canvas_geometry(height, width):
+    """Return deterministic fixed-content geometry for a 256x256 canvas.
+
+    The longest retained image side is resized to exactly
+    ``STANDARDIZED_CONTENT_LONG_SIDE`` pixels. Unlike the historical MONAI
+    helper, this transformation deliberately allows both downsampling and
+    upsampling. Consequently, native image resolution and the number of removed
+    dark-border pixels cannot change the final content scale. Aspect ratio is
+    preserved and remains auditable through the final content width/height.
+    """
+
+    height = int(height)
+    width = int(width)
+    if height <= 0 or width <= 0:
+        raise ValueError(
+            f"Fixed-content geometry requires positive dimensions, got "
+            f"{height}x{width}."
+        )
+    if not 1 <= STANDARDIZED_CONTENT_LONG_SIDE <= MONAI_INPUT_SIZE:
+        raise ValueError(
+            "STANDARDIZED_CONTENT_LONG_SIDE must lie between 1 and "
+            "MONAI_INPUT_SIZE."
+        )
+
+    scale = float(STANDARDIZED_CONTENT_LONG_SIDE / max(height, width))
+    resized_height = max(1, int(round(height * scale)))
+    resized_width = max(1, int(round(width * scale)))
+
+    # Rounding can move the nominal longest side by one pixel. Force it back to
+    # the predeclared target without changing the aspect-ratio calculation for
+    # the shorter side.
+    if height >= width:
+        resized_height = int(STANDARDIZED_CONTENT_LONG_SIDE)
+    else:
+        resized_width = int(STANDARDIZED_CONTENT_LONG_SIDE)
+
+    resized_height = min(resized_height, MONAI_INPUT_SIZE)
+    resized_width = min(resized_width, MONAI_INPUT_SIZE)
+    top = (MONAI_INPUT_SIZE - resized_height) // 2
+    left = (MONAI_INPUT_SIZE - resized_width) // 2
+    return resized_height, resized_width, top, left, scale
+
+
+def resize_to_fixed_content_canvas(image):
+    """Resize retained content to a fixed scale and center it in 256x256.
+
+    Downsampling uses INTER_AREA. Upsampling uses INTER_CUBIC because the input
+    is a continuous grayscale image rather than a categorical mask. The same
+    geometry is used for the MONAI min-max image and the robustly scaled
+    EfficientNet image, so their masks and pixels remain spatially aligned.
+    """
+
+    image = np.asarray(image, dtype=np.float32)
+    if image.ndim != 2 or image.size == 0:
+        raise ValueError(
+            "Fixed-content resizing requires a non-empty 2D grayscale image."
+        )
+
+    height, width = image.shape
+    resized_height, resized_width, top, left, scale = (
+        _fixed_content_canvas_geometry(height, width)
+    )
+    if resized_height != height or resized_width != width:
+        interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
+        resized = cv2.resize(
+            image,
+            (resized_width, resized_height),
+            interpolation=interpolation,
+        )
+    else:
+        resized = image
+
+    # Cubic interpolation can overshoot slightly beyond the source [0,1]
+    # range. Clipping preserves the documented network-input contract.
+    resized = np.clip(resized, 0.0, 1.0).astype(np.float32, copy=False)
+
+    canvas = np.zeros(
+        (MONAI_INPUT_SIZE, MONAI_INPUT_SIZE),
+        dtype=np.float32,
+    )
+    canvas[
+        top:top + resized_height,
+        left:left + resized_width,
+    ] = resized
+    return canvas, resized_height, resized_width
+
+
+def build_fixed_content_padding_canvas(height, width):
+    """Return only the padding geometry of the fixed-content canvas.
+
+    Pixels occupied by retained image content are zero; pixels introduced by
+    the standardized 256x256 canvas are one. Native dark borders are removed
+    before this operation and are audited separately through crop-fraction
+    features. This prevents their geometry from being reintroduced into the
+    supposedly standardized image representation.
+    """
+
+    resized_height, resized_width, top, left, _ = (
+        _fixed_content_canvas_geometry(height, width)
+    )
+    canvas = np.ones(
+        (MONAI_INPUT_SIZE, MONAI_INPUT_SIZE),
+        dtype=np.float32,
+    )
+    canvas[
+        top:top + resized_height,
+        left:left + resized_width,
+    ] = 0.0
+    return canvas, resized_height, resized_width
+
+
 def build_label_blind_standardized_image(image):
-    """Create the standardized image, padding mask, and audit feature vector.
+    """Create aligned MONAI/classifier canvases and standardization audits.
 
     Processing order:
 
         native uint8 JPEG
             -> conservative dark-uniform edge detection
             -> crop only the detected edge runs
-            -> robust fixed-percentile intensity scaling
-            -> separate binary padding-geometry mask
+            -> min-max scaling for the pretrained MONAI segmenter
+            -> robust fixed-percentile scaling for EfficientNet
+            -> identical fixed-content 240-in-256 geometry for both views
+            -> binary fixed-canvas padding control
 
-    The returned standardized image is not yet resized or padded; the existing
-    ``zero_pad_to_monai_canvas`` function performs that shared geometry step.
+    The Normal/Sick label, patient ID, series ID, fold and model scores are not
+    used. Separating intensity transforms preserves the segmenter's closer
+    training-time contract while still preventing bright text/compression
+    outliers from defining the classifier's complete dynamic range.
+
+    Returns:
+        robust_classifier_canvas:
+            256x256 robustly scaled image used to build EfficientNet views.
+        monai_minmax_canvas:
+            256x256 min-max image used only by the MONAI segmenter.
+        fixed_padding_canvas:
+            Binary geometry-only control after content-size normalization.
+        features:
+            Label-blind crop, intensity and final-canvas audit features.
     """
 
     image = np.asarray(image)
@@ -2436,11 +2828,30 @@ def build_label_blind_standardized_image(image):
     height, width = image.shape
     top, bottom, left, right = detect_label_blind_dark_padding_bounds(image)
     cropped = image[top:bottom, left:right]
-    scaled, lower, upper = robust_scale_intensity_0_1(cropped)
+    if cropped.size == 0:
+        raise RuntimeError("Label-blind standardization produced an empty crop.")
 
-    native_padding_mask = np.ones((height, width), dtype=np.float32)
-    native_padding_mask[top:bottom, left:right] = 0.0
-    padding_canvas = zero_pad_binary_mask_to_monai_canvas(native_padding_mask)
+    robust_scaled, lower, upper = robust_scale_intensity_0_1(cropped)
+    monai_scaled = scale_intensity_0_1(cropped)
+
+    robust_canvas, resized_height, resized_width = (
+        resize_to_fixed_content_canvas(robust_scaled)
+    )
+    monai_canvas, monai_height, monai_width = (
+        resize_to_fixed_content_canvas(monai_scaled)
+    )
+    if (resized_height, resized_width) != (monai_height, monai_width):
+        raise RuntimeError(
+            "MONAI and classifier standardized geometries are misaligned."
+        )
+
+    padding_canvas, padding_height, padding_width = (
+        build_fixed_content_padding_canvas(*cropped.shape)
+    )
+    if (resized_height, resized_width) != (padding_height, padding_width):
+        raise RuntimeError(
+            "Fixed padding control does not align with standardized content."
+        )
 
     top_fraction = float(top / height)
     bottom_fraction = float((height - bottom) / height)
@@ -2451,10 +2862,27 @@ def build_label_blind_standardized_image(image):
     detected_padding_fraction = float(
         1.0 - retained_height_fraction * retained_width_fraction
     )
+    content_height_fraction = float(resized_height / MONAI_INPUT_SIZE)
+    content_width_fraction = float(resized_width / MONAI_INPUT_SIZE)
+    pipeline_padding_fraction = float(
+        1.0
+        - (resized_height * resized_width)
+        / float(MONAI_INPUT_SIZE * MONAI_INPUT_SIZE)
+    )
 
     features = np.asarray(
         [
-            float(any(value > 0 for value in (top, height - bottom, left, width - right))),
+            float(
+                any(
+                    value > 0
+                    for value in (
+                        top,
+                        height - bottom,
+                        left,
+                        width - right,
+                    )
+                )
+            ),
             top_fraction,
             bottom_fraction,
             left_fraction,
@@ -2465,6 +2893,9 @@ def build_label_blind_standardized_image(image):
             float(lower / 255.0),
             float(upper / 255.0),
             float(max(upper - lower, 0.0) / 255.0),
+            content_height_fraction,
+            content_width_fraction,
+            pipeline_padding_fraction,
         ],
         dtype=np.float32,
     )
@@ -2476,7 +2907,7 @@ def build_label_blind_standardized_image(image):
     if not np.all(np.isfinite(features)):
         raise RuntimeError("Standardization features contain non-finite values.")
 
-    return scaled, padding_canvas, features
+    return robust_canvas, monai_canvas, padding_canvas, features
 
 
 def zero_pad_to_monai_canvas(image):
@@ -2712,16 +3143,19 @@ class MRIDataset(Dataset):
             Original min-max baseline input for the MONAI segmenter.
 
         standardized_classification_image:
-            Tensor [3, 224, 224], values in [0,1]. Label-blind padding removal
-            and robust percentile scaling are applied before square placement.
+            Tensor [3, 224, 224], values in [0,1]. Label-blind native padding
+            removal, robust percentile scaling, and fixed 240-in-256 content
+            geometry are applied before the EfficientNet resize.
 
         standardized_monai_image:
-            Tensor [1, 256, 256], values in [0,1]. Spatially aligned MONAI input
-            for the deconfounded standardized branch.
+            Tensor [1, 256, 256], values in [0,1]. It uses min-max scaling on
+            the same retained crop and exactly the same fixed geometry, keeping
+            MONAI closer to its documented intensity contract.
 
         detected_padding_image:
-            Tensor [3, 224, 224], binary. It contains only detected native and
-            pipeline-added padding geometry for a strict negative control.
+            Tensor [3, 224, 224], binary. It contains only the standardized
+            fixed-canvas padding geometry; removed native padding is represented
+            separately by tabular crop-fraction audit features.
 
         label:
             0 for Normal, 1 for Sick. The label travels as metadata only and is
@@ -2883,18 +3317,18 @@ class MRIDataset(Dataset):
         monai_canvas = zero_pad_to_monai_canvas(original_scaled_image)
         monai_image = torch.from_numpy(monai_canvas).unsqueeze(0)
 
-        # Build a second, label-blind representation that removes only
-        # conservative dark-uniform edge runs and uses fixed robust percentiles.
-        # Crop geometry and intensity limits are returned separately for the
-        # standardization-QC-only negative control.
+        # Build a second, label-blind branch on one shared crop but with two
+        # intensity contracts. MONAI receives a min-max scaled image, while
+        # EfficientNet receives robust 1st/99th-percentile scaling. Both are
+        # resized so the retained content's longest side is exactly 240 pixels
+        # and centered in the same 256x256 canvas. This removes the former
+        # dependence of pipeline-added padding on native resolution and crop size.
         (
-            standardized_scaled_image,
+            standardized_classifier_canvas,
+            standardized_monai_canvas,
             detected_padding_canvas,
             standardization_features,
         ) = build_label_blind_standardized_image(image)
-        standardized_monai_canvas = zero_pad_to_monai_canvas(
-            standardized_scaled_image
-        )
         standardized_monai_image = torch.from_numpy(
             standardized_monai_canvas
         ).unsqueeze(0)
@@ -2912,7 +3346,7 @@ class MRIDataset(Dataset):
             interpolation=cv2.INTER_AREA,
         )
         standardized_classification_gray = cv2.resize(
-            standardized_monai_canvas,
+            standardized_classifier_canvas,
             (IMG_SIZE, IMG_SIZE),
             interpolation=cv2.INTER_AREA,
         )
@@ -4525,7 +4959,11 @@ def required_efficientnet_feature_modes(experiments):
         "detected_padding_mask",
         "standardized_corners",
         "standardized_center_crop",
+        "standardized_fixed_center_50",
+        "standardized_fixed_center_60",
+        "standardized_fixed_center_70",
         "standardized_roi_zero_background",
+        "standardized_roi_zero_bg_center_fallback",
         "standardized_roi_bbox",
         "standardized_outside_large_bbox",
     )
@@ -4568,6 +5006,9 @@ def feature_bank_fingerprint(samples, dataset_root):
         "standardized_border_width_fractions": STANDARDIZED_BORDER_WIDTH_FRACTIONS,
         "standardized_corner_width_fraction": STANDARDIZED_CORNER_WIDTH_FRACTION,
         "center_crop_fallback_fraction": CENTER_CROP_FALLBACK_FRACTION,
+        "fixed_center_crop_fractions": FIXED_CENTER_CROP_FRACTIONS,
+        "standardized_content_long_side": STANDARDIZED_CONTENT_LONG_SIDE,
+        "fixed_chunk_size": FIXED_CHUNK_SIZE,
         "monai_bbox_context_fraction": MONAI_BBOX_CONTEXT_FRACTION,
         "outside_monai_bbox_context_fraction": (
             OUTSIDE_MONAI_BBOX_CONTEXT_FRACTION
@@ -4906,6 +5347,71 @@ def create_center_crop_area_matched_images(
     return torch.stack(output, dim=0)
 
 
+def create_fixed_fraction_center_crop_images(images, crop_fraction):
+    """Create a MONAI-independent square center crop at a fixed fraction.
+
+    ``crop_fraction`` is applied to the standardized 224x224 image dimensions
+    and is fixed before evaluation. No MONAI mask, gate value, label, patient ID,
+    fold assignment, or classifier score influences the crop. The selected
+    square is resized back to the full EfficientNet input size.
+    """
+
+    crop_fraction = float(crop_fraction)
+    if not 0.0 < crop_fraction <= 1.0:
+        raise ValueError("crop_fraction must lie in (0,1].")
+
+    height, width = images.shape[-2:]
+    crop_side = max(2, int(round(min(height, width) * crop_fraction)))
+    center_y = height // 2
+    center_x = width // 2
+    top = center_y - crop_side // 2
+    left = center_x - crop_side // 2
+    bottom = top + crop_side
+    right = left + crop_side
+
+    output = [
+        _resize_single_crop(
+            images[index],
+            top,
+            bottom,
+            left,
+            right,
+            (height, width),
+        )
+        for index in range(images.shape[0])
+    ]
+    return torch.stack(output, dim=0)
+
+
+def apply_zero_background_roi_with_fixed_center_fallback(
+    images,
+    roi_probability,
+    valid_mask,
+    fallback_fraction=CENTER_CROP_FALLBACK_FRACTION,
+):
+    """Use strict zero-background ROI or a fixed center crop when invalid.
+
+    The existing A10 ablation falls back to the complete standardized image when
+    MONAI gating fails. That is safe operationally but allows full export and
+    border information into an otherwise strict ROI experiment. This helper
+    instead uses a fixed, MONAI-independent center crop for invalid masks. It
+    retains every slice and makes fallback content deterministic and label-blind.
+    """
+
+    strict_roi = apply_confidence_gated_soft_roi(
+        images,
+        roi_probability,
+        valid_mask,
+        background_weight=0.0,
+    )
+    fixed_center = create_fixed_fraction_center_crop_images(
+        images,
+        fallback_fraction,
+    )
+    selector = valid_mask.view(-1, 1, 1, 1)
+    return torch.where(selector, strict_roi, fixed_center)
+
+
 def create_monai_bounding_box_crop_images(
     images,
     hard_mask,
@@ -5041,7 +5547,7 @@ def extract_feature_bank(
     WHY MEMORY-MAPPED FEATURE MATRICES?
     -----------------------------------
     A 63,648 x 1,280 float32 matrix is roughly 311 MiB. This deconfounding
-    suite can create fourteen such representations, so keeping them plus
+    suite can create eighteen such representations, so keeping them plus
     intermediate tensors in ordinary RAM is unnecessary. Each matrix is
     written incrementally to a NumPy .npy memory map, flushed, and reopened read-
     only after the metadata completion marker is written.
@@ -5068,6 +5574,7 @@ def extract_feature_bank(
         "standardized_monai_roi",
         "standardized_center_crop",
         "standardized_roi_zero_background",
+        "standardized_roi_zero_bg_center_fallback",
         "standardized_roi_bbox",
         "standardized_outside_large_bbox",
     }
@@ -5138,7 +5645,8 @@ def extract_feature_bank(
     roi_slice_score_array = np.full(n_slices, np.nan, dtype=np.float32)
 
     # The deconfounded branch receives its own MONAI inference/QC arrays because
-    # label-blind cropping and robust scaling can legitimately change masks.
+    # label-blind cropping and fixed content geometry can legitimately change
+    # masks. MONAI itself receives min-max scaling, not the robust classifier view.
     standardized_monai_valid_array = np.zeros(n_slices, dtype=bool)
     standardized_area_ratio_array = np.full(
         n_slices, np.nan, dtype=np.float32
@@ -5404,6 +5912,36 @@ def extract_feature_bank(
                         standardized_images,
                         standardized_hard_mask,
                         standardized_valid_mask,
+                    )
+                )
+            if "standardized_fixed_center_50" in required_modes:
+                variants["standardized_fixed_center_50"] = (
+                    create_fixed_fraction_center_crop_images(
+                        standardized_images,
+                        FIXED_CENTER_CROP_FRACTIONS[0],
+                    )
+                )
+            if "standardized_fixed_center_60" in required_modes:
+                variants["standardized_fixed_center_60"] = (
+                    create_fixed_fraction_center_crop_images(
+                        standardized_images,
+                        FIXED_CENTER_CROP_FRACTIONS[1],
+                    )
+                )
+            if "standardized_fixed_center_70" in required_modes:
+                variants["standardized_fixed_center_70"] = (
+                    create_fixed_fraction_center_crop_images(
+                        standardized_images,
+                        FIXED_CENTER_CROP_FRACTIONS[2],
+                    )
+                )
+            if "standardized_roi_zero_bg_center_fallback" in required_modes:
+                variants["standardized_roi_zero_bg_center_fallback"] = (
+                    apply_zero_background_roi_with_fixed_center_fallback(
+                        standardized_images,
+                        standardized_roi_probability,
+                        standardized_valid_mask,
+                        fallback_fraction=CENTER_CROP_FALLBACK_FRACTION,
                     )
                 )
             if "standardized_roi_zero_background" in required_modes:
@@ -6571,6 +7109,104 @@ def aggregate_patient_provenance_features(bank):
     return X, y, ordered_patients, tuple(output_names)
 
 
+def subset_patient_tabular_feature_set(feature_set, selected_feature_names):
+    """Return one named subset of an already aligned patient feature matrix.
+
+    This helper is used to decompose the broad provenance-only control into
+    single-family experiments. Every subset retains exactly the same patient
+    order and labels; only columns change. This avoids rerunning image decoding
+    and makes it possible to identify whether slice counts, folder counts,
+    native geometry, or file-size proxies are responsible for classification.
+    """
+
+    X, y, patient_ids, feature_names = feature_set
+    feature_names = tuple(feature_names)
+    selected_feature_names = tuple(selected_feature_names)
+    missing = [name for name in selected_feature_names if name not in feature_names]
+    if missing:
+        raise ValueError(
+            f"Requested tabular control features are missing: {missing}."
+        )
+    indices = np.asarray(
+        [feature_names.index(name) for name in selected_feature_names],
+        dtype=np.int64,
+    )
+    subset = np.asarray(X, dtype=np.float32)[:, indices]
+    if subset.ndim != 2 or subset.shape[1] != len(selected_feature_names):
+        raise RuntimeError("Patient tabular feature subsetting produced an invalid shape.")
+    return (
+        subset,
+        np.asarray(y, dtype=np.int64),
+        np.asarray(patient_ids),
+        selected_feature_names,
+    )
+
+
+def build_provenance_component_control_sets(provenance_set):
+    """Create predeclared single-family export/provenance controls.
+
+    The broad C3 matrix can obtain a high AUC without revealing which released
+    dataset property carries the label. These narrower controls separate:
+
+        - total number of exported slices;
+        - number of folder-defined series proxies;
+        - mean and maximum proxy length;
+        - native height/width/aspect-ratio summaries;
+        - file-size and bytes-per-pixel summaries.
+
+    None of these matrices contains EfficientNet embeddings, MONAI outputs, or
+    central image texture.
+    """
+
+    feature_names = tuple(provenance_set[3])
+    geometry_names = tuple(
+        name
+        for name in feature_names
+        if any(
+            token in name
+            for token in (
+                "native_height",
+                "native_width",
+                "aspect_ratio_width_over_height",
+            )
+        )
+    )
+    file_size_names = tuple(
+        name
+        for name in feature_names
+        if any(
+            token in name
+            for token in (
+                "file_size_bytes",
+                "bytes_per_native_pixel",
+            )
+        )
+    )
+
+    return {
+        "n_slices_only": subset_patient_tabular_feature_set(
+            provenance_set,
+            ("n_slices",),
+        ),
+        "n_series_only": subset_patient_tabular_feature_set(
+            provenance_set,
+            ("n_series_proxies",),
+        ),
+        "series_length_only": subset_patient_tabular_feature_set(
+            provenance_set,
+            ("mean_series_length", "max_series_length"),
+        ),
+        "native_geometry_only": subset_patient_tabular_feature_set(
+            provenance_set,
+            geometry_names,
+        ),
+        "file_size_only": subset_patient_tabular_feature_set(
+            provenance_set,
+            file_size_names,
+        ),
+    }
+
+
 def aggregate_patient_monai_qc_features(bank):
     """Aggregate MONAI gate diagnostics to one label-free patient feature row."""
 
@@ -7013,7 +7649,17 @@ def aggregate_patient_embeddings(
     retained only to measure whether the hierarchical design materially changes
     patient-level performance.
 
-    Both branches are deterministic and label-free. Labels are checked only for
+    FIXED-CHUNK POOLING ABLATION
+    --------------------------------
+
+        deterministic series-independent hash order -> FIXED_CHUNK_SIZE chunks
+        chunk means -----------------------> equal patient mean
+
+    This branch ignores folder-proxy boundaries while preventing one long run
+    of slices from receiving unlimited influence. It is designed specifically
+    to test whether arbitrary SR_*/series* export partitioning is predictive.
+
+    All branches are deterministic and label-free. Labels are checked only for
     patient consistency and later supervised fitting.
     """
 
@@ -7031,7 +7677,7 @@ def aggregate_patient_embeddings(
         == len(slice_weights)
     ):
         raise ValueError("Embedding-pooling arrays must have equal lengths.")
-    if pooling_strategy not in {"hierarchical", "flat"}:
+    if pooling_strategy not in {"hierarchical", "flat", "fixed_chunk"}:
         raise ValueError(
             f"Unsupported patient embedding pooling: {pooling_strategy!r}."
         )
@@ -7073,6 +7719,44 @@ def aggregate_patient_embeddings(
                 features[indices],
                 axis=0,
                 weights=weights,
+            )
+        elif pooling_strategy == "fixed_chunk":
+            # Ignore SR_*/series* folder boundaries and partition the patient's
+            # deterministic series-independent hash order into equal maximum-
+            # size chunks. Each chunk receives one embedding and equal patient-level
+            # influence. This tests whether folder-defined export partitioning,
+            # rather than a true acquisition hierarchy, drives performance.
+            indices = np.asarray(patient_to_indices[patient_id], dtype=np.int64)
+            # A deterministic SHA-256 ordering deliberately ignores series IDs
+            # and prevents contiguous filesystem/folder order from recreating
+            # the released proxy boundaries inside the chunks.
+            ordering_keys = [
+                hashlib.sha256(
+                    f"{RANDOM_SEED}|fixed_chunk|{patient_id}|{int(index)}".encode(
+                        "utf-8"
+                    )
+                ).hexdigest()
+                for index in indices
+            ]
+            indices = indices[np.argsort(np.asarray(ordering_keys))]
+            chunk_embeddings = []
+            for start in range(0, len(indices), FIXED_CHUNK_SIZE):
+                chunk_indices = indices[start:start + FIXED_CHUNK_SIZE]
+                weights = slice_weights[chunk_indices]
+                if not np.any(weights > 0):
+                    raise RuntimeError(
+                        f"Patient {patient_id} has a fixed chunk with no positive weight."
+                    )
+                chunk_embeddings.append(
+                    np.average(
+                        features[chunk_indices],
+                        axis=0,
+                        weights=weights,
+                    )
+                )
+            patient_embedding = np.mean(
+                np.stack(chunk_embeddings, axis=0),
+                axis=0,
             )
         else:
             series_embeddings = []
@@ -8696,7 +9380,7 @@ def run_repeated_nested_cv_stability(
     base_fold_manifest_rows,
     output_dir,
 ):
-    """Repeat the primary nested CV over several deterministic outer splits."""
+    """Repeat one selected nested-CV experiment over deterministic outer splits."""
 
     output_dir.mkdir(parents=True, exist_ok=True)
     patient_ids = np.asarray(prepared["patient_ids"]).astype(str)
@@ -9463,47 +10147,106 @@ def write_master_outputs(
 
 
 def print_final_comparison(summary_rows, failed_results=None):
-    """Print a compact ranking, shortcut warnings, and failed experiments."""
+    """Print scientifically separated result tables and shortcut warnings.
+
+    A single global AUC ranking can misleadingly place a negative control above
+    the declared baseline or reward a historical confounded representation. The
+    console therefore separates current standardized candidates, shortcut
+    controls, historical/original-canvas ablations, and robustness experiments.
+    CSV/JSON master files still contain every row for complete analysis.
+    """
 
     if failed_results is None:
         failed_results = []
 
-    print("\n" + "=" * 126, flush=True)
+    current_candidate_ids = {
+        BASELINE_EXPERIMENT_ID,
+        "A9_STANDARDIZED_FULL_HIER_LR_PCA",
+        "C9_STANDARDIZED_CENTER_CROP_HIER_LR_PCA",
+        "C13_STANDARDIZED_FIXED_CENTER50_HIER_LR_PCA",
+        "C14_STANDARDIZED_FIXED_CENTER60_HIER_LR_PCA",
+        "C15_STANDARDIZED_FIXED_CENTER70_HIER_LR_PCA",
+        "A10_STANDARDIZED_ROI_ZERO_BG_HIER_LR_PCA",
+        "A11_STANDARDIZED_ROI_BBOX_HIER_LR_PCA",
+        "A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA",
+        "A13_STANDARDIZED_ROI_FIXED_CHUNK_LR_PCA",
+    }
+
+    groups = (
+        (
+            "CURRENT STANDARDIZED MODELS / LOCALIZATION CANDIDATES",
+            [
+                row
+                for row in summary_rows
+                if row["experiment_id"] in current_candidate_ids
+            ],
+        ),
+        (
+            "NEGATIVE, EXPORT AND STRUCTURAL CONTROLS",
+            [row for row in summary_rows if row["role"] == "negative_control"],
+        ),
+        (
+            "HISTORICAL ORIGINAL-CANVAS MODELS AND METHOD ABLATIONS",
+            [
+                row
+                for row in summary_rows
+                if row["experiment_id"] not in current_candidate_ids
+                and row["role"] not in {"negative_control", "robustness"}
+            ],
+        ),
+        (
+            "ROBUSTNESS EXPERIMENTS",
+            [row for row in summary_rows if row["role"] == "robustness"],
+        ),
+    )
+
+    print("\n" + "=" * 132, flush=True)
     print("FINAL MULTI-EXPERIMENT PATIENT-LEVEL COMPARISON", flush=True)
-    print("=" * 126, flush=True)
+    print("=" * 132, flush=True)
+
     header = (
-        f"{'Rank':<5} {'Experiment':<38} {'Role':<17} "
-        f"{'AUC [95% CI]':<25} {'Delta AUC vs baseline':<22} "
+        f"{'No.':<4} {'Experiment':<50} {'Role':<20} "
+        f"{'AUC [95% CI]':<25} {'Delta AUC vs baseline':<23} "
         f"{'Sens.':>7} {'Spec.':>7} {'F1':>7}"
     )
-    print(header, flush=True)
-    print("-" * 126, flush=True)
 
-    for rank, row in enumerate(summary_rows, start=1):
-        auc_text = (
-            f"{row['auc']:.4f} "
-            f"[{row['auc_ci_lower']:.4f}, {row['auc_ci_upper']:.4f}]"
-        )
-        if row["delta_auc_vs_baseline"] is None:
-            delta_text = "baseline / unavailable"
-        else:
-            delta_text = (
-                f"{row['delta_auc_vs_baseline']:+.4f} "
-                f"[{row['delta_auc_ci_lower']:+.4f}, "
-                f"{row['delta_auc_ci_upper']:+.4f}]"
+    for title, rows in groups:
+        if not rows:
+            continue
+        print(f"\n{title}", flush=True)
+        print("-" * 132, flush=True)
+        print(header, flush=True)
+        print("-" * 132, flush=True)
+
+        # Master rows are already sorted by decreasing AUC; retain that order
+        # within each scientifically coherent section.
+        for index, row in enumerate(rows, start=1):
+            auc_text = (
+                f"{row['auc']:.4f} "
+                f"[{row['auc_ci_lower']:.4f}, {row['auc_ci_upper']:.4f}]"
             )
-        print(
-            f"{rank:<5} {row['experiment_id']:<38} {row['role']:<17} "
-            f"{auc_text:<25} {delta_text:<22} "
-            f"{row['sensitivity']:>7.3f} {row['specificity']:>7.3f} "
-            f"{row['f1']:>7.3f}",
-            flush=True,
-        )
+            if row["delta_auc_vs_baseline"] is None:
+                delta_text = "baseline / unavailable"
+            else:
+                delta_text = (
+                    f"{row['delta_auc_vs_baseline']:+.4f} "
+                    f"[{row['delta_auc_ci_lower']:+.4f}, "
+                    f"{row['delta_auc_ci_upper']:+.4f}]"
+                )
+            print(
+                f"{index:<4} {row['experiment_id']:<50} {row['role']:<20} "
+                f"{auc_text:<25} {delta_text:<23} "
+                f"{row['sensitivity']:>7.3f} {row['specificity']:>7.3f} "
+                f"{row['f1']:>7.3f}",
+                flush=True,
+            )
+        print("-" * 132, flush=True)
 
-    print("-" * 126, flush=True)
     print(
-        "All rows use the same outer patient-fold manifest. Thresholds were "
-        "selected only from inner OOF training predictions.",
+        "All rows use the same outer patient-fold manifest. Thresholds and "
+        "quantitatively selected C values were learned only from inner OOF "
+        "training predictions. Tables are separated so controls are not "
+        "misrepresented as candidate clinical models.",
         flush=True,
     )
 
@@ -9518,8 +10261,9 @@ def print_final_comparison(summary_rows, failed_results=None):
         for row in negative_controls:
             print(
                 f"[WARNING] {row['experiment_id']} achieved AUC={row['auc']:.4f} "
-                f">= {SHORTCUT_WARNING_AUC:.2f}. The primary model may be using "
-                "non-anatomical dataset/protocol/export information.",
+                f">= {SHORTCUT_WARNING_AUC:.2f}. The cohort remains predictable "
+                "from a negative-control representation; anatomical validity is "
+                "therefore not established.",
                 flush=True,
             )
     else:
@@ -9544,7 +10288,7 @@ def print_final_comparison(summary_rows, failed_results=None):
             flush=True,
         )
 
-    print("=" * 126, flush=True)
+    print("=" * 132, flush=True)
 
 # =============================
 # PIPELINE STEP 11
@@ -9772,6 +10516,9 @@ def write_suite_configuration(output_path, experiments):
         ),
         "standardized_corner_fraction": STANDARDIZED_CORNER_WIDTH_FRACTION,
         "center_crop_fallback_fraction": CENTER_CROP_FALLBACK_FRACTION,
+        "fixed_center_crop_fractions": list(FIXED_CENTER_CROP_FRACTIONS),
+        "standardized_content_long_side": STANDARDIZED_CONTENT_LONG_SIDE,
+        "fixed_chunk_size": FIXED_CHUNK_SIZE,
         "monai_bbox_context_fraction": MONAI_BBOX_CONTEXT_FRACTION,
         "outside_monai_bbox_context_fraction": (
             OUTSIDE_MONAI_BBOX_CONTEXT_FRACTION
@@ -9831,7 +10578,7 @@ def write_suite_configuration(output_path, experiments):
         ),
         "repeated_nested_cv_stability": {
             "enabled": RUN_REPEATED_NESTED_CV_STABILITY,
-            "experiment_id": STABILITY_EXPERIMENT_ID,
+            "experiment_ids": list(STABILITY_EXPERIMENT_IDS),
             "repeats": REPEATED_NESTED_CV_REPEATS,
             "random_state": REPEATED_NESTED_CV_RANDOM_STATE,
         },
@@ -9969,12 +10716,14 @@ def main():
     # ======================================================================
     # This is the expensive image-processing stage. On a cache miss, each JPEG
     # is decoded once. MONAI is run on the original canvas and, separately, on
-    # the label-blind standardized canvas because padding removal and robust
-    # scaling can legitimately change its probability map. All enabled image
+    # the label-blind standardized min-max canvas because padding removal and
+    # fixed 240-in-256 geometry can legitimately change its probability map.
+    # EfficientNet uses the aligned robust-percentile classifier canvas. All enabled image
     # variants are then derived from those aligned tensors/masks. EfficientNet
     # embeddings are written to memory-mapped arrays for the original views and
-    # for standardized full, ROI, narrow-border, corners, detected padding,
-    # center-crop, strict-ROI and outside-bounding-box controls. Small groups of
+    # for standardized full, ROI, narrow-border, corners, fixed-canvas padding,
+    # MONAI-area-matched and fixed center crops, strict-ROI, outside-bounding-box
+    # and structural-control experiments. Small groups of
     # modes are concatenated per encoder call to reduce launch overhead.
     #
     # Downstream pooling, classifier, PCA, weighting, and fusion ablations reuse
@@ -10107,6 +10856,9 @@ def main():
         "Patient-level aggregation and descriptive audit files.",
     )
     provenance_set = aggregate_patient_provenance_features(bank)
+    provenance_component_sets = build_provenance_component_control_sets(
+        provenance_set
+    )
     standardization_set = aggregate_patient_standardization_features(bank)
     monai_gate_comparison, monai_qc_set = write_monai_qc_outputs(
         OUTPUT_DIR / "audits",
@@ -10123,6 +10875,11 @@ def main():
         OUTPUT_DIR / "audits" / "patient_provenance_features.csv",
         *provenance_set,
     )
+    for control_name, control_set in provenance_component_sets.items():
+        write_patient_tabular_features(
+            OUTPUT_DIR / "audits" / f"patient_{control_name}.csv",
+            *control_set,
+        )
     write_patient_tabular_features(
         OUTPUT_DIR / "audits" / "patient_standardization_features.csv",
         *standardization_set,
@@ -10133,6 +10890,13 @@ def main():
         provenance_set[1],
         provenance_set[3],
     )
+    for control_name, control_set in provenance_component_sets.items():
+        write_tabular_class_summary(
+            OUTPUT_DIR / "audits" / f"{control_name}_class_summary.csv",
+            control_set[0],
+            control_set[1],
+            control_set[3],
+        )
     write_tabular_class_summary(
         OUTPUT_DIR / "audits" / "standardization_class_summary.csv",
         standardization_set[0],
@@ -10156,13 +10920,14 @@ def main():
         "monai_qc_only": monai_qc_set,
         "standardization_qc_only": standardization_set,
         "standardized_monai_qc_only": standardized_monai_qc_set,
+        **provenance_component_sets,
     }
     stage_durations["07 QC/provenance controls"] = _print_stage_complete(
         7,
         "Build and save provenance, standardization and MONAI-QC controls",
         stage_started,
-        "Patient-level control matrices are ready for provenance, original/"
-        "standardized MONAI QC, and standardization-geometry controls.",
+        "Patient-level control matrices are ready for broad and decomposed "
+        "provenance, original/standardized MONAI QC, and standardization geometry.",
     )
 
     # ======================================================================
@@ -10294,77 +11059,100 @@ def main():
     )
 
     # ======================================================================
-    # MAIN STAGE 10 -- REPEAT THE PRIMARY NESTED CV ACROSS OUTER SPLITS
+    # MAIN STAGE 10 -- REPEAT SELECTED NESTED-CV EXPERIMENTS ACROSS SPLITS
     # ======================================================================
     # A single five-fold assignment is statistically fragile when the effective
-    # sample size is only the number of Directory_* folders. This stage repeats
-    # the complete nested patient-level fitting path over several deterministic
-    # outer split seeds. It reuses cached patient embeddings, never chooses the
-    # best split, and reports the full AUC distribution plus per-patient score
-    # variability. No MONAI or EfficientNet inference is repeated.
+    # sample size is only the number of Directory_* folders. The prior run also
+    # showed that shortcut controls could be nearly as predictive as the primary
+    # model. This stage therefore repeats the full nested patient-level fitting
+    # path not only for the baseline, but also for the main simple-localization
+    # candidate, strict ROI candidate, and key padding/border/exterior controls.
+    # No split is selected according to AUC and no neural inference is repeated.
     stage_started = _print_stage_start(
         10,
-        "Run repeated nested-CV split-stability analysis",
-        "Several fast patient-level reruns; frozen image features are reused.",
+        "Run repeated nested-CV split-stability analyses",
+        "Several patient-level reruns for selected models and controls; frozen features are reused.",
     )
-    stability_summary = {
-        "status": "SKIPPED_DISABLED",
-        "experiment_id": STABILITY_EXPERIMENT_ID,
-    }
-    stability_result = next(
-        (
-            result
-            for result in successful_results
-            if result["config"].experiment_id == STABILITY_EXPERIMENT_ID
-        ),
-        None,
-    )
-    stability_experiment = next(
-        experiment
-        for experiment in experiments
-        if experiment.experiment_id == STABILITY_EXPERIMENT_ID
-    )
-    stability_preparation_key = (
-        stability_experiment.feature_mode,
-        stability_experiment.strategy,
-        stability_experiment.pooling_strategy,
-        stability_experiment.weighting_mode,
-        stability_experiment.slice_dropout_rate,
-    )
+    stability_summaries = {}
+    stability_root = OUTPUT_DIR / "stability"
+    stability_root.mkdir(parents=True, exist_ok=True)
 
-    if RUN_REPEATED_NESTED_CV_STABILITY and stability_result is not None:
-        stability_summary = run_repeated_nested_cv_stability(
-            experiment=stability_experiment,
-            prepared=prepared_cache[stability_preparation_key],
-            base_fold_manifest_rows=fold_manifest_rows,
-            output_dir=OUTPUT_DIR / "stability",
-        )
-    elif RUN_REPEATED_NESTED_CV_STABILITY:
-        stability_summary = {
-            "status": "SKIPPED_PRIMARY_EXPERIMENT_FAILED",
-            "experiment_id": PERMUTATION_EXPERIMENT_ID,
+    if RUN_REPEATED_NESTED_CV_STABILITY:
+        successful_by_id = {
+            result["config"].experiment_id: result
+            for result in successful_results
         }
-        (OUTPUT_DIR / "stability" / "repeated_nested_cv_summary.json").write_text(
-            json.dumps(stability_summary, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
-        print(
-            "[STABILITY] SKIPPED because the configured primary experiment "
-            "did not complete successfully.",
-            flush=True,
-        )
+        experiments_by_id = {
+            experiment.experiment_id: experiment
+            for experiment in experiments
+        }
+
+        for stability_experiment_id in STABILITY_EXPERIMENT_IDS:
+            experiment = experiments_by_id[stability_experiment_id]
+            result = successful_by_id.get(stability_experiment_id)
+            preparation_key = (
+                experiment.feature_mode,
+                experiment.strategy,
+                experiment.pooling_strategy,
+                experiment.weighting_mode,
+                experiment.slice_dropout_rate,
+            )
+
+            if result is None:
+                summary = {
+                    "status": "SKIPPED_EXPERIMENT_FAILED",
+                    "experiment_id": stability_experiment_id,
+                }
+                experiment_dir = stability_root / stability_experiment_id
+                experiment_dir.mkdir(parents=True, exist_ok=True)
+                (experiment_dir / "repeated_nested_cv_summary.json").write_text(
+                    json.dumps(summary, indent=2, sort_keys=True),
+                    encoding="utf-8",
+                )
+                print(
+                    f"[STABILITY] SKIPPED {stability_experiment_id} because "
+                    "its primary experiment did not complete successfully.",
+                    flush=True,
+                )
+            else:
+                summary = run_repeated_nested_cv_stability(
+                    experiment=experiment,
+                    prepared=prepared_cache[preparation_key],
+                    base_fold_manifest_rows=fold_manifest_rows,
+                    output_dir=stability_root / stability_experiment_id,
+                )
+            stability_summaries[stability_experiment_id] = summary
+
+        stability_summary = {
+            "status": "OK",
+            "repeats_per_experiment": int(REPEATED_NESTED_CV_REPEATS),
+            "experiment_ids": list(STABILITY_EXPERIMENT_IDS),
+            "experiment_summaries": stability_summaries,
+            "interpretation": (
+                "All configured models and controls are repeated over the same "
+                "predeclared number of outer split seeds. No best split is selected."
+            ),
+        }
     else:
-        (OUTPUT_DIR / "stability" / "repeated_nested_cv_summary.json").write_text(
-            json.dumps(stability_summary, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
+        stability_summary = {
+            "status": "SKIPPED_DISABLED",
+            "experiment_ids": list(STABILITY_EXPERIMENT_IDS),
+        }
         print("[STABILITY] SKIPPED by configuration.", flush=True)
 
+    (stability_root / "repeated_nested_cv_summary.json").write_text(
+        json.dumps(stability_summary, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    successful_stability_runs = sum(
+        summary.get("status") == "OK"
+        for summary in stability_summaries.values()
+    )
     stage_durations["10 Repeated nested CV"] = _print_stage_complete(
         10,
-        "Run repeated nested-CV split-stability analysis",
+        "Run repeated nested-CV split-stability analyses",
         stage_started,
-        stability_summary.get("status", "OK"),
+        f"Completed={successful_stability_runs}/{len(STABILITY_EXPERIMENT_IDS)} configured experiments.",
     )
 
     # ======================================================================
