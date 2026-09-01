@@ -8707,10 +8707,25 @@ def deterministic_exact_within_patient_deduplication_mask(
     times. Patient identity remains exactly Directory_*.
     """
 
-    patient_ids = np.asarray(patient_ids).astype(str)
-    series_ids = np.asarray(series_ids).astype(str)
-    decoded_pixel_hashes = np.asarray(decoded_pixel_hashes).astype(str)
+    # Convert all grouping fields to one-dimensional NumPy arrays first.
+    # The explicit dimensionality check is important: indexing a 2-D array can
+    # return another ndarray, and ndarrays are not hashable set elements.
+    patient_ids = np.asarray(patient_ids, dtype=str)
+    series_ids = np.asarray(series_ids, dtype=str)
+    decoded_pixel_hashes = np.asarray(decoded_pixel_hashes, dtype=str)
     sample_indices = np.asarray(sample_indices, dtype=np.int64)
+
+    for array_name, array in (
+        ("patient_ids", patient_ids),
+        ("series_ids", series_ids),
+        ("decoded_pixel_hashes", decoded_pixel_hashes),
+        ("sample_indices", sample_indices),
+    ):
+        if array.ndim != 1:
+            raise ValueError(
+                f"{array_name} must be one-dimensional for exact "
+                f"within-patient deduplication; received shape {array.shape}."
+            )
 
     if not (
         len(patient_ids)
@@ -8731,16 +8746,25 @@ def deterministic_exact_within_patient_deduplication_mask(
             patient_ids,
         )
     )
-    seen = set()
-    for index in order.tolist():
-        key = (patient_ids[index], decoded_pixel_hashes[index])
+
+    # NumPy's static type stubs allow scalar indexing to be inferred as either
+    # a scalar or an ndarray. Convert each value explicitly to a native Python
+    # string before constructing the set key. The key is therefore guaranteed
+    # to be hashable both for the type checker and at runtime.
+    seen: set[tuple[str, str]] = set()
+    for raw_index in order:
+        index = int(raw_index)
+        key: tuple[str, str] = (
+            str(patient_ids[index]),
+            str(decoded_pixel_hashes[index]),
+        )
         if key in seen:
             continue
         seen.add(key)
         keep[index] = True
 
-    original_patients = set(patient_ids.tolist())
-    retained_patients = set(patient_ids[keep].tolist())
+    original_patients = {str(value) for value in patient_ids.tolist()}
+    retained_patients = {str(value) for value in patient_ids[keep].tolist()}
     if retained_patients != original_patients:
         missing = sorted(original_patients - retained_patients)
         raise RuntimeError(
