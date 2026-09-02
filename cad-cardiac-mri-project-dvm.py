@@ -1,5 +1,5 @@
 #%% ============================================================
-# 🧠 CAD Detection from Cardiac MRI – Deconfounded MONAI Patient-Level Multi-Experiment Pipeline (Single File)
+# 🧠 CAD Detection from Cardiac MRI – Deconfounded MONAI Patient-Level Multi-Experiment Pipeline V4 (Single File)
 # ============================================================
 
 # ============================================================================
@@ -76,6 +76,13 @@
 #  25. Same-seed paired repeated-CV deltas for A12 versus each key comparator
 #  26. Soft-mask-only, hard-mask-only and MONAI-box-only morphology controls
 #  27. Exact within-patient deduplication and blinded pHash/series review files
+#  28. MONAI soft-map decomposition into distribution-only, block-shuffled,
+#      canonicalized-soft and canonicalized-hard representations
+#  29. Separate reporting for segmentation-derived representation controls,
+#      which are neither candidate clinical models nor purely non-anatomical
+#      negative controls
+#  30. Optional blinded series-annotation subset analysis that runs only
+#      after a completed external annotation CSV is explicitly configured
 #
 # IMPORTANT METHODOLOGICAL CHANGES:
 # The original version used one 80/20 split and discarded roughly half of the
@@ -118,6 +125,15 @@
 #     or MONAI mask/box morphology without MRI intensities;
 #   - writes blinded pHash review panels and a blinded series/view annotation
 #     template while keeping labels in separate key files;
+#   - decomposes the high-performing MONAI soft-map control into probability-
+#     distribution, globally block-shuffled, canonicalized-soft and
+#     canonicalized-hard controls so confidence, morphology, position and
+#     scale are not conflated;
+#   - classifies MONAI-derived mask controls separately from strict negative
+#     controls because a segmentation map can contain genuine anatomy as well
+#     as sequence/protocol information;
+#   - can optionally rerun a focused model/control panel on manually annotated
+#     series proxies without inferring sequence or view from folder names;
 #   - saves OOF predictions, fold assignments, paired comparisons, duplicate
 #     audits, provenance/standardization controls and original/standardized
 #     MONAI QC summaries.
@@ -387,8 +403,9 @@
 # The detailed flow above describes the standardized development branch B1.
 # A12 is now the locked primary candidate. The original suite is retained for
 # historical comparison, the deconfounding and second-stage experiments remain
-# available, and five candidate-validation experiments are added after the
-# latest Kaggle audit. The complete default registry now contains 43 experiments:
+# available. Five candidate-validation experiments from V3 are retained and
+# four MONAI-representation decomposition controls are added after the latest
+# Kaggle audit. The complete default registry now contains 47 experiments:
 #
 #   ORIGINAL / HISTORICAL SUITE
 #   B0  Original MONAI ROI + hierarchical pooling + Logistic Regression + PCA
@@ -437,6 +454,12 @@
 #   C22 Standardized hard MONAI mask-only control
 #   C23 Standardized MONAI bounding-box-geometry-only control
 #
+#   V4 MONAI-REPRESENTATION DECOMPOSITION EXTENSION
+#   C24 Soft-MONAI probability-distribution/CDF-only control
+#   C25 Deterministically block-shuffled soft-MONAI-map control
+#   C26 Canonicalized hard-mask relative-shape control
+#   C27 Canonicalized soft-mask morphology/confidence control
+#
 # Every enabled experiment uses the SAME duplicate-aware outer patient-fold
 # manifest. Classifier C and the decision threshold are selected only from each
 # outer-training cohort through inner patient-level OOF predictions. Linear-SVM
@@ -461,7 +484,9 @@
 # valid input contract is available:
 #
 #   - a cardiac-MRI-pretrained encoder requiring verified sequence/frame order;
-#   - sequence/view-specific analysis requiring reliable blinded annotation;
+#   - automatic sequence/view inference from folder names. The script can rerun
+#     selected experiments only after a blinded reviewer supplies a completed
+#     annotation CSV; it never invents those labels itself;
 #   - true external validation requiring an independent cohort adapter and a
 #     comparable patient-level CAD endpoint.
 #
@@ -478,6 +503,9 @@
 #   audits/phash_review_panels/*.png
 #   audits/series_annotation_template.csv
 #   audits/series_annotation_label_key.csv
+#   audits/series_annotation_analysis_status.json
+#   sequence_view_analysis/<selection_name>/patient_fold_manifest.csv
+#   sequence_view_analysis/<selection_name>/comparison/experiment_summary.csv
 #   audits/monai_qc_by_patient.csv
 #   audits/monai_gate_class_comparison.json
 #   audits/patient_provenance_features.csv
@@ -1313,7 +1341,7 @@ EXPERIMENT_REGISTRY = (
     ExperimentConfig(
         experiment_id="C21_STANDARDIZED_SOFT_MONAI_MASK_ONLY_HIER_LR_PCA",
         description=(
-            "Negative control encoding only the standardized dilated soft MONAI "
+            "Segmentation-derived control encoding only the standardized dilated soft MONAI "
             "probability map for gate-valid slices; invalid slices are all zero. "
             "It tests whether mask shape/confidence alone predicts the class."
         ),
@@ -1324,12 +1352,12 @@ EXPERIMENT_REGISTRY = (
         classifier_type="logistic_regression",
         use_pca=True,
         tune_c=True,
-        role="negative_control",
+        role="segmentation_representation_control",
     ),
     ExperimentConfig(
         experiment_id="C22_STANDARDIZED_HARD_MONAI_MASK_ONLY_HIER_LR_PCA",
         description=(
-            "Negative control encoding only the standardized dilated hard MONAI "
+            "Segmentation-derived control encoding only the standardized dilated hard MONAI "
             "mask for gate-valid slices; invalid slices are all zero. It removes "
             "MRI intensities while preserving mask morphology and position."
         ),
@@ -1340,12 +1368,12 @@ EXPERIMENT_REGISTRY = (
         classifier_type="logistic_regression",
         use_pca=True,
         tune_c=True,
-        role="negative_control",
+        role="segmentation_representation_control",
     ),
     ExperimentConfig(
         experiment_id="C23_STANDARDIZED_MONAI_BBOX_MASK_ONLY_HIER_LR_PCA",
         description=(
-            "Negative control encoding only a binary rectangle around each valid "
+            "Segmentation-derived control encoding only a binary rectangle around each valid "
             "standardized MONAI hard-mask bounding box; invalid slices are zero. "
             "It tests whether ROI location and extent alone encode the label."
         ),
@@ -1356,7 +1384,73 @@ EXPERIMENT_REGISTRY = (
         classifier_type="logistic_regression",
         use_pca=True,
         tune_c=True,
-        role="negative_control",
+        role="segmentation_representation_control",
+    ),
+    ExperimentConfig(
+        experiment_id="C24_STANDARDIZED_SOFT_MONAI_HISTOGRAM_ONLY_HIER_LR_PCA",
+        description=(
+            "Segmentation-derived distribution control encoding only a fixed-bin "
+            "cumulative histogram of the standardized soft MONAI probability "
+            "map. Original pixel position and mask morphology are absent."
+        ),
+        feature_mode="standardized_soft_monai_histogram_only",
+        strategy="patient_embedding",
+        pooling_strategy="hierarchical",
+        weighting_mode="equal",
+        classifier_type="logistic_regression",
+        use_pca=True,
+        tune_c=True,
+        role="segmentation_representation_control",
+    ),
+    ExperimentConfig(
+        experiment_id="C25_STANDARDIZED_SOFT_MONAI_BLOCK_SHUFFLED_HIER_LR_PCA",
+        description=(
+            "Segmentation-derived control preserving each soft MONAI map's "
+            "probability values and local within-block texture while applying a "
+            "deterministic per-image global block permutation that destroys the "
+            "original global shape and location."
+        ),
+        feature_mode="standardized_soft_monai_block_shuffled",
+        strategy="patient_embedding",
+        pooling_strategy="hierarchical",
+        weighting_mode="equal",
+        classifier_type="logistic_regression",
+        use_pca=True,
+        tune_c=True,
+        role="segmentation_representation_control",
+    ),
+    ExperimentConfig(
+        experiment_id="C26_STANDARDIZED_CANONICAL_HARD_MONAI_MASK_ONLY_HIER_LR_PCA",
+        description=(
+            "Segmentation-derived control that crops each valid hard MONAI mask "
+            "to its own bounding box, preserves relative shape, then centers it "
+            "at one fixed scale. Absolute mask position and size are removed."
+        ),
+        feature_mode="standardized_canonical_hard_monai_mask_only",
+        strategy="patient_embedding",
+        pooling_strategy="hierarchical",
+        weighting_mode="equal",
+        classifier_type="logistic_regression",
+        use_pca=True,
+        tune_c=True,
+        role="segmentation_representation_control",
+    ),
+    ExperimentConfig(
+        experiment_id="C27_STANDARDIZED_CANONICAL_SOFT_MONAI_MASK_ONLY_HIER_LR_PCA",
+        description=(
+            "Segmentation-derived control that canonicalizes the valid soft "
+            "MONAI probability map to a fixed centered scale using the hard-mask "
+            "bounding box. Relative morphology and confidence remain, while "
+            "absolute position and extent are removed."
+        ),
+        feature_mode="standardized_canonical_soft_monai_mask_only",
+        strategy="patient_embedding",
+        pooling_strategy="hierarchical",
+        weighting_mode="equal",
+        classifier_type="logistic_regression",
+        use_pca=True,
+        tune_c=True,
+        role="segmentation_representation_control",
     ),
     ExperimentConfig(
         experiment_id="R1_ROI_HIER_LR_PCA_DROP10",
@@ -1517,6 +1611,54 @@ PRIMARY_ABLATION_COMPARISONS = (
         "Does MRI intensity add information beyond MONAI bounding-box location and extent?",
     ),
     (
+        "PRIMARY_CANDIDATE_VS_SOFT_MONAI_HISTOGRAM_ONLY",
+        "C24_STANDARDIZED_SOFT_MONAI_HISTOGRAM_ONLY_HIER_LR_PCA",
+        "A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA",
+        "Does MRI intensity add information beyond the soft-map probability distribution when original spatial structure is removed?",
+    ),
+    (
+        "PRIMARY_CANDIDATE_VS_BLOCK_SHUFFLED_SOFT_MONAI_MAP",
+        "C25_STANDARDIZED_SOFT_MONAI_BLOCK_SHUFFLED_HIER_LR_PCA",
+        "A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA",
+        "Does MRI intensity add information beyond a soft map whose global shape and location are destroyed by deterministic block shuffling?",
+    ),
+    (
+        "PRIMARY_CANDIDATE_VS_CANONICAL_HARD_MONAI_MASK",
+        "C26_STANDARDIZED_CANONICAL_HARD_MONAI_MASK_ONLY_HIER_LR_PCA",
+        "A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA",
+        "Does MRI intensity add information beyond hard-mask relative shape after absolute position and scale are removed?",
+    ),
+    (
+        "PRIMARY_CANDIDATE_VS_CANONICAL_SOFT_MONAI_MASK",
+        "C27_STANDARDIZED_CANONICAL_SOFT_MONAI_MASK_ONLY_HIER_LR_PCA",
+        "A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA",
+        "Does MRI intensity add information beyond canonicalized soft-mask morphology and confidence?",
+    ),
+    (
+        "SOFT_MONAI_SPATIAL_MAP_VS_HISTOGRAM_ONLY",
+        "C24_STANDARDIZED_SOFT_MONAI_HISTOGRAM_ONLY_HIER_LR_PCA",
+        "C21_STANDARDIZED_SOFT_MONAI_MASK_ONLY_HIER_LR_PCA",
+        "How much information is added by the original soft-map spatial arrangement beyond its probability distribution?",
+    ),
+    (
+        "SOFT_MONAI_SPATIAL_MAP_VS_BLOCK_SHUFFLED",
+        "C25_STANDARDIZED_SOFT_MONAI_BLOCK_SHUFFLED_HIER_LR_PCA",
+        "C21_STANDARDIZED_SOFT_MONAI_MASK_ONLY_HIER_LR_PCA",
+        "How much information is added by intact global soft-mask morphology and location beyond block-shuffled local probability texture?",
+    ),
+    (
+        "POSITIONED_HARD_MASK_VS_CANONICAL_HARD_SHAPE",
+        "C26_STANDARDIZED_CANONICAL_HARD_MONAI_MASK_ONLY_HIER_LR_PCA",
+        "C22_STANDARDIZED_HARD_MONAI_MASK_ONLY_HIER_LR_PCA",
+        "How much information is added by absolute hard-mask position and scale beyond canonicalized relative shape?",
+    ),
+    (
+        "POSITIONED_SOFT_MASK_VS_CANONICAL_SOFT_SHAPE",
+        "C27_STANDARDIZED_CANONICAL_SOFT_MONAI_MASK_ONLY_HIER_LR_PCA",
+        "C21_STANDARDIZED_SOFT_MONAI_MASK_ONLY_HIER_LR_PCA",
+        "How much information is added by absolute soft-mask position and scale beyond canonicalized morphology and confidence?",
+    ),
+    (
         "STANDARDIZED_HIERARCHICAL_VS_FIXED_CHUNK_POOLING",
         "B1_STANDARDIZED_ROI_HIER_LR_PCA",
         "A13_STANDARDIZED_ROI_FIXED_CHUNK_LR_PCA",
@@ -1658,13 +1800,13 @@ PROGRESS_PRINT_EVERY_N_BATCHES = 25
 
 USE_FEATURE_CACHE = True
 FORCE_REBUILD_FEATURE_CACHE = False
-FEATURE_CACHE_SCHEMA_VERSION = "2026-09-01-primary-candidate-validation-v5"
+FEATURE_CACHE_SCHEMA_VERSION = "2026-09-02-soft-map-decomposition-v6"
 EFFICIENTNET_FEATURE_DIM = 1280
 FEATURE_MODES_PER_ENCODER_CALL = 4
 # Several image variants can be concatenated along the batch dimension and
 # encoded by one EfficientNet call. Four modes at a time is a conservative T4
 # default: it reduces Python/kernel-launch overhead without materializing all
-# all twenty-one views simultaneously. Lower this value if GPU memory is insufficient.
+# all twenty-five views simultaneously. Lower this value if GPU memory is insufficient.
 
 SLICE_QUALITY_MIN_WEIGHT = 0.25
 # The quality signal remains a non-clinical heuristic. It is computed once from
@@ -1724,6 +1866,56 @@ STANDARDIZATION_FEATURE_NAMES = (
 # centered in a 256x256 canvas, so pipeline padding no longer depends on native
 # resolution or on the amount of detected border removal.
 
+MONAI_SOFT_HISTOGRAM_BINS = 64
+# The distribution-only control converts each gate-valid soft MONAI map into a
+# fixed 64-bin cumulative-distribution image. It retains the empirical
+# probability distribution but removes every original pixel coordinate and all
+# connected mask morphology. The value is fixed before evaluation.
+
+MONAI_SOFT_BLOCK_SHUFFLE_GRID = 14
+MONAI_SOFT_BLOCK_SHUFFLE_VERSION = "sha256-per-image-14x14-v1"
+# The 224x224 map is divided into a 14x14 grid of 16x16 blocks. A deterministic
+# per-image permutation is derived from the exact decoded-pixel SHA-256, never
+# from label, patient ID, series ID, fold, or model score. Within-block soft-map
+# texture and the complete probability histogram are preserved, while global
+# shape and location are destroyed. This remains a diagnostic control rather
+# than a natural-image preprocessing recommendation.
+
+MONAI_CANONICAL_MASK_CONTENT_FRACTION = 0.75
+# Canonicalized mask controls crop to the gate-valid hard-mask bounding box,
+# preserve relative morphology, square-pad without anisotropic distortion, and
+# place the result at one fixed centered scale occupying 75% of the 224x224
+# canvas. Absolute mask location and original extent are therefore removed.
+
+RUN_ANNOTATED_SERIES_SUBSET_ANALYSIS = False
+SERIES_ANNOTATION_INPUT_PATH = None
+ANNOTATED_SERIES_SELECTION_NAME = "heart_nonlocalizer_nonderived"
+ANNOTATED_SERIES_REQUIRE_CONTAINS_HEART = True
+ANNOTATED_SERIES_EXCLUDE_LOCALIZERS = True
+ANNOTATED_SERIES_EXCLUDE_DERIVED_EXPORTS = True
+ANNOTATED_SERIES_ALLOWED_SEQUENCE_TYPES = ()
+ANNOTATED_SERIES_ALLOWED_VIEW_TYPES = ()
+ANNOTATED_SERIES_ALLOWED_CONFIDENCE_VALUES = ("high", "medium")
+ANNOTATED_SERIES_EXPERIMENT_IDS = (
+    PRIMARY_CANDIDATE_EXPERIMENT_ID,
+    "A14_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_FIXED_CHUNK_LR_PCA",
+    "C10_STANDARDIZED_OUTSIDE_LARGE_BBOX_HIER_LR_PCA",
+    "C14_STANDARDIZED_FIXED_CENTER60_HIER_LR_PCA",
+    "C21_STANDARDIZED_SOFT_MONAI_MASK_ONLY_HIER_LR_PCA",
+    "C22_STANDARDIZED_HARD_MONAI_MASK_ONLY_HIER_LR_PCA",
+    "C23_STANDARDIZED_MONAI_BBOX_MASK_ONLY_HIER_LR_PCA",
+    "C24_STANDARDIZED_SOFT_MONAI_HISTOGRAM_ONLY_HIER_LR_PCA",
+    "C25_STANDARDIZED_SOFT_MONAI_BLOCK_SHUFFLED_HIER_LR_PCA",
+    "C26_STANDARDIZED_CANONICAL_HARD_MONAI_MASK_ONLY_HIER_LR_PCA",
+    "C27_STANDARDIZED_CANONICAL_SOFT_MONAI_MASK_ONLY_HIER_LR_PCA",
+)
+# The pipeline never infers sequence or view from SR_*/series* folder names.
+# When this optional stage is enabled, the user must point to a completed copy
+# of the blinded series_annotation_template.csv stored outside the current run
+# directory. Only explicitly annotated series proxies are retained, and a fresh
+# patient-level fold manifest is created for the retained cohort. The default is
+# disabled because empty annotation columns cannot support valid filtering.
+
 C_SELECTION_AUC_TOLERANCE = 0.01
 # Select the smallest (most regularized) C whose inner AUC is within this
 # absolute tolerance of the best candidate. This prevents tiny inner-CV
@@ -1748,6 +1940,10 @@ STABILITY_EXPERIMENT_IDS = (
     "C21_STANDARDIZED_SOFT_MONAI_MASK_ONLY_HIER_LR_PCA",
     "C22_STANDARDIZED_HARD_MONAI_MASK_ONLY_HIER_LR_PCA",
     "C23_STANDARDIZED_MONAI_BBOX_MASK_ONLY_HIER_LR_PCA",
+    "C24_STANDARDIZED_SOFT_MONAI_HISTOGRAM_ONLY_HIER_LR_PCA",
+    "C25_STANDARDIZED_SOFT_MONAI_BLOCK_SHUFFLED_HIER_LR_PCA",
+    "C26_STANDARDIZED_CANONICAL_HARD_MONAI_MASK_ONLY_HIER_LR_PCA",
+    "C27_STANDARDIZED_CANONICAL_SOFT_MONAI_MASK_ONLY_HIER_LR_PCA",
 )
 
 # All comparisons below use the exact same outer split seeds. The first model
@@ -1815,6 +2011,60 @@ REPEATED_STABILITY_COMPARISONS = (
         "C23_STANDARDIZED_MONAI_BBOX_MASK_ONLY_HIER_LR_PCA",
         PRIMARY_CANDIDATE_EXPERIMENT_ID,
         "MRI intensities versus MONAI bounding-box geometry only.",
+    ),
+    (
+        "A12_VS_SOFT_HISTOGRAM_ONLY",
+        "C24_STANDARDIZED_SOFT_MONAI_HISTOGRAM_ONLY_HIER_LR_PCA",
+        PRIMARY_CANDIDATE_EXPERIMENT_ID,
+        "MRI intensities versus soft-map probability distribution only.",
+    ),
+    (
+        "A12_VS_BLOCK_SHUFFLED_SOFT_MAP",
+        "C25_STANDARDIZED_SOFT_MONAI_BLOCK_SHUFFLED_HIER_LR_PCA",
+        PRIMARY_CANDIDATE_EXPERIMENT_ID,
+        "MRI intensities versus block-shuffled soft-map probabilities.",
+    ),
+    (
+        "A12_VS_CANONICAL_HARD_MASK",
+        "C26_STANDARDIZED_CANONICAL_HARD_MONAI_MASK_ONLY_HIER_LR_PCA",
+        PRIMARY_CANDIDATE_EXPERIMENT_ID,
+        "MRI intensities versus canonicalized hard-mask relative shape.",
+    ),
+    (
+        "A12_VS_CANONICAL_SOFT_MASK",
+        "C27_STANDARDIZED_CANONICAL_SOFT_MONAI_MASK_ONLY_HIER_LR_PCA",
+        PRIMARY_CANDIDATE_EXPERIMENT_ID,
+        "MRI intensities versus canonicalized soft morphology/confidence.",
+    ),
+    (
+        "SOFT_SPATIAL_MAP_VS_HISTOGRAM_ONLY",
+        "C24_STANDARDIZED_SOFT_MONAI_HISTOGRAM_ONLY_HIER_LR_PCA",
+        "C21_STANDARDIZED_SOFT_MONAI_MASK_ONLY_HIER_LR_PCA",
+        "Intact soft-map spatial arrangement versus probability distribution only.",
+    ),
+    (
+        "SOFT_SPATIAL_MAP_VS_BLOCK_SHUFFLED",
+        "C25_STANDARDIZED_SOFT_MONAI_BLOCK_SHUFFLED_HIER_LR_PCA",
+        "C21_STANDARDIZED_SOFT_MONAI_MASK_ONLY_HIER_LR_PCA",
+        "Intact global soft-map morphology/location versus block-shuffled control.",
+    ),
+    (
+        "POSITIONED_HARD_MASK_VS_CANONICAL_HARD",
+        "C26_STANDARDIZED_CANONICAL_HARD_MONAI_MASK_ONLY_HIER_LR_PCA",
+        "C22_STANDARDIZED_HARD_MONAI_MASK_ONLY_HIER_LR_PCA",
+        "Absolute hard-mask position/scale plus shape versus relative shape only.",
+    ),
+    (
+        "POSITIONED_SOFT_MASK_VS_CANONICAL_SOFT",
+        "C27_STANDARDIZED_CANONICAL_SOFT_MONAI_MASK_ONLY_HIER_LR_PCA",
+        "C21_STANDARDIZED_SOFT_MONAI_MASK_ONLY_HIER_LR_PCA",
+        "Absolute soft-mask position/scale plus confidence versus canonicalized morphology/confidence.",
+    ),
+    (
+        "CANONICAL_SOFT_MASK_VS_HISTOGRAM_ONLY",
+        "C24_STANDARDIZED_SOFT_MONAI_HISTOGRAM_ONLY_HIER_LR_PCA",
+        "C27_STANDARDIZED_CANONICAL_SOFT_MONAI_MASK_ONLY_HIER_LR_PCA",
+        "Canonicalized soft morphology/confidence versus probability distribution only.",
     ),
 )
 
@@ -2071,6 +2321,12 @@ _suite_identity = {
     "fixed_center_crop_fractions": FIXED_CENTER_CROP_FRACTIONS,
     "standardized_content_long_side": STANDARDIZED_CONTENT_LONG_SIDE,
     "fixed_chunk_size": FIXED_CHUNK_SIZE,
+    "monai_soft_histogram_bins": MONAI_SOFT_HISTOGRAM_BINS,
+    "monai_soft_block_shuffle_grid": MONAI_SOFT_BLOCK_SHUFFLE_GRID,
+    "monai_soft_block_shuffle_version": MONAI_SOFT_BLOCK_SHUFFLE_VERSION,
+    "monai_canonical_mask_content_fraction": (
+        MONAI_CANONICAL_MASK_CONTENT_FRACTION
+    ),
     "monai_bbox_context_fraction": MONAI_BBOX_CONTEXT_FRACTION,
     "outside_monai_bbox_context_fraction": (
         OUTSIDE_MONAI_BBOX_CONTEXT_FRACTION
@@ -2122,6 +2378,28 @@ _suite_identity = {
     "label_permutation_replicates": LABEL_PERMUTATION_REPLICATES,
     "label_permutation_random_state": LABEL_PERMUTATION_RANDOM_STATE,
     "permutation_experiment_ids": PERMUTATION_EXPERIMENT_IDS,
+    "run_annotated_series_subset_analysis": (
+        RUN_ANNOTATED_SERIES_SUBSET_ANALYSIS
+    ),
+    "series_annotation_input_path": SERIES_ANNOTATION_INPUT_PATH,
+    "annotated_series_selection_name": ANNOTATED_SERIES_SELECTION_NAME,
+    "annotated_series_require_contains_heart": (
+        ANNOTATED_SERIES_REQUIRE_CONTAINS_HEART
+    ),
+    "annotated_series_exclude_localizers": (
+        ANNOTATED_SERIES_EXCLUDE_LOCALIZERS
+    ),
+    "annotated_series_exclude_derived_exports": (
+        ANNOTATED_SERIES_EXCLUDE_DERIVED_EXPORTS
+    ),
+    "annotated_series_allowed_sequence_types": (
+        ANNOTATED_SERIES_ALLOWED_SEQUENCE_TYPES
+    ),
+    "annotated_series_allowed_view_types": ANNOTATED_SERIES_ALLOWED_VIEW_TYPES,
+    "annotated_series_allowed_confidence_values": (
+        ANNOTATED_SERIES_ALLOWED_CONFIDENCE_VALUES
+    ),
+    "annotated_series_experiment_ids": ANNOTATED_SERIES_EXPERIMENT_IDS,
 }
 
 SUITE_CONFIGURATION_TAG = hashlib.sha256(
@@ -2145,7 +2423,7 @@ else:
 # EXECUTION STATUS + TIMING HELPERS
 # =============================
 
-PIPELINE_STAGE_COUNT = 13
+PIPELINE_STAGE_COUNT = 14
 # The number matches the suite orchestration stages inside ``main``.
 
 
@@ -2438,6 +2716,10 @@ def validate_configuration():
         "standardized_soft_monai_mask_only",
         "standardized_hard_monai_mask_only",
         "standardized_monai_bbox_mask_only",
+        "standardized_soft_monai_histogram_only",
+        "standardized_soft_monai_block_shuffled",
+        "standardized_canonical_hard_monai_mask_only",
+        "standardized_canonical_soft_monai_mask_only",
         "provenance_only",
         "monai_qc_only",
         "standardization_qc_only",
@@ -2673,6 +2955,97 @@ def validate_configuration():
         raise ValueError("LABEL_PERMUTATION_REPLICATES must be positive.")
     if FEATURE_MODES_PER_ENCODER_CALL <= 0:
         raise ValueError("FEATURE_MODES_PER_ENCODER_CALL must be positive.")
+
+    # The four V4 segmentation-representation controls use fixed synthetic
+    # encodings. Validate their spatial/distribution settings before the very
+    # expensive feature-bank extraction begins.
+    if MONAI_SOFT_HISTOGRAM_BINS < 2:
+        raise ValueError("MONAI_SOFT_HISTOGRAM_BINS must be at least 2.")
+    if MONAI_SOFT_BLOCK_SHUFFLE_GRID <= 1:
+        raise ValueError(
+            "MONAI_SOFT_BLOCK_SHUFFLE_GRID must be greater than 1."
+        )
+    if IMG_SIZE % MONAI_SOFT_BLOCK_SHUFFLE_GRID != 0:
+        raise ValueError(
+            "IMG_SIZE must be divisible by MONAI_SOFT_BLOCK_SHUFFLE_GRID so "
+            "block shuffling preserves every pixel exactly."
+        )
+    if not 0.0 < MONAI_CANONICAL_MASK_CONTENT_FRACTION <= 1.0:
+        raise ValueError(
+            "MONAI_CANONICAL_MASK_CONTENT_FRACTION must lie in (0,1]."
+        )
+    if not str(MONAI_SOFT_BLOCK_SHUFFLE_VERSION).strip():
+        raise ValueError(
+            "MONAI_SOFT_BLOCK_SHUFFLE_VERSION must be a non-empty string."
+        )
+
+    # Sequence/view analysis is optional because the released JPEG folders do
+    # not expose validated DICOM sequence metadata. When enabled, it must be
+    # driven by a completed external copy of the blinded annotation template.
+    if RUN_ANNOTATED_SERIES_SUBSET_ANALYSIS:
+        if not SERIES_ANNOTATION_INPUT_PATH:
+            raise ValueError(
+                "RUN_ANNOTATED_SERIES_SUBSET_ANALYSIS=True requires "
+                "SERIES_ANNOTATION_INPUT_PATH."
+            )
+        annotation_path = Path(SERIES_ANNOTATION_INPUT_PATH).expanduser()
+        if not annotation_path.is_file():
+            raise FileNotFoundError(
+                "Completed series annotation CSV was not found: "
+                f"{annotation_path}"
+            )
+        try:
+            annotation_path.resolve().relative_to(OUTPUT_DIR.resolve())
+        except ValueError:
+            pass
+        else:
+            raise ValueError(
+                "SERIES_ANNOTATION_INPUT_PATH must point to a completed copy "
+                "stored outside the current run directory. Stage 2 cleans the "
+                "run-specific output package before execution."
+            )
+        if not str(ANNOTATED_SERIES_SELECTION_NAME).strip():
+            raise ValueError(
+                "ANNOTATED_SERIES_SELECTION_NAME must be non-empty."
+            )
+        if any(
+            character in str(ANNOTATED_SERIES_SELECTION_NAME)
+            for character in ("/", "\\")
+        ):
+            raise ValueError(
+                "ANNOTATED_SERIES_SELECTION_NAME must be a safe directory "
+                "name without path separators."
+            )
+        if not ANNOTATED_SERIES_EXPERIMENT_IDS:
+            raise ValueError(
+                "ANNOTATED_SERIES_EXPERIMENT_IDS must not be empty when the "
+                "optional annotated-series analysis is enabled."
+            )
+        if len(ANNOTATED_SERIES_EXPERIMENT_IDS) != len(
+            set(ANNOTATED_SERIES_EXPERIMENT_IDS)
+        ):
+            raise ValueError(
+                "ANNOTATED_SERIES_EXPERIMENT_IDS must not contain duplicates."
+            )
+        enabled_by_id = {
+            experiment.experiment_id: experiment for experiment in experiments
+        }
+        for experiment_id in ANNOTATED_SERIES_EXPERIMENT_IDS:
+            if experiment_id not in enabled_by_id:
+                raise ValueError(
+                    "Annotated-series experiment must be enabled in the main "
+                    f"suite: {experiment_id!r}."
+                )
+            if enabled_by_id[experiment_id].strategy != "patient_embedding":
+                raise ValueError(
+                    "Annotated-series subset analysis supports image-based "
+                    "patient-embedding experiments only."
+                )
+        if not ANNOTATED_SERIES_ALLOWED_CONFIDENCE_VALUES:
+            raise ValueError(
+                "ANNOTATED_SERIES_ALLOWED_CONFIDENCE_VALUES must contain at "
+                "least one accepted confidence label."
+            )
 
     if PHASH_HAMMING_THRESHOLD < 0 or PHASH_HAMMING_THRESHOLD > 64:
         raise ValueError("PHASH_HAMMING_THRESHOLD must lie in [0,64].")
@@ -5282,6 +5655,10 @@ def required_efficientnet_feature_modes(experiments):
         "standardized_soft_monai_mask_only",
         "standardized_hard_monai_mask_only",
         "standardized_monai_bbox_mask_only",
+        "standardized_soft_monai_histogram_only",
+        "standardized_soft_monai_block_shuffled",
+        "standardized_canonical_hard_monai_mask_only",
+        "standardized_canonical_soft_monai_mask_only",
     )
     requested = {
         experiment.feature_mode
@@ -5325,6 +5702,12 @@ def feature_bank_fingerprint(samples, dataset_root):
         "fixed_center_crop_fractions": FIXED_CENTER_CROP_FRACTIONS,
         "standardized_content_long_side": STANDARDIZED_CONTENT_LONG_SIDE,
         "fixed_chunk_size": FIXED_CHUNK_SIZE,
+        "monai_soft_histogram_bins": MONAI_SOFT_HISTOGRAM_BINS,
+        "monai_soft_block_shuffle_grid": MONAI_SOFT_BLOCK_SHUFFLE_GRID,
+        "monai_soft_block_shuffle_version": MONAI_SOFT_BLOCK_SHUFFLE_VERSION,
+        "monai_canonical_mask_content_fraction": (
+            MONAI_CANONICAL_MASK_CONTENT_FRACTION
+        ),
         "monai_bbox_context_fraction": MONAI_BBOX_CONTEXT_FRACTION,
         "outside_monai_bbox_context_fraction": (
             OUTSIDE_MONAI_BBOX_CONTEXT_FRACTION
@@ -5885,6 +6268,294 @@ def create_monai_bbox_mask_only_images(hard_mask, valid_mask):
     return output
 
 
+
+def create_soft_monai_histogram_only_images(
+    roi_probability,
+    valid_mask,
+    histogram_bins=MONAI_SOFT_HISTOGRAM_BINS,
+):
+    """Encode only the soft-map probability distribution as a CDF image.
+
+    This segmentation-derived control deliberately removes every original
+    spatial coordinate. For each gate-valid slice, the dilated MONAI
+    probabilities are summarized into a fixed-bin histogram and cumulative
+    distribution function (CDF). The one-dimensional CDF is then repeated over
+    image rows and copied to three channels so the same frozen EfficientNet
+    encoder can be used. Gate-invalid slices remain all zero, matching C21's
+    no-full-image-fallback policy.
+
+    The resulting image is synthetic and must not be interpreted anatomically.
+    Its purpose is to test whether the empirical confidence/probability
+    distribution alone can explain the high performance of the intact soft-map
+    representation. Original mask location, connected components, contour shape,
+    and local spatial adjacency are absent.
+    """
+
+    if roi_probability.ndim != 4 or roi_probability.shape[1] != 1:
+        raise ValueError(
+            "Soft MONAI histogram input must have shape [B,1,H,W]."
+        )
+    histogram_bins = int(histogram_bins)
+    if histogram_bins < 2:
+        raise ValueError("histogram_bins must be at least 2.")
+
+    batch_size, _, height, width = roi_probability.shape
+    output = torch.zeros(
+        batch_size,
+        1,
+        height,
+        width,
+        device=roi_probability.device,
+        dtype=roi_probability.dtype,
+    )
+
+    for index in range(batch_size):
+        if not bool(valid_mask[index].item()):
+            continue
+
+        values = roi_probability[index, 0].float().clamp(0.0, 1.0)
+        histogram = torch.histc(
+            values,
+            bins=histogram_bins,
+            min=0.0,
+            max=1.0,
+        )
+        total = histogram.sum()
+        if not bool(torch.isfinite(total).item()) or float(total.item()) <= 0.0:
+            continue
+
+        cdf = torch.cumsum(histogram, dim=0) / total
+        cdf_line = F.interpolate(
+            cdf.view(1, 1, histogram_bins),
+            size=width,
+            mode="linear",
+            align_corners=False,
+        ).view(width)
+        output[index, 0] = cdf_line.view(1, width).expand(height, width)
+
+    return output.repeat(1, 3, 1, 1).to(roi_probability.dtype)
+
+
+def create_block_shuffled_soft_monai_mask_only_images(
+    roi_probability,
+    valid_mask,
+    decoded_pixel_hashes,
+    block_grid=MONAI_SOFT_BLOCK_SHUFFLE_GRID,
+):
+    """Destroy global soft-mask shape/location while preserving local blocks.
+
+    The gate-valid 224x224 probability map is divided into a fixed block grid.
+    Blocks are permuted independently for each image using a deterministic seed
+    derived from the image's exact decoded-pixel SHA-256. No label, patient ID,
+    series ID, fold assignment, or model score contributes to the permutation.
+
+    This preserves:
+        - the complete soft-probability histogram;
+        - all pixel values;
+        - local texture within each block.
+
+    It destroys:
+        - the original global mask contour;
+        - original absolute location;
+        - long-range spatial relationships between blocks.
+
+    The control is complementary to the CDF/histogram-only representation. A
+    high score here but a lower histogram-only score suggests that local
+    within-block confidence texture contributes beyond the marginal
+    distribution. Gate-invalid slices remain all zero.
+    """
+
+    if roi_probability.ndim != 4 or roi_probability.shape[1] != 1:
+        raise ValueError(
+            "Block-shuffled soft MONAI input must have shape [B,1,H,W]."
+        )
+
+    batch_size, _, height, width = roi_probability.shape
+    block_grid = int(block_grid)
+    if block_grid <= 1:
+        raise ValueError("block_grid must be greater than 1.")
+    if height % block_grid != 0 or width % block_grid != 0:
+        raise ValueError(
+            f"Soft-map size {(height, width)} must be divisible by block_grid="
+            f"{block_grid}."
+        )
+    if len(decoded_pixel_hashes) != batch_size:
+        raise ValueError(
+            "decoded_pixel_hashes must contain one value per soft MONAI map."
+        )
+
+    selector = valid_mask.view(-1, 1, 1, 1).to(roi_probability.dtype)
+    soft_maps = roi_probability.clamp(0.0, 1.0) * selector
+    output = torch.zeros_like(soft_maps)
+    block_height = height // block_grid
+    block_width = width // block_grid
+    n_blocks = block_grid * block_grid
+
+    for index in range(batch_size):
+        if not bool(valid_mask[index].item()):
+            continue
+
+        seed_material = (
+            f"{MONAI_SOFT_BLOCK_SHUFFLE_VERSION}|"
+            f"{str(decoded_pixel_hashes[index])}"
+        ).encode("utf-8")
+        seed = int(hashlib.sha256(seed_material).hexdigest()[:16], 16) % (
+            2 ** 32
+        )
+        permutation = np.random.default_rng(seed).permutation(n_blocks)
+        permutation_tensor = torch.as_tensor(
+            permutation,
+            dtype=torch.long,
+            device=roi_probability.device,
+        )
+
+        blocks = (
+            soft_maps[index, 0]
+            .reshape(block_grid, block_height, block_grid, block_width)
+            .permute(0, 2, 1, 3)
+            .reshape(n_blocks, block_height, block_width)
+        )
+        shuffled_blocks = blocks.index_select(0, permutation_tensor)
+        shuffled_map = (
+            shuffled_blocks
+            .reshape(block_grid, block_grid, block_height, block_width)
+            .permute(0, 2, 1, 3)
+            .reshape(height, width)
+        )
+        output[index, 0] = shuffled_map
+
+    return output.repeat(1, 3, 1, 1)
+
+
+def _create_canonicalized_monai_map_only_images(
+    source_map,
+    hard_mask,
+    valid_mask,
+    *,
+    binary,
+    content_fraction=MONAI_CANONICAL_MASK_CONTENT_FRACTION,
+):
+    """Canonicalize one MONAI-derived map to fixed centered location and scale.
+
+    The gate-valid hard mask defines the source bounding box. The corresponding
+    hard or soft map is cropped to that box, square-padded without anisotropic
+    stretching, resized to one predeclared target side, and centered in the
+    original classifier canvas. This removes absolute position and original
+    extent while preserving relative contour geometry; the soft variant also
+    preserves within-mask confidence gradients. Invalid/empty masks produce an
+    all-zero image.
+    """
+
+    if source_map.ndim != 4 or source_map.shape[1] != 1:
+        raise ValueError("Canonical source_map must have shape [B,1,H,W].")
+    if hard_mask.shape != source_map.shape:
+        raise ValueError(
+            "Canonical source_map and hard_mask must have identical shapes."
+        )
+
+    content_fraction = float(content_fraction)
+    if not 0.0 < content_fraction <= 1.0:
+        raise ValueError("content_fraction must lie in (0,1].")
+
+    batch_size, _, height, width = source_map.shape
+    target_side = max(
+        2,
+        int(round(min(height, width) * content_fraction)),
+    )
+    target_top = (height - target_side) // 2
+    target_left = (width - target_side) // 2
+    output = torch.zeros_like(source_map)
+
+    for index in range(batch_size):
+        if not bool(valid_mask[index].item()):
+            continue
+        box = _hard_mask_bounding_box(hard_mask[index, 0])
+        if box is None:
+            continue
+
+        top, bottom, left, right = box
+        crop = source_map[index:index + 1, :, top:bottom, left:right]
+        if crop.numel() == 0:
+            continue
+        if binary:
+            crop = (crop > 0.5).to(source_map.dtype)
+        else:
+            crop = crop.clamp(0.0, 1.0)
+
+        crop_height = int(crop.shape[-2])
+        crop_width = int(crop.shape[-1])
+        square_side = max(crop_height, crop_width)
+        square = torch.zeros(
+            1,
+            1,
+            square_side,
+            square_side,
+            device=source_map.device,
+            dtype=source_map.dtype,
+        )
+        square_top = (square_side - crop_height) // 2
+        square_left = (square_side - crop_width) // 2
+        square[
+            :,
+            :,
+            square_top:square_top + crop_height,
+            square_left:square_left + crop_width,
+        ] = crop
+
+        if binary:
+            resized = F.interpolate(
+                square,
+                size=(target_side, target_side),
+                mode="nearest",
+            )
+            resized = (resized > 0.5).to(source_map.dtype)
+        else:
+            resized = F.interpolate(
+                square,
+                size=(target_side, target_side),
+                mode="bilinear",
+                align_corners=False,
+            ).clamp(0.0, 1.0)
+
+        output[
+            index:index + 1,
+            :,
+            target_top:target_top + target_side,
+            target_left:target_left + target_side,
+        ] = resized
+
+    return output.repeat(1, 3, 1, 1)
+
+
+def create_canonicalized_hard_monai_mask_only_images(
+    hard_mask,
+    valid_mask,
+):
+    """Retain relative hard-mask shape while removing location and scale."""
+
+    return _create_canonicalized_monai_map_only_images(
+        hard_mask,
+        hard_mask,
+        valid_mask,
+        binary=True,
+    )
+
+
+def create_canonicalized_soft_monai_mask_only_images(
+    roi_probability,
+    hard_mask,
+    valid_mask,
+):
+    """Retain canonical soft morphology/confidence without absolute geometry."""
+
+    return _create_canonicalized_monai_map_only_images(
+        roi_probability,
+        hard_mask,
+        valid_mask,
+        binary=False,
+    )
+
+
 def create_outside_monai_mask_images(images, roi_probability):
     """Retain signal outside the dilated soft MONAI probability map.
 
@@ -5934,7 +6605,7 @@ def extract_feature_bank(
     WHY MEMORY-MAPPED FEATURE MATRICES?
     -----------------------------------
     A 63,648 x 1,280 float32 matrix is roughly 311 MiB. This deconfounding
-    suite can create twenty-one such representations, so keeping them plus
+    suite can create twenty-five such representations, so keeping them plus
     intermediate tensors in ordinary RAM is unnecessary. Each matrix is
     written incrementally to a NumPy .npy memory map, flushed, and reopened read-
     only after the metadata completion marker is written.
@@ -5967,6 +6638,10 @@ def extract_feature_bank(
         "standardized_soft_monai_mask_only",
         "standardized_hard_monai_mask_only",
         "standardized_monai_bbox_mask_only",
+        "standardized_soft_monai_histogram_only",
+        "standardized_soft_monai_block_shuffled",
+        "standardized_canonical_hard_monai_mask_only",
+        "standardized_canonical_soft_monai_mask_only",
     }
     need_original_monai = any(
         mode in original_monai_modes for mode in required_modes
@@ -6380,6 +7055,36 @@ def extract_feature_bank(
                         standardized_valid_mask,
                     )
                 )
+            if "standardized_soft_monai_histogram_only" in required_modes:
+                variants["standardized_soft_monai_histogram_only"] = (
+                    create_soft_monai_histogram_only_images(
+                        standardized_roi_probability,
+                        standardized_valid_mask,
+                    )
+                )
+            if "standardized_soft_monai_block_shuffled" in required_modes:
+                variants["standardized_soft_monai_block_shuffled"] = (
+                    create_block_shuffled_soft_monai_mask_only_images(
+                        standardized_roi_probability,
+                        standardized_valid_mask,
+                        decoded_pixel_hashes,
+                    )
+                )
+            if "standardized_canonical_hard_monai_mask_only" in required_modes:
+                variants["standardized_canonical_hard_monai_mask_only"] = (
+                    create_canonicalized_hard_monai_mask_only_images(
+                        standardized_hard_mask,
+                        standardized_valid_mask,
+                    )
+                )
+            if "standardized_canonical_soft_monai_mask_only" in required_modes:
+                variants["standardized_canonical_soft_monai_mask_only"] = (
+                    create_canonicalized_soft_monai_mask_only_images(
+                        standardized_roi_probability,
+                        standardized_hard_mask,
+                        standardized_valid_mask,
+                    )
+                )
 
             # -------------------------------------------------------------
             # Feature-bank stage 8: encode requested views in small mode chunks.
@@ -6653,6 +7358,10 @@ def load_or_extract_feature_bank(samples, required_modes, fingerprint, cache_dir
         "standardized_soft_monai_mask_only",
         "standardized_hard_monai_mask_only",
         "standardized_monai_bbox_mask_only",
+        "standardized_soft_monai_histogram_only",
+        "standardized_soft_monai_block_shuffled",
+        "standardized_canonical_hard_monai_mask_only",
+        "standardized_canonical_soft_monai_mask_only",
     }
     need_monai = any(
         mode in monai_dependent_modes for mode in required_modes
@@ -7652,6 +8361,471 @@ def write_series_annotation_template(output_path, samples):
         flush=True,
     )
     return rows
+
+
+def _normalize_annotation_token(value):
+    """Normalize one manually entered annotation token for exact matching."""
+
+    return str(value or "").strip().casefold()
+
+
+def _parse_required_annotation_boolean(value, field_name, row_number):
+    """Parse a required blinded annotation Boolean without guessing.
+
+    Manual CSV editors can serialize Boolean choices in several equivalent
+    forms. Accepted positive values are ``1/true/yes/y`` and accepted negative
+    values are ``0/false/no/n``. Blank or unfamiliar values return ``None`` so
+    the row is counted as incomplete rather than silently coerced.
+    """
+
+    normalized = _normalize_annotation_token(value)
+    if normalized in {"1", "true", "yes", "y"}:
+        return True
+    if normalized in {"0", "false", "no", "n"}:
+        return False
+    if normalized == "":
+        return None
+
+    print(
+        f"[SERIES SUBSET] Row {row_number}: unrecognized {field_name}="
+        f"{value!r}; treating the row as incomplete.",
+        flush=True,
+    )
+    return None
+
+
+def build_annotated_series_selection(annotation_path, bank):
+    """Create one feature-bank row mask from completed blinded annotations.
+
+    The function never infers sequence/view from ``SR_*`` or ``series*`` names.
+    It reads only explicit reviewer entries from the completed CSV, applies the
+    predeclared label-blind inclusion rules, verifies that the series identifiers
+    belong to the current feature bank, and then expands selected series proxies
+    to their aligned image rows.
+
+    Rows with incomplete required annotations are reported and excluded. A
+    stale annotation file containing unknown series identifiers fails loudly,
+    because silently ignoring them could mix annotations from another dataset
+    version. Sequence and view filters are optional; an empty configured tuple
+    means that all explicitly annotated values are eligible.
+    """
+
+    annotation_path = Path(annotation_path).expanduser().resolve()
+    required_columns = {
+        "patient_id",
+        "series_proxy_id",
+        "contains_heart",
+        "is_localizer",
+        "is_derived_export",
+        "annotation_confidence",
+        "sequence_type",
+        "view_type",
+    }
+
+    with open(annotation_path, "r", newline="", encoding="utf-8-sig") as file:
+        reader = csv.DictReader(file)
+        actual_columns = set(reader.fieldnames or [])
+        missing_columns = sorted(required_columns - actual_columns)
+        if missing_columns:
+            raise ValueError(
+                "Completed series annotation CSV is missing required columns: "
+                f"{missing_columns}."
+            )
+        annotation_rows = list(reader)
+
+    if not annotation_rows:
+        raise ValueError("Completed series annotation CSV contains no data rows.")
+
+    bank_series_ids = np.asarray(bank["series_ids"]).astype(str)
+    bank_patient_ids = np.asarray(bank["patient_ids"]).astype(str)
+    if len(bank_series_ids) != len(bank_patient_ids):
+        raise RuntimeError(
+            "Feature-bank series and patient arrays have different lengths."
+        )
+    series_to_patient = {}
+    for series_id, patient_id in zip(bank_series_ids, bank_patient_ids):
+        previous = series_to_patient.get(str(series_id))
+        if previous is not None and previous != str(patient_id):
+            raise RuntimeError(
+                f"Series proxy {series_id!r} maps to multiple patients in the "
+                "feature bank."
+            )
+        series_to_patient[str(series_id)] = str(patient_id)
+    available_series = set(series_to_patient)
+    allowed_sequences = {
+        _normalize_annotation_token(value)
+        for value in ANNOTATED_SERIES_ALLOWED_SEQUENCE_TYPES
+        if _normalize_annotation_token(value)
+    }
+    allowed_views = {
+        _normalize_annotation_token(value)
+        for value in ANNOTATED_SERIES_ALLOWED_VIEW_TYPES
+        if _normalize_annotation_token(value)
+    }
+    allowed_confidences = {
+        _normalize_annotation_token(value)
+        for value in ANNOTATED_SERIES_ALLOWED_CONFIDENCE_VALUES
+        if _normalize_annotation_token(value)
+    }
+
+    seen_series = set()
+    selected_series = set()
+    selected_annotation_rows = []
+    incomplete_rows = 0
+    excluded_by_confidence = 0
+    excluded_by_clinical_rules = 0
+    excluded_by_sequence_or_view = 0
+    unknown_series = []
+
+    for row_number, row in enumerate(annotation_rows, start=2):
+        series_id = str(row.get("series_proxy_id", "")).strip()
+        if not series_id:
+            incomplete_rows += 1
+            continue
+        if series_id in seen_series:
+            raise ValueError(
+                "Completed annotation CSV contains a duplicate "
+                f"series_proxy_id at row {row_number}: {series_id!r}."
+            )
+        seen_series.add(series_id)
+
+        if series_id not in available_series:
+            unknown_series.append(series_id)
+            continue
+
+        annotated_patient_id = str(row.get("patient_id", "")).strip()
+        expected_patient_id = series_to_patient[series_id]
+        if not annotated_patient_id:
+            incomplete_rows += 1
+            continue
+        if annotated_patient_id != expected_patient_id:
+            raise ValueError(
+                f"Annotation row {row_number} maps series {series_id!r} to "
+                f"patient {annotated_patient_id!r}, but the current feature "
+                f"bank maps it to {expected_patient_id!r}."
+            )
+
+        contains_heart = _parse_required_annotation_boolean(
+            row.get("contains_heart"), "contains_heart", row_number
+        )
+        is_localizer = _parse_required_annotation_boolean(
+            row.get("is_localizer"), "is_localizer", row_number
+        )
+        is_derived = _parse_required_annotation_boolean(
+            row.get("is_derived_export"), "is_derived_export", row_number
+        )
+        confidence = _normalize_annotation_token(
+            row.get("annotation_confidence")
+        )
+        sequence_type = _normalize_annotation_token(row.get("sequence_type"))
+        view_type = _normalize_annotation_token(row.get("view_type"))
+
+        if (
+            contains_heart is None
+            or is_localizer is None
+            or is_derived is None
+            or not confidence
+        ):
+            incomplete_rows += 1
+            continue
+
+        if confidence not in allowed_confidences:
+            excluded_by_confidence += 1
+            continue
+
+        if (
+            ANNOTATED_SERIES_REQUIRE_CONTAINS_HEART
+            and not contains_heart
+        ):
+            excluded_by_clinical_rules += 1
+            continue
+        if ANNOTATED_SERIES_EXCLUDE_LOCALIZERS and is_localizer:
+            excluded_by_clinical_rules += 1
+            continue
+        if ANNOTATED_SERIES_EXCLUDE_DERIVED_EXPORTS and is_derived:
+            excluded_by_clinical_rules += 1
+            continue
+
+        if allowed_sequences and sequence_type not in allowed_sequences:
+            excluded_by_sequence_or_view += 1
+            continue
+        if allowed_views and view_type not in allowed_views:
+            excluded_by_sequence_or_view += 1
+            continue
+
+        selected_series.add(series_id)
+        selected_annotation_rows.append(
+            {
+                "patient_id": annotated_patient_id,
+                "series_proxy_id": series_id,
+                "sequence_type": str(row.get("sequence_type", "")).strip(),
+                "view_type": str(row.get("view_type", "")).strip(),
+                "contains_heart": int(contains_heart),
+                "is_localizer": int(is_localizer),
+                "is_derived_export": int(is_derived),
+                "annotation_confidence": str(
+                    row.get("annotation_confidence", "")
+                ).strip(),
+                "reviewer": str(row.get("reviewer", "")).strip(),
+                "notes": str(row.get("notes", "")).strip(),
+            }
+        )
+
+    if unknown_series:
+        examples = unknown_series[:10]
+        raise ValueError(
+            "The completed annotation CSV contains series_proxy_id values that "
+            "are absent from the current feature bank. This usually means the "
+            "annotation belongs to another dataset/run. Examples: "
+            f"{examples}; total_unknown={len(unknown_series)}."
+        )
+    if not selected_series:
+        raise ValueError(
+            "The completed annotations and configured inclusion rules retained "
+            "no series proxies."
+        )
+
+    row_mask = np.isin(bank_series_ids, np.asarray(sorted(selected_series)))
+    labels = np.asarray(bank["labels"], dtype=np.int64)[row_mask]
+    patient_ids = np.asarray(bank["patient_ids"]).astype(str)[row_mask]
+    selected_patient_ids, selected_patient_labels = build_patient_label_table(
+        labels,
+        patient_ids,
+    )
+    class_counts = {
+        0: int(np.sum(selected_patient_labels == 0)),
+        1: int(np.sum(selected_patient_labels == 1)),
+    }
+    if min(class_counts.values()) < N_SPLITS:
+        raise ValueError(
+            "Annotated-series subset must retain at least N_SPLITS patients in "
+            "each class. Retained counts: "
+            f"Normal={class_counts[0]}, Sick={class_counts[1]}, "
+            f"N_SPLITS={N_SPLITS}."
+        )
+
+    summary = {
+        "status": "READY",
+        "annotation_path": str(annotation_path),
+        "selection_name": str(ANNOTATED_SERIES_SELECTION_NAME),
+        "n_annotation_rows": int(len(annotation_rows)),
+        "n_feature_bank_series": int(len(available_series)),
+        "n_selected_series": int(len(selected_series)),
+        "n_selected_image_rows": int(np.sum(row_mask)),
+        "n_selected_patients": int(len(selected_patient_ids)),
+        "normal_patients": class_counts[0],
+        "sick_patients": class_counts[1],
+        "n_incomplete_rows_excluded": int(incomplete_rows),
+        "n_rows_excluded_by_confidence": int(excluded_by_confidence),
+        "n_rows_excluded_by_clinical_rules": int(
+            excluded_by_clinical_rules
+        ),
+        "n_rows_excluded_by_sequence_or_view": int(
+            excluded_by_sequence_or_view
+        ),
+        "require_contains_heart": bool(
+            ANNOTATED_SERIES_REQUIRE_CONTAINS_HEART
+        ),
+        "exclude_localizers": bool(ANNOTATED_SERIES_EXCLUDE_LOCALIZERS),
+        "exclude_derived_exports": bool(
+            ANNOTATED_SERIES_EXCLUDE_DERIVED_EXPORTS
+        ),
+        "allowed_sequence_types": list(
+            ANNOTATED_SERIES_ALLOWED_SEQUENCE_TYPES
+        ),
+        "allowed_view_types": list(ANNOTATED_SERIES_ALLOWED_VIEW_TYPES),
+        "allowed_confidence_values": list(
+            ANNOTATED_SERIES_ALLOWED_CONFIDENCE_VALUES
+        ),
+    }
+    return row_mask, selected_annotation_rows, summary
+
+
+def run_annotated_series_subset_analysis(
+    bank,
+    experiments,
+    tabular_feature_sets,
+    base_fold_manifest_rows,
+):
+    """Optionally rerun selected image experiments on annotated series only.
+
+    This is a secondary sensitivity analysis, not a replacement for the locked
+    full-cohort result. It can run only after a blinded reviewer completes the
+    exported series annotation template. The selected image rows are filtered
+    before pooling; a fresh patient-level fold manifest is then constructed for
+    the retained patient set using the same duplicate-component constraints.
+    No annotation field is derived from class labels or model predictions.
+    """
+
+    status_path = OUTPUT_DIR / "audits" / "series_annotation_analysis_status.json"
+    if not RUN_ANNOTATED_SERIES_SUBSET_ANALYSIS:
+        summary = {
+            "status": "SKIPPED_DISABLED",
+            "annotation_path": SERIES_ANNOTATION_INPUT_PATH,
+            "selection_name": ANNOTATED_SERIES_SELECTION_NAME,
+            "reason": (
+                "Enable RUN_ANNOTATED_SERIES_SUBSET_ANALYSIS only after a "
+                "blinded reviewer completes a copy of "
+                "series_annotation_template.csv."
+            ),
+        }
+        status_path.write_text(
+            json.dumps(summary, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        print(
+            "[SERIES SUBSET] SKIPPED: no completed annotation CSV was enabled.",
+            flush=True,
+        )
+        return summary
+
+    row_mask, selected_rows, selection_summary = (
+        build_annotated_series_selection(SERIES_ANNOTATION_INPUT_PATH, bank)
+    )
+    selection_root = (
+        OUTPUT_DIR
+        / "sequence_view_analysis"
+        / str(ANNOTATED_SERIES_SELECTION_NAME)
+    )
+    experiment_root = selection_root / "experiments"
+    comparison_root = selection_root / "comparison"
+    selection_root.mkdir(parents=True, exist_ok=True)
+    experiment_root.mkdir(parents=True, exist_ok=True)
+    comparison_root.mkdir(parents=True, exist_ok=True)
+
+    selected_series_path = selection_root / "selected_series_proxies.csv"
+    with open(selected_series_path, "w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=list(selected_rows[0]))
+        writer.writeheader()
+        writer.writerows(selected_rows)
+
+    selected_labels = np.asarray(bank["labels"], dtype=np.int64)[row_mask]
+    selected_patients = np.asarray(bank["patient_ids"]).astype(str)[row_mask]
+    patient_ids, patient_labels = build_patient_label_table(
+        selected_labels,
+        selected_patients,
+    )
+    base_group_by_patient = {
+        str(row["patient_id"]): str(row["duplicate_component_id"])
+        for row in base_fold_manifest_rows
+    }
+    missing_group_patients = sorted(
+        set(patient_ids.tolist()) - set(base_group_by_patient)
+    )
+    if missing_group_patients:
+        raise RuntimeError(
+            "Annotated-series patients are missing duplicate-component IDs: "
+            f"{missing_group_patients}."
+        )
+    subset_fold_rows = _build_fold_manifest_rows_for_seed(
+        patient_ids,
+        patient_labels,
+        base_group_by_patient,
+        CV_RANDOM_STATE + 70_000,
+    )
+    write_patient_fold_manifest(
+        selection_root / "patient_fold_manifest.csv",
+        subset_fold_rows,
+    )
+
+    experiments_by_id = {
+        experiment.experiment_id: experiment for experiment in experiments
+    }
+    successful_results = []
+    failed_results = []
+    prepared_cache = {}
+
+    for index, experiment_id in enumerate(
+        ANNOTATED_SERIES_EXPERIMENT_IDS,
+        start=1,
+    ):
+        experiment = experiments_by_id[experiment_id]
+        print(
+            f"[SERIES SUBSET] Experiment {index}/"
+            f"{len(ANNOTATED_SERIES_EXPERIMENT_IDS)}: {experiment_id}",
+            flush=True,
+        )
+        output_dir = experiment_root / experiment_id
+        preparation_key = experiment_preparation_cache_key(experiment)
+        try:
+            if preparation_key not in prepared_cache:
+                prepared_cache[preparation_key] = prepare_experiment_data(
+                    experiment,
+                    bank,
+                    tabular_feature_sets,
+                    row_mask=row_mask,
+                )
+            result = run_one_experiment(
+                experiment=experiment,
+                prepared=prepared_cache[preparation_key],
+                fold_manifest_rows=subset_fold_rows,
+                output_dir=output_dir,
+                legacy_prediction_cache=None,
+            )
+            successful_results.append(result)
+        except Exception as error:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            failure = {
+                "experiment_id": experiment_id,
+                "status": "FAILED",
+                "error_type": type(error).__name__,
+                "error_message": str(error),
+                "traceback": traceback.format_exc(),
+            }
+            failed_results.append(failure)
+            (output_dir / "failure.json").write_text(
+                json.dumps(failure, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+            print(
+                f"[SERIES SUBSET] FAILED {experiment_id}: "
+                f"{type(error).__name__}: {error}",
+                flush=True,
+            )
+            traceback.print_exc(file=sys.stdout)
+
+    paired_rows = compare_experiments_to_baseline(successful_results)
+    primary_rows = compare_predeclared_ablation_pairs(successful_results)
+    summary_rows = write_master_outputs(
+        successful_results,
+        failed_results,
+        paired_rows,
+        primary_rows,
+        comparison_root,
+    )
+
+    summary = {
+        **selection_summary,
+        "status": (
+            "OK" if not failed_results else "COMPLETED_WITH_FAILURES"
+        ),
+        "selected_series_csv": str(selected_series_path),
+        "fold_manifest": str(selection_root / "patient_fold_manifest.csv"),
+        "comparison_directory": str(comparison_root),
+        "requested_experiment_ids": list(ANNOTATED_SERIES_EXPERIMENT_IDS),
+        "successful_experiment_ids": [
+            result["config"].experiment_id for result in successful_results
+        ],
+        "failed_experiments": failed_results,
+        "experiment_summary_rows": summary_rows,
+        "interpretation": (
+            "This sensitivity analysis uses manually annotated folder proxies "
+            "only. It does not create validated DICOM SeriesInstanceUIDs and "
+            "does not replace independent external validation."
+        ),
+    }
+    status_path.write_text(
+        json.dumps(summary, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    print(
+        "[SERIES SUBSET] Completed annotated series/view sensitivity analysis: "
+        f"patients={selection_summary['n_selected_patients']}, "
+        f"series={selection_summary['n_selected_series']}, "
+        f"successful={len(successful_results)}, failed={len(failed_results)}.",
+        flush=True,
+    )
+    return summary
 
 
 def _patient_indices(patient_ids):
@@ -8860,8 +10034,20 @@ def experiment_preparation_cache_key(experiment):
     )
 
 
-def prepare_experiment_data(experiment, bank, tabular_feature_sets):
-    """Build the fixed, label-blind data representation for one experiment."""
+def prepare_experiment_data(
+    experiment,
+    bank,
+    tabular_feature_sets,
+    row_mask=None,
+):
+    """Build one fixed, label-blind representation for an experiment.
+
+    ``row_mask`` is used only by the optional manually annotated series/view
+    subset stage. It is applied identically to features, labels, grouping
+    identifiers, hashes, sample indices and ROI scores before any deduplication,
+    dropout, weighting or pooling. The ordinary full-cohort suite passes None
+    and therefore retains the exact full-cohort V3 behavior.
+    """
 
     labels = np.asarray(bank["labels"], dtype=np.int64)
     patient_ids = np.asarray(bank["patient_ids"])
@@ -8870,6 +10056,12 @@ def prepare_experiment_data(experiment, bank, tabular_feature_sets):
     sample_indices = np.asarray(bank["sample_indices"], dtype=np.int64)
 
     if experiment.strategy == "patient_tabular":
+        if row_mask is not None:
+            raise ValueError(
+                "A slice/series row mask cannot be applied to patient-tabular "
+                "controls. Annotated-series analysis is restricted to "
+                "image-based patient-embedding experiments."
+            )
         X, y, patients, feature_names = tabular_feature_sets[
             experiment.feature_mode
         ]
@@ -8886,6 +10078,36 @@ def prepare_experiment_data(experiment, bank, tabular_feature_sets):
 
     features = bank["features"][experiment.feature_mode]
     roi_slice_scores = np.asarray(bank["roi_slice_scores"])
+
+    # Optional manual sequence/view filtering is performed on the common
+    # feature-bank row axis. Reject malformed masks instead of flattening them,
+    # because silent reshaping could misalign images and patient metadata.
+    series_subset_applied = row_mask is not None
+    if row_mask is not None:
+        row_mask = np.asarray(row_mask, dtype=bool)
+        if row_mask.ndim != 1:
+            raise ValueError(
+                "Annotated-series row_mask must be one-dimensional; received "
+                f"shape {row_mask.shape}."
+            )
+        if len(row_mask) != len(labels):
+            raise ValueError(
+                "Annotated-series row_mask length must equal the feature-bank "
+                f"row count ({len(labels)}), got {len(row_mask)}."
+            )
+        if not np.any(row_mask):
+            raise ValueError(
+                "Annotated-series filtering retained no image rows."
+            )
+
+        features = features[row_mask]
+        labels = labels[row_mask]
+        patient_ids = patient_ids[row_mask]
+        series_ids = series_ids[row_mask]
+        roi_slice_scores = roi_slice_scores[row_mask]
+        decoded_pixel_hashes = decoded_pixel_hashes[row_mask]
+        sample_indices = sample_indices[row_mask]
+
     n_source_slices = int(len(labels))
 
     # Exact within-patient deduplication is an explicit matched ablation. It is
@@ -8972,6 +10194,7 @@ def prepare_experiment_data(experiment, bank, tabular_feature_sets):
             ),
             "n_source_slices": n_source_slices,
             "n_retained_slices": int(len(labels)),
+            "annotated_series_subset_applied": bool(series_subset_applied),
         }
 
     if experiment.strategy == "slice_probability_fusion":
@@ -9000,6 +10223,7 @@ def prepare_experiment_data(experiment, bank, tabular_feature_sets):
             ),
             "n_source_slices": n_source_slices,
             "n_retained_slices": int(len(labels)),
+            "annotated_series_subset_applied": bool(series_subset_applied),
         }
 
     raise ValueError(
@@ -9940,6 +11164,9 @@ def run_one_experiment(
             ),
             "n_source_slices": prepared.get("n_source_slices"),
             "n_retained_slices": prepared.get("n_retained_slices"),
+            "annotated_series_subset_applied": bool(
+                prepared.get("annotated_series_subset_applied", False)
+            ),
         },
         "metrics": metrics,
         "confidence_intervals": intervals,
@@ -10930,6 +12157,13 @@ def result_summary_row(result, comparison_lookup):
         "n_retained_slices": result["prepared_metadata"].get(
             "n_retained_slices"
         ),
+        "annotated_series_subset_applied": int(
+            bool(
+                result["prepared_metadata"].get(
+                    "annotated_series_subset_applied", False
+                )
+            )
+        ),
         "n_patients": summary["n_patients"],
         "auc": metrics["auc"],
         "auc_ci_lower": intervals["auc"][0],
@@ -11118,6 +12352,13 @@ def write_master_outputs(
                 "margins receive training-only sigmoid calibration. Brier scores "
                 "must therefore be interpreted as exploratory."
             ),
+            "segmentation_representation_control": (
+                "C21-C27 are MONAI-derived representation controls, not pure "
+                "non-anatomical negative controls. Their scores can reflect "
+                "morphology, sequence/view, segmenter confidence, protocol, or "
+                "export effects even though EfficientNet does not receive the "
+                "original MRI intensity image."
+            ),
             "clinical_warning": (
                 "All scores are exploratory and require independent external "
                 "validation before clinical interpretation."
@@ -11136,8 +12377,9 @@ def print_final_comparison(summary_rows, failed_results=None):
 
     A single global AUC ranking can misleadingly place a negative control above
     the declared baseline or reward a historical confounded representation. The
-    console therefore separates current standardized candidates, shortcut
-    controls, historical/original-canvas ablations, and robustness experiments.
+    console therefore separates current standardized candidates, strict
+    shortcut controls, MONAI-derived morphology/confidence controls, historical
+    original-canvas ablations, and robustness experiments.
     CSV/JSON master files still contain every row for complete analysis.
     """
 
@@ -11174,12 +12416,24 @@ def print_final_comparison(summary_rows, failed_results=None):
             [row for row in summary_rows if row["role"] == "negative_control"],
         ),
         (
+            "MONAI-DERIVED MORPHOLOGY / CONFIDENCE CONTROLS",
+            [
+                row
+                for row in summary_rows
+                if row["role"] == "segmentation_representation_control"
+            ],
+        ),
+        (
             "HISTORICAL ORIGINAL-CANVAS MODELS AND METHOD ABLATIONS",
             [
                 row
                 for row in summary_rows
                 if row["experiment_id"] not in current_candidate_ids
-                and row["role"] not in {"negative_control", "robustness"}
+                and row["role"] not in {
+                    "negative_control",
+                    "segmentation_representation_control",
+                    "robustness",
+                }
             ],
         ),
         (
@@ -11188,13 +12442,14 @@ def print_final_comparison(summary_rows, failed_results=None):
         ),
     )
 
-    print("\n" + "=" * 132, flush=True)
+    table_width = 196
+    print("\n" + "=" * table_width, flush=True)
     print("FINAL MULTI-EXPERIMENT PATIENT-LEVEL COMPARISON", flush=True)
-    print("=" * 132, flush=True)
+    print("=" * table_width, flush=True)
 
     header = (
-        f"{'No.':<4} {'Experiment':<50} {'Role':<20} "
-        f"{'AUC [95% CI]':<25} {'Delta AUC vs baseline':<23} "
+        f"{'No.':<4} {'Experiment':<72} {'Role':<36} "
+        f"{'AUC [95% CI]':<25} {'Delta AUC vs baseline':<31} "
         f"{'Sens.':>7} {'Spec.':>7} {'F1':>7}"
     )
 
@@ -11202,9 +12457,9 @@ def print_final_comparison(summary_rows, failed_results=None):
         if not rows:
             continue
         print(f"\n{title}", flush=True)
-        print("-" * 132, flush=True)
+        print("-" * table_width, flush=True)
         print(header, flush=True)
-        print("-" * 132, flush=True)
+        print("-" * table_width, flush=True)
 
         # Master rows are already sorted by decreasing AUC; retain that order
         # within each scientifically coherent section.
@@ -11222,13 +12477,13 @@ def print_final_comparison(summary_rows, failed_results=None):
                     f"{row['delta_auc_ci_upper']:+.4f}]"
                 )
             print(
-                f"{index:<4} {row['experiment_id']:<50} {row['role']:<20} "
-                f"{auc_text:<25} {delta_text:<23} "
+                f"{index:<4} {row['experiment_id']:<72} {row['role']:<36} "
+                f"{auc_text:<25} {delta_text:<31} "
                 f"{row['sensitivity']:>7.3f} {row['specificity']:>7.3f} "
                 f"{row['f1']:>7.3f}",
                 flush=True,
             )
-        print("-" * 132, flush=True)
+        print("-" * table_width, flush=True)
 
     print(
         "All rows use the same outer patient-fold manifest. Thresholds and "
@@ -11261,6 +12516,28 @@ def print_final_comparison(summary_rows, failed_results=None):
             flush=True,
         )
 
+    segmentation_controls = [
+        row
+        for row in summary_rows
+        if row["role"] == "segmentation_representation_control"
+        and row["auc"] >= SHORTCUT_WARNING_AUC
+    ]
+    if segmentation_controls:
+        print(
+            "\nMONAI-DERIVED REPRESENTATION FINDINGS",
+            flush=True,
+        )
+        for row in segmentation_controls:
+            print(
+                f"[SEGMENTATION CONTROL] {row['experiment_id']} achieved "
+                f"AUC={row['auc']:.4f}. This means label information remains "
+                "in MONAI-derived probability, morphology, position, scale, "
+                "or confidence structure. It is not, by itself, proof of a "
+                "non-anatomical shortcut because the representation is derived "
+                "from the MRI image.",
+                flush=True,
+            )
+
     if failed_results:
         print("\nFAILED EXPERIMENTS", flush=True)
         for failure in failed_results:
@@ -11276,7 +12553,7 @@ def print_final_comparison(summary_rows, failed_results=None):
             flush=True,
         )
 
-    print("=" * 132, flush=True)
+    print("=" * table_width, flush=True)
 
 # =============================
 # PIPELINE STEP 11
@@ -11321,6 +12598,7 @@ def collect_suite_metadata(
     standardized_monai_gate_comparison,
     stability_summary,
     permutation_summary,
+    series_annotation_summary,
     successful_results,
     failed_results,
     total_runtime,
@@ -11355,6 +12633,12 @@ def collect_suite_metadata(
         "feature_bank_cache_status": cache_status,
         "feature_cache_schema": FEATURE_CACHE_SCHEMA_VERSION,
         "feature_modes_per_encoder_call": FEATURE_MODES_PER_ENCODER_CALL,
+        "monai_soft_histogram_bins": MONAI_SOFT_HISTOGRAM_BINS,
+        "monai_soft_block_shuffle_grid": MONAI_SOFT_BLOCK_SHUFFLE_GRID,
+        "monai_soft_block_shuffle_version": MONAI_SOFT_BLOCK_SHUFFLE_VERSION,
+        "monai_canonical_mask_content_fraction": (
+            MONAI_CANONICAL_MASK_CONTENT_FRACTION
+        ),
         "repeated_stability_comparisons": [
             {
                 "comparison_name": comparison_name,
@@ -11429,8 +12713,22 @@ def collect_suite_metadata(
         "standardized_monai_gate_comparison": (
             standardized_monai_gate_comparison
         ),
+        "monai_representation_decomposition": {
+            "soft_histogram_bins": MONAI_SOFT_HISTOGRAM_BINS,
+            "block_shuffle_grid": MONAI_SOFT_BLOCK_SHUFFLE_GRID,
+            "block_shuffle_version": MONAI_SOFT_BLOCK_SHUFFLE_VERSION,
+            "canonical_mask_content_fraction": (
+                MONAI_CANONICAL_MASK_CONTENT_FRACTION
+            ),
+            "interpretation": (
+                "C21-C27 separate intact soft-map information into marginal "
+                "probability distribution, block-local texture, relative "
+                "shape, and absolute position/scale components."
+            ),
+        },
         "repeated_nested_cv_stability": stability_summary,
         "patient_label_permutation_test": permutation_summary,
+        "annotated_series_subset_analysis": series_annotation_summary,
         "successful_experiment_ids": [
             result["config"].experiment_id for result in successful_results
         ],
@@ -11544,6 +12842,14 @@ def write_suite_configuration(output_path, experiments):
         "fixed_center_crop_fractions": list(FIXED_CENTER_CROP_FRACTIONS),
         "standardized_content_long_side": STANDARDIZED_CONTENT_LONG_SIDE,
         "fixed_chunk_size": FIXED_CHUNK_SIZE,
+        "monai_soft_histogram_bins": MONAI_SOFT_HISTOGRAM_BINS,
+        "monai_soft_block_shuffle_grid": MONAI_SOFT_BLOCK_SHUFFLE_GRID,
+        "monai_soft_block_shuffle_version": (
+            MONAI_SOFT_BLOCK_SHUFFLE_VERSION
+        ),
+        "monai_canonical_mask_content_fraction": (
+            MONAI_CANONICAL_MASK_CONTENT_FRACTION
+        ),
         "monai_bbox_context_fraction": MONAI_BBOX_CONTEXT_FRACTION,
         "outside_monai_bbox_context_fraction": (
             OUTSIDE_MONAI_BBOX_CONTEXT_FRACTION
@@ -11612,6 +12918,28 @@ def write_suite_configuration(output_path, experiments):
             "experiment_ids": list(PERMUTATION_EXPERIMENT_IDS),
             "replicates": LABEL_PERMUTATION_REPLICATES,
             "random_state": LABEL_PERMUTATION_RANDOM_STATE,
+        },
+        "annotated_series_subset_analysis": {
+            "enabled": RUN_ANNOTATED_SERIES_SUBSET_ANALYSIS,
+            "annotation_input_path": SERIES_ANNOTATION_INPUT_PATH,
+            "selection_name": ANNOTATED_SERIES_SELECTION_NAME,
+            "require_contains_heart": (
+                ANNOTATED_SERIES_REQUIRE_CONTAINS_HEART
+            ),
+            "exclude_localizers": ANNOTATED_SERIES_EXCLUDE_LOCALIZERS,
+            "exclude_derived_exports": (
+                ANNOTATED_SERIES_EXCLUDE_DERIVED_EXPORTS
+            ),
+            "allowed_sequence_types": list(
+                ANNOTATED_SERIES_ALLOWED_SEQUENCE_TYPES
+            ),
+            "allowed_view_types": list(
+                ANNOTATED_SERIES_ALLOWED_VIEW_TYPES
+            ),
+            "allowed_confidence_values": list(
+                ANNOTATED_SERIES_ALLOWED_CONFIDENCE_VALUES
+            ),
+            "experiment_ids": list(ANNOTATED_SERIES_EXPERIMENT_IDS),
         },
         "external_validation_requested": RUN_EXTERNAL_VALIDATION,
         "external_dataset_path": EXTERNAL_DATASET_PATH,
@@ -11698,6 +13026,7 @@ def main():
         "comparison",
         "stability",
         "permutation",
+        "sequence_view_analysis",
     ):
         directory = OUTPUT_DIR / subdirectory_name
         if directory.exists():
@@ -12287,7 +13616,37 @@ def main():
     )
 
     # ======================================================================
-    # MAIN STAGE 12 -- RECORD, BUT DO NOT FABRICATE, EXTERNAL VALIDATION
+    # MAIN STAGE 12 -- OPTIONAL BLINDED SEQUENCE/VIEW SUBSET ANALYSIS
+    # ======================================================================
+    # The released JPEG folders do not contain sufficient DICOM metadata to
+    # infer sequence/view identity safely. This stage therefore remains disabled
+    # until a reviewer completes a copy of series_annotation_template.csv. When
+    # enabled, it applies the predeclared annotation filters before pooling,
+    # creates a fresh patient-level fold manifest for the retained cohort, and
+    # reruns only the selected image experiments. Empty annotation fields are
+    # never guessed and Normal/Sick labels remain outside the blinded template.
+    stage_started = _print_stage_start(
+        12,
+        "Run optional annotated sequence/view subset analysis",
+        "Immediate when disabled; otherwise several patient-level nested-CV fits.",
+    )
+    series_annotation_summary = run_annotated_series_subset_analysis(
+        bank=bank,
+        experiments=experiments,
+        tabular_feature_sets=tabular_feature_sets,
+        base_fold_manifest_rows=fold_manifest_rows,
+    )
+    stage_durations["12 Annotated sequence/view subset"] = (
+        _print_stage_complete(
+            12,
+            "Run optional annotated sequence/view subset analysis",
+            stage_started,
+            series_annotation_summary.get("status", "UNKNOWN"),
+        )
+    )
+
+    # ======================================================================
+    # MAIN STAGE 13 -- RECORD, BUT DO NOT FABRICATE, EXTERNAL VALIDATION
     # ======================================================================
     # External validation cannot be made valid merely by pointing the script at
     # an arbitrary cardiac dataset. A verified adapter must first establish a
@@ -12296,7 +13655,7 @@ def main():
     # exists, the suite writes an explicit SKIPPED/BLOCKED status instead of
     # silently adapting parameters after inspecting external labels.
     stage_started = _print_stage_start(
-        12,
+        13,
         "Record external-validation status",
         "Immediate unless a verified independent-data adapter is later added.",
     )
@@ -12329,15 +13688,15 @@ def main():
         json.dumps(external_status, indent=2, sort_keys=True),
         encoding="utf-8",
     )
-    stage_durations["12 External validation status"] = _print_stage_complete(
-        12,
+    stage_durations["13 External validation status"] = _print_stage_complete(
+        13,
         "Record external-validation status",
         stage_started,
         external_status["status"],
     )
 
     # ======================================================================
-    # MAIN STAGE 13 -- PRINT THE FINAL TABLE AND SAVE COMPLETE PROVENANCE
+    # MAIN STAGE 14 -- PRINT THE FINAL TABLE AND SAVE COMPLETE PROVENANCE
     # ======================================================================
     # The final console table ranks successful experiments but also prints
     # explicit shortcut warnings for negative controls above the configured AUC
@@ -12346,7 +13705,7 @@ def main():
     # failed experiments, and total runtime. All ordinary print() output and
     # tracebacks are simultaneously preserved in console_output.log.
     stage_started = _print_stage_start(
-        13,
+        14,
         "Print final comparison and save suite metadata",
         "Console table, warnings, metadata JSON and timing summary.",
     )
@@ -12366,6 +13725,7 @@ def main():
         ),
         stability_summary=stability_summary,
         permutation_summary=permutation_summary,
+        series_annotation_summary=series_annotation_summary,
         successful_results=successful_results,
         failed_results=failed_results,
         total_runtime=total_runtime,
@@ -12375,8 +13735,8 @@ def main():
         encoding="utf-8",
     )
 
-    stage_durations["13 Final reporting"] = _print_stage_complete(
-        13,
+    stage_durations["14 Final reporting"] = _print_stage_complete(
+        14,
         "Print final comparison and save suite metadata",
         stage_started,
         f"Master summary: {OUTPUT_DIR / 'comparison' / 'experiment_summary.csv'}",
@@ -12448,9 +13808,9 @@ if __name__ == "__main__":
 # 1. A cardiac-MRI-pretrained encoder comparison requires a public checkpoint
 #    whose exact 2D/temporal input contract can be reconstructed from these
 #    released files. Repeating one JPEG as a fake cine clip is not valid.
-# 2. Sequence/view-specific evaluation requires reliable blinded recovery or
-#    annotation of sequence/view identity. SR_* and series* names alone are not
-#    treated as validated sequence labels.
+# 2. Automatic sequence/view inference remains prohibited. V4 can run an
+#    optional subset analysis only after a reviewer completes the blinded CSV;
+#    SR_* and series* names alone are never treated as validated sequence labels.
 # 3. True external validation requires an independent cohort adapter with a
 #    comparable CAD endpoint, patient unit and locked preprocessing contract.
 #
