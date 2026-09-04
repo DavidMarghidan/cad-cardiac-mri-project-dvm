@@ -767,24 +767,9 @@ class ExperimentConfig:
 # FOCUSED SUITE: candidate + key comparators + shortcut/mask controls only.
 # Set back to None to restore the full 47-experiment registry.
 EXPERIMENTS_TO_RUN = (
-    # --- core candidate + comparators ---
-    "A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA",  # locked primary candidate
-    "B1_STANDARDIZED_ROI_HIER_LR_PCA",                           # development baseline (ref for ablations)
-    "A9_STANDARDIZED_FULL_HIER_LR_PCA",                          # ROI vs full image
-    "B0_ROI_HIER_LR_PCA",                                        # historical original-canvas reference
-    # --- shortcut detectors (headline finding) ---
-    "C1_BORDER_ONLY_HIER_LR_PCA",
+    "A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA",
     "C2_OUTSIDE_MONAI_MASK_HIER_LR_PCA",
-    "C3_EXPORT_PROVENANCE_ONLY_LR",
-    "C19_NATIVE_GEOMETRY_ONLY_LR",
-    "C20_FILE_SIZE_ONLY_LR",
-    # --- localization sanity controls ---
-    "C14_STANDARDIZED_FIXED_CENTER60_HIER_LR_PCA",              # A12's key comparator
-    "C10_STANDARDIZED_OUTSIDE_LARGE_BBOX_HIER_LR_PCA",
-    # --- MONAI-representation probe ---
-    "C21_STANDARDIZED_SOFT_MONAI_MASK_ONLY_HIER_LR_PCA",
-    # --- robustness ---
-    "R2_ROI_HIER_LR_PCA_DROP25",
+    "C1_BORDER_ONLY_HIER_LR_PCA",
 )
 
 PRIMARY_CANDIDATE_EXPERIMENT_ID = (
@@ -4218,11 +4203,11 @@ def load_samples(root_dir):
 
             if class_path == "Normal":
                 countNormal += 1
-                if countNormal > 2:
+                if countNormal > 1:
                     break
             else:
                 countStick += 1
-                if countStick > 2:
+                if countStick > 1:
                     break
 
 
