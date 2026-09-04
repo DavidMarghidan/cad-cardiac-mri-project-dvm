@@ -1,5 +1,5 @@
 #%% ============================================================
-# 🧠 CAD Detection from Cardiac MRI – Deconfounded MONAI Patient-Level Multi-Experiment Pipeline V4 (Single File)
+# 🧠 CAD Detection from Cardiac MRI – Region-Normalized Deconfounded MONAI Patient-Level Pipeline V5 (Single File)
 # ============================================================
 
 # ============================================================================
@@ -72,8 +72,8 @@
 #      localization comparators, pooling/deduplication variants and major
 #      shortcut controls rather than only one favorable split
 #  24. A 1,000-replicate patient-label permutation test that repeats the full
-#      nested fitting path directly for the locked A12 primary candidate
-#  25. Same-seed paired repeated-CV deltas for A12 versus each key comparator
+#      nested fitting path for both the locked A12 reference and prospective A18
+#  25. Same-seed paired repeated-CV deltas for A12/A18 and key comparators
 #  26. Soft-mask-only, hard-mask-only and MONAI-box-only morphology controls
 #  27. Exact within-patient deduplication and blinded pHash/series review files
 #  28. MONAI soft-map decomposition into distribution-only, block-shuffled,
@@ -83,6 +83,19 @@
 #      negative controls
 #  30. Optional blinded series-annotation subset analysis that runs only
 #      after a completed external annotation CSV is explicitly configured
+#  31. A raw standardized intensity canvas whose values are not globally scaled
+#      before the final cardiac/extracardiac region is selected
+#  32. Fixed-FOV heart-centred and binary-hard-support candidate branches that
+#      use MONAI for localization without injecting its soft confidence as image
+#      brightness
+#  33. Region-specific robust scaling calculated only from pixels that remain
+#      visible in the final inside or outside representation
+#  34. A conservative outside-whole-heart proxy and a MONAI-independent fixed
+#      periphery control, including a matched A18/C30 common-valid-slice test
+#  35. Optional hierarchical mean-plus-standard-deviation pooling and corrected
+#      fixed-chunk handling for very small final remainders
+#  36. Optional equal pooling over explicitly annotated (sequence, view) cells,
+#      with no automatic inference from SR_*/series* folder names
 #
 # IMPORTANT METHODOLOGICAL CHANGES:
 # The original version used one 80/20 split and discarded roughly half of the
@@ -133,7 +146,18 @@
 #     controls because a segmentation map can contain genuine anatomy as well
 #     as sequence/protocol information;
 #   - can optionally rerun a focused model/control panel on manually annotated
-#     series proxies without inferring sequence or view from folder names;
+#     series proxies without inferring sequence or view from folder names, and
+#     can weight each annotated (sequence, view) cell equally;
+#   - preserves A12 as the locked V4 reference while prospectively declaring A18
+#     as the V5 candidate, avoiding retrospective replacement of the baseline;
+#   - constructs V5 inside and outside branches from an unscaled raw standardized
+#     canvas, then estimates robust intensity limits only inside the final visible
+#     region so removed heart pixels cannot affect the outside control;
+#   - evaluates A18 and C30 on exactly the same standardized-MONAI-valid slices;
+#   - removes MONAI soft-confidence modulation from A16-A19 and tests a hard-
+#     support alternative in A17;
+#   - merges a fixed-chunk remainder smaller than half a nominal chunk into the
+#     preceding chunk so one residual slice cannot receive full chunk weight;
 #   - saves OOF predictions, fold assignments, paired comparisons, duplicate
 #     audits, provenance/standardization controls and original/standardized
 #     MONAI QC summaries.
@@ -192,7 +216,7 @@
 # the pinned bundle files under the configured MONAI bundle directory.
 #
 # ============================================================================
-# PRIMARY DECONFOUNDED BASELINE PIPELINE FLOW
+# STANDARDIZED REFERENCE AND PROSPECTIVE V5 PIPELINE FLOW
 # ============================================================================
 #
 # Raw MRI JPEG slice
@@ -203,9 +227,10 @@
 # Remove only the accepted native padding; preserve the complete retained field
 # of view and save crop/padding geometry as QC metadata
 #    ↓
-# Create two intensity views of the SAME retained crop:
+# Create three intensity views of the SAME retained crop:
 #   - min-max scaling to [0,1] for MONAI
 #   - robust 1st/99th-percentile scaling to [0,1] for EfficientNet
+#   - raw uint8/255 intensity for V5 post-localization region scaling
 #    ↓
 # Resize the retained content's longest side to exactly 240 pixels (up or down)
 # and center both aligned views in a 256×256 zero-padded canvas
@@ -214,6 +239,17 @@
 #    ↓
 # Confidence-gated soft ROI on the robust classifier view or standardized
 # full-image fallback
+#
+# Prospective V5 A18 branch in parallel:
+#   - require a plausible standardized MONAI mask
+#   - centre a fixed 65% square FOV on the hard-mask centroid
+#   - estimate robust limits only from non-padding pixels inside that FOV
+#   - crop and resize directly to 224x224, without surrounding canvas padding
+#
+# Matched V5 C30 control in parallel:
+#   - use the exact same plausible-mask slice rows as A18
+#   - exclude a predeclared conservative whole-heart proxy
+#   - estimate robust limits only from the remaining extracardiac pixels
 #    ↓
 # Custom 256→224 whole-canvas resize + ImageNet mean/std normalization
 #    ↓
@@ -260,6 +296,7 @@
 #          monai_image                   : original [1,256,256] MONAI canvas
 #          standardized_classification   : standardized [3,224,224] view
 #          standardized_monai_image      : standardized [1,256,256] canvas
+#          standardized_raw_classification: raw [3,224,224] uint8/255 view
 #          detected_padding_image        : [3,224,224] binary padding control
 #          label                         : scalar 0 or 1
 #          patient_id                    : Directory_* string
@@ -276,6 +313,7 @@
 #          monai_images                 : original [B,1,256,256]
 #          standardized_images          : standardized [B,3,224,224]
 #          standardized_monai_images    : standardized [B,1,256,256]
+#          standardized_raw_images      : raw uint8/255 [B,3,224,224]
 #          detected_padding_images      : binary-control [B,3,224,224]
 #
 #   D. MONAI outputs -- produced when a selected experiment requires MONAI
@@ -285,8 +323,9 @@
 #          aligned ROI probability : [B, 1, 224, 224]
 #          valid_mask              : [B], one plausibility decision per slice
 #
-#      A failed plausibility check does not delete the slice. It selects the
-#      unmodified full image for that slice.
+#      Historical/reference branches retain their declared fallback behavior.
+#      A18 and C30 instead apply one common valid-slice filter, so neither side
+#      receives zero embeddings or full-image fallbacks for invalid masks.
 #
 #   E. EfficientNet output
 #
@@ -298,7 +337,8 @@
 #   F. Cached extraction arrays -- one row per decoded JPEG slice
 #
 #      Original full/ROI/border/outside-mask embeddings and standardized
-#      full/ROI/narrow-border/corner/center-crop/strict-ROI/outside-box
+#      full/ROI/narrow-border/corner/center-crop/strict-ROI/outside-box and V5
+#      fixed-FOV/hard-support/outside-whole-heart/fixed-periphery
 #      embeddings are stored in one shared feature bank. Labels, patient IDs,
 #      series IDs, original and standardized MONAI QC, ROI slice scores, exact/
 #      perceptual hashes, provenance features and standardization QC remain in
@@ -307,9 +347,11 @@
 #
 #   G. Recommended supervised input
 #
-#      Slice embeddings are pooled within each series proxy, then equally across
-#      all series proxies of one Directory_* patient. The classifier therefore
-#      receives exactly one vector and one label per patient.
+#      Slice embeddings are normally pooled within each series proxy, then
+#      equally across all proxies of one Directory_* patient. A19 concatenates
+#      series mean and standard deviation; the optional annotated analysis can
+#      instead average series inside each explicit (sequence, view) cell and then
+#      weight cells equally. The classifier still receives one row per patient.
 #
 #   H. Evaluation output
 #
@@ -405,7 +447,7 @@
 # historical comparison, the deconfounding and second-stage experiments remain
 # available. Five candidate-validation experiments from V3 are retained and
 # four MONAI-representation decomposition controls are added after the latest
-# Kaggle audit. The complete default registry now contains 47 experiments:
+# Kaggle audit. The complete default registry now contains 54 experiments:
 #
 #   ORIGINAL / HISTORICAL SUITE
 #   B0  Original MONAI ROI + hierarchical pooling + Logistic Regression + PCA
@@ -454,20 +496,29 @@
 #   C22 Standardized hard MONAI mask-only control
 #   C23 Standardized MONAI bounding-box-geometry-only control
 #
-#   V4 MONAI-REPRESENTATION DECOMPOSITION EXTENSION
+#   V4 MONAI-REPRESENTATION DECOMPOSITION EXTENSION (retained)
 #   C24 Soft-MONAI probability-distribution/CDF-only control
 #   C25 Deterministically block-shuffled soft-MONAI-map control
 #   C26 Canonicalized hard-mask relative-shape control
 #   C27 Canonicalized soft-mask morphology/confidence control
 #
+#   V5 REGION-NORMALIZED EXTENSION
+#   A16 Heart-centred fixed FOV with post-localization region scaling
+#   A17 Binary hard support with region-only scaling
+#   A18 A16 on the common standardized-MONAI-valid slice set (prospective)
+#   A19 A18 with mean-plus-standard-deviation series summaries
+#   C28 Conservative outside-whole-heart proxy with independent scaling
+#   C29 Fixed MONAI-independent peripheral control with independent scaling
+#   C30 C28 on exactly the same valid slice set as A18
+#
 # Every enabled experiment uses the SAME duplicate-aware outer patient-fold
 # manifest. Classifier C and the decision threshold are selected only from each
 # outer-training cohort through inner patient-level OOF predictions. Linear-SVM
 # margins are calibrated by a sigmoid fitted only to inner OOF training scores.
-# A12, its direct localization/pooling/deduplication comparators, and the
+# A12, A18, their direct localization/pooling/deduplication comparators, and the
 # principal shortcut/mask-only controls are rerun across 50 identical outer-split
-# seeds. Same-seed delta-AUC distributions are saved. A12 also receives 1,000
-# patient-label permutations. No favorable split or permutation is selected.
+# seeds. Same-seed delta-AUC distributions are saved. A12 and A18 each receive
+# 1,000 patient-label permutations. No favorable split or permutation is selected.
 #
 # A single script launch does NOT mean one classifier represents every ablation.
 # It means the expensive operations are shared correctly:
@@ -557,7 +608,7 @@ import traceback
 from collections import defaultdict
 # Efficient grouping for duplicate candidates and patient/series aggregation.
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 # Immutable experiment configurations and reproducible JSON serialization.
 
 from itertools import combinations
@@ -756,6 +807,13 @@ class ExperimentConfig:
     # Directory_* patient before weighting and pooling. A deterministic
     # canonical row is retained for each (patient_id, decoded-pixel SHA-256)
     # group, so the experiment does not redefine patient identity or use labels.
+    slice_filter: str = "all"
+    # Supported values:
+    #   "all" -> retain every decoded slice;
+    #   "standardized_monai_valid" -> retain only slices for which the
+    #       standardized MONAI output passes the predeclared plausibility gate.
+    # Matched inside/outside experiments use the same filter so gate failure
+    # cannot expose full images in one branch or create zero images in the other.
     role: str = "ablation"
     enabled: bool = True
 
@@ -763,17 +821,19 @@ class ExperimentConfig:
 # Every enabled experiment is launched automatically by main(). To run a
 # smaller preliminary suite, set EXPERIMENTS_TO_RUN to a tuple of IDs. Keep it
 # as None to run every configuration whose enabled field is True.
-#
-# FOCUSED SUITE: candidate + key comparators + shortcut/mask controls only.
-# Set back to None to restore the full 47-experiment registry.
-EXPERIMENTS_TO_RUN = (
-    "A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA",
-    "C2_OUTSIDE_MONAI_MASK_HIER_LR_PCA",
-    "C1_BORDER_ONLY_HIER_LR_PCA",
-)
+EXPERIMENTS_TO_RUN = None
 
 PRIMARY_CANDIDATE_EXPERIMENT_ID = (
     "A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA"
+)
+# A12 remains the locked V4 reference until the new representations are run.
+# V5_CANDIDATE_EXPERIMENT_ID is predeclared prospectively and receives matched
+# stability/permutation analysis, but is not silently promoted before results.
+V5_CANDIDATE_EXPERIMENT_ID = (
+    "A18_HEART_CENTERED_FIXED_FOV_REGION_NORM_VALID_ONLY_HIER_LR_PCA"
+)
+V5_MATCHED_OUTSIDE_CONTROL_EXPERIMENT_ID = (
+    "C30_OUTSIDE_WHOLE_HEART_REGION_NORM_VALID_ONLY_HIER_LR_PCA"
 )
 DEVELOPMENT_BASELINE_EXPERIMENT_ID = "B1_STANDARDIZED_ROI_HIER_LR_PCA"
 BASELINE_EXPERIMENT_ID = PRIMARY_CANDIDATE_EXPERIMENT_ID
@@ -1459,6 +1519,125 @@ EXPERIMENT_REGISTRY = (
         tune_c=True,
         role="segmentation_representation_control",
     ),
+    # ------------------------------------------------------------------
+    # V5 REGION-NORMALIZED CARDIAC / EXTRACARDIAC EXTENSION
+    # ------------------------------------------------------------------
+    ExperimentConfig(
+        experiment_id="A16_HEART_CENTERED_FIXED_FOV_REGION_NORM_HIER_LR_PCA",
+        description=(
+            "Fixed-size field of view centred on the valid MONAI hard-mask "
+            "centroid, with image-centre fallback. Intensities are robustly "
+            "scaled only inside the retained non-padding crop after cardiac "
+            "localization; no soft MONAI confidence is multiplied into MRI pixels."
+        ),
+        feature_mode="standardized_heart_centered_fixed_fov_region_norm",
+        strategy="patient_embedding",
+        pooling_strategy="hierarchical",
+        weighting_mode="equal",
+        classifier_type="logistic_regression",
+        use_pca=True,
+        tune_c=True,
+        role="v5_candidate",
+    ),
+    ExperimentConfig(
+        experiment_id="A17_HARD_SUPPORT_REGION_NORM_HIER_LR_PCA",
+        description=(
+            "Binary dilated cardiac support with region-only robust scaling and "
+            "fixed-centre fallback. It tests whether MRI intensity remains "
+            "predictive after removing soft-segmenter confidence modulation."
+        ),
+        feature_mode="standardized_hard_support_region_norm",
+        strategy="patient_embedding",
+        pooling_strategy="hierarchical",
+        weighting_mode="equal",
+        classifier_type="logistic_regression",
+        use_pca=True,
+        tune_c=True,
+        role="v5_candidate",
+    ),
+    ExperimentConfig(
+        experiment_id="A18_HEART_CENTERED_FIXED_FOV_REGION_NORM_VALID_ONLY_HIER_LR_PCA",
+        description=(
+            "Prospective V5 candidate: A16 pixels restricted to the standardized "
+            "MONAI gate-valid slice set. The matched C30 outside control uses "
+            "exactly the same patient, series and slice rows."
+        ),
+        feature_mode="standardized_heart_centered_fixed_fov_region_norm",
+        strategy="patient_embedding",
+        pooling_strategy="hierarchical",
+        weighting_mode="equal",
+        classifier_type="logistic_regression",
+        use_pca=True,
+        tune_c=True,
+        slice_filter="standardized_monai_valid",
+        role="v5_prospective_candidate",
+    ),
+    ExperimentConfig(
+        experiment_id="A19_HEART_CENTERED_FIXED_FOV_REGION_NORM_VALID_ONLY_HIER_MEAN_STD_LR_PCA",
+        description=(
+            "A18 representation with mean-plus-standard-deviation summaries "
+            "inside each folder-defined series proxy before equal patient pooling. "
+            "It tests whether within-series heterogeneity adds stable information."
+        ),
+        feature_mode="standardized_heart_centered_fixed_fov_region_norm",
+        strategy="patient_embedding",
+        pooling_strategy="hierarchical_mean_std",
+        weighting_mode="equal",
+        classifier_type="logistic_regression",
+        use_pca=True,
+        tune_c=True,
+        slice_filter="standardized_monai_valid",
+        role="v5_ablation",
+    ),
+    ExperimentConfig(
+        experiment_id="C28_OUTSIDE_WHOLE_HEART_REGION_NORM_HIER_LR_PCA",
+        description=(
+            "Conservative outside-heart proxy using region-only normalization. "
+            "It removes the union of a large fixed central square, a mask-centred "
+            "square and a substantially enlarged ventricular box. Invalid masks "
+            "still receive the fixed central exclusion instead of an all-zero image."
+        ),
+        feature_mode="standardized_outside_whole_heart_region_norm",
+        strategy="patient_embedding",
+        pooling_strategy="hierarchical",
+        weighting_mode="equal",
+        classifier_type="logistic_regression",
+        use_pca=True,
+        tune_c=True,
+        role="negative_control",
+    ),
+    ExperimentConfig(
+        experiment_id="C29_FIXED_PERIPHERY_REGION_NORM_HIER_LR_PCA",
+        description=(
+            "MONAI-independent peripheral control retaining only pixels outside "
+            "a fixed central square and scaling intensities only in that periphery."
+        ),
+        feature_mode="standardized_fixed_periphery_region_norm",
+        strategy="patient_embedding",
+        pooling_strategy="hierarchical",
+        weighting_mode="equal",
+        classifier_type="logistic_regression",
+        use_pca=True,
+        tune_c=True,
+        role="negative_control",
+    ),
+    ExperimentConfig(
+        experiment_id="C30_OUTSIDE_WHOLE_HEART_REGION_NORM_VALID_ONLY_HIER_LR_PCA",
+        description=(
+            "Matched outside-heart control for A18. It uses the same standardized "
+            "MONAI gate-valid rows and independent region-only scaling, so the "
+            "inside/outside comparison cannot be driven by gate-failure frequency."
+        ),
+        feature_mode="standardized_outside_whole_heart_region_norm",
+        strategy="patient_embedding",
+        pooling_strategy="hierarchical",
+        weighting_mode="equal",
+        classifier_type="logistic_regression",
+        use_pca=True,
+        tune_c=True,
+        slice_filter="standardized_monai_valid",
+        role="negative_control",
+    ),
     ExperimentConfig(
         experiment_id="R1_ROI_HIER_LR_PCA_DROP10",
         description=(
@@ -1773,6 +1952,60 @@ PRIMARY_ABLATION_COMPARISONS = (
         "R3_ROI_HIER_LR_PCA_DROP50",
         "How stable is the patient model after deterministic 50% within-series slice removal?",
     ),
+    (
+        "A12_VS_V5_FIXED_FOV_REGION_NORMALIZATION",
+        PRIMARY_CANDIDATE_EXPERIMENT_ID,
+        "A16_HEART_CENTERED_FIXED_FOV_REGION_NORM_HIER_LR_PCA",
+        "Does post-localization region-only intensity scaling improve over A12's soft-probability-weighted pixels?",
+    ),
+    (
+        "V5_ALL_SLICES_VS_GATE_VALID_ONLY",
+        "A16_HEART_CENTERED_FIXED_FOV_REGION_NORM_HIER_LR_PCA",
+        V5_CANDIDATE_EXPERIMENT_ID,
+        "Does excluding standardized MONAI gate-invalid slices improve the fixed-FOV candidate?",
+    ),
+    (
+        "V5_FIXED_FOV_VS_HARD_SUPPORT",
+        "A17_HARD_SUPPORT_REGION_NORM_HIER_LR_PCA",
+        V5_CANDIDATE_EXPERIMENT_ID,
+        "Does a fixed heart-centred field of view outperform a zero-background binary support?",
+    ),
+    (
+        "V5_HIERARCHICAL_MEAN_VS_MEAN_STD",
+        V5_CANDIDATE_EXPERIMENT_ID,
+        "A19_HEART_CENTERED_FIXED_FOV_REGION_NORM_VALID_ONLY_HIER_MEAN_STD_LR_PCA",
+        "Does within-series embedding dispersion add information beyond the series mean?",
+    ),
+    (
+        "V5_MATCHED_INSIDE_VS_OUTSIDE_WHOLE_HEART",
+        V5_MATCHED_OUTSIDE_CONTROL_EXPERIMENT_ID,
+        V5_CANDIDATE_EXPERIMENT_ID,
+        "On exactly the same gate-valid slices, how much more predictive is the heart-centred region than the conservative outside-heart proxy?",
+    ),
+    (
+        "V5_CANDIDATE_VS_MONAI_INDEPENDENT_PERIPHERY",
+        "C29_FIXED_PERIPHERY_REGION_NORM_HIER_LR_PCA",
+        V5_CANDIDATE_EXPERIMENT_ID,
+        "Does the V5 cardiac candidate outperform a fixed, independently normalized image periphery?",
+    ),
+    (
+        "V5_OUTSIDE_ALL_SLICES_VS_GATE_VALID_ONLY",
+        "C28_OUTSIDE_WHOLE_HEART_REGION_NORM_HIER_LR_PCA",
+        V5_MATCHED_OUTSIDE_CONTROL_EXPERIMENT_ID,
+        "How much does using the common gate-valid slice set change the conservative outside-heart control?",
+    ),
+    (
+        "V5_CANDIDATE_VS_BLOCK_SHUFFLED_SOFT_MAP",
+        "C25_STANDARDIZED_SOFT_MONAI_BLOCK_SHUFFLED_HIER_LR_PCA",
+        V5_CANDIDATE_EXPERIMENT_ID,
+        "Does region-normalized cardiac MRI intensity add information beyond block-local MONAI confidence texture?",
+    ),
+    (
+        "V5_CANDIDATE_VS_CANONICAL_SOFT_MASK",
+        "C27_STANDARDIZED_CANONICAL_SOFT_MONAI_MASK_ONLY_HIER_LR_PCA",
+        V5_CANDIDATE_EXPERIMENT_ID,
+        "Does the V5 intensity candidate add information beyond canonicalized MONAI morphology and confidence?",
+    ),
 )
 
 N_SPLITS = 5
@@ -1807,13 +2040,13 @@ PROGRESS_PRINT_EVERY_N_BATCHES = 25
 
 USE_FEATURE_CACHE = True
 FORCE_REBUILD_FEATURE_CACHE = False
-FEATURE_CACHE_SCHEMA_VERSION = "2026-09-02-soft-map-decomposition-v6"
+FEATURE_CACHE_SCHEMA_VERSION = "2026-09-04-region-normalized-v5-v2"
 EFFICIENTNET_FEATURE_DIM = 1280
 FEATURE_MODES_PER_ENCODER_CALL = 4
 # Several image variants can be concatenated along the batch dimension and
 # encoded by one EfficientNet call. Four modes at a time is a conservative T4
 # default: it reduces Python/kernel-launch overhead without materializing all
-# all twenty-five views simultaneously. Lower this value if GPU memory is insufficient.
+# all twenty-nine views simultaneously. Lower this value if GPU memory is insufficient.
 
 SLICE_QUALITY_MIN_WEIGHT = 0.25
 # The quality signal remains a non-clinical heuristic. It is computed once from
@@ -1829,8 +2062,51 @@ CENTER_CROP_FALLBACK_FRACTION = 0.60
 FIXED_CENTER_CROP_FRACTIONS = (0.50, 0.60, 0.70)
 STANDARDIZED_CONTENT_LONG_SIDE = 240
 FIXED_CHUNK_SIZE = 20
+FIXED_CHUNK_MIN_REMAINDER_FRACTION = 0.50
+# A final fixed chunk smaller than half the nominal chunk size is merged into
+# the preceding chunk. This prevents one or two residual slices from receiving
+# the same patient-level weight as a complete 20-slice chunk.
+
 MONAI_BBOX_CONTEXT_FRACTION = 0.15
 OUTSIDE_MONAI_BBOX_CONTEXT_FRACTION = 0.30
+
+# ---------------------------------------------------------------------------
+# V5 REGION-NORMALIZED CARDIAC / EXTRACARDIAC REPRESENTATIONS
+# ---------------------------------------------------------------------------
+V5_FIXED_HEART_FOV_FRACTION = 0.65
+# Fixed square field of view used by the heart-centred candidate. The square is
+# centred on the MONAI hard-mask centroid when valid and on the image centre
+# otherwise. Its size is independent of mask area, label, fold, and score.
+
+V5_HARD_SUPPORT_EXTRA_DILATION_KERNEL = 15
+# Additional odd-kernel dilation applied to the already dilated MONAI hard mask
+# for the binary-support candidate. This retains nearby myocardium/context while
+# avoiding soft-probability modulation of MRI intensity.
+
+V5_WHOLE_HEART_EXCLUSION_CENTER_FRACTION = 0.75
+V5_WHOLE_HEART_EXCLUSION_BBOX_CONTEXT_FRACTION = 0.65
+# C28/C30 remove the union of a large fixed central square and a substantially
+# expanded MONAI ventricular bounding box. This is a conservative whole-heart
+# proxy, not a validated whole-heart segmentation. The constants are fixed
+# before evaluation and must not be tuned to force the outside AUC downward.
+
+V5_FIXED_PERIPHERY_EXCLUSION_FRACTION = 0.75
+# MONAI-independent peripheral control retaining only pixels outside a fixed
+# central square. It tests residual export/protocol signal without using a mask.
+
+V5_REGION_NORM_LOWER_PERCENTILE = 1.0
+V5_REGION_NORM_UPPER_PERCENTILE = 99.0
+V5_REGION_NORM_MIN_PIXELS = 64
+V5_REGION_NORM_HISTOGRAM_BINS = 256
+V5_REGION_NORM_MIN_DYNAMIC_RANGE = 8.0 / 255.0
+# Intensities are robustly rescaled only from pixels inside the region that will
+# remain visible. This removes the V4 coupling in which cardiac intensities could
+# influence the scaling of an outside-heart control.
+# Percentiles are estimated from a fixed 256-bin masked histogram in a batched
+# GPU-friendly implementation. This avoids one sorting/synchronization operation
+# per image while retaining the natural resolution of the source 8-bit JPEGs.
+# A fixed minimum denominator prevents a nearly uniform peripheral region from
+# amplifying one or two JPEG quantization levels to the complete [0,1] range.
 # The standardized branch now resizes the longest retained content dimension
 # to exactly 240 pixels, including upsampling when needed, and centers it in a
 # 256x256 canvas. This removes the previous dependence of pipeline-added
@@ -1903,6 +2179,12 @@ ANNOTATED_SERIES_EXCLUDE_DERIVED_EXPORTS = True
 ANNOTATED_SERIES_ALLOWED_SEQUENCE_TYPES = ()
 ANNOTATED_SERIES_ALLOWED_VIEW_TYPES = ()
 ANNOTATED_SERIES_ALLOWED_CONFIDENCE_VALUES = ("high", "medium")
+ANNOTATED_SERIES_USE_SEQUENCE_VIEW_BALANCED_POOLING = True
+# When annotations are enabled, hierarchical image experiments are rerun with
+# equal weighting across explicitly annotated (sequence_type, view_type) cells:
+# slices -> series proxy -> sequence/view cell -> patient. This prevents a
+# protocol with many exported folders from dominating the patient embedding.
+
 ANNOTATED_SERIES_EXPERIMENT_IDS = (
     PRIMARY_CANDIDATE_EXPERIMENT_ID,
     "A14_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_FIXED_CHUNK_LR_PCA",
@@ -1915,6 +2197,13 @@ ANNOTATED_SERIES_EXPERIMENT_IDS = (
     "C25_STANDARDIZED_SOFT_MONAI_BLOCK_SHUFFLED_HIER_LR_PCA",
     "C26_STANDARDIZED_CANONICAL_HARD_MONAI_MASK_ONLY_HIER_LR_PCA",
     "C27_STANDARDIZED_CANONICAL_SOFT_MONAI_MASK_ONLY_HIER_LR_PCA",
+    "A16_HEART_CENTERED_FIXED_FOV_REGION_NORM_HIER_LR_PCA",
+    "A17_HARD_SUPPORT_REGION_NORM_HIER_LR_PCA",
+    V5_CANDIDATE_EXPERIMENT_ID,
+    "A19_HEART_CENTERED_FIXED_FOV_REGION_NORM_VALID_ONLY_HIER_MEAN_STD_LR_PCA",
+    "C28_OUTSIDE_WHOLE_HEART_REGION_NORM_HIER_LR_PCA",
+    "C29_FIXED_PERIPHERY_REGION_NORM_HIER_LR_PCA",
+    V5_MATCHED_OUTSIDE_CONTROL_EXPERIMENT_ID,
 )
 # The pipeline never infers sequence or view from SR_*/series* folder names.
 # When this optional stage is enabled, the user must point to a completed copy
@@ -1928,7 +2217,7 @@ C_SELECTION_AUC_TOLERANCE = 0.01
 # absolute tolerance of the best candidate. This prevents tiny inner-CV
 # differences from repeatedly choosing the least regularized edge of the grid.
 
-RUN_REPEATED_NESTED_CV_STABILITY = False
+RUN_REPEATED_NESTED_CV_STABILITY = True
 REPEATED_NESTED_CV_REPEATS = 50
 REPEATED_NESTED_CV_RANDOM_STATE = RANDOM_SEED + 20_000
 STABILITY_EXPERIMENT_IDS = (
@@ -1951,6 +2240,13 @@ STABILITY_EXPERIMENT_IDS = (
     "C25_STANDARDIZED_SOFT_MONAI_BLOCK_SHUFFLED_HIER_LR_PCA",
     "C26_STANDARDIZED_CANONICAL_HARD_MONAI_MASK_ONLY_HIER_LR_PCA",
     "C27_STANDARDIZED_CANONICAL_SOFT_MONAI_MASK_ONLY_HIER_LR_PCA",
+    "A16_HEART_CENTERED_FIXED_FOV_REGION_NORM_HIER_LR_PCA",
+    "A17_HARD_SUPPORT_REGION_NORM_HIER_LR_PCA",
+    V5_CANDIDATE_EXPERIMENT_ID,
+    "A19_HEART_CENTERED_FIXED_FOV_REGION_NORM_VALID_ONLY_HIER_MEAN_STD_LR_PCA",
+    "C28_OUTSIDE_WHOLE_HEART_REGION_NORM_HIER_LR_PCA",
+    "C29_FIXED_PERIPHERY_REGION_NORM_HIER_LR_PCA",
+    V5_MATCHED_OUTSIDE_CONTROL_EXPERIMENT_ID,
 )
 
 # All comparisons below use the exact same outer split seeds. The first model
@@ -2073,12 +2369,69 @@ REPEATED_STABILITY_COMPARISONS = (
         "C27_STANDARDIZED_CANONICAL_SOFT_MONAI_MASK_ONLY_HIER_LR_PCA",
         "Canonicalized soft morphology/confidence versus probability distribution only.",
     ),
+    (
+        "A12_VS_A16_REGION_NORMALIZED_FIXED_FOV",
+        PRIMARY_CANDIDATE_EXPERIMENT_ID,
+        "A16_HEART_CENTERED_FIXED_FOV_REGION_NORM_HIER_LR_PCA",
+        "Locked A12 versus the all-slice V5 region-normalized fixed-FOV candidate.",
+    ),
+    (
+        "A16_ALL_VS_A18_VALID_ONLY",
+        "A16_HEART_CENTERED_FIXED_FOV_REGION_NORM_HIER_LR_PCA",
+        V5_CANDIDATE_EXPERIMENT_ID,
+        "All slices versus the prospective common-valid-slice V5 candidate.",
+    ),
+    (
+        "A17_HARD_SUPPORT_VS_A18_FIXED_FOV",
+        "A17_HARD_SUPPORT_REGION_NORM_HIER_LR_PCA",
+        V5_CANDIDATE_EXPERIMENT_ID,
+        "Binary support versus fixed heart-centred FOV after region normalization.",
+    ),
+    (
+        "A18_MEAN_VS_A19_MEAN_STD",
+        V5_CANDIDATE_EXPERIMENT_ID,
+        "A19_HEART_CENTERED_FIXED_FOV_REGION_NORM_VALID_ONLY_HIER_MEAN_STD_LR_PCA",
+        "Series means versus mean-plus-standard-deviation summaries.",
+    ),
+    (
+        "C30_MATCHED_OUTSIDE_VS_A18_INSIDE",
+        V5_MATCHED_OUTSIDE_CONTROL_EXPERIMENT_ID,
+        V5_CANDIDATE_EXPERIMENT_ID,
+        "Same-slice conservative outside-heart control versus heart-centred candidate.",
+    ),
+    (
+        "C29_FIXED_PERIPHERY_VS_A18_INSIDE",
+        "C29_FIXED_PERIPHERY_REGION_NORM_HIER_LR_PCA",
+        V5_CANDIDATE_EXPERIMENT_ID,
+        "MONAI-independent periphery versus prospective V5 cardiac candidate.",
+    ),
+    (
+        "C28_ALL_VS_C30_VALID_ONLY_OUTSIDE",
+        "C28_OUTSIDE_WHOLE_HEART_REGION_NORM_HIER_LR_PCA",
+        V5_MATCHED_OUTSIDE_CONTROL_EXPERIMENT_ID,
+        "All-slice versus gate-valid-only conservative outside-heart control.",
+    ),
+    (
+        "C25_BLOCK_SHUFFLED_SOFT_MAP_VS_A18",
+        "C25_STANDARDIZED_SOFT_MONAI_BLOCK_SHUFFLED_HIER_LR_PCA",
+        V5_CANDIDATE_EXPERIMENT_ID,
+        "Block-shuffled MONAI confidence texture versus region-normalized MRI intensity.",
+    ),
+    (
+        "C27_CANONICAL_SOFT_MASK_VS_A18",
+        "C27_STANDARDIZED_CANONICAL_SOFT_MONAI_MASK_ONLY_HIER_LR_PCA",
+        V5_CANDIDATE_EXPERIMENT_ID,
+        "Canonicalized soft morphology/confidence versus region-normalized MRI intensity.",
+    ),
 )
 
-RUN_PATIENT_LABEL_PERMUTATION_TEST = False
+RUN_PATIENT_LABEL_PERMUTATION_TEST = True
 LABEL_PERMUTATION_REPLICATES = 1000
 LABEL_PERMUTATION_RANDOM_STATE = RANDOM_SEED + 40_000
-PERMUTATION_EXPERIMENT_IDS = (PRIMARY_CANDIDATE_EXPERIMENT_ID,)
+PERMUTATION_EXPERIMENT_IDS = (
+    PRIMARY_CANDIDATE_EXPERIMENT_ID,
+    V5_CANDIDATE_EXPERIMENT_ID,
+)
 # Stability analysis now includes the locked primary candidate, matched pooling
 # and deduplication variants, direct localization comparators, and mask-only
 # controls. Label permutation is performed directly on A12 rather than only on
@@ -2286,6 +2639,10 @@ _selected_experiments_for_identity = [
 _suite_identity = {
     "experiments": _selected_experiments_for_identity,
     "primary_candidate_experiment_id": PRIMARY_CANDIDATE_EXPERIMENT_ID,
+    "v5_candidate_experiment_id": V5_CANDIDATE_EXPERIMENT_ID,
+    "v5_matched_outside_control_experiment_id": (
+        V5_MATCHED_OUTSIDE_CONTROL_EXPERIMENT_ID
+    ),
     "development_baseline_experiment_id": DEVELOPMENT_BASELINE_EXPERIMENT_ID,
     "primary_ablation_comparisons": PRIMARY_ABLATION_COMPARISONS,
     "repeated_stability_comparisons": REPEATED_STABILITY_COMPARISONS,
@@ -2328,6 +2685,29 @@ _suite_identity = {
     "fixed_center_crop_fractions": FIXED_CENTER_CROP_FRACTIONS,
     "standardized_content_long_side": STANDARDIZED_CONTENT_LONG_SIDE,
     "fixed_chunk_size": FIXED_CHUNK_SIZE,
+    "fixed_chunk_min_remainder_fraction": (
+        FIXED_CHUNK_MIN_REMAINDER_FRACTION
+    ),
+    "v5_fixed_heart_fov_fraction": V5_FIXED_HEART_FOV_FRACTION,
+    "v5_hard_support_extra_dilation_kernel": (
+        V5_HARD_SUPPORT_EXTRA_DILATION_KERNEL
+    ),
+    "v5_whole_heart_exclusion_center_fraction": (
+        V5_WHOLE_HEART_EXCLUSION_CENTER_FRACTION
+    ),
+    "v5_whole_heart_exclusion_bbox_context_fraction": (
+        V5_WHOLE_HEART_EXCLUSION_BBOX_CONTEXT_FRACTION
+    ),
+    "v5_fixed_periphery_exclusion_fraction": (
+        V5_FIXED_PERIPHERY_EXCLUSION_FRACTION
+    ),
+    "v5_region_norm_lower_percentile": V5_REGION_NORM_LOWER_PERCENTILE,
+    "v5_region_norm_upper_percentile": V5_REGION_NORM_UPPER_PERCENTILE,
+    "v5_region_norm_min_pixels": V5_REGION_NORM_MIN_PIXELS,
+    "v5_region_norm_histogram_bins": V5_REGION_NORM_HISTOGRAM_BINS,
+    "v5_region_norm_min_dynamic_range": (
+        V5_REGION_NORM_MIN_DYNAMIC_RANGE
+    ),
     "monai_soft_histogram_bins": MONAI_SOFT_HISTOGRAM_BINS,
     "monai_soft_block_shuffle_grid": MONAI_SOFT_BLOCK_SHUFFLE_GRID,
     "monai_soft_block_shuffle_version": MONAI_SOFT_BLOCK_SHUFFLE_VERSION,
@@ -2405,6 +2785,9 @@ _suite_identity = {
     "annotated_series_allowed_view_types": ANNOTATED_SERIES_ALLOWED_VIEW_TYPES,
     "annotated_series_allowed_confidence_values": (
         ANNOTATED_SERIES_ALLOWED_CONFIDENCE_VALUES
+    ),
+    "annotated_series_use_sequence_view_balanced_pooling": (
+        ANNOTATED_SERIES_USE_SEQUENCE_VIEW_BALANCED_POOLING
     ),
     "annotated_series_experiment_ids": ANNOTATED_SERIES_EXPERIMENT_IDS,
 }
@@ -2727,6 +3110,10 @@ def validate_configuration():
         "standardized_soft_monai_block_shuffled",
         "standardized_canonical_hard_monai_mask_only",
         "standardized_canonical_soft_monai_mask_only",
+        "standardized_heart_centered_fixed_fov_region_norm",
+        "standardized_hard_support_region_norm",
+        "standardized_outside_whole_heart_region_norm",
+        "standardized_fixed_periphery_region_norm",
         "provenance_only",
         "monai_qc_only",
         "standardization_qc_only",
@@ -2744,6 +3131,8 @@ def validate_configuration():
     }
     valid_pooling = {
         "hierarchical",
+        "hierarchical_mean_std",
+        "sequence_view_balanced",
         "flat",
         "fixed_chunk",
         "probability_fusion",
@@ -2784,6 +3173,21 @@ def validate_configuration():
                 f"{experiment.experiment_id}: invalid fusion method "
                 f"{experiment.fusion_method!r}."
             )
+        if experiment.slice_filter not in {
+            "all",
+            "standardized_monai_valid",
+        }:
+            raise ValueError(
+                f"{experiment.experiment_id}: invalid slice_filter "
+                f"{experiment.slice_filter!r}."
+            )
+        if experiment.strategy == "patient_tabular" and (
+            experiment.slice_filter != "all"
+        ):
+            raise ValueError(
+                f"{experiment.experiment_id}: patient-tabular experiments "
+                "cannot use an image-row slice filter."
+            )
         if experiment.fixed_c <= 0:
             raise ValueError(
                 f"{experiment.experiment_id}: fixed_c must be positive."
@@ -2805,6 +3209,10 @@ def validate_configuration():
                 "standardized_roi_zero_background",
                 "standardized_roi_zero_bg_center_fallback",
                 "standardized_roi_bbox",
+                "standardized_heart_centered_fixed_fov_region_norm",
+                "standardized_hard_support_region_norm",
+                "standardized_outside_whole_heart_region_norm",
+                "standardized_fixed_periphery_region_norm",
             }
         ):
             raise ValueError(
@@ -2947,6 +3355,48 @@ def validate_configuration():
         )
     if FIXED_CHUNK_SIZE <= 0:
         raise ValueError("FIXED_CHUNK_SIZE must be strictly positive.")
+    if not 0.0 < FIXED_CHUNK_MIN_REMAINDER_FRACTION <= 1.0:
+        raise ValueError(
+            "FIXED_CHUNK_MIN_REMAINDER_FRACTION must lie in (0,1]."
+        )
+    for setting_name, setting_value in (
+        ("V5_FIXED_HEART_FOV_FRACTION", V5_FIXED_HEART_FOV_FRACTION),
+        (
+            "V5_WHOLE_HEART_EXCLUSION_CENTER_FRACTION",
+            V5_WHOLE_HEART_EXCLUSION_CENTER_FRACTION,
+        ),
+        (
+            "V5_FIXED_PERIPHERY_EXCLUSION_FRACTION",
+            V5_FIXED_PERIPHERY_EXCLUSION_FRACTION,
+        ),
+    ):
+        if not 0.0 < float(setting_value) <= 1.0:
+            raise ValueError(f"{setting_name} must lie in (0,1].")
+    if V5_WHOLE_HEART_EXCLUSION_BBOX_CONTEXT_FRACTION < 0.0:
+        raise ValueError(
+            "V5_WHOLE_HEART_EXCLUSION_BBOX_CONTEXT_FRACTION cannot be negative."
+        )
+    if V5_HARD_SUPPORT_EXTRA_DILATION_KERNEL <= 0 or (
+        V5_HARD_SUPPORT_EXTRA_DILATION_KERNEL % 2 == 0
+    ):
+        raise ValueError(
+            "V5_HARD_SUPPORT_EXTRA_DILATION_KERNEL must be a positive odd integer."
+        )
+    if not (
+        0.0 <= V5_REGION_NORM_LOWER_PERCENTILE
+        < V5_REGION_NORM_UPPER_PERCENTILE <= 100.0
+    ):
+        raise ValueError("Invalid V5 region-normalization percentile interval.")
+    if V5_REGION_NORM_MIN_PIXELS < 1:
+        raise ValueError("V5_REGION_NORM_MIN_PIXELS must be positive.")
+    if V5_REGION_NORM_HISTOGRAM_BINS < 2:
+        raise ValueError(
+            "V5_REGION_NORM_HISTOGRAM_BINS must be at least 2."
+        )
+    if not 0.0 < V5_REGION_NORM_MIN_DYNAMIC_RANGE <= 1.0:
+        raise ValueError(
+            "V5_REGION_NORM_MIN_DYNAMIC_RANGE must lie in (0,1]."
+        )
     if len(FIXED_CENTER_CROP_FRACTIONS) != 3 or any(
         not 0.0 < float(value) <= 1.0
         for value in FIXED_CENTER_CROP_FRACTIONS
@@ -3492,8 +3942,9 @@ def build_label_blind_standardized_image(image):
             -> conservative dark-uniform edge detection
             -> crop only the detected edge runs
             -> min-max scaling for the pretrained MONAI segmenter
-            -> robust fixed-percentile scaling for EfficientNet
-            -> identical fixed-content 240-in-256 geometry for both views
+            -> robust fixed-percentile scaling for historical EfficientNet views
+            -> unscaled [0,1] uint8-intensity view for V5 region normalization
+            -> identical fixed-content 240-in-256 geometry for all views
             -> binary fixed-canvas padding control
 
     The Normal/Sick label, patient ID, series ID, fold and model scores are not
@@ -3506,6 +3957,10 @@ def build_label_blind_standardized_image(image):
             256x256 robustly scaled image used to build EfficientNet views.
         monai_minmax_canvas:
             256x256 min-max image used only by the MONAI segmenter.
+        raw_classifier_canvas:
+            256x256 retained uint8 intensity divided by 255, with no per-image
+            min-max or global percentile scaling. V5 computes percentiles only
+            inside the final visible region after MONAI localization.
         fixed_padding_canvas:
             Binary geometry-only control after content-size normalization.
         features:
@@ -3526,6 +3981,7 @@ def build_label_blind_standardized_image(image):
 
     robust_scaled, lower, upper = robust_scale_intensity_0_1(cropped)
     monai_scaled = scale_intensity_0_1(cropped)
+    raw_scaled = cropped.astype(np.float32) / 255.0
 
     robust_canvas, resized_height, resized_width = (
         resize_to_fixed_content_canvas(robust_scaled)
@@ -3533,9 +3989,16 @@ def build_label_blind_standardized_image(image):
     monai_canvas, monai_height, monai_width = (
         resize_to_fixed_content_canvas(monai_scaled)
     )
-    if (resized_height, resized_width) != (monai_height, monai_width):
+    raw_canvas, raw_height, raw_width = (
+        resize_to_fixed_content_canvas(raw_scaled)
+    )
+    if (
+        (resized_height, resized_width) != (monai_height, monai_width)
+        or (resized_height, resized_width) != (raw_height, raw_width)
+    ):
         raise RuntimeError(
-            "MONAI and classifier standardized geometries are misaligned."
+            "MONAI, robust-classifier and raw standardized geometries are "
+            "misaligned."
         )
 
     padding_canvas, padding_height, padding_width = (
@@ -3600,7 +4063,7 @@ def build_label_blind_standardized_image(image):
     if not np.all(np.isfinite(features)):
         raise RuntimeError("Standardization features contain non-finite values.")
 
-    return robust_canvas, monai_canvas, padding_canvas, features
+    return robust_canvas, monai_canvas, raw_canvas, padding_canvas, features
 
 
 def zero_pad_to_monai_canvas(image):
@@ -3822,8 +4285,9 @@ def compute_image_provenance_features(image, image_path):
 class MRIDataset(Dataset):
     """
     PIPELINE STEP 1:
-    Load one JPEG MRI slice and construct two spatially aligned network inputs
-    plus the label-free audit metadata needed by the multi-experiment suite.
+    Load one JPEG MRI slice and construct the spatially aligned MONAI,
+    historical-classifier, V5-raw-classifier, and padding-control inputs plus
+    the label-free audit metadata needed by the multi-experiment suite.
 
     Returns:
         classification_image:
@@ -3844,6 +4308,12 @@ class MRIDataset(Dataset):
             Tensor [1, 256, 256], values in [0,1]. It uses min-max scaling on
             the same retained crop and exactly the same fixed geometry, keeping
             MONAI closer to its documented intensity contract.
+
+        standardized_raw_classification_image:
+            Tensor [3, 224, 224], values in [0,1], created from retained uint8
+            intensities divided by 255 without global percentile scaling. V5
+            uses it only to compute region-specific normalization after the
+            final cardiac or extracardiac support has been defined.
 
         detected_padding_image:
             Tensor [3, 224, 224], binary. It contains only the standardized
@@ -3887,7 +4357,7 @@ class MRIDataset(Dataset):
             the standardized branch. They support a separate QC-only control.
 
     =========================================================================
-    WHY TWO INPUT TENSORS?
+    WHY SEPARATE ALIGNED INPUT TENSORS?
     =========================================================================
 
     The two pretrained networks were built around different input conventions:
@@ -3903,8 +4373,11 @@ class MRIDataset(Dataset):
             - ImageNet mean/std normalization
 
     Reusing one already-normalized tensor for both networks would violate at
-    least one model's expected input distribution. Therefore segmentation and
-    classification preprocessing remain explicitly separate.
+    least one model's expected input distribution. V5 additionally needs the
+    retained raw uint8/255 intensity so its inside and outside branches can be
+    normalized only after their final visible regions are defined. Therefore
+    segmentation, historical classification, and V5 preprocessing remain
+    explicitly separate while sharing one geometry.
 
     =========================================================================
     SPATIAL ALIGNMENT
@@ -4010,15 +4483,16 @@ class MRIDataset(Dataset):
         monai_canvas = zero_pad_to_monai_canvas(original_scaled_image)
         monai_image = torch.from_numpy(monai_canvas).unsqueeze(0)
 
-        # Build a second, label-blind branch on one shared crop but with two
-        # intensity contracts. MONAI receives a min-max scaled image, while
-        # EfficientNet receives robust 1st/99th-percentile scaling. Both are
-        # resized so the retained content's longest side is exactly 240 pixels
-        # and centered in the same 256x256 canvas. This removes the former
-        # dependence of pipeline-added padding on native resolution and crop size.
+        # Build a label-blind branch on one shared crop with three aligned
+        # intensity views. MONAI receives min-max scaling, historical V4
+        # EfficientNet views receive global robust scaling, and V5 receives raw
+        # uint8/255 intensity for later region-only scaling. Every view uses the
+        # same fixed 240-in-256 geometry, removing the former dependence of
+        # pipeline-added padding on native resolution and crop size.
         (
             standardized_classifier_canvas,
             standardized_monai_canvas,
+            standardized_raw_canvas,
             detected_padding_canvas,
             standardization_features,
         ) = build_label_blind_standardized_image(image)
@@ -4043,6 +4517,11 @@ class MRIDataset(Dataset):
             (IMG_SIZE, IMG_SIZE),
             interpolation=cv2.INTER_AREA,
         )
+        standardized_raw_classification_gray = cv2.resize(
+            standardized_raw_canvas,
+            (IMG_SIZE, IMG_SIZE),
+            interpolation=cv2.INTER_AREA,
+        )
         detected_padding_gray = cv2.resize(
             detected_padding_canvas,
             (IMG_SIZE, IMG_SIZE),
@@ -4061,6 +4540,10 @@ class MRIDataset(Dataset):
             [standardized_classification_gray] * 3,
             axis=-1,
         )
+        standardized_raw_classification_image = np.stack(
+            [standardized_raw_classification_gray] * 3,
+            axis=-1,
+        )
         detected_padding_image = np.stack(
             [detected_padding_gray] * 3,
             axis=-1,
@@ -4073,6 +4556,9 @@ class MRIDataset(Dataset):
             standardized_classification_image = self.transform(
                 standardized_classification_image
             )
+            standardized_raw_classification_image = self.transform(
+                standardized_raw_classification_image
+            )
             detected_padding_image = self.transform(detected_padding_image)
         else:
             classification_image = torch.from_numpy(
@@ -4080,6 +4566,9 @@ class MRIDataset(Dataset):
             ).permute(2, 0, 1)
             standardized_classification_image = torch.from_numpy(
                 standardized_classification_image
+            ).permute(2, 0, 1)
+            standardized_raw_classification_image = torch.from_numpy(
+                standardized_raw_classification_image
             ).permute(2, 0, 1)
             detected_padding_image = torch.from_numpy(
                 detected_padding_image
@@ -4093,6 +4582,7 @@ class MRIDataset(Dataset):
             monai_image,
             standardized_classification_image,
             standardized_monai_image,
+            standardized_raw_classification_image,
             detected_padding_image,
             label,
             patient_id,
@@ -4196,20 +4686,7 @@ def load_samples(root_dir):
 
         # Stage 2: inspect immediate children of the class directory. Only
         # Directory_* folders are eligible to become computational patients.
-        # TEMP only 2 patients
-        countStick = 0
-        countNormal = 0
         for directory in sorted(os.listdir(class_path)):
-
-            if class_path == "Normal":
-                countNormal += 1
-                if countNormal > 1:
-                    break
-            else:
-                countStick += 1
-                if countStick > 1:
-                    break
-
 
             patient_path = os.path.join(class_path, directory)
 
@@ -5679,6 +6156,11 @@ def required_efficientnet_feature_modes(experiments):
         "standardized_soft_monai_block_shuffled",
         "standardized_canonical_hard_monai_mask_only",
         "standardized_canonical_soft_monai_mask_only",
+        # V5 region-normalized intensity representations.
+        "standardized_heart_centered_fixed_fov_region_norm",
+        "standardized_hard_support_region_norm",
+        "standardized_outside_whole_heart_region_norm",
+        "standardized_fixed_periphery_region_norm",
     )
     requested = {
         experiment.feature_mode
@@ -5722,6 +6204,29 @@ def feature_bank_fingerprint(samples, dataset_root):
         "fixed_center_crop_fractions": FIXED_CENTER_CROP_FRACTIONS,
         "standardized_content_long_side": STANDARDIZED_CONTENT_LONG_SIDE,
         "fixed_chunk_size": FIXED_CHUNK_SIZE,
+        "fixed_chunk_min_remainder_fraction": (
+            FIXED_CHUNK_MIN_REMAINDER_FRACTION
+        ),
+        "v5_fixed_heart_fov_fraction": V5_FIXED_HEART_FOV_FRACTION,
+        "v5_hard_support_extra_dilation_kernel": (
+            V5_HARD_SUPPORT_EXTRA_DILATION_KERNEL
+        ),
+        "v5_whole_heart_exclusion_center_fraction": (
+            V5_WHOLE_HEART_EXCLUSION_CENTER_FRACTION
+        ),
+        "v5_whole_heart_exclusion_bbox_context_fraction": (
+            V5_WHOLE_HEART_EXCLUSION_BBOX_CONTEXT_FRACTION
+        ),
+        "v5_fixed_periphery_exclusion_fraction": (
+            V5_FIXED_PERIPHERY_EXCLUSION_FRACTION
+        ),
+        "v5_region_norm_lower_percentile": V5_REGION_NORM_LOWER_PERCENTILE,
+        "v5_region_norm_upper_percentile": V5_REGION_NORM_UPPER_PERCENTILE,
+        "v5_region_norm_min_pixels": V5_REGION_NORM_MIN_PIXELS,
+        "v5_region_norm_histogram_bins": V5_REGION_NORM_HISTOGRAM_BINS,
+        "v5_region_norm_min_dynamic_range": (
+            V5_REGION_NORM_MIN_DYNAMIC_RANGE
+        ),
         "monai_soft_histogram_bins": MONAI_SOFT_HISTOGRAM_BINS,
         "monai_soft_block_shuffle_grid": MONAI_SOFT_BLOCK_SHUFFLE_GRID,
         "monai_soft_block_shuffle_version": MONAI_SOFT_BLOCK_SHUFFLE_VERSION,
@@ -6217,6 +6722,366 @@ def create_outside_monai_bounding_box_images(
     return output
 
 
+def _fixed_square_bounds(height, width, center_y, center_x, fraction):
+    """Return a fixed-size in-bounds square around a floating-point centre."""
+
+    height = int(height)
+    width = int(width)
+    fraction = float(fraction)
+    if height <= 0 or width <= 0:
+        raise ValueError("Square bounds require positive image dimensions.")
+    if not 0.0 < fraction <= 1.0:
+        raise ValueError("Square fraction must lie in (0,1].")
+
+    side = max(2, int(round(min(height, width) * fraction)))
+    side = min(side, height, width)
+    top = int(round(float(center_y) - side / 2.0))
+    left = int(round(float(center_x) - side / 2.0))
+    top = int(np.clip(top, 0, height - side))
+    left = int(np.clip(left, 0, width - side))
+    return top, top + side, left, left + side
+
+
+def _mask_centroid_or_image_center(mask_2d, use_mask):
+    """Return a hard-mask centroid or the deterministic geometric centre."""
+
+    height, width = mask_2d.shape[-2:]
+    if use_mask:
+        positions = torch.nonzero(mask_2d > 0.5, as_tuple=False)
+        if positions.numel() > 0:
+            center_y = float(positions[:, 0].float().mean().item())
+            center_x = float(positions[:, 1].float().mean().item())
+            return center_y, center_x
+    return (height - 1) / 2.0, (width - 1) / 2.0
+
+
+def _robust_scale_visible_regions(images, visible_masks):
+    """Batched masked robust scaling for V5 inside/outside representations.
+
+    ``images`` contains the raw standardized view: retained native JPEG
+    intensity divided by 255 and placed in the fixed-content canvas, without a
+    global per-image percentile transformation. ``visible_masks`` defines the
+    pixels that will remain in each final representation.
+
+    The lower and upper percentiles are estimated independently for every image
+    from a fixed-bin masked histogram. This is intentionally batched: an exact
+    ``torch.quantile`` call inside a Python loop would sort tens of thousands of
+    pixels and synchronize the GPU once per image, making a 63,425-slice V5
+    feature bank unnecessarily slow. With 256 bins, the estimate matches the
+    natural precision of the original 8-bit JPEG source while remaining robust
+    to the interpolation used for fixed-canvas resizing.
+
+    Pixels outside the visible mask are set to zero after scaling. Consequently,
+    cardiac pixels cannot define an outside-region transform and extracardiac
+    pixels cannot define an inside-region transform.
+    """
+
+    if images.ndim != 4 or images.shape[1] != 3:
+        raise ValueError(
+            f"Region scaling expects [B,3,H,W], got {tuple(images.shape)}."
+        )
+    if visible_masks.ndim == 3:
+        visible_masks = visible_masks.unsqueeze(1)
+    if visible_masks.ndim != 4 or visible_masks.shape[1] != 1:
+        raise ValueError("visible_masks must have shape [B,1,H,W].")
+    if images.shape[0] != visible_masks.shape[0] or tuple(
+        images.shape[-2:]
+    ) != tuple(visible_masks.shape[-2:]):
+        raise ValueError(
+            "Visible-region masks must align with the image batch and spatial shape."
+        )
+
+    bins = int(V5_REGION_NORM_HISTOGRAM_BINS)
+    mask = visible_masks > 0.5
+    mask_flat = mask[:, 0].reshape(images.shape[0], -1)
+    counts = mask_flat.sum(dim=1).to(torch.long)
+
+    # All three image channels are identical grayscale copies. Histogram only
+    # channel 0, then broadcast the resulting limits across all channels.
+    values = images[:, 0].float().clamp(0.0, 1.0)
+    bin_indices = torch.round(values * float(bins - 1)).to(torch.long)
+    bin_indices = bin_indices.clamp_(0, bins - 1).reshape(images.shape[0], -1)
+
+    histogram = torch.zeros(
+        images.shape[0],
+        bins,
+        device=images.device,
+        dtype=torch.float32,
+    )
+    histogram.scatter_add_(
+        dim=1,
+        index=bin_indices,
+        src=mask_flat.to(torch.float32),
+    )
+    cumulative = torch.cumsum(histogram, dim=1)
+
+    safe_counts = counts.clamp_min(1)
+    lower_rank = (
+        torch.floor(
+            (V5_REGION_NORM_LOWER_PERCENTILE / 100.0)
+            * (safe_counts - 1).to(torch.float32)
+        ).to(torch.long)
+        + 1
+    )
+    upper_rank = (
+        torch.floor(
+            (V5_REGION_NORM_UPPER_PERCENTILE / 100.0)
+            * (safe_counts - 1).to(torch.float32)
+        ).to(torch.long)
+        + 1
+    )
+
+    lower_bins = (
+        cumulative >= lower_rank.unsqueeze(1).to(cumulative.dtype)
+    ).to(torch.int64).argmax(dim=1)
+    upper_bins = (
+        cumulative >= upper_rank.unsqueeze(1).to(cumulative.dtype)
+    ).to(torch.int64).argmax(dim=1)
+
+    lower = lower_bins.to(torch.float32) / float(bins - 1)
+    upper = upper_bins.to(torch.float32) / float(bins - 1)
+    valid_rows = (
+        (counts >= int(V5_REGION_NORM_MIN_PIXELS))
+        & torch.isfinite(lower)
+        & torch.isfinite(upper)
+        & (upper > lower)
+    )
+
+    lower = lower.view(-1, 1, 1, 1)
+    upper = upper.view(-1, 1, 1, 1)
+    scaled = (
+        (images.float() - lower)
+        / (upper - lower).clamp_min(
+            float(V5_REGION_NORM_MIN_DYNAMIC_RANGE)
+        )
+    ).clamp(0.0, 1.0)
+    scaled = scaled * mask.to(scaled.dtype)
+    scaled = scaled * valid_rows.view(-1, 1, 1, 1).to(scaled.dtype)
+    return scaled.to(images.dtype)
+
+
+def create_heart_centered_fixed_fov_region_normalized_images(
+    raw_images,
+    hard_mask,
+    valid_mask,
+    content_mask,
+    crop_fraction=V5_FIXED_HEART_FOV_FRACTION,
+):
+    """Create the V5 fixed-FOV, heart-centred, region-normalized candidate.
+
+    A fixed square is centred on the valid MONAI hard-mask centroid. Gate-invalid
+    slices use the image centre, so no full-image fallback can reintroduce border
+    or export information. The square size is fixed independently of predicted
+    mask area. Intensities are scaled only from retained, non-padding pixels
+    inside that square, and the crop is uniformly resized to 224x224 without a
+    surrounding square-canvas padding signature.
+    """
+
+    if raw_images.ndim != 4 or raw_images.shape[1] != 3:
+        raise ValueError("raw_images must have shape [B,3,H,W].")
+    if hard_mask.ndim != 4 or hard_mask.shape[1] != 1:
+        raise ValueError("hard_mask must have shape [B,1,H,W].")
+    if content_mask.ndim != 4 or content_mask.shape[1] != 1:
+        raise ValueError("content_mask must have shape [B,1,H,W].")
+
+    height, width = raw_images.shape[-2:]
+    crop_bounds = []
+    visible = torch.zeros(
+        raw_images.shape[0],
+        1,
+        height,
+        width,
+        device=raw_images.device,
+        dtype=raw_images.dtype,
+    )
+    for index in range(raw_images.shape[0]):
+        use_mask = bool(valid_mask[index].item())
+        center_y, center_x = _mask_centroid_or_image_center(
+            hard_mask[index, 0],
+            use_mask,
+        )
+        top, bottom, left, right = _fixed_square_bounds(
+            height,
+            width,
+            center_y,
+            center_x,
+            crop_fraction,
+        )
+        crop_bounds.append((top, bottom, left, right))
+        visible[index, 0, top:bottom, left:right] = 1.0
+
+    visible = visible * content_mask
+    scaled_full = _robust_scale_visible_regions(raw_images, visible)
+    output = []
+    for index, (top, bottom, left, right) in enumerate(crop_bounds):
+        scaled_crop = scaled_full[index, :, top:bottom, left:right]
+        output.append(
+            F.interpolate(
+                scaled_crop.unsqueeze(0),
+                size=(height, width),
+                mode="bilinear",
+                align_corners=False,
+            )[0]
+        )
+    return torch.stack(output, dim=0)
+
+
+def create_hard_support_region_normalized_images(
+    raw_images,
+    hard_mask,
+    valid_mask,
+    content_mask,
+):
+    """Use a binary cardiac support without injecting MONAI soft confidence.
+
+    For valid slices the already dilated hard mask receives one fixed additional
+    dilation. Invalid slices use the same fixed central-square support as the V5
+    centroid crop fallback. Region-specific scaling is then calculated only from
+    visible pixels, and all other pixels are set to zero.
+    """
+
+    kernel = int(V5_HARD_SUPPORT_EXTRA_DILATION_KERNEL)
+    binary_support = (hard_mask > 0.5).to(raw_images.dtype)
+    binary_support = F.max_pool2d(
+        binary_support,
+        kernel_size=kernel,
+        stride=1,
+        padding=kernel // 2,
+    )
+    height, width = raw_images.shape[-2:]
+    output = []
+    for index in range(raw_images.shape[0]):
+        if bool(valid_mask[index].item()) and bool(
+            torch.any(binary_support[index, 0] > 0.5).item()
+        ):
+            support = binary_support[index, 0]
+        else:
+            top, bottom, left, right = _fixed_square_bounds(
+                height,
+                width,
+                (height - 1) / 2.0,
+                (width - 1) / 2.0,
+                V5_FIXED_HEART_FOV_FRACTION,
+            )
+            support = torch.zeros(
+                height,
+                width,
+                device=raw_images.device,
+                dtype=raw_images.dtype,
+            )
+            support[top:bottom, left:right] = 1.0
+        output.append(support)
+    visible = torch.stack(output, dim=0).unsqueeze(1) * content_mask
+    return _robust_scale_visible_regions(raw_images, visible)
+
+
+def _fixed_central_square_mask(batch_size, height, width, fraction, device, dtype):
+    """Create one MONAI-independent central square mask for an entire batch."""
+
+    top, bottom, left, right = _fixed_square_bounds(
+        height,
+        width,
+        (height - 1) / 2.0,
+        (width - 1) / 2.0,
+        fraction,
+    )
+    mask = torch.zeros(batch_size, 1, height, width, device=device, dtype=dtype)
+    mask[:, :, top:bottom, left:right] = 1.0
+    return mask
+
+
+def create_conservative_whole_heart_exclusion_mask(hard_mask, valid_mask):
+    """Build a conservative whole-heart exclusion proxy for C28/C30.
+
+    The mask is the union of: (1) a large fixed central square for every slice,
+    (2) a same-size square centred on the MONAI hard-mask centroid for valid
+    slices, and (3) a substantially expanded ventricular bounding box. This is
+    intentionally conservative because the ventricular model does not segment
+    atria, great vessels, or the complete heart on every view. It remains a
+    proxy and must not be described as ground-truth whole-heart segmentation.
+    """
+
+    if hard_mask.ndim != 4 or hard_mask.shape[1] != 1:
+        raise ValueError("hard_mask must have shape [B,1,H,W].")
+    batch_size, _, height, width = hard_mask.shape
+    exclusion = _fixed_central_square_mask(
+        batch_size,
+        height,
+        width,
+        V5_WHOLE_HEART_EXCLUSION_CENTER_FRACTION,
+        hard_mask.device,
+        hard_mask.dtype,
+    )
+
+    for index in range(batch_size):
+        if not bool(valid_mask[index].item()):
+            continue
+        box = _hard_mask_bounding_box(hard_mask[index, 0])
+        if box is None:
+            continue
+        center_y, center_x = _mask_centroid_or_image_center(
+            hard_mask[index, 0],
+            True,
+        )
+        top, bottom, left, right = _fixed_square_bounds(
+            height,
+            width,
+            center_y,
+            center_x,
+            V5_WHOLE_HEART_EXCLUSION_CENTER_FRACTION,
+        )
+        exclusion[index, 0, top:bottom, left:right] = 1.0
+
+        box_top, box_bottom, box_left, box_right = box
+        box_height = box_bottom - box_top
+        box_width = box_right - box_left
+        margin = int(
+            round(
+                max(box_height, box_width)
+                * V5_WHOLE_HEART_EXCLUSION_BBOX_CONTEXT_FRACTION
+            )
+        )
+        box_top = max(0, box_top - margin)
+        box_bottom = min(height, box_bottom + margin)
+        box_left = max(0, box_left - margin)
+        box_right = min(width, box_right + margin)
+        exclusion[index, 0, box_top:box_bottom, box_left:box_right] = 1.0
+
+    return exclusion.clamp(0.0, 1.0)
+
+
+def create_outside_whole_heart_region_normalized_images(
+    raw_images,
+    hard_mask,
+    valid_mask,
+    content_mask,
+):
+    """Retain and independently scale only a conservative extracardiac proxy."""
+
+    exclusion = create_conservative_whole_heart_exclusion_mask(
+        hard_mask,
+        valid_mask,
+    )
+    visible = (1.0 - exclusion) * content_mask
+    return _robust_scale_visible_regions(raw_images, visible)
+
+
+def create_fixed_periphery_region_normalized_images(raw_images, content_mask):
+    """Retain only a fixed MONAI-independent periphery with local scaling."""
+
+    batch_size, _, height, width = raw_images.shape
+    exclusion = _fixed_central_square_mask(
+        batch_size,
+        height,
+        width,
+        V5_FIXED_PERIPHERY_EXCLUSION_FRACTION,
+        raw_images.device,
+        raw_images.dtype,
+    )
+    visible = (1.0 - exclusion) * content_mask
+    return _robust_scale_visible_regions(raw_images, visible)
+
+
 def create_soft_monai_mask_only_images(roi_probability, valid_mask):
     """Encode only the standardized soft MONAI map as a three-channel image.
 
@@ -6625,7 +7490,7 @@ def extract_feature_bank(
     WHY MEMORY-MAPPED FEATURE MATRICES?
     -----------------------------------
     A 63,648 x 1,280 float32 matrix is roughly 311 MiB. This deconfounding
-    suite can create twenty-five such representations, so keeping them plus
+    suite can create twenty-nine such representations, so keeping them plus
     intermediate tensors in ordinary RAM is unnecessary. Each matrix is
     written incrementally to a NumPy .npy memory map, flushed, and reopened read-
     only after the metadata completion marker is written.
@@ -6662,6 +7527,9 @@ def extract_feature_bank(
         "standardized_soft_monai_block_shuffled",
         "standardized_canonical_hard_monai_mask_only",
         "standardized_canonical_soft_monai_mask_only",
+        "standardized_heart_centered_fixed_fov_region_norm",
+        "standardized_hard_support_region_norm",
+        "standardized_outside_whole_heart_region_norm",
     }
     need_original_monai = any(
         mode in original_monai_modes for mode in required_modes
@@ -6814,6 +7682,7 @@ def extract_feature_bank(
                 monai_images,
                 standardized_images,
                 standardized_monai_images,
+                standardized_raw_images,
                 detected_padding_images,
                 labels,
                 patient_ids,
@@ -6835,6 +7704,9 @@ def extract_feature_bank(
                 DEVICE, non_blocking=True
             )
             standardized_monai_images = standardized_monai_images.to(
+                DEVICE, non_blocking=True
+            )
+            standardized_raw_images = standardized_raw_images.to(
                 DEVICE, non_blocking=True
             )
             detected_padding_images = detected_padding_images.to(
@@ -6959,6 +7831,9 @@ def extract_feature_bank(
             # geometry, center cropping, stricter ROI removal, and exterior
             # signal after label-blind export normalization.
             variants = {}
+            standardized_content_mask = (
+                1.0 - detected_padding_images[:, 0:1]
+            ).clamp(0.0, 1.0)
             if "monai_roi" in required_modes:
                 variants["monai_roi"] = roi_images
             if "full_image" in required_modes:
@@ -7052,6 +7927,46 @@ def extract_feature_bank(
                         standardized_images,
                         standardized_hard_mask,
                         standardized_valid_mask,
+                    )
+                )
+            if (
+                "standardized_heart_centered_fixed_fov_region_norm"
+                in required_modes
+            ):
+                variants[
+                    "standardized_heart_centered_fixed_fov_region_norm"
+                ] = create_heart_centered_fixed_fov_region_normalized_images(
+                    standardized_raw_images,
+                    standardized_hard_mask,
+                    standardized_valid_mask,
+                    standardized_content_mask,
+                )
+            if "standardized_hard_support_region_norm" in required_modes:
+                variants["standardized_hard_support_region_norm"] = (
+                    create_hard_support_region_normalized_images(
+                        standardized_raw_images,
+                        standardized_hard_mask,
+                        standardized_valid_mask,
+                        standardized_content_mask,
+                    )
+                )
+            if (
+                "standardized_outside_whole_heart_region_norm"
+                in required_modes
+            ):
+                variants[
+                    "standardized_outside_whole_heart_region_norm"
+                ] = create_outside_whole_heart_region_normalized_images(
+                    standardized_raw_images,
+                    standardized_hard_mask,
+                    standardized_valid_mask,
+                    standardized_content_mask,
+                )
+            if "standardized_fixed_periphery_region_norm" in required_modes:
+                variants["standardized_fixed_periphery_region_norm"] = (
+                    create_fixed_periphery_region_normalized_images(
+                        standardized_raw_images,
+                        standardized_content_mask,
                     )
                 )
             if "standardized_soft_monai_mask_only" in required_modes:
@@ -8548,6 +9463,13 @@ def build_annotated_series_selection(annotation_path, bank):
         ):
             incomplete_rows += 1
             continue
+        if ANNOTATED_SERIES_USE_SEQUENCE_VIEW_BALANCED_POOLING and (
+            not sequence_type or not view_type
+        ):
+            # Equal cell weighting is meaningful only when both fields were
+            # explicitly reviewed. Blank cells are excluded rather than guessed.
+            incomplete_rows += 1
+            continue
 
         if confidence not in allowed_confidences:
             excluded_by_confidence += 1
@@ -8624,6 +9546,17 @@ def build_annotated_series_selection(annotation_path, bank):
             f"N_SPLITS={N_SPLITS}."
         )
 
+    series_to_pooling_cell = {
+        str(row["series_proxy_id"]): (
+            f"{_normalize_annotation_token(row['sequence_type'])}::"
+            f"{_normalize_annotation_token(row['view_type'])}"
+        )
+        for row in selected_annotation_rows
+    }
+    selected_cell_counts = defaultdict(int)
+    for cell in series_to_pooling_cell.values():
+        selected_cell_counts[str(cell)] += 1
+
     summary = {
         "status": "READY",
         "annotation_path": str(annotation_path),
@@ -8633,6 +9566,13 @@ def build_annotated_series_selection(annotation_path, bank):
         "n_selected_series": int(len(selected_series)),
         "n_selected_image_rows": int(np.sum(row_mask)),
         "n_selected_patients": int(len(selected_patient_ids)),
+        "n_selected_sequence_view_cells": int(len(selected_cell_counts)),
+        "selected_sequence_view_cell_series_counts": dict(
+            sorted(selected_cell_counts.items())
+        ),
+        "sequence_view_balanced_pooling_enabled": bool(
+            ANNOTATED_SERIES_USE_SEQUENCE_VIEW_BALANCED_POOLING
+        ),
         "normal_patients": class_counts[0],
         "sick_patients": class_counts[1],
         "n_incomplete_rows_excluded": int(incomplete_rows),
@@ -8658,7 +9598,12 @@ def build_annotated_series_selection(annotation_path, bank):
             ANNOTATED_SERIES_ALLOWED_CONFIDENCE_VALUES
         ),
     }
-    return row_mask, selected_annotation_rows, summary
+    return (
+        row_mask,
+        selected_annotation_rows,
+        series_to_pooling_cell,
+        summary,
+    )
 
 
 def run_annotated_series_subset_analysis(
@@ -8699,8 +9644,14 @@ def run_annotated_series_subset_analysis(
         )
         return summary
 
-    row_mask, selected_rows, selection_summary = (
-        build_annotated_series_selection(SERIES_ANNOTATION_INPUT_PATH, bank)
+    (
+        row_mask,
+        selected_rows,
+        series_to_pooling_cell,
+        selection_summary,
+    ) = build_annotated_series_selection(
+        SERIES_ANNOTATION_INPUT_PATH,
+        bank,
     )
     selection_root = (
         OUTPUT_DIR
@@ -8760,23 +9711,39 @@ def run_annotated_series_subset_analysis(
         start=1,
     ):
         experiment = experiments_by_id[experiment_id]
+        analysis_experiment = experiment
+        if (
+            ANNOTATED_SERIES_USE_SEQUENCE_VIEW_BALANCED_POOLING
+            and experiment.pooling_strategy == "hierarchical"
+        ):
+            analysis_experiment = replace(
+                experiment,
+                pooling_strategy="sequence_view_balanced",
+                description=(
+                    experiment.description
+                    + " In this annotated sensitivity analysis, series proxies "
+                    + "are additionally balanced across explicit sequence/view cells."
+                ),
+            )
         print(
             f"[SERIES SUBSET] Experiment {index}/"
-            f"{len(ANNOTATED_SERIES_EXPERIMENT_IDS)}: {experiment_id}",
+            f"{len(ANNOTATED_SERIES_EXPERIMENT_IDS)}: {experiment_id}; "
+            f"pooling={analysis_experiment.pooling_strategy}",
             flush=True,
         )
         output_dir = experiment_root / experiment_id
-        preparation_key = experiment_preparation_cache_key(experiment)
+        preparation_key = experiment_preparation_cache_key(analysis_experiment)
         try:
             if preparation_key not in prepared_cache:
                 prepared_cache[preparation_key] = prepare_experiment_data(
-                    experiment,
+                    analysis_experiment,
                     bank,
                     tabular_feature_sets,
                     row_mask=row_mask,
+                    series_to_pooling_cell=series_to_pooling_cell,
                 )
             result = run_one_experiment(
-                experiment=experiment,
+                experiment=analysis_experiment,
                 prepared=prepared_cache[preparation_key],
                 fold_manifest_rows=subset_fold_rows,
                 output_dir=output_dir,
@@ -9452,51 +10419,50 @@ def aggregate_patient_embeddings(
     series_ids,
     slice_weights,
     pooling_strategy,
+    sample_order_keys=None,
+    series_to_pooling_cell=None,
 ):
-    """
-    Pool frozen slice embeddings to exactly one vector per Directory_* patient.
+    """Pool frozen slice embeddings to one vector per Directory_* patient.
 
-    RECOMMENDED HIERARCHICAL STRATEGY
-    ---------------------------------
+    Supported label-blind pooling strategies:
 
-        slice embeddings --weighted mean within series proxy--> series embedding
-        series embeddings --------equal mean across proxies----> patient embedding
+    ``hierarchical``
+        weighted slice mean inside each folder-defined series proxy, followed by
+        an equal mean across the patient's series proxies.
 
-    This is the recommended default because the supervised classifier receives
-    one observation and one label per validated Directory_* patient. Equal
-    series-proxy weighting prevents a folder with many exported JPEG frames from
-    dominating merely because it is long. The series unit remains an operational
-    folder proxy, not a recovered DICOM SeriesInstanceUID.
+    ``hierarchical_mean_std``
+        concatenate the weighted mean and weighted standard deviation inside
+        every series proxy, then average those summaries equally across series.
+        This preserves within-series heterogeneity without adding a trainable
+        attention mechanism to a 30-patient cohort.
 
-    FLAT-POOLING ABLATION
-    ---------------------
+    ``sequence_view_balanced``
+        weighted slice mean -> equal series mean inside each explicitly annotated
+        (sequence_type, view_type) cell -> equal mean across cells. This strategy
+        is available only in the optional blinded annotation analysis and never
+        infers sequence or view from SR_*/series* names.
 
-        all patient slices --one weighted mean--> patient embedding
+    ``flat``
+        one weighted mean over all slices from the patient.
 
-    Flat pooling intentionally removes the series hierarchy. With equal slice
-    weights, a long folder proxy receives proportionally more influence. It is
-    retained only to measure whether the hierarchical design materially changes
-    patient-level performance.
+    ``fixed_chunk``
+        deterministic series-independent ordering -> fixed-size chunks -> equal
+        chunk mean. A very small final remainder is merged into the preceding
+        chunk, preventing one residual slice from receiving a full chunk's weight.
 
-    FIXED-CHUNK POOLING ABLATION
-    --------------------------------
-
-        deterministic series-independent hash order -> FIXED_CHUNK_SIZE chunks
-        chunk means -----------------------> equal patient mean
-
-    This branch ignores folder-proxy boundaries while preventing one long run
-    of slices from receiving unlimited influence. It is designed specifically
-    to test whether arbitrary SR_*/series* export partitioning is predictive.
-
-    All branches are deterministic and label-free. Labels are checked only for
-    patient consistency and later supervised fitting.
+    Every strategy remains label-free. Labels are used only to verify that one
+    Directory_* patient has a single consistent outcome.
     """
 
     features = np.asarray(features)
     labels = np.asarray(labels, dtype=np.int64)
-    patient_ids = np.asarray(patient_ids)
-    series_ids = np.asarray(series_ids)
+    patient_ids = np.asarray(patient_ids).astype(str)
+    series_ids = np.asarray(series_ids).astype(str)
     slice_weights = np.asarray(slice_weights, dtype=np.float64)
+
+    if sample_order_keys is None:
+        sample_order_keys = np.arange(len(labels), dtype=np.int64)
+    sample_order_keys = np.asarray(sample_order_keys)
 
     if not (
         len(features)
@@ -9504,14 +10470,26 @@ def aggregate_patient_embeddings(
         == len(patient_ids)
         == len(series_ids)
         == len(slice_weights)
+        == len(sample_order_keys)
     ):
         raise ValueError("Embedding-pooling arrays must have equal lengths.")
-    if pooling_strategy not in {"hierarchical", "flat", "fixed_chunk"}:
+    if pooling_strategy not in {
+        "hierarchical",
+        "hierarchical_mean_std",
+        "sequence_view_balanced",
+        "flat",
+        "fixed_chunk",
+    }:
         raise ValueError(
             f"Unsupported patient embedding pooling: {pooling_strategy!r}."
         )
     if np.any(slice_weights < 0) or not np.all(np.isfinite(slice_weights)):
         raise ValueError("Slice weights must be finite and non-negative.")
+    if pooling_strategy == "sequence_view_balanced" and not series_to_pooling_cell:
+        raise ValueError(
+            "sequence_view_balanced pooling requires explicit blinded "
+            "series-to-(sequence,view) annotations."
+        )
 
     patient_to_label = {}
     patient_to_indices = defaultdict(list)
@@ -9520,8 +10498,6 @@ def aggregate_patient_embeddings(
     for index, (label, patient_id, series_id) in enumerate(
         zip(labels, patient_ids, series_ids)
     ):
-        patient_id = str(patient_id)
-        series_id = str(series_id)
         label = int(label)
         previous = patient_to_label.get(patient_id)
         if previous is not None and previous != label:
@@ -9532,88 +10508,106 @@ def aggregate_patient_embeddings(
         patient_to_indices[patient_id].append(index)
         patient_to_series_indices[patient_id][series_id].append(index)
 
+    def weighted_mean(indices):
+        indices = np.asarray(indices, dtype=np.int64)
+        weights = slice_weights[indices]
+        if not np.any(weights > 0):
+            raise RuntimeError("A pooling unit has no positive slice weight.")
+        return np.average(features[indices], axis=0, weights=weights)
+
+    def weighted_mean_and_std(indices):
+        indices = np.asarray(indices, dtype=np.int64)
+        weights = slice_weights[indices]
+        if not np.any(weights > 0):
+            raise RuntimeError("A pooling unit has no positive slice weight.")
+        mean = np.average(features[indices], axis=0, weights=weights)
+        variance = np.average(
+            np.square(features[indices] - mean),
+            axis=0,
+            weights=weights,
+        )
+        std = np.sqrt(np.maximum(variance, 0.0))
+        return np.concatenate([mean, std], axis=0)
+
     ordered_patients = np.asarray(sorted(patient_to_label))
     pooled_features = []
     pooled_labels = []
 
     for patient_id in ordered_patients:
         if pooling_strategy == "flat":
-            indices = np.asarray(patient_to_indices[patient_id], dtype=np.int64)
-            weights = slice_weights[indices]
-            if not np.any(weights > 0):
-                raise RuntimeError(
-                    f"Patient {patient_id} has no positive flat-pooling weight."
-                )
-            patient_embedding = np.average(
-                features[indices],
-                axis=0,
-                weights=weights,
-            )
+            patient_embedding = weighted_mean(patient_to_indices[patient_id])
+
         elif pooling_strategy == "fixed_chunk":
-            # Ignore SR_*/series* folder boundaries and partition the patient's
-            # deterministic series-independent hash order into equal maximum-
-            # size chunks. Each chunk receives one embedding and equal patient-level
-            # influence. This tests whether folder-defined export partitioning,
-            # rather than a true acquisition hierarchy, drives performance.
             indices = np.asarray(patient_to_indices[patient_id], dtype=np.int64)
-            # A deterministic SHA-256 ordering deliberately ignores series IDs
-            # and prevents contiguous filesystem/folder order from recreating
-            # the released proxy boundaries inside the chunks.
             ordering_keys = [
                 hashlib.sha256(
-                    f"{RANDOM_SEED}|fixed_chunk|{patient_id}|{int(index)}".encode(
-                        "utf-8"
-                    )
+                    (
+                        f"{RANDOM_SEED}|fixed_chunk|{patient_id}|"
+                        f"{sample_order_keys[index]}"
+                    ).encode("utf-8")
                 ).hexdigest()
                 for index in indices
             ]
             indices = indices[np.argsort(np.asarray(ordering_keys))]
-            chunk_embeddings = []
-            for start in range(0, len(indices), FIXED_CHUNK_SIZE):
-                chunk_indices = indices[start:start + FIXED_CHUNK_SIZE]
-                weights = slice_weights[chunk_indices]
-                if not np.any(weights > 0):
-                    raise RuntimeError(
-                        f"Patient {patient_id} has a fixed chunk with no positive weight."
+            chunks = [
+                indices[start:start + FIXED_CHUNK_SIZE]
+                for start in range(0, len(indices), FIXED_CHUNK_SIZE)
+            ]
+            minimum_remainder = max(
+                1,
+                int(
+                    np.ceil(
+                        FIXED_CHUNK_SIZE
+                        * FIXED_CHUNK_MIN_REMAINDER_FRACTION
                     )
-                chunk_embeddings.append(
-                    np.average(
-                        features[chunk_indices],
-                        axis=0,
-                        weights=weights,
-                    )
-                )
+                ),
+            )
+            if len(chunks) > 1 and len(chunks[-1]) < minimum_remainder:
+                chunks[-2] = np.concatenate([chunks[-2], chunks[-1]])
+                chunks.pop()
+            chunk_embeddings = [weighted_mean(chunk) for chunk in chunks]
             patient_embedding = np.mean(
                 np.stack(chunk_embeddings, axis=0),
                 axis=0,
             )
-        else:
-            series_embeddings = []
-            for series_id in sorted(patient_to_series_indices[patient_id]):
-                indices = np.asarray(
-                    patient_to_series_indices[patient_id][series_id],
-                    dtype=np.int64,
-                )
-                weights = slice_weights[indices]
-                if not np.any(weights > 0):
-                    raise RuntimeError(
-                        f"Series proxy {series_id} has no positive pooling weight."
-                    )
-                series_embeddings.append(
-                    np.average(
-                        features[indices],
-                        axis=0,
-                        weights=weights,
-                    )
-                )
-            patient_embedding = np.mean(
-                np.stack(series_embeddings, axis=0),
-                axis=0,
-            )
 
-        pooled_features.append(
-            np.asarray(patient_embedding, dtype=np.float32)
-        )
+        else:
+            series_embeddings = {}
+            for series_id in sorted(patient_to_series_indices[patient_id]):
+                indices = patient_to_series_indices[patient_id][series_id]
+                if pooling_strategy == "hierarchical_mean_std":
+                    series_embeddings[series_id] = weighted_mean_and_std(indices)
+                else:
+                    series_embeddings[series_id] = weighted_mean(indices)
+
+            if pooling_strategy == "sequence_view_balanced":
+                cell_to_series_embeddings = defaultdict(list)
+                for series_id, series_embedding in series_embeddings.items():
+                    cell = series_to_pooling_cell.get(series_id)
+                    if not cell:
+                        raise RuntimeError(
+                            "Missing sequence/view pooling cell for selected "
+                            f"series proxy {series_id!r}."
+                        )
+                    cell_to_series_embeddings[str(cell)].append(series_embedding)
+                cell_embeddings = [
+                    np.mean(np.stack(cell_to_series_embeddings[cell], axis=0), axis=0)
+                    for cell in sorted(cell_to_series_embeddings)
+                ]
+                patient_embedding = np.mean(
+                    np.stack(cell_embeddings, axis=0),
+                    axis=0,
+                )
+            else:
+                patient_embedding = np.mean(
+                    np.stack(
+                        [series_embeddings[key] for key in sorted(series_embeddings)],
+                        axis=0,
+                    ),
+                    axis=0,
+                )
+
+        pooled_features.append(np.asarray(patient_embedding, dtype=np.float32))
         pooled_labels.append(patient_to_label[patient_id])
 
     X_patient = np.stack(pooled_features, axis=0)
@@ -10051,6 +11045,7 @@ def experiment_preparation_cache_key(experiment):
         experiment.weighting_mode,
         float(experiment.slice_dropout_rate),
         bool(experiment.deduplicate_exact_within_patient),
+        str(experiment.slice_filter),
     )
 
 
@@ -10059,19 +11054,20 @@ def prepare_experiment_data(
     bank,
     tabular_feature_sets,
     row_mask=None,
+    series_to_pooling_cell=None,
 ):
     """Build one fixed, label-blind representation for an experiment.
 
-    ``row_mask`` is used only by the optional manually annotated series/view
-    subset stage. It is applied identically to features, labels, grouping
-    identifiers, hashes, sample indices and ROI scores before any deduplication,
-    dropout, weighting or pooling. The ordinary full-cohort suite passes None
-    and therefore retains the exact full-cohort V3 behavior.
+    ``row_mask`` is supplied only by the optional manually annotated
+    series/view stage. ``slice_filter='standardized_monai_valid'`` can then be
+    applied identically to a cardiac candidate and its outside-region control.
+    All aligned arrays are filtered together before deduplication, robustness
+    dropout, weighting, or pooling.
     """
 
     labels = np.asarray(bank["labels"], dtype=np.int64)
-    patient_ids = np.asarray(bank["patient_ids"])
-    series_ids = np.asarray(bank["series_ids"])
+    patient_ids = np.asarray(bank["patient_ids"]).astype(str)
+    series_ids = np.asarray(bank["series_ids"]).astype(str)
     decoded_pixel_hashes = np.asarray(bank["decoded_pixel_hashes"])
     sample_indices = np.asarray(bank["sample_indices"], dtype=np.int64)
 
@@ -10081,6 +11077,10 @@ def prepare_experiment_data(
                 "A slice/series row mask cannot be applied to patient-tabular "
                 "controls. Annotated-series analysis is restricted to "
                 "image-based patient-embedding experiments."
+            )
+        if experiment.slice_filter != "all":
+            raise ValueError(
+                "Patient-tabular controls cannot use an image-row slice filter."
             )
         X, y, patients, feature_names = tabular_feature_sets[
             experiment.feature_mode
@@ -10092,16 +11092,25 @@ def prepare_experiment_data(
             "patient_ids": np.asarray(patients),
             "feature_names": tuple(feature_names),
             "slice_dropout_rate": 0.0,
+            "slice_filter": "all",
             "n_source_slices": None,
             "n_retained_slices": None,
         }
 
     features = bank["features"][experiment.feature_mode]
-    roi_slice_scores = np.asarray(bank["roi_slice_scores"])
+    if experiment.feature_mode.startswith("standardized_"):
+        roi_slice_scores = np.asarray(
+            bank["standardized_roi_slice_scores"],
+            dtype=np.float64,
+        )
+    else:
+        roi_slice_scores = np.asarray(
+            bank["roi_slice_scores"],
+            dtype=np.float64,
+        )
 
-    # Optional manual sequence/view filtering is performed on the common
-    # feature-bank row axis. Reject malformed masks instead of flattening them,
-    # because silent reshaping could misalign images and patient metadata.
+    n_bank_rows = len(labels)
+    eligible_before_slice_filter = np.ones(n_bank_rows, dtype=bool)
     series_subset_applied = row_mask is not None
     if row_mask is not None:
         row_mask = np.asarray(row_mask, dtype=bool)
@@ -10110,29 +11119,65 @@ def prepare_experiment_data(
                 "Annotated-series row_mask must be one-dimensional; received "
                 f"shape {row_mask.shape}."
             )
-        if len(row_mask) != len(labels):
+        if len(row_mask) != n_bank_rows:
             raise ValueError(
                 "Annotated-series row_mask length must equal the feature-bank "
-                f"row count ({len(labels)}), got {len(row_mask)}."
+                f"row count ({n_bank_rows}), got {len(row_mask)}."
             )
         if not np.any(row_mask):
-            raise ValueError(
-                "Annotated-series filtering retained no image rows."
+            raise ValueError("Annotated-series filtering retained no image rows.")
+        eligible_before_slice_filter &= row_mask
+
+    expected_patients = set(
+        patient_ids[eligible_before_slice_filter].astype(str).tolist()
+    )
+    n_source_slices = int(np.sum(eligible_before_slice_filter))
+
+    combined_mask = eligible_before_slice_filter.copy()
+    if experiment.slice_filter == "standardized_monai_valid":
+        monai_valid = np.asarray(bank["standardized_monai_valid"], dtype=bool)
+        if monai_valid.shape != combined_mask.shape:
+            raise RuntimeError(
+                "standardized_monai_valid does not align with feature-bank rows."
             )
+        combined_mask &= monai_valid
+    elif experiment.slice_filter != "all":
+        raise ValueError(
+            f"Unsupported experiment slice filter: {experiment.slice_filter!r}."
+        )
 
-        features = features[row_mask]
-        labels = labels[row_mask]
-        patient_ids = patient_ids[row_mask]
-        series_ids = series_ids[row_mask]
-        roi_slice_scores = roi_slice_scores[row_mask]
-        decoded_pixel_hashes = decoded_pixel_hashes[row_mask]
-        sample_indices = sample_indices[row_mask]
+    if not np.any(combined_mask):
+        raise ValueError(
+            f"{experiment.experiment_id}: row and slice filters retained no images."
+        )
+    retained_filter_patients = set(patient_ids[combined_mask].tolist())
+    if retained_filter_patients != expected_patients:
+        missing = sorted(expected_patients - retained_filter_patients)
+        raise RuntimeError(
+            f"{experiment.experiment_id}: slice filtering removed every row "
+            f"for patients {missing}. Matched patient-level comparison would be invalid."
+        )
 
-    n_source_slices = int(len(labels))
+    if not np.all(combined_mask):
+        features = features[combined_mask]
+        labels = labels[combined_mask]
+        patient_ids = patient_ids[combined_mask]
+        series_ids = series_ids[combined_mask]
+        roi_slice_scores = roi_slice_scores[combined_mask]
+        decoded_pixel_hashes = decoded_pixel_hashes[combined_mask]
+        sample_indices = sample_indices[combined_mask]
 
-    # Exact within-patient deduplication is an explicit matched ablation. It is
-    # performed before any slice-dropout robustness perturbation so later masks
-    # operate on the unique retained rows rather than on repeated copies.
+    n_after_slice_filter = int(len(labels))
+    if experiment.slice_filter != "all":
+        print(
+            f"[SLICE FILTER] {experiment.experiment_id}: retained "
+            f"{n_after_slice_filter}/{n_source_slices} rows using "
+            f"{experiment.slice_filter!r}.",
+            flush=True,
+        )
+
+    # Exact within-patient deduplication is performed after common row filtering
+    # so paired candidate/control experiments retain identical source rows.
     n_exact_duplicate_rows_removed = 0
     if experiment.deduplicate_exact_within_patient:
         exact_keep_mask = deterministic_exact_within_patient_deduplication_mask(
@@ -10158,9 +11203,6 @@ def prepare_experiment_data(
             flush=True,
         )
 
-    # Robustness variants use the same frozen feature bank; only a deterministic
-    # subset of aligned rows is retained before weighting and pooling. The mask
-    # is generated without labels and is independent of outer-fold assignment.
     retention_mask = deterministic_series_preserving_slice_dropout_mask(
         patient_ids,
         series_ids,
@@ -10187,6 +11229,17 @@ def prepare_experiment_data(
         experiment.weighting_mode,
     )
 
+    if experiment.pooling_strategy == "sequence_view_balanced":
+        if not series_to_pooling_cell:
+            raise ValueError(
+                "sequence_view_balanced pooling requires completed explicit "
+                "sequence/view annotations."
+            )
+        series_to_pooling_cell = {
+            str(key): str(value)
+            for key, value in series_to_pooling_cell.items()
+        }
+
     if experiment.strategy == "patient_embedding":
         X, y, patients = aggregate_patient_embeddings(
             features=features,
@@ -10195,6 +11248,8 @@ def prepare_experiment_data(
             series_ids=series_ids,
             slice_weights=slice_weights,
             pooling_strategy=experiment.pooling_strategy,
+            sample_order_keys=sample_indices,
+            series_to_pooling_cell=series_to_pooling_cell,
         )
         return {
             "unit": "patient",
@@ -10202,10 +11257,10 @@ def prepare_experiment_data(
             "y": y,
             "patient_ids": patients,
             "feature_names": tuple(
-                f"embedding_{index:04d}"
-                for index in range(X.shape[1])
+                f"embedding_{index:04d}" for index in range(X.shape[1])
             ),
             "slice_dropout_rate": float(experiment.slice_dropout_rate),
+            "slice_filter": str(experiment.slice_filter),
             "deduplicate_exact_within_patient": bool(
                 experiment.deduplicate_exact_within_patient
             ),
@@ -10213,8 +11268,12 @@ def prepare_experiment_data(
                 n_exact_duplicate_rows_removed
             ),
             "n_source_slices": n_source_slices,
+            "n_after_slice_filter": n_after_slice_filter,
             "n_retained_slices": int(len(labels)),
             "annotated_series_subset_applied": bool(series_subset_applied),
+            "sequence_view_balanced_pooling": bool(
+                experiment.pooling_strategy == "sequence_view_balanced"
+            ),
         }
 
     if experiment.strategy == "slice_probability_fusion":
@@ -10225,16 +11284,15 @@ def prepare_experiment_data(
             "patient_ids": patient_ids,
             "series_ids": series_ids,
             "slice_weights": slice_weights,
-            # A3 and A4 differ only in probability fusion. This process-local
-            # signature lets them reuse identical fold-local slice classifier
-            # predictions without storing models or changing scientific output.
             "legacy_cache_signature": (
                 experiment.feature_mode,
                 experiment.weighting_mode,
+                experiment.slice_filter,
                 int(features.shape[0]),
                 int(features.shape[1]),
             ),
             "slice_dropout_rate": float(experiment.slice_dropout_rate),
+            "slice_filter": str(experiment.slice_filter),
             "deduplicate_exact_within_patient": bool(
                 experiment.deduplicate_exact_within_patient
             ),
@@ -10242,6 +11300,7 @@ def prepare_experiment_data(
                 n_exact_duplicate_rows_removed
             ),
             "n_source_slices": n_source_slices,
+            "n_after_slice_filter": n_after_slice_filter,
             "n_retained_slices": int(len(labels)),
             "annotated_series_subset_applied": bool(series_subset_applied),
         }
@@ -10249,6 +11308,7 @@ def prepare_experiment_data(
     raise ValueError(
         f"Unsupported experiment strategy: {experiment.strategy!r}."
     )
+
 
 def build_patient_classifier(experiment, c_value):
     """Create a fresh scaler/PCA/linear classifier for patient rows."""
@@ -10896,6 +11956,7 @@ def run_one_experiment(
         f"classifier={experiment.classifier_type}, PCA={experiment.use_pca}, "
         f"fusion={experiment.fusion_method}, "
         f"slice_dropout={experiment.slice_dropout_rate:.0%}, "
+        f"slice_filter={experiment.slice_filter}, "
         f"exact_within_patient_dedup="
         f"{experiment.deduplicate_exact_within_patient}",
         flush=True,
@@ -11183,7 +12244,12 @@ def run_one_experiment(
                 "n_exact_duplicate_rows_removed", 0
             ),
             "n_source_slices": prepared.get("n_source_slices"),
+            "n_after_slice_filter": prepared.get("n_after_slice_filter"),
             "n_retained_slices": prepared.get("n_retained_slices"),
+            "slice_filter": prepared.get("slice_filter", "all"),
+            "sequence_view_balanced_pooling": bool(
+                prepared.get("sequence_view_balanced_pooling", False)
+            ),
             "annotated_series_subset_applied": bool(
                 prepared.get("annotated_series_subset_applied", False)
             ),
@@ -11238,7 +12304,15 @@ def run_one_experiment(
                 "n_exact_duplicate_rows_removed", 0
             ),
             "n_source_slices": prepared.get("n_source_slices"),
+            "n_after_slice_filter": prepared.get("n_after_slice_filter"),
             "n_retained_slices": prepared.get("n_retained_slices"),
+            "slice_filter": prepared.get("slice_filter", "all"),
+            "sequence_view_balanced_pooling": bool(
+                prepared.get("sequence_view_balanced_pooling", False)
+            ),
+            "annotated_series_subset_applied": bool(
+                prepared.get("annotated_series_subset_applied", False)
+            ),
         },
     }
 
@@ -12165,6 +13239,7 @@ def result_summary_row(result, comparison_lookup):
         "fusion_method": experiment.fusion_method or "",
         "use_pca": int(experiment.use_pca),
         "slice_dropout_rate": float(experiment.slice_dropout_rate),
+        "slice_filter": str(experiment.slice_filter),
         "deduplicate_exact_within_patient": int(
             experiment.deduplicate_exact_within_patient
         ),
@@ -12173,6 +13248,9 @@ def result_summary_row(result, comparison_lookup):
         ),
         "n_source_slices": result["prepared_metadata"].get(
             "n_source_slices"
+        ),
+        "n_after_slice_filter": result["prepared_metadata"].get(
+            "n_after_slice_filter"
         ),
         "n_retained_slices": result["prepared_metadata"].get(
             "n_retained_slices"
@@ -12354,8 +13432,47 @@ def write_master_outputs(
             encoding="utf-8",
         )
 
+    summary_lookup = {
+        row["experiment_id"]: row for row in summary_rows
+    }
+    v5_inside = summary_lookup.get(V5_CANDIDATE_EXPERIMENT_ID)
+    v5_outside = summary_lookup.get(
+        V5_MATCHED_OUTSIDE_CONTROL_EXPERIMENT_ID
+    )
+    if v5_inside is not None and v5_outside is not None:
+        v5_matched_contrast = {
+            "status": "OK",
+            "inside_experiment_id": V5_CANDIDATE_EXPERIMENT_ID,
+            "outside_experiment_id": (
+                V5_MATCHED_OUTSIDE_CONTROL_EXPERIMENT_ID
+            ),
+            "inside_auc": float(v5_inside["auc"]),
+            "outside_auc": float(v5_outside["auc"]),
+            "inside_minus_outside_auc": float(
+                v5_inside["auc"] - v5_outside["auc"]
+            ),
+            "row_contract": (
+                "Both experiments use slice_filter=standardized_monai_valid "
+                "and therefore the same patient/series/slice rows."
+            ),
+        }
+    else:
+        v5_matched_contrast = {
+            "status": "UNAVAILABLE",
+            "missing_experiments": [
+                experiment_id
+                for experiment_id, row in (
+                    (V5_CANDIDATE_EXPERIMENT_ID, v5_inside),
+                    (V5_MATCHED_OUTSIDE_CONTROL_EXPERIMENT_ID, v5_outside),
+                )
+                if row is None
+            ],
+        }
+
     report = {
         "baseline_experiment_id": BASELINE_EXPERIMENT_ID,
+        "v5_candidate_experiment_id": V5_CANDIDATE_EXPERIMENT_ID,
+        "v5_matched_inside_outside_contrast": v5_matched_contrast,
         "successful_experiments": summary_rows,
         "failed_experiments": failed_results,
         "paired_auc_comparisons_vs_baseline": paired_rows,
@@ -12371,6 +13488,11 @@ def write_master_outputs(
                 "not externally calibrated clinical probabilities. Linear-SVM "
                 "margins receive training-only sigmoid calibration. Brier scores "
                 "must therefore be interpreted as exploratory."
+            ),
+            "v5_region_normalization": (
+                "A16-A19 and C28-C30 compute robust intensity limits only "
+                "from pixels that remain visible after localization. C30 and "
+                "A18 additionally use exactly the same gate-valid slice rows."
             ),
             "segmentation_representation_control": (
                 "C21-C27 are MONAI-derived representation controls, not pure "
@@ -12420,6 +13542,10 @@ def print_final_comparison(summary_rows, failed_results=None):
         "A13_STANDARDIZED_ROI_FIXED_CHUNK_LR_PCA",
         "A14_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_FIXED_CHUNK_LR_PCA",
         "A15_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_DEDUP_HIER_LR_PCA",
+        "A16_HEART_CENTERED_FIXED_FOV_REGION_NORM_HIER_LR_PCA",
+        "A17_HARD_SUPPORT_REGION_NORM_HIER_LR_PCA",
+        V5_CANDIDATE_EXPERIMENT_ID,
+        "A19_HEART_CENTERED_FIXED_FOV_REGION_NORM_VALID_ONLY_HIER_MEAN_STD_LR_PCA",
     }
 
     groups = (
@@ -12558,6 +13684,19 @@ def print_final_comparison(summary_rows, failed_results=None):
                 flush=True,
             )
 
+    summary_lookup = {row["experiment_id"]: row for row in summary_rows}
+    v5_inside = summary_lookup.get(V5_CANDIDATE_EXPERIMENT_ID)
+    v5_outside = summary_lookup.get(V5_MATCHED_OUTSIDE_CONTROL_EXPERIMENT_ID)
+    if v5_inside is not None and v5_outside is not None:
+        print("\nV5 MATCHED INSIDE / OUTSIDE CHECK", flush=True)
+        print(
+            f"[V5] inside AUC={v5_inside['auc']:.4f}; "
+            f"outside AUC={v5_outside['auc']:.4f}; "
+            f"inside-minus-outside={v5_inside['auc'] - v5_outside['auc']:+.4f}. "
+            "Both use the same standardized-MONAI-valid image rows.",
+            flush=True,
+        )
+
     if failed_results:
         print("\nFAILED EXPERIMENTS", flush=True)
         for failure in failed_results:
@@ -12637,6 +13776,10 @@ def collect_suite_metadata(
         "suite_configuration_tag": SUITE_CONFIGURATION_TAG,
         "baseline_experiment_id": BASELINE_EXPERIMENT_ID,
         "primary_candidate_experiment_id": PRIMARY_CANDIDATE_EXPERIMENT_ID,
+        "v5_candidate_experiment_id": V5_CANDIDATE_EXPERIMENT_ID,
+        "v5_matched_outside_control_experiment_id": (
+            V5_MATCHED_OUTSIDE_CONTROL_EXPERIMENT_ID
+        ),
         "development_baseline_experiment_id": (
             DEVELOPMENT_BASELINE_EXPERIMENT_ID
         ),
@@ -12798,6 +13941,10 @@ def write_suite_configuration(output_path, experiments):
         "suite_configuration_tag": SUITE_CONFIGURATION_TAG,
         "baseline_experiment_id": BASELINE_EXPERIMENT_ID,
         "primary_candidate_experiment_id": PRIMARY_CANDIDATE_EXPERIMENT_ID,
+        "v5_candidate_experiment_id": V5_CANDIDATE_EXPERIMENT_ID,
+        "v5_matched_outside_control_experiment_id": (
+            V5_MATCHED_OUTSIDE_CONTROL_EXPERIMENT_ID
+        ),
         "development_baseline_experiment_id": (
             DEVELOPMENT_BASELINE_EXPERIMENT_ID
         ),
@@ -12862,6 +14009,29 @@ def write_suite_configuration(output_path, experiments):
         "fixed_center_crop_fractions": list(FIXED_CENTER_CROP_FRACTIONS),
         "standardized_content_long_side": STANDARDIZED_CONTENT_LONG_SIDE,
         "fixed_chunk_size": FIXED_CHUNK_SIZE,
+        "fixed_chunk_min_remainder_fraction": (
+            FIXED_CHUNK_MIN_REMAINDER_FRACTION
+        ),
+        "v5_fixed_heart_fov_fraction": V5_FIXED_HEART_FOV_FRACTION,
+        "v5_hard_support_extra_dilation_kernel": (
+            V5_HARD_SUPPORT_EXTRA_DILATION_KERNEL
+        ),
+        "v5_whole_heart_exclusion_center_fraction": (
+            V5_WHOLE_HEART_EXCLUSION_CENTER_FRACTION
+        ),
+        "v5_whole_heart_exclusion_bbox_context_fraction": (
+            V5_WHOLE_HEART_EXCLUSION_BBOX_CONTEXT_FRACTION
+        ),
+        "v5_fixed_periphery_exclusion_fraction": (
+            V5_FIXED_PERIPHERY_EXCLUSION_FRACTION
+        ),
+        "v5_region_norm_lower_percentile": V5_REGION_NORM_LOWER_PERCENTILE,
+        "v5_region_norm_upper_percentile": V5_REGION_NORM_UPPER_PERCENTILE,
+        "v5_region_norm_min_pixels": V5_REGION_NORM_MIN_PIXELS,
+        "v5_region_norm_histogram_bins": V5_REGION_NORM_HISTOGRAM_BINS,
+        "v5_region_norm_min_dynamic_range": (
+            V5_REGION_NORM_MIN_DYNAMIC_RANGE
+        ),
         "monai_soft_histogram_bins": MONAI_SOFT_HISTOGRAM_BINS,
         "monai_soft_block_shuffle_grid": MONAI_SOFT_BLOCK_SHUFFLE_GRID,
         "monai_soft_block_shuffle_version": (
@@ -12958,6 +14128,9 @@ def write_suite_configuration(output_path, experiments):
             ),
             "allowed_confidence_values": list(
                 ANNOTATED_SERIES_ALLOWED_CONFIDENCE_VALUES
+            ),
+            "sequence_view_balanced_pooling": bool(
+                ANNOTATED_SERIES_USE_SEQUENCE_VIEW_BALANCED_POOLING
             ),
             "experiment_ids": list(ANNOTATED_SERIES_EXPERIMENT_IDS),
         },
