@@ -1,808 +1,507 @@
 #!/usr/bin/env python3
-r"""CAD Cardiac MRI — University Admissions Research Portfolio Pipeline
-========================================================================
+r"""CAD Cardiac MRI — University Research Portfolio Pipeline, Revision 2
+===================================================================
 
-DOCUMENT PURPOSE AND AUDIENCE
------------------------------
-This single Python file is intentionally self-contained.  It contains the
-research motivation, dataset contract, mathematical derivations, implementation,
-Kaggle instructions, output definitions, evaluation rules, limitations, and a
-suggested university-application narrative.  A reviewer should be able to
-understand the project without opening separate README or methodology files.
+PURPOSE AND SCOPE
+----------------
+This is a single-file, institution-neutral research implementation for patient-
+level classification of the Normal/Sick labels in a public cardiac MRI JPEG
+release. It includes the research question, data contracts, mathematics, runtime
+instructions, implementation, output definitions, and interpretation limits.
+A high AUROC is an association with this released cohort, NOT proof of CAD-
+specific image interpretation, prospective clinical validity, or causality.
 
-The intended audience is broad and institution-neutral:
+The research question is:
+    Does cardiac-region information outperform exactly matched controls, and can
+    a fold-local mathematical nuisance penalty preserve discrimination while
+    reducing measured score dependence on acquisition/export variables?
 
-* university admissions readers evaluating intellectual initiative;
-* research mentors reviewing experimental design;
-* technical readers checking leakage control and mathematical correctness;
-* future collaborators who need a reproducible execution entry point.
+The public release was previously confirmed by its author to contain 30 patient
+units: 16 Normal and 14 Sick, with 63,425 images in the user's earlier runs.
+Those images do not create 63,425 independent labeled observations. All series
+and slices of one Directory_* remain in the same supervised fold.
 
-The recommended generic filename is:
-
-    cad_mri_university_showcase.py
-
-A compatibility copy may use an older filename, but the scientific content and
-terminology in this module are deliberately university-generic.
-
-ONE-SENTENCE PROJECT DESCRIPTION
---------------------------------
-I built a patient-level cardiac MRI classifier, discovered that a high internal
-score was partly reproducible from non-cardiac and segmentation-derived
-shortcuts, and redesigned the project around exact matched controls and custom
-mathematical methods for reducing dependence on nuisance information.
-
-THE CENTRAL RESEARCH QUESTION
------------------------------
-The project asks a harder question than "How high is the AUROC?":
-
-    Can cardiac-region MRI information classify the released Normal/Sick labels
-    more strongly than exact matched shortcut controls, and can compact custom
-    mathematics preserve discrimination while reducing dependence on those
-    controls?
-
-This is important because a medical-imaging model can be accurate for the wrong
-reason.  It may exploit scanner style, JPEG export geometry, sequence mixture,
-mask shape, padding, or anatomy outside the intended region instead of learning
-the disease-related information that motivated the study.
-
-DATASET AND PATIENT CONTRACT
-----------------------------
-Dataset:
-
-    CAD Cardiac MRI Dataset
-    https://www.kaggle.com/datasets/danialsharifrazi/cad-cardiac-mri-dataset
-
-Validated computational patient unit for this release:
-
-    patient_id = Directory_*
-
-Class mapping:
-
-    Normal/Directory_* -> label 0
-    Sick/Directory_*   -> label 1
-
-Every descendant image of one Directory_* folder belongs to the same patient.
-The immediate image parent is treated only as a folder-defined series proxy.
-It is not described as a verified DICOM SeriesInstanceUID because the public
-release contains JPEG exports rather than original DICOM metadata.
-
-The release contains approximately:
-
-    30 patient units
-    16 Normal patients
-    14 Sick patients
-    63,425 image files
-    2,859 folder-defined series proxies
-
-The effective labeled sample size is 30 patients, not 63,425 images.  All images
-and series proxies from one patient remain in the same train/validation fold.
-No slice is treated as an independent labeled patient.
-
-HISTORICAL RESULT THAT MOTIVATED THIS SIMPLIFICATION
-----------------------------------------------------
-The larger audit suite evaluated 58 experiments and 32 image representations.
-In the supplied V6 Kaggle audit, the repeated patient-level median AUROCs that
-most directly motivate this simplified file were approximately:
-
-    A17 cardiac hard-support intensity            0.9732
-    C31 exact A17 support only                     0.8661
-    C32 same support/histogram, shuffled spatially 0.7991
-    C33 exact complement of the A17 support        0.8170
-
-These values are historical motivation only.  They are not hard-coded into this
-pipeline and do not count as results of this simplified implementation.  This
-file must recompute its own metrics.
-
-The intellectual turning point was that the candidate model was highly
-predictive, but carefully chosen controls were also predictive.  The project
-therefore changed from "optimize one model" to "test what information the model
-uses and whether that dependence can be reduced."
-
-WHY THIS VERSION IS SMALLER
----------------------------
-The full audit is valuable as an archival stress-test, but it is not the clearest
-first view of the project.  This file reduces the scientific core to seven
-experiments with one interpretable purpose each:
-
-1. BASELINE_A17
-   Region-normalized MRI intensities inside one exact binary cardiac support.
-
-2. CONTROL_SUPPORT_ONLY
-   The exact same final support mask, with MRI intensities removed.
-
-3. CONTROL_SHUFFLED_INTENSITY
-   The same support and exact visible intensity multiset as the baseline, but
-   with spatial locations deterministically permuted.
-
-4. CONTROL_OUTSIDE_SUPPORT
-   The exact retained-content complement of the baseline support, independently
-   normalized.
-
-5. CUSTOM_NUISANCE_PROJECTION
-   A fold-local ridge projection that removes cardiac-feature components that
-   can be reconstructed from nuisance variables.
-
-6. CUSTOM_MINIMAX_CONFOUNDER_GUARD
-   A logistic classifier optimized from scratch with a penalty on the strongest
-   linear covariance between its score and any nuisance direction.
-
-7. CUSTOM_BAYESIAN_SERIES_FUSION
-   A patient-trained classifier whose validation-series evidence is combined in
-   prior-relative log-odds space with saturating reliability weights.
-
-The following historical branches are removed from the default execution path:
-
-* the 58-entry experiment registry;
-* many border widths, corner crops, center crops, fixed chunks, dropout levels,
-  SVM variants, no-PCA variants, and legacy slice classifiers;
-* 32 independently cached slice-level feature views;
-* multiple generations of candidate aliases and broad report orchestration.
-
-They are not declared useless.  They are moved out of the explanatory core
-because they answer historical debugging questions rather than the final
-scientific question.
-
-END-TO-END PIPELINE
--------------------
-
-    JPEG cardiac MRI files
-            |
-            v
-    Directory_* patient grouping
-            |
-            v
-    Conservative label-blind dark-border removal
-            |
-            v
-    Fixed 240-in-256 geometry with preserved aspect ratio
-            |
-            v
-    Pinned pretrained MONAI ventricular segmentation
-            |
-            v
-    One exact final binary support per slice
-            |-----------------------|-----------------------|
-            v                       v                       v
-    cardiac intensity        support-only control    exact complement
-            |
-            v
-    deterministic within-support shuffled-intensity control
-            |
-            v
-    Frozen ImageNet EfficientNet-B0 embeddings
-            |
-            v
-    mean embedding inside each folder-defined series proxy
-            |
-            v
-    equal mean across all series proxies of one patient
-            |
-            v
-    exactly one feature vector and one label per patient
-            |
-            v
-    nested patient-level cross-validation
-            |
-            v
-    AUROC, AUPRC, threshold metrics, repeated-split stability,
-    exact-control comparisons, and nuisance-score predictability
-
-DATA AND SHAPE CONTRACT
+WHY THIS REVISION EXISTS
 -----------------------
-A. SliceRecord
-
-    path       : path to one image file
-    label      : 0 or 1, carried as metadata only during frozen inference
-    patient_id : Directory_* identifier
-    series_id  : patient-scoped folder proxy
-
-B. SliceDataset item
-
-    raw       : [1, 256, 256] retained uint8 intensity divided by 255
-    monai     : [1, 256, 256] min-max view for the MONAI segmenter
-    content   : [1, 256, 256] mask of retained content versus canvas padding
-    metadata  : compact acquisition/export proxy vector
-    label     : scalar patient label, never passed to MONAI or EfficientNet
-    patient_id, series_id, decoded-pixel hash, perceptual hash
-
-C. MONAI output
-
-    logits             : [B, 4, 256, 256]
-    heart probability  : sum of LV blood-pool, LV myocardium, and RV channels
-    valid gate          : one Boolean per slice
-    exact support       : [B, 1, 256, 256]
-
-D. Four exact matched image views
-
-    cardiac             : MRI intensity visible only inside exact support
-    support_only        : exact support without MRI intensity
-    shuffled_intensity  : exact support + exact intensity multiset, shuffled
-    outside_support     : independently scaled exact support complement
-
-E. EfficientNet output
-
-    one frozen 1,280-dimensional embedding per slice and view
-
-F. Series cache
-
-    one mean embedding per series proxy and view, plus metadata and slice count
-
-G. Patient representation
-
-    equal mean across the patient's series-proxy means
-
-FROZEN VERSUS FITTED COMPONENTS
--------------------------------
-Frozen and label-independent:
-
-* dark-border detection and fixed-canvas geometry;
-* pinned MONAI ventricular segmenter;
-* exact support construction;
-* matched control construction;
-* ImageNet EfficientNet-B0 encoder;
-* decoded-pixel and perceptual hashing;
-* slice-to-series and series-to-patient mean rules;
-* fixed random projection used only to compact nuisance features.
-
-Fitted separately inside training partitions:
-
-* StandardScaler objects;
-* PCA for cardiac representations;
-* PCA for nuisance representations;
-* ridge coefficients used by nuisance residualization;
-* Logistic Regression coefficients;
-* the custom confounder-guard coefficients;
-* hyperparameters selected by inner cross-validation;
-* the operating threshold selected from inner out-of-fold scores.
-
-Validation-patient labels never fit preprocessing, nuisance removal,
-classification, hyperparameter selection, or threshold selection.
-
-COMPUTATIONAL SIMPLIFICATION
-----------------------------
-The full audit conceptually stores:
-
-    63,425 slices x 32 views x 1,280 features
-
-This file stores approximately:
-
-    2,859 series proxies x 4 views x 1,280 features
-
-For mean-based hierarchical pooling, online accumulation is algebraically exact:
-
-    series_mean = (1 / n_s) * sum_i embedding(slice_i)
-
-No label is used in this compression.  The reduction primarily saves disk space
-and makes the data flow easier to explain.
-
-CUSTOM ALGORITHM A — FOLD-LOCAL NUISANCE PROJECTION
----------------------------------------------------
-Inputs:
-
-    X : patient cardiac embedding matrix
-    Z : nuisance matrix built from support-only features, outside-support
-        features, acquisition/export metadata, series count, and slice count
-    y : patient labels
-
-Inside each training fold:
-
-1. Standardize and compress Z using training patients only.
-2. Center X using the training mean.
-3. Solve the ridge problem
-
-       B* = argmin_B ||X_c - Z_c B||_F^2 + alpha ||B||_F^2
-
-4. Use the closed-form solution
-
-       B* = (Z_c^T Z_c + alpha I)^(-1) Z_c^T X_c
-
-5. Remove the predictable nuisance component
-
-       X_clean = X_c - Z_c B*
-
-6. Fit the ordinary compact PCA + Logistic Regression model to X_clean.
-
-Why it may help:
-A cardiac embedding dimension may respond to both myocardial texture and JPEG
-export geometry.  If the export-related part is predictable from Z, the ridge
-projection removes it while retaining unexplained cardiac variation.
-
-Main risk:
-A nuisance variable can contain real biological signal or can be causally linked
-to clinical workflow.  Projection may remove legitimate information.  The
-method is therefore a sensitivity analysis, not a causal guarantee.
-
-CUSTOM ALGORITHM B — WORST-CASE LINEAR CONFOUNDER GUARD
--------------------------------------------------------
-Let
-
-    s = Xw + b
-
-be the patient score and let Z contain centered nuisance axes.  The model solves
-
-    min_(w,b) logistic_loss(y, s)
-              + lambda * max_(||a||_2 <= 1) Cov(s, Za)^2
-              + (gamma / 2) ||w||_2^2.
-
-The inner adversarial maximum has the closed form
-
-    max_(||a||_2 <= 1) Cov(s, Za)^2
-      = || Z^T (s - mean(s)) / n ||_2^2.
-
-Therefore no second adversarial neural network is needed.  The code optimizes
-one differentiable objective with explicit gradients and backtracking line
-search.
-
-Conceptual interpretation:
-
-* the predictor minimizes classification error;
-* an implicit adversary finds the strongest linear nuisance direction;
-* the covariance penalty makes scores expensive when that adversary can align
-  them with acquisition or support-derived features.
-
-Why it may help:
-Unlike hard residualization, the model may retain a feature direction when it is
-important for the label, while paying a penalty only when the final decision
-score remains strongly aligned with nuisance axes.
-
-Main risk:
-Only linear score dependence is penalized.  Nonlinear confounding can remain.
-The 30-patient sample is too small to justify a high-capacity adversarial neural
-network as the principal method.
-
-CUSTOM ALGORITHM C — CONSERVATIVE BAYESIAN-STYLE SERIES FUSION
---------------------------------------------------------------
-A simple patient mean can dilute a focal signal found in a few informative
-series.  A literal product of hundreds of series probabilities is also invalid
-because those series are correlated and would create extreme overconfidence.
-
-The classifier is trained on one mean embedding per training patient.  The same
-decision function then scores each validation series.  For series s:
-
-    reliability r_s = n_s / (n_s + tau)
-
-where n_s is the slice count.  Patient evidence is combined as
-
-    logit(p_patient) = logit(prior)
-                       + sum_s r_s [logit(p_s) - logit(prior)] / sum_s r_s.
-
-The prior is estimated from the outer-training cohort only.
-
-Important consequence:
-Duplicating identical series evidence does not multiply certainty without bound,
-because evidence is averaged rather than naively multiplied.
-
-Main risk:
-A classifier trained on patient means may produce noisy series-level scores.
-This method is experimental, not the default clinical interpretation.
-
-OPTIONAL FUTURE ALGORITHM D — SIMULATED-ANNEALING POOLING SEARCH
----------------------------------------------------------------
-This method is documented but intentionally not enabled in the seven-method
-panel.  A small pooling state could combine mean, top-quartile, and maximum
-series evidence:
-
-    w = (w_mean, w_top25, w_max),  w_i >= 0,  sum_i w_i = 1.
-
-A fold-local objective could be
-
-    J(w) = AUC_inner(w) - beta * max(0, nuisance_R2(w)).
-
-A neighboring state transfers a small amount of weight between two coordinates.
-Simulated annealing may accept a temporarily worse state with probability
-
-    exp((J_new - J_old) / T).
-
-This must be searched only inside inner cross-validation.  Searching many
-pooling rules on all 30 labels would recreate the multiple-comparison problem
-the simplified pipeline is designed to avoid.
-
-OPTIONAL FUTURE ALGORITHM E — CONFOUNDER-MATCHED k-NEAREST NEIGHBORS
--------------------------------------------------------------------
-A diagnostic k-nearest-neighbor adaptation could compare a validation patient
-only with training patients that are close in nuisance space, then vote using
-cardiac-space distance.  One possible combined distance is
-
-    d(i,j) = ||x_i - x_j||_2^2 + eta ||z_i - z_j||_2^2,
-
-with a hard nuisance-distance eligibility threshold.
-
-With only 30 patients, this should remain a diagnostic of whether discrimination
-survives acquisition-style matching, not the principal model.
-
-RELATION TO CS50'S INTRODUCTION TO ARTIFICIAL INTELLIGENCE WITH PYTHON
----------------------------------------------------------------------
-The code does not copy course assignments.  It adapts central ideas to a new
-medical-imaging research problem:
-
-* Search and data structures:
-  a BK-tree performs complete Hamming-radius search for perceptual-hash
-  duplicate candidates.
-
-* Minimax:
-  the confounder guard treats the strongest linear nuisance direction as an
-  adversary to the disease predictor.
-
-* Uncertainty:
-  Bayesian-style fusion combines prior-relative series evidence without assuming
-  hundreds of correlated series are independent.
-
-* Optimization:
-  explicit objective functions, hyperparameter search, gradient descent, and
-  backtracking line search are implemented directly.
-
-* Learning:
-  all supervised fitting occurs at patient level with strict train/test
-  separation.
-
-* Neural networks:
-  MONAI and EfficientNet are frozen representation functions because only 30
-  labeled patients are available.
-
-Official course notes used as conceptual references:
-
-    https://cs50.harvard.edu/ai/notes/0/  search and minimax
-    https://cs50.harvard.edu/ai/notes/2/  uncertainty and Bayesian networks
-    https://cs50.harvard.edu/ai/notes/3/  optimization
-    https://cs50.harvard.edu/ai/notes/4/  learning
-    https://cs50.harvard.edu/ai/notes/5/  neural networks and gradient descent
-
-DUPLICATE AUDIT
----------------
-Exact decoded-pixel SHA-256 hashes are computed during feature extraction.
-Confirmed cross-patient exact duplicates can stop the run before evaluation.
-
-A 64-bit DCT perceptual hash and a BK-tree provide a complete radius search for
-near-duplicate screening candidates.  A close perceptual hash is not proof that
-two images are duplicates.  The output must be manually reviewed before using
-perceptual candidates to alter fold grouping.
-
-EVALUATION DESIGN
------------------
-The outer loop estimates patient-level generalization within the released
-cohort.  The inner loop selects model hyperparameters and the operating
-threshold.  Every patient receives exactly one outer out-of-fold score per run.
-
-Repeated cross-validation changes the patient split seed and is used to examine
-ranking stability.  Repeated runs reuse the same 30 patients; they are
-sensitivity analyses, not independent validation cohorts.
-
-The summary is ranked by repeated-CV median AUROC rather than by one favorable
-split.
-
-NUISANCE-SCORE R-SQUARED
-------------------------
-For each model, the pipeline asks how well nuisance variables can reconstruct
-the model's out-of-fold score.  A fold-local Ridge model predicts the score from
-nuisance features only:
-
-    nuisance_score_R2 = 1 - SSE / SST.
-
-Interpretation:
-
-* high positive R2: model score is substantially predictable from nuisance;
-* near zero: little linear out-of-fold reconstructability;
-* negative: nuisance prediction generalizes worse than predicting the mean.
-
-This diagnostic measures modeled linear dependence; it is not proof of causal
-independence.
-
-HOW TO JUDGE SUCCESS
---------------------
-A custom method is promising only if both conditions are considered:
-
-1. repeated-CV AUROC is preserved or improved relative to BASELINE_A17;
-2. nuisance_score_R2 decreases.
-
-A high AUROC with unchanged or increased nuisance predictability is not evidence
-that confounding has been solved.
-
-The most important comparisons are:
-
-    BASELINE_A17 - CONTROL_SUPPORT_ONLY
-    BASELINE_A17 - CONTROL_SHUFFLED_INTENSITY
-    BASELINE_A17 - CONTROL_OUTSIDE_SUPPORT
-    CUSTOM_NUISANCE_PROJECTION - BASELINE_A17
-    CUSTOM_MINIMAX_CONFOUNDER_GUARD - BASELINE_A17
-    CUSTOM_BAYESIAN_SERIES_FUSION - BASELINE_A17
-
-A method that slightly lowers AUROC while sharply reducing nuisance dependence
-may be scientifically more valuable than a method that maximizes AUROC alone.
-
-PORTABLE DATASET AND OUTPUT PATH RESOLUTION
+The user supplied a previous compact-pipeline run with:
+    BASELINE_A17: main AUROC 0.9732, repeated median 0.9621;
+    guarded custom logistic: main AUROC 0.9509, repeated median 0.9643;
+    full nuisance projection: repeated median 0.7567;
+    outside-support control: repeated median 0.8281.
+These are HISTORICAL observations, not results generated by this revision.
+
+The earlier audit found several issues that this revision addresses explicitly:
+* The compact pipeline counted 2,879 series proxies, versus 2,859 in earlier
+  full-suite logs. Immediate-parent grouping can split nested folders differently.
+  Both grouping policies are now enumerated and saved, not silently conflated.
+* The console combined repeated median AUROC with a single main-run nuisance R2.
+  Every repetition now computes and saves its own nuisance diagnostics.
+* The old nuisance probe trained on global outer-OOF score targets. Generators of
+  those targets could have trained on the current probe's held-out patients.
+  New probes use ONLY score targets generated within the current outer training.
+* A guarded result could select lambda=0 and therefore contain no nuisance penalty.
+  A separate no-guard ablation now fixes lambda=0; guard candidates are positive.
+* Full residualization could remove genuine biological information along with
+  nuisance. rho now selects partial removal, and export metadata are separated
+  from potentially anatomical control representations.
+* The purported Bayesian prior canceled algebraically in the fusion formula.
+  Fusion is now honestly named reliability-weighted logit pooling, with no prior.
+* Larger tau increased relative long-series weight, contrary to the old comment.
+  The corrected tie-break prefers SMALLER tau and includes tau=0 (equal pooling).
+
+Reusing the same explored patients after changing a protocol is an internal
+sensitivity experiment, NOT independent prospective validation. Changes to series
+membership and training/evaluation rules also mean that differences from the
+old run cannot be attributed to one mathematical modification in isolation.
+
+EIGHT EXPERIMENTS, FOUR FROZEN IMAGE VIEWS
+----------------------------------------
+1. BASELINE_A17
+   Compact A17-like hard-support cardiac intensity reference. Its preprocessing
+   and capped PCA are preserved from the compact script, not claimed to be a
+   bit-identical reproduction of the much larger historical full-suite A17.
+2. CONTROL_SUPPORT_ONLY
+   Exact binary support used by the reference, without original MRI intensities.
+3. CONTROL_SHUFFLED_INTENSITY
+   Same support and same normalized intensity multiset, with deterministic affine
+   permutation of visible pixel ranks. This is a spatial perturbation, not a
+   uniformly sampled random permutation or proof that every spatial cue is gone.
+4. CONTROL_OUTSIDE_SUPPORT
+   Exact retained-content complement of the support, independently normalized.
+5. CUSTOM_NUISANCE_PROJECTION
+   Ridge residualization with selected partial-removal fraction rho in [0,1].
+6. CUSTOM_LOGISTIC_NO_GUARD
+   The SAME custom optimizer and L2 grid as experiment 7, with lambda fixed to 0.
+7. CUSTOM_MINIMAX_CONFOUNDER_GUARD
+   Custom logistic objective plus a strictly positive linear covariance penalty.
+8. CUSTOM_RELIABILITY_WEIGHTED_LOGIT_FUSION
+   Patient training and inference both use reliability-weighted series pooling.
+
+Only four image representations are encoded. All extra mathematical experiments
+reuse the same frozen series bank. No large architecture sweep is performed.
+The ordinary reference still uses scikit-learn's liblinear logistic regression;
+it is NOT a solver-matched ablation for the custom optimizer. Experiment 6 is.
+Both custom variants share the same hyperparameter selection procedure; L2 may
+still be selected differently, and all selected values are saved.
+
+DATASET CONTRACT AND SERIES GROUPING
+-----------------------------------
+Input root:
+    Normal/Directory_*/.../image.jpg
+    Sick/Directory_*/.../image.jpg
+
+patient_id = Directory_*; labels are 0 for Normal and 1 for Sick. A Directory_*
+identifier cannot appear in both classes. Empty patients and unreadable images
+raise explicit errors instead of silently changing the cohort.
+
+Default MAIN_SERIES_GROUPING = "patient_child":
+    Directory_1/SR_1/subfolder/image.jpg -> Directory_1/SR_1
+Every descendant of one immediate child of a patient is collected into one
+folder-defined proxy. Images directly under a patient form __ROOT__. This is the
+rule in the available historical full-suite source.
+
+Sensitivity option MAIN_SERIES_GROUPING = "immediate_parent":
+    Directory_1/SR_1/subfolder/image.jpg -> Directory_1/SR_1/subfolder
+This reproduces the previous compact grouping rule. It is not selected by AUC.
+
+The pipeline saves both assignments for every image and both per-patient counts.
+It does NOT force the total to 2,859 or 2,879. Exact attribution of the historical
+20-series difference requires the actual manifests, not just previous totals.
+Neither series rule recovers a validated DICOM SeriesInstanceUID, view, sequence,
+cardiac phase, or acquisition protocol from a folder name.
+
+FROZEN IMAGE PIPELINE AND SHAPE TRACE
+-----------------------------------
+    JPEG -> grayscale pixels
+         -> conservative label-blind dark-border removal
+         -> fixed-content 240-in-256 canvas, preserving aspect ratio
+         -> raw uint8/255 view, separate min-max MONAI view, content mask
+         -> frozen pinned MONAI segmenter
+         -> hard foreground mask and plausibility gate
+         -> fixed dilations OR fixed central fallback
+         -> intersection with content mask = one exact final support
+         -> four matched views -> ImageNet normalization -> frozen EfficientNet
+         -> 1,280-dimensional embedding per slice
+         -> streaming exact mean per series -> equal mean per patient
+         -> fold-local learning and nested patient cross-validation
+
+Relevant tensors:
+    raw/min-max/content views       [B, 1, 256, 256]
+    MONAI logits                    [B, 4, 256, 256]
+    hard support                    [B, 1, 256, 256]
+    four RGB-copy views             each [B, 3, 256, 256]
+    aligned EfficientNet inputs     each [B, 3, 224, 224]
+    slice embeddings                [B, 1280]
+    each series feature matrix      [n_series, 1280]
+    each patient feature matrix     [n_patients, 1280]
+
+MONAI ventricular_short_axis_3label is pinned by repository revision and SHA-256.
+Its classes are background, LV blood pool, LV myocardium, and RV blood pool.
+It is a short-axis ventricular segmenter, not a validated whole-heart segmenter
+for every sequence/view in this heterogeneous dataset. The plausibility gate
+is an engineering safeguard, not clinically validated segmentation quality.
+The exact support complement can contain atria, vessels, or missed heart tissue.
+
+EfficientNet-B0 uses an explicit IMAGENET1K_V1 checkpoint with the ImageNet head
+removed. MONAI and EfficientNet are frozen/evaluation-only. Neither sees outcome
+labels. This is operationally end-to-end from files to scores, not joint neural
+end-to-end training. No claim is made that ImageNet textures are cardiac-specific.
+
+REGIONAL NORMALIZATION AND CONTROL CONTRACT
 -------------------------------------------
-The same source file runs in Kaggle, Colab/Jupyter, Windows, Linux, or macOS.
-The entry point intentionally does NOT parse ``sys.argv``.  Notebook kernels
-usually inject internal arguments such as ``-f <kernel.json>``; ignoring command-
-line arguments prevents those kernel parameters from reaching a command-line
-parser and raising ``SystemExit: 2``.
+The visible region defines the robust percentiles, not the full image. For a
+fixed support, changing hidden outside pixels cannot affect normalized cardiac
+pixels; changing hidden inside pixels cannot affect the complement's scaling.
+This statement CONDITIONS ON A FIXED SUPPORT. Recomputing segmentation after
+changing an image could change support location or shape and thus the output.
 
-Runtime paths are resolved before the expensive neural-network stage by the
-following fixed priority:
+A fixed masked histogram approximates the 1st/99th percentiles. A minimum range
+avoids extreme amplification of low-contrast regions. Tiny/constant visible
+regions can produce zero images. Their frequency is not proof of pathology.
+Support-only retains geometry, and the spatial shuffle retains intensity values
+and mask geometry. These controls can themselves contain anatomy and protocol
+information; they are not all purely non-anatomical negatives.
 
-Dataset root:
+SERIES CACHE AND MEAN POOLING
+----------------------------
+For series s with n_s slices and embeddings e_i:
+    mu_s = sum_i e_i / n_s.
+For patient p with S_p series, by default:
+    x_p = sum_s mu_s / S_p.
+Streaming float64 sums followed by float32 means reproduce this aggregation up
+to floating-point rounding without retaining every slice embedding in RAM.
+A long series does not receive more patient-level mass merely because it has
+more exported frames. Each series proxy still contributes equally, so changing
+proxy boundaries changes the patient representation.
 
-    1. optional source-code constant ``MAIN_DATASET_PATH_OVERRIDE``;
-    2. ``CAD_MRI_DATASET_PATH`` environment variable;
-    3. ``CAD_DATASET_PATH`` compatibility environment variable;
-    4. exact Kaggle paths used by this project;
-    5. a bounded search below ``/kaggle/input`` for a directory containing both
-       ``Normal/`` and ``Sick/``;
-    6. the validated Windows path used by the full V6 suite;
-    7. common dataset folder names beside the script, in the current working
-       directory, or in their ``datasets/`` subfolders.
+A new cache schema includes the grouping policy AND every image's patient/series
+assignment, as well as feature settings and file size/mtime. It is a practical
+cache identity, not a byte-for-byte digest of all source images before decoding.
+Confirmed decoded-pixel duplicates are audited during extraction. Cache hits
+also validate the current manifest and enforce the stored duplicate policy.
+Changing only classifier grids/repeats does not force repeated neural inference.
+Changing series membership does: old compact caches are not silently relabeled.
 
-Output directory:
+A unique run folder holds reports. A sibling feature_cache directory is reused.
+This prevents old seven-experiment outputs from masquerading as current results.
 
-    1. optional source-code constant ``MAIN_OUTPUT_DIR_OVERRIDE``;
-    2. ``CAD_MRI_OUTPUT_DIR`` environment variable;
-    3. ``CAD_OUTPUT_DIR`` compatibility environment variable;
-    4. ``/kaggle/working/cad_mri_university_showcase`` on Kaggle;
-    5. ``cad_mri_university_showcase_outputs`` beside the script locally, or in
-       the current working directory when the script directory is not writable.
+OPTIONAL MANUALLY REVIEWED SEQUENCE/VIEW ANALYSIS
+----------------------------------------------
+The pipeline always writes a CSV template containing series IDs and empty review
+fields. Supply a completed CSV through MAIN_SERIES_ANNOTATION_PATH or the
+CAD_SERIES_ANNOTATION_CSV environment variable. Required fields are:
+    series_id, sequence_type, view_type, contains_heart,
+    is_localizer, is_derived_export.
 
-An explicitly supplied source-code or environment path is strict: if it does not
-lead to a directory containing both ``Normal/`` and ``Sick/``, the script stops
-with a detailed error instead of silently using another dataset.
+Only explicitly cardiac, non-localizer, non-derived reviewed rows are eligible.
+Unknown/duplicate series IDs fail instead of silently mapping old-grouping rows.
+Blank review fields remain unreviewed. To avoid label-driven matching, retain
+only sequence/view cells present in EVERY patient. If no common reviewed cell
+exists, the optional controlled run stops with an explicit report; no patient is
+automatically dropped to make the result look stronger. Ordinary runs without
+annotations record SKIPPED_NO_ANNOTATIONS and continue.
 
-KAGGLE — NORMAL RUN WITHOUT MANUAL ARGUMENTS
------------------------------------------------
-Attach the public dataset:
+Annotated pooling is:
+    slice -> series -> equal mean within sequence/view cell -> equal cell mean.
+The reliability method uses the same equal-cell policy, with its weights applied
+only within a cell. The template omits outcome labels, but patient IDs/paths may
+still reveal provenance; it is not claimed to be a fully blinded clinical review.
+Nominal cell matching does not certify identical scanner or acquisition settings.
 
-    danialsharifrazi/cad-cardiac-mri-dataset
+SEPARATE NUISANCE BLOCKS
+-----------------------
+export:
+    native height, width, aspect ratio, bytes per pixel, crop/content fractions,
+    number of series and slices, mean/max series length.
+anatomy_proxy:
+    fixed random projections of support-only and outside-support embeddings,
+    MONAI-valid fraction, support-area fraction.
+combined:
+    both groups, retained for comparison with the old diagnostic concept.
 
-Install the lightweight dependency if it is not already present:
+The random projections use a fixed seed and learn nothing from labels or cohort
+values. All subsequent learned scaling/PCA/regression remains fold-local.
+The default training penalty uses ONLY export metadata. The anatomy_proxy group
+is audited separately because it can contain genuine biology. No block is a
+certified causal confounder set: acquisition and biology can be correlated.
+For an explicitly labeled sensitivity run, regularization_nuisance_scope may be
+changed to anatomy_proxy or combined. It is not tuned using outer-test metrics.
 
-    !pip -q install huggingface_hub
+CUSTOM MATHEMATICS 1 — PARTIAL FOLD-LOCAL RIDGE RESIDUALIZATION
+------------------------------------------------------------
+For centered cardiac X_c and training-encoded nuisance Z_c, estimate:
+    B = argmin_B ||X_c - Z_c B||_F^2 + alpha ||B||_F^2
+      = solve(Z_c^T Z_c + alpha I, Z_c^T X_c).
+Then transform:
+    X_clean = X_c - rho Z_c B,        0 <= rho <= 1.
 
-Then execute the source file directly, without command-line arguments:
+rho=0 removes nothing; rho=1 is full residualization. alpha shrinks the nuisance
+regression coefficients and is NOT itself the fraction of information removed.
+Means, scalers, PCA axes and B are fitted on training patients only. Validation
+uses the frozen subtraction. At rho=0, only centering remains; the downstream
+training scaler absorbs that constant shift, apart from numerical roundoff.
 
-    %run /kaggle/input/YOUR-CODE-DATASET/cad_mri_university_showcase.py
+rho and alpha are selected inside inner CV. AUC is protected by a predeclared
+near-best frontier, then nuisance score predictability can break near-ties.
+Removing information predictable from Z can remove true disease-related signal.
+Neither ridge algebra nor a low surrogate R2 proves causal deconfounding.
 
-or:
+CUSTOM MATHEMATICS 2 — LINEAR NUISANCE GUARD WITH MATCHED ABLATION
+---------------------------------------------------------------
+Let s = Xw+b, and Z_c be centered fold-local nuisance coordinates. The loss is:
+    balanced logistic loss(y,s)
+    + lambda || Z_c^T (s-mean(s)) / n ||_2^2
+    + (l2/2) ||w||_2^2.
 
-    !python /kaggle/input/YOUR-CODE-DATASET/cad_mri_university_showcase.py
+For covariance vector c = Z_c^T(s-mean(s))/n:
+    max_{||a||_2 <= 1} Cov(s, Z_c a)^2 = ||c||_2^2.
+Thus the penalty controls the strongest linear nuisance direction under the
+chosen coordinate norm. Scaling of Z matters; nonlinear dependence is not
+constrained. PCA coordinates are not automatically a causal invariant space.
 
-The script recognizes both common Kaggle mount forms:
+The code implements balanced weights, analytical gradients, batch gradient
+descent, and Armijo backtracking. Centering Z explicitly makes the gradient valid
+for noncentered numerical inputs too. Accepted losses and iteration counts are
+recorded; reaching the iteration cap is not claimed to be a proven optimum.
 
-    /kaggle/input/datasets/danialsharifrazi/cad-cardiac-mri-dataset
-    /kaggle/input/cad-cardiac-mri-dataset
+CUSTOM_LOGISTIC_NO_GUARD uses lambda=0, the SAME optimizer/L2 grid/preprocessing
+and inner selection rule as the guarded experiment. The guarded grid contains
+only positive values. L2 can still be selected differently in the two families;
+inspect saved parameters rather than attributing every difference solely to one
+coefficient. The sklearn baseline uses liblinear, whose intercept regularization
+also differs from this custom implementation.
 
-It also performs a small bounded search below ``/kaggle/input`` so a renamed
-Kaggle dataset slug can still be found from the required ``Normal/`` and
-``Sick/`` directory contract.
+CUSTOM MATHEMATICS 3 — RELIABILITY-WEIGHTED LOGIT POOLING
+------------------------------------------------------
+For raw per-series classifier logits l_s and lengths n_s:
+    r_s = n_s / (n_s + tau),
+    l_patient = sum_s r_s l_s / sum_s r_s,
+    score = sigmoid(l_patient).
 
-LOCAL — AUTOMATIC OR EXPLICIT SOURCE-CODE OVERRIDE
---------------------------------------------------
-The validated V6 local default remains:
+The old prior-relative expression simplifies exactly:
+    l_prior + sum_s r_s(l_s-l_prior)/sum_s r_s
+      = sum_s r_s l_s / sum_s r_s.
+There is therefore no prior correction. The old Bayesian name has been removed.
+For affine scaler/PCA/linear classification, averaging raw logits is equivalent
+to classifying the identically weighted embedding mean. The implementation uses
+that equivalent pooling at BOTH training and inference. It avoids the old train/
+test aggregation mismatch and avoids inverse-logit clipping of probabilities.
 
-    C:\F\_Develop\AI\Datasets\CAD Cardiac MRI Dataset
+At tau=0 all series have equal weight. As tau grows, relative preference for long
+series increases; for very large tau the weights become approximately proportional
+to n_s. Ties prefer SMALLER tau. Counts can themselves encode export confounding.
+Duplicating all series equally preserves normalized weights; duplicating just one
+series can change its influence. This is not an exact-deduplication algorithm.
 
-The script also checks common relative locations such as:
+NESTED SELECTION AND NUISANCE AUDIT: THE LEAKAGE BOUNDARY
+------------------------------------------------------
+For every outer split:
+    outer-training patients T           held-out patients V
+      -> inner candidate evaluation       never used for fitting/selection
+      -> choose hyperparameters
+      -> choose threshold on inner OOF
+      -> fit predictor on all T
+      -> predict disease score on V
 
-    ./CAD Cardiac MRI Dataset
-    ./cad-cardiac-mri-dataset
-    ./datasets/CAD Cardiac MRI Dataset
-    ./datasets/cad-cardiac-mri-dataset
+For candidate selection:
+1. Evaluate all predeclared hyperparameter settings on identical inner folds.
+2. Retain settings within auc_tolerance (default 0.01) of best inner AUROC.
+3. For residualization and BOTH custom logistic variants, optionally score
+   nuisance predictability on this frontier with an extra training-local crossfit.
+4. Prefer lower nonnegative nuisance prediction skill, within a fixed tolerance.
+   Negative skill receives no extra reward. Use conservative parameter ties.
+5. Baseline, control, and reliability grids use AUC plus parameter tie-breaking.
 
-For another location, edit the small MAIN EXECUTION SETTINGS block near the
-configuration section:
+The extra inner nuisance evaluation is nested as follows:
+    split T into A and B (inner training and validation)
+    generate fixed-parameter OOF scores ONLY inside A
+    fit nuisance(A) -> those scores
+    predict the candidate's scores on B
+All target-generating models exclude B, and the entire operation excludes V.
+The additional targets hold the candidate parameters fixed; they do not perform
+an unbounded recursive hyperparameter search.
 
-    MAIN_DATASET_PATH_OVERRIDE = r"D:\Datasets\CAD Cardiac MRI Dataset"
-    MAIN_OUTPUT_DIR_OVERRIDE = r"D:\Results\cad_mri_university_showcase"
+For the FINAL outer nuisance diagnostic:
+    chosen inner OOF scores on T -> fit nuisance(T) -> training scores
+    apply this surrogate to nuisance(V)
+    compare its prediction to the predictor's actual scores on V.
+The surrogate never trains on global outer-OOF scores from other outer folds.
+Those other target-generating models may have trained on V, the flaw fixed here.
+Hyperparameters for these training targets were selected using T, which is
+allowed; no outer-test patient influenced that selection.
+
+The surrogate learns targets from smaller inner-trained models and is evaluated
+against scores of a larger outer-trained model. This distribution mismatch and
+small sample size can affect diagnostic R2. R2 is not a direct fraction of
+confounding or a proof of independence. Scoring scale/calibration matters too.
+
+R2, PREDICTIVE SKILL, AND REPEATED REPORTING
+-----------------------------------------
+Conventional score R2:
+    1 - sum_i (s_i - predicted_s_i)^2 / sum_i (s_i - mean(s))^2.
+Predictive score skill:
+    1 - sum_i (s_i - predicted_s_i)^2 / sum_i (s_i - reference_i)^2,
+where reference_i is the mean of training-only OOF targets in that outer fold.
+The latter never learns its reference from the held-out score distribution.
+
+For each nuisance block, component caps 3 and 5 are both evaluated and reported.
+The largest configured cap is the primary diagnostic, not the one that looks
+most favorable on test. This is a limited linear sensitivity analysis; nonlinear
+nuisance predictability and omitted confounders may remain. Undefined constant-
+target cases are reported as null, not fabricated finite R2 values.
+
+Negative R2 means the surrogate predicts worse than its constant reference; it
+does not mean negative dependence or that all confounding has been eliminated.
+The familiar nuisance_score_r2 field now aliases the combined primary-cap R2,
+but its training-local calculation is NOT numerically interchangeable with v1.
+
+Every repeated split recomputes AUROC, AUPRC, all R2 probes, and selected settings.
+Main-run metrics have explicit main_ prefixes in summary tables; repeated values
+have repeated_ prefixes. Parameters and per-patient probe predictions are saved
+for every seed, so lambda/rho/tau frequencies and failures can be inspected.
+Paired deltas are comparison minus reference on matching seeds. A difference of
+medians is not mislabeled as the median of paired differences. Repeats reuse the
+same patients and cannot be treated as independent samples for significance.
+
+DUPLICATES AND VALIDATION LIMITS
+--------------------------------
+Exact decoded-pixel hashes detect copied images across patients. By default such
+cross-patient exact duplicates stop evaluation. Perceptual hashes and a BK-tree
+screen visually similar pairs; similarity is not proof of identity. Manual
+review is needed before treating candidate matches as duplicate components.
+
+A patient bootstrap of fixed OOF predictions does not refit the entire training
+and selection process; its interval understates some sources of model uncertainty.
+No test here corrects all historical exploratory choices. No original DICOM
+metadata, clinical covariates, external cohort, or expert segmentation truth is
+invented. The outside support may contain heart tissue and real anatomy.
+A high outside-control AUC is evidence of dataset structure, not proof that all
+its signal is nonclinical. Penalizing a cardiac model's scores does not change the
+AUC of a separately trained outside classifier automatically.
+
+CS50 AI CONNECTION — CONCEPTUAL, NOT A CLAIM OF NEW INVENTION
+-----------------------------------------------------------
+Search: BK-tree metric search supports a complete pHash-radius audit.
+Optimization: explicit objectives, gradients, and backtracking expose the math.
+Minimax: the closed-form worst linear nuisance direction motivates the penalty;
+this is not the game-tree minimax algorithm copied into a classifier.
+Uncertainty: score fusion illustrates dependence and why multiplying correlated
+series probabilities can overstate evidence. The corrected fusion is not Bayesian.
+Learning: fixed pretrained representations plus supervised patient-level models.
+Neural networks: pretrained segmenter/encoder are frozen, not trained on 30 labels.
+
+Ridge projection, logistic regression, and covariance penalties are established
+ideas adapted for this project. Their implementation is personal work, but no
+claim of a newly discovered mathematical method is made. A convincing portfolio
+emphasizes a testable hypothesis, transparent negative controls, rejected ideas,
+implementation tests, and honest limitations instead of a chosen maximum AUC.
+
+Possible FUTURE methods, not executed by this script:
+* Simulated annealing over explicit reviewed sequence/view weights, with a
+  training-only objective combining AUROC and nuisance dependence. Every search
+  would have to remain nested and be evaluated on independent patients.
+* Nuisance-matched nearest-neighbor diagnostics to test whether cardiac rankings
+  remain informative among patients with similar acquisition/export features.
+These are proposals, not completed experiments or validated improvements.
+
+Primary references for concepts and API interpretation:
+    https://cs50.harvard.edu/ai/notes/0/
+    https://cs50.harvard.edu/ai/notes/2/
+    https://cs50.harvard.edu/ai/notes/3/
+    https://cs50.harvard.edu/ai/notes/4/
+    https://cs50.harvard.edu/ai/notes/5/
+    https://scikit-learn.org/stable/auto_examples/model_selection/plot_nested_cross_validation_iris.html
+    https://scikit-learn.org/stable/modules/generated/sklearn.metrics.r2_score.html
+    https://scikit-learn.org/stable/modules/generated/sklearn.linear_model.LogisticRegression.html
+
+HOW TO RUN: KAGGLE, COLAB, AND LOCAL PYTHON
+-----------------------------------------
+The file needs Python 3.10+ and compatible torch/torchvision, numpy, opencv-python,
+scikit-learn, tqdm, and huggingface_hub. The ordinary segmenter path loads the
+pinned TorchScript artifact and does not require importing MONAI Python itself.
+First-time pretrained-weight loading needs network access or prepopulated caches.
+
+main() has NO parameters and reads NO command-line arguments. Jupyter's injected
+-f kernel.json is ignored. Code pasted into a cell is supported: __file__ is not
+required; unavailable source path/hash is honestly recorded as null.
+
+Edit the MAIN_* constants instead of adding CLI flags:
+    MAIN_DATASET_PATH_OVERRIDE = None
+    MAIN_OUTPUT_DIR_OVERRIDE = None
     MAIN_BATCH_SIZE = 8
     MAIN_REPEATED_CV_RUNS = 20
+    MAIN_NUM_WORKERS = 0
+    MAIN_FORCE_REBUILD_CACHE = False
+    MAIN_USE_AMP = False
+    MAIN_CHECK_PATHS_ONLY = False
+    MAIN_SERIES_GROUPING = "patient_child"
+    MAIN_SERIES_ANNOTATION_PATH = None
+    MAIN_REGULARIZATION_NUISANCE_SCOPE = "export"
+    MAIN_AUDIT_COMPONENT_CAPS = (3, 5)
 
-Then run without arguments:
+Dataset override priority is source-code setting, environment variables
+CAD_MRI_DATASET_PATH / CAD_DATASET_PATH, known Kaggle paths, bounded Kaggle search,
+the historical local Windows path, then relative local candidates. A valid root
+must contain both Normal and Sick. An explicitly invalid override fails rather
+than silently selecting a different dataset.
 
-    python cad_mri_university_showcase.py
+Typical Kaggle root:
+    /kaggle/input/datasets/danialsharifrazi/cad-cardiac-mri-dataset
+Typical output root:
+    /kaggle/working/cad_mri_university_showcase
+Local dataset candidate:
+    C:\F\_Develop\AI\Datasets\CAD Cardiac MRI Dataset
 
-ENVIRONMENT-VARIABLE OVERRIDES
-------------------------------
-Environment variables are useful in IDEs, notebooks, containers, and scheduled
-runs:
-
-Windows PowerShell:
-
-    $env:CAD_MRI_DATASET_PATH = "D:\Datasets\CAD Cardiac MRI Dataset"
-    $env:CAD_MRI_OUTPUT_DIR = "D:\Results\cad_mri_university_showcase"
-    python cad_mri_university_showcase.py
-
-Linux/macOS:
-
-    export CAD_MRI_DATASET_PATH="$HOME/datasets/cad-cardiac-mri-dataset"
-    export CAD_MRI_OUTPUT_DIR="$HOME/results/cad_mri_university_showcase"
-    python cad_mri_university_showcase.py
-
-PATH-ONLY DIAGNOSTIC
---------------------
-Before starting a long run, set this source-code constant:
-
-    MAIN_CHECK_PATHS_ONLY = True
-
-and execute the file normally.  The script validates the paths, prints them,
-and exits before loading MONAI or decoding any image.  It prints:
-
-    [PATHS] Runtime environment: Kaggle or local
-    [PATHS] Dataset source: ...
-    [PATHS] Dataset root: ...
-    [PATHS] Output source: ...
-    [PATHS] Output directory: ...
-
-Explicit paths remain supported on Kaggle through the same source-code
-overrides or environment variables.  The default uses full-precision neural
-inference.  Set ``MAIN_USE_AMP = True`` only for a faster exploratory extraction.
-The first run downloads the pinned MONAI TorchScript artifact and EfficientNet-B0
-weights.  Later runs reuse model caches and the compact series feature bank stored
-below the selected output directory.
-
-EXPECTED FIRST-RUN WORK
------------------------
-The first run will:
-
-* discover the Directory_* patients;
-* download and verify the pinned MONAI artifact if absent;
-* load EfficientNet-B0 ImageNet weights;
-* decode every image;
-* build four exact matched representations;
-* store only series-level means;
-* perform exact and perceptual duplicate screening;
-* run the seven nested-CV experiments;
-* run repeated patient-level split sensitivity;
-* write machine-readable OOF, parameter, summary, and report files.
+Run the file normally or paste it into a notebook cell. For a file already added
+to a notebook's filesystem, %run /actual/path/cad_mri_university_showcase.py also
+works. To check paths without model loading, set MAIN_CHECK_PATHS_ONLY=True.
+Output must remain outside the input dataset to avoid contaminating discovery.
 
 MAIN OUTPUTS
-------------
-
+-------------
+output_root/feature_cache/
+    series_feature_bank_<fingerprint>.npz
+    series_feature_bank_<fingerprint>.json (includes duplicate audit)
+output_root/run_<timestamp>_<tag>/
     configuration.json
     run_metadata.json
+    series_grouping_manifest.csv
+    series_grouping_audit.json
+    series_annotation_template.csv
+    series_annotation_status.json
+    nuisance_design.json
     duplicate_audit.json
-    series_feature_bank_<fingerprint>.npz
-    series_feature_bank_<fingerprint>.json
-    experiment_summary.csv
+    oof_<experiment>.csv (includes predicted nuisance scores and references)
+    selected_params_<experiment>.json (all candidates and selected values)
+    metrics_<experiment>.json
+    repeated/seed_<seed>/ (the same OOF/parameter/metric files for every repeat)
     repeated_cv_results.csv
-    oof_<experiment>.csv
-    selected_params_<experiment>.json
+    selected_params_all_runs.csv
+    selected_parameter_frequencies.json
+    experiment_summary.csv
+    paired_comparisons.json
     final_report.json
 
-experiment_summary.csv is ranked by repeated-CV median AUROC.
+INTERPRETATION ORDER
+--------------------
+Start with patient/series counts and the grouping audit. Check annotation status
+and duplicate findings. Compare cardiac versus support/shuffle/outside controls.
+Then compare guarded versus matched no-guard custom logistic on the SAME seeds:
+look jointly at paired AUROC and nuisance-R2 changes, parameter frequencies, and
+optimizer iteration caps. Inspect both export and anatomy-proxy audits and both
+component caps. A slight AUROC gain without reduced dependence is not successful
+deconfounding; a large R2 drop accompanied by collapsed AUROC is not a useful
+classifier. Finally require protocol-controlled and independent-cohort evidence
+before making claims about disease specificity or generalization.
 
-SUGGESTED UNIVERSITY-APPLICATION PROJECT NARRATIVE
---------------------------------------------------
-One-sentence description:
-
-    I built a patient-level cardiac MRI classifier, discovered that its high
-    performance was partly reproducible from non-cardiac and segmentation-derived
-    shortcuts, and redesigned the project around exact matched controls and
-    custom mathematical deconfounding.
-
-Intellectual turning point:
-The first model appeared successful because its patient-level AUROC was high.
-Instead of stopping, I asked whether the model could classify patients when the
-heart was removed, when only the support mask remained, or when intensities were
-spatially shuffled.  Several controls remained predictive.  That changed the
-project from model optimization into an investigation of shortcut learning and
-scientific validity.
-
-Personal implementation highlights:
-
-* patient-level grouping and nested cross-validation;
-* pinned MONAI segmentation;
-* exact matched image controls;
-* compact series-level feature caching;
-* decoded-pixel hashing and BK-tree near-duplicate screening;
-* fold-local nuisance residualization using ridge linear algebra;
-* a minimax-inspired logistic objective optimized from scratch;
-* Bayesian-style series evidence fusion;
-* repeated split analysis and nuisance-predictability diagnostics.
-
-Strongest mathematical contribution:
-Rather than training a large adversarial network on 30 patients, derive the
-strongest linear nuisance direction in closed form and penalize its covariance
-with the classifier score.  This keeps the method interpretable and appropriate
-for the sample size.
-
-Honest result statement:
-The project can demonstrate robust internal association with the released
-Normal/Sick labels and test whether spatial cardiac information contributes
-beyond exact controls.  It does not, by itself, establish clinical CAD diagnosis.
-Protocol/export confounding, sequence/view matching, and external validation
-remain decisive.
-
-Why the project matters:
-In high-stakes AI, accuracy is insufficient when a model can be right for the
-wrong reason.  The contribution is the experimental framework that makes the
-source of predictive information testable.
-
-RECOMMENDED PRESENTATION ORDER
-------------------------------
-Because this file embeds the complete explanation, a repository can be presented
-in a compact order:
-
-1. cad_mri_university_showcase.py
-2. a results folder from a complete Kaggle run
-3. an archival link to the full 58-experiment audit
-4. optional figures or a concise research report
-
-The strongest narrative is not simply "I obtained AUROC 0.97."  It is:
-
-    I challenged an apparently successful medical AI result, designed controls
-    that exposed shortcut signals, and developed interpretable mathematical
-    methods to test and reduce those dependencies.
-
-SCIENTIFIC LIMITATIONS
-----------------------
-* The effective labeled sample size is 30 patients.
-* Repeated splits reuse the same patients and are not external cohorts.
-* The MONAI model is short-axis-specific, while the JPEG release is heterogeneous.
-* Folder-defined series are proxies, not verified DICOM series identifiers.
-* The Normal/Sick endpoint does not identify which pixels represent coronary
-  pathology.
-* Support geometry can contain true anatomy and protocol information at the same
-  time.
-* Nuisance projection and covariance penalties remove only modeled linear
-  dependence.
-* A high negative-control AUROC means unresolved dataset structure remains.
-* Model outputs are research scores, not calibrated clinical probabilities.
-* Manually verified sequence/view matching remains important.
-* Independent external validation is required before a clinical claim.
-
-REPRODUCIBILITY AND ARTIFACT INTEGRITY
---------------------------------------
-* The MONAI repository revision is pinned.
-* The MONAI TorchScript SHA-256 is verified before inference.
-* EfficientNet uses an explicit ImageNet weight enum.
-* Configuration and software versions are written to JSON.
-* Feature-affecting settings and the file manifest determine the cache fingerprint.
-* Exact decoded-pixel hashes are computed during extraction.
-* Random seeds are explicit, while the code does not overclaim bitwise identity
-  across every hardware and library combination.
-
-LOCAL VALIDATION EXPECTATIONS
------------------------------
-Before distribution, the source should pass:
-
-* Python compilation;
-* module import;
-* configuration validation;
-* command-line --help;
-* exact support/complement separation tests;
-* shuffled-intensity multiset preservation;
-* deterministic affine-permutation tests;
-* nuisance-residualization sanity tests;
-* confounder-guard loss-decrease tests;
-* bounded Bayesian-fusion tests;
-* all seven nested-CV paths on synthetic patient data;
-* report-writing tests.
-
-Passing those checks validates program structure and mathematical contracts.  It
-does not replace a complete run on the public dataset with the real MONAI and
-EfficientNet models.
-
-CURRENT ARTIFACT VALIDATION
+LOCAL TESTS VERSUS REAL DATA
 ---------------------------
-The university-generic, self-contained source delivered with this project was
-checked after documentation integration:
-
-* Python compilation: PASS
-* AST parsing: PASS
-* module import: PASS
-* notebook-safe main that ignores kernel ``sys.argv``: PASS
-* configuration validation: PASS
-* all classes and functions have explanatory docstrings: PASS
-* module-level research guide exceeds 600 lines: PASS
-* exact support / complement separation: PASS
-* shuffled-intensity multiset preservation: PASS
-* deterministic affine permutation: PASS
-* nuisance residualization sanity check: PASS
-* confounder-guard accepted-loss monotonicity: PASS
-* Bayesian fusion boundedness and duplicate-evidence invariance: PASS
-* all seven nested-CV method paths on synthetic 30-patient data: PASS
-* complete orchestration and report writing with a synthetic feature bank: PASS
-
-These checks validate implementation contracts only.  The revised source has not
-been rerun here over all 63,425 images with the real pinned MONAI and EfficientNet
-models, so no new real-data AUROC is claimed by this documentation revision.
+The distributed regression tests check grouping, fingerprints, mathematical
+identities, gradient correctness, patient isolation, notebook compatibility,
+synthetic inference/cache contracts, and report serialization. Synthetic fixtures
+and mocked pretrained networks do NOT measure real cardiac-MRI performance.
+There is no hard-coded "validation passed" conclusion inside the model. Run the
+tests, inspect the saved test report, and evaluate the new protocol on Kaggle.
 """
 
 from __future__ import annotations
@@ -837,7 +536,7 @@ import time
 from collections import defaultdict
 # Accumulates per-series feature sums and duplicate-hash patient memberships.
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 # Defines explicit data contracts and converts configuration to machine-readable JSON.
 
 from pathlib import Path
@@ -894,7 +593,6 @@ from torchvision import models
 # Provides the explicitly selected ImageNet EfficientNet-B0 architecture and weights.
 
 from tqdm import tqdm
-
 # Displays progress during the expensive all-slice frozen feature extraction stage.
 
 
@@ -983,7 +681,13 @@ MAIN_NUM_WORKERS = 0
 MAIN_FORCE_REBUILD_CACHE = False
 MAIN_USE_AMP = False
 MAIN_CHECK_PATHS_ONLY = False
-
+# New scientific settings remain explicit and notebook-safe; no CLI is parsed.
+MAIN_SERIES_GROUPING = "patient_child"
+MAIN_SERIES_ANNOTATION_PATH: str | None = None
+MAIN_REGULARIZATION_NUISANCE_SCOPE = "export"
+MAIN_AUDIT_COMPONENT_CAPS = (3, 5)
+PIPELINE_REVISION = "2026-09-06-university-v2-training-local-audit"
+FEATURE_CACHE_SCHEMA = "2026-09-06-series-membership-v2"
 
 # Set MAIN_CHECK_PATHS_ONLY=True for a fast path diagnostic that loads no model.
 # Notebook/Kaggle-cell safety: ``main()`` and run metadata never require
@@ -1426,6 +1130,15 @@ class Config:
     # Saved beside the resolved output path for reproducible runtime provenance.
 
     runtime_environment: str = "programmatic"
+    series_grouping: str = "patient_child"
+    # patient_child: all descendants of one immediate Directory_* child share
+    # a proxy, as in the historical full-suite source. immediate_parent retains
+    # the previous compact script's grouping for explicitly labelled sensitivity.
+    series_annotations_path: str | None = None
+    # Optional manually reviewed CSV. When supplied, use only explicit cardiac,
+    # non-localizer, non-derived rows and sequence/view cells common to EVERY
+    # patient. No patient is dropped and no sequence/view is inferred from paths.
+
     # Usually ``Kaggle`` or ``local`` when the notebook-safe entry point resolves it.
 
     # -------------------------------------------------------------------------
@@ -1515,10 +1228,26 @@ class Config:
     # -------------------------------------------------------------------------
     # CUSTOM METHOD 1: FOLD-LOCAL NUISANCE PROJECTION
     # -------------------------------------------------------------------------
-    # Ridge ``alpha`` controls how aggressively cardiac dimensions predictable
-    # from the nuisance subspace are removed.  The nuisance projection itself is
-    # label-independent; scaling/PCA and ridge coefficients remain fold-local.
-    residual_alpha_grid: tuple[float, ...] = (0.01, 0.1, 1.0, 10.0)
+    # Ridge alpha shrinks the nuisance regression; rho controls the fraction
+    # subtracted. Scaling/PCA and coefficients are training-only. Grid selection
+    # uses training labels/score diagnostics, never outer-test metrics.
+    residual_alpha_grid: tuple[float, ...] = (1.0, 10.0)
+    residual_rho_grid: tuple[float, ...] = (0.0, 0.25, 0.5, 1.0)
+    # X_clean = X_centered - rho * Z_encoded @ B. rho=0 is the no-removal
+    # candidate; rho=1 is full residualization. Small grids limit adaptive search.
+    regularization_nuisance_scope: str = "export"
+    # export excludes control-image embeddings and MONAI geometry. combined and
+    # anatomy_proxy are explicit sensitivity settings, NOT automatic choices.
+    use_two_objective_selection: bool = True
+    nuisance_skill_tolerance: float = 0.01
+    # For residualization and BOTH custom logistic variants, among candidates
+    # within auc_tolerance of best inner AUROC prefer lower nonnegative nuisance
+    # prediction skill measured with an additional training-local crossfit. Negative skill is treated as zero, not as extra success.
+    audit_pca_components: tuple[int, ...] = (3, 5)
+    audit_ridge_alpha: float = 1.0
+    # Both caps are reported, never chosen on outer-test performance. The largest
+    # cap is the predeclared primary score, the smaller cap a sensitivity probe.
+
     max_nuisance_components: int = 5
     nuisance_random_projection_dim: int = 16
     nuisance_random_projection_seed: int = 91_731
@@ -1529,18 +1258,20 @@ class Config:
     # ``guard_lambda_grid`` controls the adversarial covariance penalty and
     # ``guard_l2_grid`` controls ordinary weight shrinkage.  Optimization uses
     # explicit gradients with backtracking line search.
-    guard_lambda_grid: tuple[float, ...] = (0.0, 0.1, 1.0, 10.0)
+    guard_lambda_grid: tuple[float, ...] = (0.1, 1.0, 10.0)
     guard_l2_grid: tuple[float, ...] = (0.01, 0.1, 1.0)
     guard_learning_rate: float = 0.20
     guard_max_iterations: int = 1500
     guard_tolerance: float = 1e-7
 
     # -------------------------------------------------------------------------
-    # CUSTOM METHOD 3: CONSERVATIVE BAYESIAN-STYLE SERIES FUSION
+    # CUSTOM METHOD 3: RELIABILITY-WEIGHTED LOGIT FUSION (NOT BAYESIAN)
     # -------------------------------------------------------------------------
-    # ``tau`` sets how rapidly reliability n/(n+tau) saturates with series length.
-    # It is selected only inside inner CV.
-    bayes_tau_grid: tuple[float, ...] = (5.0, 20.0, 50.0)
+    # r_s=n_s/(n_s+tau); average raw decision logits without probability clipping.
+    # tau=0 gives equal series weights. Larger tau increases RELATIVE preference
+    # for longer series. Tie-breaking therefore prefers SMALLER tau.
+    fusion_tau_grid: tuple[float, ...] = (0.0, 5.0, 20.0)
+
 
     # -------------------------------------------------------------------------
     # CACHE AND DUPLICATE AUDITS
@@ -1587,11 +1318,10 @@ EXPERIMENTS = (
     "CONTROL_SHUFFLED_INTENSITY",
     "CONTROL_OUTSIDE_SUPPORT",
     "CUSTOM_NUISANCE_PROJECTION",
+    "CUSTOM_LOGISTIC_NO_GUARD",
     "CUSTOM_MINIMAX_CONFOUNDER_GUARD",
-    "CUSTOM_BAYESIAN_SERIES_FUSION",
+    "CUSTOM_RELIABILITY_WEIGHTED_LOGIT_FUSION",
 )
-
-
 # Experiment order is fixed before evaluation.  It also determines presentation
 # order before the final table is re-ranked by repeated-CV median AUROC.
 
@@ -1619,7 +1349,7 @@ class SeriesBank:
     ``features[mode]`` has shape ``[n_series, 1280]`` and stores the exact mean
     of all frozen slice embeddings in that series.  ``metadata`` stores the
     corresponding mean export/QC variables, while ``n_slices`` preserves the
-    amount of evidence available to Bayesian-style fusion.  Array rows are kept
+    slice counts available to reliability-weighted fusion.  Array rows are kept
     in a single deterministic ``series_ids`` order.
     """
 
@@ -1629,6 +1359,8 @@ class SeriesBank:
     n_slices: np.ndarray
     features: dict[str, np.ndarray]
     metadata: np.ndarray
+    pooling_cells: np.ndarray | None = None
+    # Populated ONLY by the optional manual annotation stage, not the raw cache.
 
 
 @dataclass
@@ -1639,7 +1371,7 @@ class PatientBank:
     proxies, so a long exported series cannot dominate merely by containing more
     JPEG frames.  ``nuisance`` combines compressed support-only, outside-support,
     and acquisition/export variables.  ``patient_to_series_rows`` allows the
-    Bayesian-style method to return to series-level evidence without redefining
+    reliability-weighted method to return to series-level pooling without redefining
     a series as an independent labeled patient.
     """
 
@@ -1649,6 +1381,9 @@ class PatientBank:
     nuisance: np.ndarray
     metadata: np.ndarray
     patient_to_series_rows: dict[str, np.ndarray]
+    nuisance_blocks: dict[str, np.ndarray] | None = None
+    # Separate export, anatomy_proxy, and combined diagnostics. None is allowed
+    # only for compatibility with programmatically built legacy banks.
 
 
 def validate_config(config: Config) -> None:
@@ -1712,13 +1447,29 @@ def validate_config(config: Config) -> None:
     ):
         raise ValueError("Every residualization alpha must be positive.")
     if not config.guard_lambda_grid or any(
-            value < 0 for value in config.guard_lambda_grid
+            value <= 0 for value in config.guard_lambda_grid
     ):
-        raise ValueError("Confounder penalties cannot be negative.")
+        raise ValueError("Guard penalties must be positive; lambda=0 has its own ablation.")
     if not config.guard_l2_grid or any(value <= 0 for value in config.guard_l2_grid):
         raise ValueError("Every custom-model L2 value must be positive.")
-    if not config.bayes_tau_grid or any(value <= 0 for value in config.bayes_tau_grid):
-        raise ValueError("Every Bayesian reliability tau must be positive.")
+    if not config.fusion_tau_grid or any(value < 0 for value in config.fusion_tau_grid):
+        raise ValueError("Reliability tau must be nonnegative; tau=0 is equal pooling.")
+    if not config.residual_rho_grid or any(not 0 <= x <= 1 for x in config.residual_rho_grid):
+        raise ValueError("Residualization rho must lie in [0, 1].")
+    if config.series_grouping not in {"patient_child", "immediate_parent"}:
+        raise ValueError("Unknown series_grouping policy.")
+    if config.regularization_nuisance_scope not in {"export", "anatomy_proxy", "combined"}:
+        raise ValueError("Unknown regularization_nuisance_scope.")
+    if (not config.audit_pca_components or any(x < 1 for x in config.audit_pca_components)
+            or len(set(config.audit_pca_components)) != len(config.audit_pca_components)):
+        raise ValueError("Audit component caps must be distinct positive integers.")
+    if config.audit_ridge_alpha <= 0 or config.nuisance_skill_tolerance < 0:
+        raise ValueError("Invalid nuisance audit regularization/tolerance.")
+    if not 0 <= config.auc_tolerance <= 1:
+        raise ValueError("auc_tolerance must lie in [0, 1].")
+    if config.series_annotations_path and not Path(config.series_annotations_path).is_file():
+        raise FileNotFoundError(config.series_annotations_path)
+
     if config.nuisance_random_projection_dim < 1:
         raise ValueError("nuisance_random_projection_dim must be positive.")
     if len(config.monai_sha256) != 64:
@@ -1763,7 +1514,7 @@ def stable_sigmoid(x: np.ndarray) -> np.ndarray:
 
     Positive and negative inputs use algebraically equivalent branches.  This
     avoids evaluating ``exp(-x)`` for very negative ``x`` or ``exp(x)`` for very
-    positive ``x`` and is used by the custom optimizer and Bayesian fusion.
+    positive ``x`` and is used by the custom optimizer and logit fusion.
     """
 
     x = np.asarray(x, dtype=np.float64)
@@ -1801,58 +1552,39 @@ def sha256_file(path: Path) -> str:
 
 
 def configuration_fingerprint(config: Config, records: Sequence[SliceRecord]) -> str:
-    """Create a deterministic cache identity from feature-affecting settings.
+    """Hash feature preprocessing AND each image's exact patient/series membership.
 
-    The fingerprint includes preprocessing, segmentation, encoder, batch, and
-    hardware-relevant feature settings, together with each relative file path,
-    size, and modification time.  Classifier grids and repeated-CV settings are
-    excluded because they do not change frozen embeddings.  Exact decoded-pixel
-    hashes are still calculated during extraction for the scientific duplicate
-    audit.
-
-    This is a practical cache invalidation contract, not a cryptographic hash of
-    every dataset byte before extraction.
+    Classifier grids, nuisance audit, annotations (applied after caching), and
+    repeat counts do not affect this key. The schema and grouping policy do.
+    A changed policy intentionally invalidates the old 2,879-series cache; no
+    target count is forced and no old cache is renamed to pretend compatibility.
     """
-
-    root = Path(config.dataset_path).resolve()
-    feature_settings = {
-        key: value
-        for key, value in asdict(config).items()
-        if key
-           not in {
-               "output_dir",
-               "dataset_path_source",
-               "output_dir_source",
-               "runtime_environment",
-               "force_rebuild_cache",
-               "outer_folds",
-               "inner_folds",
-               "repeated_cv_runs",
-               "c_grid",
-               "pca_variance",
-               "max_pca_components",
-               "auc_tolerance",
-               "bootstrap_replicates",
-               "residual_alpha_grid",
-               "max_nuisance_components",
-               "guard_lambda_grid",
-               "guard_l2_grid",
-               "guard_learning_rate",
-               "guard_max_iterations",
-               "guard_tolerance",
-               "bayes_tau_grid",
-           }
-    }
-    digest = hashlib.sha256(
-        json.dumps(feature_settings, sort_keys=True).encode("utf-8")
+    feature_fields = (
+        "batch_size", "use_amp", "monai_input_size", "encoder_input_size",
+        "standardized_content_long_side", "monai_hard_threshold", "monai_min_area_ratio",
+        "monai_max_area_ratio", "monai_min_peak_probability", "monai_dilation_kernel",
+        "a17_extra_dilation_kernel", "fallback_square_fraction", "lower_percentile",
+        "upper_percentile", "histogram_bins", "minimum_visible_pixels",
+        "minimum_dynamic_range", "dark_line_max_mean", "dark_line_max_std",
+        "dark_pixel_max_value", "dark_pixel_min_fraction", "max_crop_fraction_per_side",
+        "min_retained_fraction", "min_padding_run", "monai_repo_id", "monai_revision",
+        "monai_filename", "monai_sha256", "efficientnet_weights", "embedding_dim",
+        "series_grouping",
     )
+    identity = {name: getattr(config, name) for name in feature_fields}
+    identity.update(schema=FEATURE_CACHE_SCHEMA, feature_modes=FEATURE_MODES,
+                    torch=torch.__version__, torchvision=torchvision.__version__,
+                    run_perceptual_hash_audit=config.run_perceptual_hash_audit,
+                    phash_hamming_radius=config.phash_hamming_radius,
+                    device="cuda" if torch.cuda.is_available() else "cpu")
+    digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode("utf-8"))
+    root = Path(config.dataset_path).resolve()
     for record in records:
         path = Path(record.path)
         stat = path.stat()
-        relative = str(path.resolve().relative_to(root))
-        digest.update(relative.encode("utf-8"))
-        digest.update(str(stat.st_size).encode("ascii"))
-        digest.update(str(stat.st_mtime_ns).encode("ascii"))
+        row = [path.resolve().relative_to(root).as_posix(), record.patient_id,
+               record.series_id, int(record.label), stat.st_size, stat.st_mtime_ns]
+        digest.update(json.dumps(row, separators=(",", ":")).encode("utf-8"))
     return digest.hexdigest()[:16]
 
 
@@ -1861,13 +1593,72 @@ def configuration_fingerprint(config: Config, records: Sequence[SliceRecord]) ->
 # =============================================================================
 
 
-def discover_records(dataset_path: str) -> list[SliceRecord]:
+def series_id_for_image(image_path: Path, patient_dir: Path, grouping: str) -> str:
+    """Map one descendant path without interpreting folder names as MR sequences.
+
+    patient_child reproduces the available full-suite rule: e.g.
+    Directory_1/SR_1/subfolder/im.jpg -> Directory_1/SR_1. Images directly under
+    the patient become Directory_1/__ROOT__. immediate_parent preserves the old
+    compact mapping (including ROOT instead of __ROOT__) for audit only.
+    """
+    parts = image_path.relative_to(patient_dir).parts[:-1]
+    if grouping == "patient_child":
+        suffix = parts[0] if parts else "__ROOT__"
+    elif grouping == "immediate_parent":
+        suffix = "/".join(parts) if parts else "ROOT"
+    else:
+        raise ValueError(f"Unknown grouping: {grouping}")
+    return f"{patient_dir.name}/{suffix}"
+
+
+def write_series_grouping_audit(records: Sequence[SliceRecord], config: Config) -> dict[str, Any]:
+    """Save a per-image mapping plus per-patient counts under BOTH grouping rules.
+
+    This diagnoses the reported 2,859-versus-2,879 discrepancy without asserting
+    its cause or coercing the current cohort to either count. File paths and
+    grouping choices are audit data, never classifier input. Counts are measured
+    from the mounted dataset, not copied from a historical console log.
+    """
+    root = Path(config.dataset_path).resolve()
+    output = Path(config.output_dir)
+    groups: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
+    changed = 0
+    with (output / "series_grouping_manifest.csv").open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["relative_path", "patient_id", "selected_series_id",
+                         "patient_child_series_id", "previous_immediate_parent_series_id"])
+        for record in records:
+            relative = Path(record.path).resolve().relative_to(root)
+            patient_dir = root / relative.parts[0] / record.patient_id
+            child = series_id_for_image(Path(record.path), patient_dir, "patient_child")
+            immediate = series_id_for_image(Path(record.path), patient_dir, "immediate_parent")
+            groups[record.patient_id]["patient_child"].add(child)
+            groups[record.patient_id]["immediate_parent"].add(immediate)
+            changed += int(child != immediate)
+            writer.writerow([relative.as_posix(), record.patient_id, record.series_id, child, immediate])
+    rows = [{"patient_id": p, "patient_child_series": len(g["patient_child"]),
+             "immediate_parent_series": len(g["immediate_parent"])} for p, g in sorted(groups.items())]
+    summary = {"selected_policy": config.series_grouping, "patients": len(rows),
+               "images": len(records), "images_with_changed_series_id": changed,
+               "patient_child_series": sum(r["patient_child_series"] for r in rows),
+               "immediate_parent_series": sum(r["immediate_parent_series"] for r in rows),
+               "patients_detail": rows,
+               "historical_reported_series_counts": [2859, 2879],
+               "historical_counts_are_not_forced": True}
+    write_json(output / "series_grouping_audit.json", summary)
+    print(f"[SERIES AUDIT] patient_child={summary['patient_child_series']}; "
+          f"immediate_parent={summary['immediate_parent_series']}; selected={config.series_grouping}", flush=True)
+    return summary
+
+
+def discover_records(dataset_path: str, grouping: str = "patient_child") -> list[SliceRecord]:
     """Build the complete image manifest without decoding pixels.
 
     Hard invariants:
     * ``Directory_*`` is the patient unit;
     * every descendant image remains assigned to that patient;
-    * the immediate parent path becomes a patient-scoped series proxy;
+    * patient_child groups ALL descendants of one immediate patient child;
+    * immediate_parent is an explicit previous-version sensitivity policy;
     * one patient may not occur under both labels;
     * both classes must be present.
 
@@ -1912,11 +1703,7 @@ def discover_records(dataset_path: str) -> list[SliceRecord]:
                 raise RuntimeError(f"Patient {patient_id} has no image files.")
 
             for image_path in image_paths:
-                relative_parent = image_path.parent.relative_to(patient_dir)
-                series_suffix = str(relative_parent).replace(os.sep, "/")
-                if series_suffix == ".":
-                    series_suffix = "ROOT"
-                series_id = f"{patient_id}/{series_suffix}"
+                series_id = series_id_for_image(image_path, patient_dir, grouping)
                 records.append(
                     SliceRecord(
                         path=str(image_path),
@@ -2018,7 +1805,7 @@ def remove_conservative_dark_border(
         top = bottom = left = right = 0
         retained_height, retained_width = height, width
 
-    cropped = image[top: height - bottom, left: width - right]
+    cropped = image[top : height - bottom, left : width - right]
     crop_fraction = 1.0 - (cropped.size / float(image.size))
     return cropped, float(crop_fraction)
 
@@ -2047,8 +1834,8 @@ def resize_to_fixed_canvas(
     content = np.zeros((canvas_size, canvas_size), dtype=np.float32)
     top = (canvas_size - new_height) // 2
     left = (canvas_size - new_width) // 2
-    canvas[top: top + new_height, left: left + new_width] = resized
-    content[top: top + new_height, left: left + new_width] = 1.0
+    canvas[top : top + new_height, left : left + new_width] = resized
+    content[top : top + new_height, left : left + new_width] = 1.0
     return canvas, content
 
 
@@ -2318,7 +2105,7 @@ def fixed_central_square_mask(
     top = (height - side) // 2
     left = (width - side) // 2
     mask = torch.zeros(batch, 1, height, width, device=device, dtype=dtype)
-    mask[:, :, top: top + side, left: left + side] = 1.0
+    mask[:, :, top : top + side, left : left + side] = 1.0
     return mask
 
 
@@ -2562,8 +2349,19 @@ def extract_series_bank(config: Config, records: Sequence[SliceRecord]) -> Serie
     manifest_path = output_dir / f"series_feature_bank_{fingerprint}.json"
 
     if cache_path.is_file() and manifest_path.is_file() and not config.force_rebuild_cache:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest.get("schema") != FEATURE_CACHE_SCHEMA or manifest.get("fingerprint") != fingerprint:
+            raise RuntimeError("Cache manifest identity mismatch; set MAIN_FORCE_REBUILD_CACHE=True.")
+        if "duplicate_audit" not in manifest:
+            raise RuntimeError("Cache lacks its duplicate audit; rebuild instead of bypassing the audit.")
+        audit = manifest["duplicate_audit"]
+        write_json(output_dir / "duplicate_audit.json", audit)
+        if audit.get("cross_patient_exact_groups") and config.fail_on_cross_patient_exact_duplicate:
+            raise RuntimeError("Cached cross-patient exact duplicates require review before evaluation.")
+        cached = load_series_bank(cache_path)
+        validate_series_bank_records(cached, records)
         print(f"[CACHE] Loading {cache_path}", flush=True)
-        return load_series_bank(cache_path)
+        return cached
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[MODEL] device={device}", flush=True)
@@ -2723,6 +2521,8 @@ def extract_series_bank(config: Config, records: Sequence[SliceRecord]) -> Serie
         manifest_path,
         {
             "fingerprint": fingerprint,
+            "schema": FEATURE_CACHE_SCHEMA,
+            "duplicate_audit": audit,
             "config": asdict(config),
             "feature_modes": list(FEATURE_MODES),
             "metadata_names": list(METADATA_NAMES),
@@ -2735,7 +2535,31 @@ def extract_series_bank(config: Config, records: Sequence[SliceRecord]) -> Serie
         f"{time.perf_counter() - started:.1f}s",
         flush=True,
     )
-    return SeriesBank(series_ids, patient_ids, labels, counts, features, metadata)
+    bank = SeriesBank(series_ids, patient_ids, labels, counts, features, metadata)
+    validate_series_bank_records(bank, records)
+    return bank
+
+
+def validate_series_bank_records(bank: SeriesBank, records: Sequence[SliceRecord]) -> None:
+    """Reject cache rows whose grouping/count/label contract differs from discovery."""
+    expected: dict[str, list[Any]] = {}
+    for row in records:
+        if row.series_id not in expected:
+            expected[row.series_id] = [row.patient_id, row.label, 0]
+        entry = expected[row.series_id]
+        if entry[:2] != [row.patient_id, row.label]:
+            raise RuntimeError("Conflicting series ownership.")
+        entry[2] += 1
+    if len(set(bank.series_ids.tolist())) != len(bank.series_ids) or set(expected) != set(bank.series_ids.tolist()):
+        raise RuntimeError("Series cache membership does not match the discovered manifest.")
+    for sid, pid, label, n in zip(bank.series_ids, bank.patient_ids, bank.labels, bank.n_slices):
+        if expected[str(sid)] != [str(pid), int(label), int(n)]:
+            raise RuntimeError(f"Series cache contract mismatch: {sid}")
+    if len(bank.metadata) != len(expected) or not np.isfinite(bank.metadata).all():
+        raise RuntimeError("Invalid cached metadata rows.")
+    for mode in FEATURE_MODES:
+        if len(bank.features[mode]) != len(expected) or not np.isfinite(bank.features[mode]).all():
+            raise RuntimeError(f"Invalid cached features: {mode}")
 
 
 def load_series_bank(path: Path) -> SeriesBank:
@@ -2860,6 +2684,104 @@ def phash_patient_pairs(
 # =============================================================================
 
 
+def apply_reviewed_series_annotations(
+        series: SeriesBank,
+        config: Config,
+) -> tuple[SeriesBank, dict[str, Any]]:
+    """Optionally retain reviewed cardiac sequence/view cells common to ALL patients.
+
+    The blank template is always written. The input CSV must contain series_id,
+    sequence_type, view_type, contains_heart, is_localizer, is_derived_export.
+    Boolean fields require explicit true/false (or 1/0). Blank/incomplete rows are
+    excluded, never guessed. Unknown or duplicate IDs raise an error because an
+    annotation made under immediate_parent grouping cannot be silently reused
+    under patient_child. No patient is removed to manufacture a common protocol.
+
+    Selection uses anatomy/protocol annotations, not class labels. The strict
+    common-cell intersection is a label-blind cohort restriction, still not an
+    external test. Different scan settings may remain within a nominal cell.
+    """
+    out = Path(config.output_dir)
+    columns = ["series_id", "patient_id", "n_slices", "sequence_type", "view_type",
+               "contains_heart", "is_localizer", "is_derived_export"]
+    with (out / "series_annotation_template.csv").open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(columns)
+        for sid, pid, n in zip(series.series_ids, series.patient_ids, series.n_slices):
+            writer.writerow([str(sid), str(pid), int(n), "", "", "", "", ""])
+    if not config.series_annotations_path:
+        status = {"status": "SKIPPED_NO_ANNOTATIONS", "reason": "No manually reviewed sequence/view CSV supplied."}
+        write_json(out / "series_annotation_status.json", status)
+        return series, status
+    known = set(map(str, series.series_ids))
+    by_id: dict[str, str] = {}
+    seen: set[str] = set()
+    def boolean(value: str) -> bool | None:
+        """Parse only explicit annotation booleans; blanks mean unreviewed."""
+        token = str(value).strip().lower()
+        if token in {"true", "1", "yes"}:
+            return True
+        if token in {"false", "0", "no"}:
+            return False
+        if not token:
+            return None
+        raise ValueError(f"Invalid annotation boolean: {value!r}")
+    with Path(config.series_annotations_path).open(newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        required = set(columns) - {"patient_id", "n_slices"}
+        if not required.issubset(reader.fieldnames or []):
+            raise ValueError(f"Annotation CSV requires columns: {sorted(required)}")
+        for row in reader:
+            sid = str(row["series_id"]).strip()
+            if sid not in known or sid in seen:
+                raise ValueError(f"Unknown/duplicate annotation series_id {sid!r}; regenerate the template for this grouping.")
+            seen.add(sid)
+            heart, localizer, derived = [boolean(row[k]) for k in
+                                         ("contains_heart", "is_localizer", "is_derived_export")]
+            seq, view = [str(row[k]).strip().lower() for k in ("sequence_type", "view_type")]
+            if heart is True and localizer is False and derived is False and seq and view:
+                by_id[sid] = f"{seq}::{view}"
+    patients = sorted(set(series.patient_ids.tolist()))
+    cells_by_patient = {pid: {by_id[str(series.series_ids[i])] for i in
+                              np.flatnonzero(series.patient_ids == pid) if str(series.series_ids[i]) in by_id}
+                        for pid in patients}
+    common = set.intersection(*(cells_by_patient[p] for p in patients))
+    if not common:
+        status = {"status": "FAILED_NO_COMMON_REVIEWED_CELLS", "cells_by_patient":
+            {str(k): sorted(v) for k, v in cells_by_patient.items()},
+                  "reason": "No reviewed sequence/view cell exists for every patient. No automatic patient dropping is permitted."}
+        write_json(out / "series_annotation_status.json", status)
+        raise ValueError(status["reason"])
+    keep = np.asarray([by_id.get(str(sid)) in common for sid in series.series_ids], dtype=bool)
+    cells = np.asarray([by_id[str(sid)] for sid in series.series_ids[keep]])
+    filtered = SeriesBank(series.series_ids[keep], series.patient_ids[keep], series.labels[keep],
+                          series.n_slices[keep], {k: v[keep] for k, v in series.features.items()},
+                          series.metadata[keep], cells)
+    if set(filtered.patient_ids.tolist()) != set(patients):
+        raise RuntimeError("Annotation filter unexpectedly changed the patient cohort.")
+    status = {"status": "APPLIED_COMMON_CELLS", "input_sha256": sha256_file(Path(config.series_annotations_path)),
+              "common_sequence_view_cells": sorted(common), "patients_retained": len(patients),
+              "series_before": len(series.series_ids), "series_retained": int(keep.sum()),
+              "slices_retained": int(filtered.n_slices.sum()), "pooling": "slice -> series -> equal cell -> patient"}
+    write_json(out / "series_annotation_status.json", status)
+    return filtered, status
+
+
+def nuisance_block(bank: PatientBank, scope: str) -> np.ndarray:
+    """Return explicitly named nuisance variables without learning from the cohort.
+
+    export = geometry/bytes/padding/count metadata; anatomy_proxy = projected
+    support/outside plus MONAI gate/support area; combined = both. Neither group
+    is a certified causal confounder set. A missing block is NOT silently replaced
+    by combined because that would change the scientific experiment.
+    """
+    if bank.nuisance_blocks is None:
+        if scope == "combined":
+            return bank.nuisance
+        raise ValueError("Separated nuisance blocks require build_patient_bank().")
+    return bank.nuisance_blocks[scope]
+
+
 def build_patient_bank(
         series: SeriesBank, nuisance_projection_dim: int, nuisance_projection_seed: int
 ) -> PatientBank:
@@ -2891,7 +2813,14 @@ def build_patient_bank(
             raise RuntimeError(f"Inconsistent labels for {patient_id}")
         labels.append(int(patient_labels[0]))
         for mode in FEATURE_MODES:
-            patient_features[mode].append(series.features[mode][rows].mean(axis=0))
+            if series.pooling_cells is None:
+                patient_features[mode].append(series.features[mode][rows].mean(axis=0))
+            else:
+                # Equal sequence/view-cell mass; equal series weights inside each cell.
+                cells = series.pooling_cells[rows]
+                cell_means = [series.features[mode][rows[cells == cell]].mean(axis=0)
+                              for cell in sorted(set(cells.tolist()))]
+                patient_features[mode].append(np.mean(cell_means, axis=0))
         metadata_mean = series.metadata[rows].mean(axis=0)
         metadata_augmented = np.concatenate(
             [
@@ -2932,7 +2861,7 @@ def build_patient_bank(
             feature_arrays["support_only"] @ support_projection,
             feature_arrays["outside_support"] @ outside_projection,
             metadata_array,
-        ],
+            ],
         axis=1,
     )
     return PatientBank(
@@ -2942,6 +2871,15 @@ def build_patient_bank(
         nuisance=nuisance.astype(np.float32),
         metadata=metadata_array,
         patient_to_series_rows=patient_to_rows,
+        nuisance_blocks={
+            "export": metadata_array[:, [0, 1, 2, 3, 4, 5, 8, 9, 10, 11]].astype(np.float32),
+            "anatomy_proxy": np.concatenate([
+                feature_arrays["support_only"] @ support_projection,
+                feature_arrays["outside_support"] @ outside_projection,
+                metadata_array[:, [6, 7]],
+                ], axis=1).astype(np.float32),
+            "combined": nuisance.astype(np.float32),
+        },
     )
 
 
@@ -3022,16 +2960,19 @@ class NuisanceResidualizer:
 
         B* = argmin_B ||Xc - Zc B||_F^2 + alpha ||B||_F^2
 
-    and return ``Xc - Zc B*``.  Ridge regularization prevents the unstable exact
+    and return ``Xc - rho Zc B*`` with an explicit fraction rho in [0,1].  Ridge regularization prevents the unstable exact
     projection that would arise from a tiny training cohort and many controls.
     Every mean, scaler, PCA axis, and coefficient is learned inside the current
     training fold.  The operation is a sensitivity analysis, not a proof of
     causal deconfounding.
     """
 
-    def __init__(self, alpha: float, max_nuisance_components: int):
+    def __init__(self, alpha: float, max_nuisance_components: int, rho: float = 1.0):
         """Create an unfitted ridge residualizer and fold-local nuisance encoder."""
         self.alpha = float(alpha)
+        self.rho = float(rho)
+        if not 0.0 <= self.rho <= 1.0:
+            raise ValueError("rho must lie in [0, 1].")
         self.encoder = NuisanceEncoder(max_nuisance_components)
         self.x_mean: np.ndarray | None = None
         self.coefficients: np.ndarray | None = None
@@ -3046,14 +2987,14 @@ class NuisanceResidualizer:
         return self
 
     def transform(self, X: np.ndarray, Z: np.ndarray) -> np.ndarray:
-        """Subtract the training-estimated nuisance component from new cardiac rows."""
+        """Subtract rho times the training-estimated nuisance component from new rows."""
         if self.x_mean is None or self.coefficients is None:
             raise RuntimeError("NuisanceResidualizer is not fitted.")
         Zc = self.encoder.transform(Z).astype(np.float64)
         return (
                 np.asarray(X, dtype=np.float64)
                 - self.x_mean
-                - Zc @ self.coefficients
+                - self.rho * (Zc @ self.coefficients)
         ).astype(np.float32)
 
 
@@ -3125,7 +3066,8 @@ class WorstCaseLinearConfounderLogistic:
         # Z is centered by the fold-local nuisance encoder.  The expression below
         # is the maximizing linear nuisance direction in closed form.
         centered_scores = scores - scores.mean()
-        covariance_vector = Z.T @ centered_scores / float(n)
+        centered_Z = Z - Z.mean(axis=0, keepdims=True)
+        covariance_vector = centered_Z.T @ centered_scores / float(n)
         confounder_penalty = self.confounder_lambda * float(
             covariance_vector @ covariance_vector
         )
@@ -3133,7 +3075,7 @@ class WorstCaseLinearConfounderLogistic:
                 2.0
                 * self.confounder_lambda
                 / float(n)
-                * (Z @ covariance_vector)
+                * (centered_Z @ covariance_vector)
         )
 
         regularization = 0.5 * self.l2 * float(weights @ weights)
@@ -3142,7 +3084,12 @@ class WorstCaseLinearConfounderLogistic:
         grad_b = float(np.sum(sample_weight * (probabilities - y) / normalizer))
         return loss, grad_w, grad_b
 
-    def fit(self, X: np.ndarray, Z: np.ndarray, y: np.ndarray) -> "WorstCaseLinearConfounderLogistic":
+    def fit(
+            self,
+            X: np.ndarray,
+            Z: np.ndarray,
+            y: np.ndarray,
+    ) -> "WorstCaseLinearConfounderLogistic":
         """Optimize weights with batch gradient descent and Armijo backtracking.
 
         The model starts at zero, stops on small gradient norm or loss improvement,
@@ -3172,7 +3119,7 @@ class WorstCaseLinearConfounderLogistic:
                 candidate_loss, candidate_grad_w, candidate_grad_b = self._loss_and_gradient(
                     X, Z, y, candidate_w, candidate_b
                 )
-                if candidate_loss <= loss - 1e-4 * trial_rate * gradient_norm ** 2:
+                if candidate_loss <= loss - 1e-4 * trial_rate * gradient_norm**2:
                     weights, bias = candidate_w, candidate_b
                     loss, grad_w, grad_b = (
                         candidate_loss,
@@ -3204,32 +3151,59 @@ class WorstCaseLinearConfounderLogistic:
 
 
 # =============================================================================
-# 11. BAYESIAN-STYLE SERIES EVIDENCE FUSION
+# 11. RELIABILITY-WEIGHTED LOGIT FUSION (NO PRIOR)
 # =============================================================================
 
 
-def fuse_series_evidence(
-        probabilities: np.ndarray,
-        n_slices: np.ndarray,
-        prior: float,
-        tau: float,
-) -> float:
-    """Combine correlated series scores conservatively in prior-relative log-odds.
+def fuse_series_logits(logits: np.ndarray, n_slices: np.ndarray, tau: float) -> float:
+    """Return sigmoid(sum(r*logit)/sum(r)), r=n/(n+tau), with no prior claim.
 
-    Reliability ``n/(n+tau)`` increases with slice count but saturates.  Evidence
-    is averaged rather than multiplied, so exporting the same information many
-    times cannot make certainty grow without bound.  This is Bayesian-inspired
-    accounting, not a complete causal Bayesian network.
+    In the old expression prior_logit + mean(logit-prior_logit), the prior
+    cancels algebraically. This method is explicitly a weighted logit mean, NOT
+    Bayesian inference and NOT calibrated clinical evidence. Raw decision logits
+    avoid clipping probabilities before the inverse logistic transform.
+
+    tau=0 gives equal weights; larger tau increases relative preference for long
+    series. Duplicating ALL series equally leaves the result unchanged. Duplicating
+    one series can change its relative mass: this is not a deduplication method.
     """
+    logits = np.asarray(logits, dtype=np.float64)
+    counts = np.asarray(n_slices, dtype=np.float64)
+    if (logits.ndim != 1 or counts.shape != logits.shape or not len(logits)
+            or not np.isfinite(logits).all() or not np.isfinite(counts).all()
+            or np.any(counts <= 0) or not np.isfinite(tau) or tau < 0):
+        raise ValueError("Expected finite aligned logits, positive counts, and tau>=0.")
+    weights = counts / (counts + float(tau))
+    return float(stable_sigmoid(np.asarray([np.average(logits, weights=weights)]))[0])
 
-    probabilities = np.asarray(probabilities, dtype=np.float64)
-    reliability = np.asarray(n_slices, dtype=np.float64) / (
-            np.asarray(n_slices, dtype=np.float64) + float(tau)
-    )
-    evidence = logit(probabilities) - float(logit(prior))
-    total_weight = max(float(reliability.sum()), 1e-12)
-    patient_logit = float(logit(prior)) + float(np.dot(reliability, evidence) / total_weight)
-    return float(stable_sigmoid(np.asarray([patient_logit]))[0])
+
+def reliability_patient_embeddings(
+        series: SeriesBank,
+        patient_ids: Sequence[str],
+        tau: float,
+) -> np.ndarray:
+    """Use the SAME reliability pooling at training and inference.
+
+    For an annotated run, each common sequence/view cell receives equal mass;
+    reliability weights operate only inside a cell. tau=0 then reduces exactly
+    to build_patient_bank's baseline pooling, apart from floating-point roundoff.
+    """
+    if tau < 0 or not np.isfinite(tau):
+        raise ValueError("tau must be finite and nonnegative.")
+    vectors = []
+    for pid in patient_ids:
+        rows = np.flatnonzero(series.patient_ids == pid)
+        if not len(rows):
+            raise ValueError(f"No series for patient {pid}")
+        cells = np.zeros(len(rows), dtype=int) if series.pooling_cells is None else series.pooling_cells[rows]
+        cell_vectors = []
+        for cell in sorted(set(cells.tolist())):
+            indices = rows[cells == cell]
+            n = series.n_slices[indices].astype(np.float64)
+            weights = n / (n + tau)
+            cell_vectors.append(np.average(series.features["cardiac"][indices], axis=0, weights=weights))
+        vectors.append(np.mean(cell_vectors, axis=0))
+    return np.asarray(vectors, dtype=np.float32)
 
 
 # =============================================================================
@@ -3277,6 +3251,7 @@ def fit_residualized_logistic(
         alpha: float,
         C: float,
         config: Config,
+        rho: float = 1.0,
 ) -> tuple[NuisanceResidualizer, CompactPCA, LogisticRegression]:
     """Fit nuisance residualization followed by the standard logistic pipeline.
 
@@ -3284,7 +3259,7 @@ def fit_residualized_logistic(
     partition.  Validation nuisance variables are used only to apply the already
     learned subtraction, never to estimate coefficients.
     """
-    residualizer = NuisanceResidualizer(alpha, config.max_nuisance_components).fit(X, Z)
+    residualizer = NuisanceResidualizer(alpha, config.max_nuisance_components, rho=rho).fit(X, Z)
     cleaned = residualizer.transform(X, Z)
     preprocessor, model = fit_standard_logistic(cleaned, y, C, config)
     return residualizer, preprocessor, model
@@ -3347,57 +3322,27 @@ def predict_guarded_logistic(
     return model.predict_proba(x_encoder.transform(X))[:, 1]
 
 
-def fit_bayesian_base_classifier(
-        patient_bank: PatientBank,
-        train_indices: np.ndarray,
-        C: float,
-        config: Config,
-) -> tuple[CompactPCA, LogisticRegression, float]:
-    """Fit one patient-level base classifier for later series evidence fusion.
+def fit_reliability_classifier(
+        patient_bank: PatientBank, series_bank: SeriesBank, train_indices: np.ndarray,
+        C: float, tau: float, config: Config,
+) -> tuple[CompactPCA, LogisticRegression]:
+    """Fit one row per training patient using the selected reliability weights.
 
-    Training uses one cardiac mean per patient, avoiding repeated labels on
-    series rows.  The training-class prevalence becomes the fold-local prior.
-    At validation time the same decision function is reused on each series and
-    evidence is fused conservatively.
+    Because PCA/scaling/classifier are affine, averaging raw series logits with
+    the same normalized weights is equivalent to classifying the weighted patient
+    vector. Training directly on this vector avoids the old mismatch (equal-weight
+    training followed by slice-count-weighted inference). No prior is estimated.
     """
-
-    fitted = fit_standard_logistic(
-        patient_bank.features["cardiac"][train_indices],
-        patient_bank.labels[train_indices],
-        C,
-        config,
-    )
-    prior = float(patient_bank.labels[train_indices].mean())
-    return fitted[0], fitted[1], prior
+    X = reliability_patient_embeddings(series_bank, patient_bank.patient_ids[train_indices], tau)
+    return fit_standard_logistic(X, patient_bank.labels[train_indices], C, config)
 
 
-def predict_bayesian_patients(
-        fitted: tuple[CompactPCA, LogisticRegression, float],
-        series: SeriesBank,
-        patient_ids: Sequence[str],
-        tau: float,
+def predict_reliability_patients(
+        fitted: tuple[CompactPCA, LogisticRegression], series: SeriesBank,
+        patient_ids: Sequence[str], tau: float,
 ) -> np.ndarray:
-    """Score every validation series and fuse evidence to one score per patient.
-
-    Series rows are selected only by patient ID.  Slice counts determine
-    saturating reliability weights, and ``tau`` is chosen in inner CV.
-    """
-    preprocessor, model, prior = fitted
-    probabilities = []
-    for patient_id in patient_ids:
-        rows = np.flatnonzero(series.patient_ids == patient_id)
-        series_probability = model.predict_proba(
-            preprocessor.transform(series.features["cardiac"][rows])
-        )[:, 1]
-        probabilities.append(
-            fuse_series_evidence(
-                series_probability,
-                series.n_slices[rows],
-                prior=prior,
-                tau=tau,
-            )
-        )
-    return np.asarray(probabilities, dtype=np.float64)
+    """Classify reliability-pooled embeddings; equivalent to weighted raw logits."""
+    return predict_standard_logistic(fitted, reliability_patient_embeddings(series, patient_ids, tau))
 
 
 # =============================================================================
@@ -3421,285 +3366,325 @@ def choose_threshold(y_true: np.ndarray, scores: np.ndarray) -> float:
 
 
 def candidate_grid(experiment: str, config: Config) -> list[dict[str, float]]:
-    """Return the predeclared hyperparameter combinations for one experiment.
+    """Return a small predeclared grid; no expansion after inspecting outer results.
 
-    Standard controls tune only ``C``.  Residualization tunes ridge ``alpha`` and
-    ``C``; the guard tunes nuisance penalty and L2; Bayesian fusion tunes ``C``
-    and reliability ``tau``.  No grid is expanded after observing outer results.
+    The matched custom logistic uses the same code and L2 grid as the guarded
+    method, but fixes lambda=0. Guard candidates must be strictly positive.
+    rho=0 occurs only once per C (alpha is irrelevant when nothing is removed).
     """
-    if experiment in {
-        "BASELINE_A17",
-        "CONTROL_SUPPORT_ONLY",
-        "CONTROL_SHUFFLED_INTENSITY",
-        "CONTROL_OUTSIDE_SUPPORT",
-    }:
+    if experiment in {"BASELINE_A17", "CONTROL_SUPPORT_ONLY", "CONTROL_SHUFFLED_INTENSITY", "CONTROL_OUTSIDE_SUPPORT"}:
         return [{"C": C} for C in config.c_grid]
     if experiment == "CUSTOM_NUISANCE_PROJECTION":
-        return [
-            {"alpha": alpha, "C": C}
-            for alpha in config.residual_alpha_grid
-            for C in config.c_grid
-        ]
-    if experiment == "CUSTOM_MINIMAX_CONFOUNDER_GUARD":
-        return [
-            {"lambda": value, "l2": l2}
-            for value in config.guard_lambda_grid
-            for l2 in config.guard_l2_grid
-        ]
-    if experiment == "CUSTOM_BAYESIAN_SERIES_FUSION":
-        return [
-            {"C": C, "tau": tau}
-            for C in config.c_grid
-            for tau in config.bayes_tau_grid
-        ]
+        return [{"alpha": alpha, "rho": rho, "C": C}
+                for rho in config.residual_rho_grid
+                for alpha in ((max(config.residual_alpha_grid),) if rho == 0 else config.residual_alpha_grid)
+                for C in config.c_grid]
+    if experiment in {"CUSTOM_LOGISTIC_NO_GUARD", "CUSTOM_MINIMAX_CONFOUNDER_GUARD"}:
+        lambdas = (0.0,) if experiment == "CUSTOM_LOGISTIC_NO_GUARD" else config.guard_lambda_grid
+        return [{"lambda": lam, "l2": l2} for lam in lambdas for l2 in config.guard_l2_grid]
+    if experiment == "CUSTOM_RELIABILITY_WEIGHTED_LOGIT_FUSION":
+        return [{"C": C, "tau": tau} for C in config.c_grid for tau in config.fusion_tau_grid]
     raise KeyError(experiment)
 
 
 def method_feature_mode(experiment: str) -> str:
-    """Map each experiment to its frozen patient feature representation."""
-    return {
-        "BASELINE_A17": "cardiac",
-        "CONTROL_SUPPORT_ONLY": "support_only",
-        "CONTROL_SHUFFLED_INTENSITY": "shuffled_intensity",
-        "CONTROL_OUTSIDE_SUPPORT": "outside_support",
-        "CUSTOM_NUISANCE_PROJECTION": "cardiac",
-        "CUSTOM_MINIMAX_CONFOUNDER_GUARD": "cardiac",
-    }.get(experiment, "cardiac")
+    """Map a known experiment to its only frozen classifier feature mode."""
+    if experiment not in EXPERIMENTS:
+        raise KeyError(experiment)
+    return {"CONTROL_SUPPORT_ONLY": "support_only",
+            "CONTROL_SHUFFLED_INTENSITY": "shuffled_intensity",
+            "CONTROL_OUTSIDE_SUPPORT": "outside_support"}.get(experiment, "cardiac")
 
 
 def fit_predict_method(
-        experiment: str,
-        params: dict[str, float],
-        patient_bank: PatientBank,
-        series_bank: SeriesBank,
-        train_indices: np.ndarray,
-        valid_indices: np.ndarray,
-        config: Config,
+        experiment: str, params: dict[str, float], patient_bank: PatientBank,
+        series_bank: SeriesBank, train_indices: np.ndarray, valid_indices: np.ndarray,
+        config: Config, diagnostics: dict[str, Any] | None = None,
 ) -> np.ndarray:
-    """Fit one declared method on training patients and score validation patients.
+    """Fit ONLY train_indices; score ONLY valid_indices, enforcing disjoint patients.
 
-    This dispatcher centralizes the leakage boundary.  It selects the correct
-    frozen feature mode, passes nuisance variables only to deconfounding methods,
-    and invokes series-level evidence only for the Bayesian-style experiment.
-    It always returns one score per validation patient.
+    Fixed pretrained encoders and per-patient pooling precede CV, but all learned
+    scalers, PCA, nuisance regression and classifiers are fitted here. The custom
+    no-guard and guarded variants share every solver setting except lambda.
     """
-    train_patients = patient_bank.patient_ids[train_indices]
-    valid_patients = patient_bank.patient_ids[valid_indices]
+    train_indices = np.asarray(train_indices, dtype=int)
+    valid_indices = np.asarray(valid_indices, dtype=int)
+    if set(train_indices.tolist()) & set(valid_indices.tolist()):
+        raise ValueError("Training and validation patient rows overlap.")
     y_train = patient_bank.labels[train_indices]
-
-    if experiment == "CUSTOM_BAYESIAN_SERIES_FUSION":
-        fitted = fit_bayesian_base_classifier(
-            patient_bank,
-            train_indices,
-            params["C"],
-            config,
-        )
-        return predict_bayesian_patients(
-            fitted,
-            series_bank,
-            valid_patients,
-            params["tau"],
-        )
-
+    if experiment == "CUSTOM_RELIABILITY_WEIGHTED_LOGIT_FUSION":
+        fitted = fit_reliability_classifier(patient_bank, series_bank, train_indices,
+                                            params["C"], params["tau"], config)
+        return predict_reliability_patients(fitted, series_bank, patient_bank.patient_ids[valid_indices], params["tau"])
     mode = method_feature_mode(experiment)
-    X_train = patient_bank.features[mode][train_indices]
-    X_valid = patient_bank.features[mode][valid_indices]
-
-    if experiment in {
-        "BASELINE_A17",
-        "CONTROL_SUPPORT_ONLY",
-        "CONTROL_SHUFFLED_INTENSITY",
-        "CONTROL_OUTSIDE_SUPPORT",
-    }:
-        fitted = fit_standard_logistic(X_train, y_train, params["C"], config)
-        return predict_standard_logistic(fitted, X_valid)
-
-    Z_train = patient_bank.nuisance[train_indices]
-    Z_valid = patient_bank.nuisance[valid_indices]
+    X_train, X_valid = patient_bank.features[mode][train_indices], patient_bank.features[mode][valid_indices]
+    if experiment in {"BASELINE_A17", "CONTROL_SUPPORT_ONLY", "CONTROL_SHUFFLED_INTENSITY", "CONTROL_OUTSIDE_SUPPORT"}:
+        return predict_standard_logistic(fit_standard_logistic(X_train, y_train, params["C"], config), X_valid)
+    Z = nuisance_block(patient_bank, config.regularization_nuisance_scope)
+    Z_train, Z_valid = Z[train_indices], Z[valid_indices]
     if experiment == "CUSTOM_NUISANCE_PROJECTION":
-        fitted = fit_residualized_logistic(
-            X_train,
-            Z_train,
-            y_train,
-            params["alpha"],
-            params["C"],
-            config,
-        )
+        fitted = fit_residualized_logistic(X_train, Z_train, y_train, params["alpha"], params["C"], config, rho=params["rho"])
         return predict_residualized_logistic(fitted, X_valid, Z_valid)
-
-    if experiment == "CUSTOM_MINIMAX_CONFOUNDER_GUARD":
-        fitted = fit_guarded_logistic(
-            X_train,
-            Z_train,
-            y_train,
-            params["lambda"],
-            params["l2"],
-            config,
-        )
+    if experiment in {"CUSTOM_LOGISTIC_NO_GUARD", "CUSTOM_MINIMAX_CONFOUNDER_GUARD"}:
+        fitted = fit_guarded_logistic(X_train, Z_train, y_train, params["lambda"], params["l2"], config)
+        model = fitted[2]
+        if diagnostics is not None:
+            diagnostics.update(lambda_active=bool(params["lambda"] > 0),
+                               optimizer_accepted_steps=len(model.training_trace) - 1,
+                               initial_loss=float(model.training_trace[0]), final_loss=float(model.training_trace[-1]),
+                               optimizer_max_iterations=config.guard_max_iterations,
+                               reached_iteration_cap=len(model.training_trace) - 1 >= config.guard_max_iterations)
         return predict_guarded_logistic(fitted, X_valid, Z_valid)
-
     raise KeyError(experiment)
 
 
 def parameter_preference(experiment: str, params: dict[str, float]) -> tuple:
-    """Apply deterministic scientific tie-breaking within the AUC tolerance.
+    """Prefer less removal/count dependence when validation evidence is tied.
 
-    The rule favors simpler/stronger-regularized settings or, for the guard,
-    stronger nuisance control when inner AUROC differences are negligible.  This
-    avoids repeatedly selecting an extreme weakly regularized setting because of
-    one tiny inner-CV fluctuation.
+    alpha is ridge shrinkage, not removal fraction: rho explicitly controls removal.
+    tau grows relative long-series preference, so SMALL tau wins a fusion tie.
+    lambda=0 is available only in the separate matched no-guard experiment.
     """
-
     if experiment == "CUSTOM_NUISANCE_PROJECTION":
-        # Smaller alpha removes nuisance more strongly; smaller C regularizes more.
-        return (params["alpha"], params["C"])
-    if experiment == "CUSTOM_MINIMAX_CONFOUNDER_GUARD":
-        # Prefer stronger nuisance guard, then stronger L2, if AUC is effectively tied.
-        return (-params["lambda"], -params["l2"])
-    if experiment == "CUSTOM_BAYESIAN_SERIES_FUSION":
-        # Prefer stronger classifier regularization and weaker slice-count
-        # dependence when inner AUC is effectively tied.
-        return (params["C"], -params["tau"])
+        return (params["rho"], -params["alpha"], params["C"])
+    if experiment in {"CUSTOM_LOGISTIC_NO_GUARD", "CUSTOM_MINIMAX_CONFOUNDER_GUARD"}:
+        return (params["lambda"], -params["l2"])
+    if experiment == "CUSTOM_RELIABILITY_WEIGHTED_LOGIT_FUSION":
+        return (params["tau"], params["C"])
     return (params["C"],)
 
 
-def select_hyperparameters(
-        experiment: str,
-        patient_bank: PatientBank,
-        series_bank: SeriesBank,
-        outer_train_indices: np.ndarray,
-        config: Config,
+def stratified_partitions(
+        labels: np.ndarray,
+        requested_folds: int,
         seed: int,
-) -> tuple[dict[str, float], np.ndarray, np.ndarray]:
-    """Select parameters using only inner out-of-fold patient scores.
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Construct patient folds, reducing their number only in tiny nested subsets.
 
-    Every candidate is evaluated on identical stratified inner folds within the
-    current outer-training cohort.  Candidates within ``auc_tolerance`` of the
-    best inner AUROC are resolved by ``parameter_preference``.  The selected
-    inner OOF scores are also returned for threshold choice.
+    Reducing an inner fold count to the minority-class count is documented and
+    label-stratified, not score-driven. Fewer than two patients per class cannot
+    support a crossfit and causes a clear failure rather than fabricated scores.
     """
+    labels = np.asarray(labels, dtype=np.int64)
+    counts = np.bincount(labels, minlength=2)
+    n_splits = min(requested_folds, int(counts.min()))
+    if n_splits < 2:
+        raise ValueError(f"Need at least two patients per class; counts={counts.tolist()}")
+    return list(StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed).split(np.zeros(len(labels)), labels))
 
-    y_outer = patient_bank.labels[outer_train_indices]
-    splitter = StratifiedKFold(
-        n_splits=config.inner_folds,
-        shuffle=True,
-        random_state=seed,
-    )
+
+def fixed_parameter_oof(
+        experiment: str, params: dict[str, float], patient_bank: PatientBank,
+        series_bank: SeriesBank, indices: np.ndarray, config: Config, seed: int,
+) -> np.ndarray:
+    """Generate score targets using ONLY a supplied training subset.
+
+    Hyperparameters are held fixed; every target row is scored by a model fitted
+    on other rows of this subset. This extra crossfit provides training targets
+    for a nuisance-to-score emulator WITHOUT using any surrounding validation
+    patient in the score generator. It never retunes on the surrounding test set.
+    """
+    values = np.full(len(indices), np.nan, dtype=np.float64)
+    for train, valid in stratified_partitions(patient_bank.labels[indices], config.inner_folds, seed):
+        values[valid] = fit_predict_method(experiment, params, patient_bank, series_bank,
+                                           indices[train], indices[valid], config)
+    if not np.isfinite(values).all():
+        raise RuntimeError("Incomplete training-local OOF score targets.")
+    return values
+
+
+def fit_nuisance_score_probe(
+        Z_train: np.ndarray, training_oof_scores: np.ndarray, Z_valid: np.ndarray,
+        component_cap: int, ridge_alpha: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Fit a score emulator on training-only targets; predict held-out scores.
+
+    Scaling, nuisance PCA, ridge coefficients and the constant reference are
+    learned exclusively from Z_train and training_oof_scores. No held-out score
+    or label is accepted by this function. Both outputs are forecasts of model
+    scores, NOT estimates of disease probability from nuisance variables.
+    """
+    if not np.isfinite(training_oof_scores).all():
+        raise ValueError("Invalid nuisance training targets.")
+    encoder = NuisanceEncoder(component_cap).fit(Z_train)
+    model = Ridge(alpha=ridge_alpha).fit(encoder.transform(Z_train), training_oof_scores)
+    prediction = model.predict(encoder.transform(Z_valid))
+    reference = np.full(len(Z_valid), float(np.mean(training_oof_scores)), dtype=np.float64)
+    return np.asarray(prediction, dtype=np.float64), reference
+
+
+def r2_diagnostics(
+        target: np.ndarray,
+        predicted: np.ndarray,
+        reference: np.ndarray,
+) -> dict[str, float | None]:
+    """Report conventional R2 AND prediction skill versus a training-only mean.
+
+    R2 = 1 - SSE/SST, where SST uses the pooled observed score mean. Prediction
+    skill = 1 - SSE/SSE_reference, where each reference was predicted from that
+    fold's training OOF score mean. A constant target/reference is reported as
+    undefined (None), not forced to zero/one. Negative R2 means a weak surrogate,
+    not negative confounding or demonstrated independence.
+    """
+    target, predicted, reference = [np.asarray(x, dtype=np.float64) for x in (target, predicted, reference)]
+    if target.shape != predicted.shape or target.shape != reference.shape:
+        raise ValueError("Nuisance diagnostic arrays must align.")
+    if not all(np.isfinite(x).all() for x in (target, predicted, reference)):
+        raise ValueError("Nuisance diagnostic arrays must be finite.")
+    sse = float(np.sum((target - predicted) ** 2))
+    sst = float(np.sum((target - target.mean()) ** 2))
+    reference_sse = float(np.sum((target - reference) ** 2))
+    return {"r2": None if sst <= 1e-12 else 1.0 - sse / sst,
+            "predictive_r2": None if reference_sse <= 1e-12 else 1.0 - sse / reference_sse,
+            "mse": sse / max(1, len(target)), "reference_mse": reference_sse / max(1, len(target))}
+
+
+def inner_candidate_nuisance_skill(
+        experiment: str, params: dict[str, float], scores: np.ndarray,
+        outer_train_indices: np.ndarray, partitions: list[tuple[np.ndarray, np.ndarray]],
+        patient_bank: PatientBank, series_bank: SeriesBank, config: Config, seed: int,
+) -> dict[str, float | None]:
+    """Evaluate nuisance predictability for one eligible candidate inside training.
+
+    For each inner split, score targets for its TRAIN portion come from an extra
+    crossfit confined to that portion. Fit Z->target there and predict the inner
+    validation scores. The surrounding outer-test cohort is never read. This
+    extra nesting avoids using scores generated by models that trained on the
+    probe's validation patients, the flaw in the previous global-OOF R2 audit.
+    """
+    Z = nuisance_block(patient_bank, config.regularization_nuisance_scope)
+    predicted, reference = np.full(len(scores), np.nan), np.full(len(scores), np.nan)
+    for fold, (train, valid) in enumerate(partitions):
+        inner_train, inner_valid = outer_train_indices[train], outer_train_indices[valid]
+        targets = fixed_parameter_oof(experiment, params, patient_bank, series_bank,
+                                      inner_train, config, seed + 2000 + fold)
+        predicted[valid], reference[valid] = fit_nuisance_score_probe(
+            Z[inner_train], targets, Z[inner_valid], max(config.audit_pca_components), config.audit_ridge_alpha)
+    return r2_diagnostics(scores, predicted, reference)
+
+
+def select_hyperparameters(
+        experiment: str, patient_bank: PatientBank, series_bank: SeriesBank,
+        outer_train_indices: np.ndarray, config: Config, seed: int,
+) -> tuple[dict[str, float], np.ndarray, np.ndarray, list[dict[str, Any]]]:
+    """Select on inner AUROC, then training-local nuisance skill when configured.
+
+    First evaluate every candidate on the same inner folds. Restrict to those
+    within auc_tolerance of best AUROC. For partial residualization and guarded
+    logistic (with AND without guard), evaluate training-local nuisance prediction skill for eligible
+    candidates. Prefer its lowest nonnegative value, within a declared tolerance;
+    then use conservative parameter_preference. Negative skill gets no extra
+    reward. Baseline/controls/fusion use AUROC plus deterministic ties.
+
+    The returned OOF targets and selected parameters belong entirely to outer
+    training. They can train the final outer-fold nuisance probe without seeing
+    any outer-validation row. Model-score R2 is exploratory, not a causal metric.
+    """
+    outer_train_indices = np.asarray(outer_train_indices, dtype=int)
+    labels = patient_bank.labels[outer_train_indices]
+    partitions = stratified_partitions(labels, config.inner_folds, seed)
     candidates = []
     for params in candidate_grid(experiment, config):
-        scores = np.full(len(outer_train_indices), np.nan, dtype=np.float64)
-        for inner_train_local, inner_valid_local in splitter.split(
-                np.zeros(len(y_outer)), y_outer
-        ):
-            inner_train = outer_train_indices[inner_train_local]
-            inner_valid = outer_train_indices[inner_valid_local]
-            scores[inner_valid_local] = fit_predict_method(
-                experiment,
-                params,
-                patient_bank,
-                series_bank,
-                inner_train,
-                inner_valid,
-                config,
-            )
-        if not np.all(np.isfinite(scores)):
-            raise RuntimeError(f"Non-finite inner scores for {experiment}: {params}")
-        candidates.append(
-            {
-                "params": params,
-                "auc": float(roc_auc_score(y_outer, scores)),
-                "scores": scores,
-            }
-        )
-
-    best_auc = max(row["auc"] for row in candidates)
-    eligible = [
-        row for row in candidates if row["auc"] >= best_auc - config.auc_tolerance
-    ]
-    selected = min(
-        eligible,
-        key=lambda row: parameter_preference(experiment, row["params"]),
-    )
-    return selected["params"], y_outer, selected["scores"]
+        scores = np.full(len(labels), np.nan)
+        for train, valid in partitions:
+            scores[valid] = fit_predict_method(experiment, params, patient_bank, series_bank,
+                                               outer_train_indices[train], outer_train_indices[valid], config)
+        if not np.isfinite(scores).all():
+            raise RuntimeError(f"Invalid inner scores: {experiment} {params}")
+        candidates.append({"params": params, "inner_auc": float(roc_auc_score(labels, scores)),
+                           "scores": scores, "nuisance_prediction_skill": None,
+                           "nuisance_r2": None, "nuisance_selection_evaluated": False})
+    best_auc = max(row["inner_auc"] for row in candidates)
+    eligible = [row for row in candidates if row["inner_auc"] >= best_auc - config.auc_tolerance]
+    if config.use_two_objective_selection and experiment in {
+        "CUSTOM_NUISANCE_PROJECTION", "CUSTOM_LOGISTIC_NO_GUARD", "CUSTOM_MINIMAX_CONFOUNDER_GUARD"
+    }:
+        for row in eligible:
+            diagnostic = inner_candidate_nuisance_skill(experiment, row["params"], row["scores"],
+                                                        outer_train_indices, partitions, patient_bank, series_bank, config, seed)
+            row["nuisance_prediction_skill"] = diagnostic["predictive_r2"]
+            row["nuisance_r2"] = diagnostic["r2"]
+            row["nuisance_selection_evaluated"] = True
+        evaluable = [row for row in eligible if row["nuisance_prediction_skill"] is not None]
+        if evaluable:
+            best_penalty = min(max(0.0, row["nuisance_prediction_skill"]) for row in evaluable)
+            eligible = [row for row in evaluable if max(0.0, row["nuisance_prediction_skill"])
+                        <= best_penalty + config.nuisance_skill_tolerance]
+    selected = min(eligible, key=lambda row: parameter_preference(experiment, row["params"]))
+    audit = [{k: v for k, v in row.items() if k != "scores"} | {
+        "within_auc_tolerance": row["inner_auc"] >= best_auc - config.auc_tolerance,
+        "selected": row is selected,
+        "nuisance_scope": config.regularization_nuisance_scope,
+    } for row in candidates]
+    return selected["params"], labels, selected["scores"], audit
 
 
 def nested_cv_once(
-        experiment: str,
-        patient_bank: PatientBank,
-        series_bank: SeriesBank,
-        config: Config,
-        seed: int,
+        experiment: str, patient_bank: PatientBank, series_bank: SeriesBank,
+        config: Config, seed: int,
 ) -> dict[str, Any]:
-    """Run one complete nested patient-level cross-validation pass.
+    """Generate patient OOF disease scores AND strictly training-local nuisance forecasts.
 
-    For each outer fold, hyperparameters and threshold are selected inside the
-    outer-training patients, the selected method is refit on all outer training
-    rows, and each held-out patient receives exactly one score.  The output stores
-    fold IDs, scores, thresholds, predictions, selected parameters, and pooled
-    patient-level metrics.
+    Each outer fold chooses parameters on inner CV, trains the disease predictor,
+    and scores its held-out patients once. Independently fit each nuisance probe
+    on the chosen INNER OOF training scores, never on OOF scores from other OUTER
+    folds. Such other-fold generators may have trained on current test patients.
+
+    Every cap/scope is evaluated prospectively. The largest configured cap is the
+    primary nuisance diagnostic, not whichever looks most favorable. Test scores
+    enter ONLY metric calculation after both disease and nuisance forecasts exist.
+    The surrogate learns scores of smaller inner models and tests scores of a
+    larger outer model; this distribution mismatch remains a limitation.
     """
-
     labels = patient_bank.labels
-    splitter = StratifiedKFold(
-        n_splits=config.outer_folds,
-        shuffle=True,
-        random_state=seed,
-    )
-    scores = np.full(len(labels), np.nan, dtype=np.float64)
+    if int(np.bincount(labels, minlength=2).min()) < config.outer_folds:
+        raise ValueError("Not enough patients per class for the requested outer folds.")
+    scores = np.full(len(labels), np.nan)
     predictions = np.full(len(labels), -1, dtype=np.int64)
-    thresholds = np.full(len(labels), np.nan, dtype=np.float64)
+    thresholds = np.full(len(labels), np.nan)
     folds = np.full(len(labels), -1, dtype=np.int64)
-    selected_params: list[dict[str, Any]] = []
-
-    for fold_index, (train_indices, valid_indices) in enumerate(
-            splitter.split(np.zeros(len(labels)), labels), start=1
-    ):
-        params, inner_labels, inner_scores = select_hyperparameters(
-            experiment,
-            patient_bank,
-            series_bank,
-            train_indices,
-            config,
-            seed=seed + 1000 + fold_index,
-        )
+    probes = {f"{scope}_pc{cap}": {"scope": scope, "cap": cap,
+                                   "predicted": np.full(len(labels), np.nan), "reference": np.full(len(labels), np.nan)}
+              for scope in ("export", "anatomy_proxy", "combined") for cap in config.audit_pca_components}
+    selected_params = []
+    for fold, (train, valid) in enumerate(stratified_partitions(labels, config.outer_folds, seed), start=1):
+        params, inner_labels, inner_scores, candidate_audit = select_hyperparameters(
+            experiment, patient_bank, series_bank, train, config, seed + 1000 + fold)
         threshold = choose_threshold(inner_labels, inner_scores)
-        fold_scores = fit_predict_method(
-            experiment,
-            params,
-            patient_bank,
-            series_bank,
-            train_indices,
-            valid_indices,
-            config,
-        )
-        scores[valid_indices] = fold_scores
-        thresholds[valid_indices] = threshold
-        predictions[valid_indices] = (fold_scores >= threshold).astype(np.int64)
-        folds[valid_indices] = fold_index
-        selected_params.append(
-            {
-                "outer_fold": fold_index,
-                "params": params,
-                "inner_auc": float(roc_auc_score(inner_labels, inner_scores)),
-                "threshold": threshold,
-            }
-        )
-
-    if not np.all(np.isfinite(scores)) or np.any(predictions < 0):
+        optimization = {}
+        fold_scores = fit_predict_method(experiment, params, patient_bank, series_bank, train, valid, config,
+                                         diagnostics=optimization)
+        scores[valid] = fold_scores
+        thresholds[valid] = threshold
+        predictions[valid] = (fold_scores >= threshold).astype(np.int64)
+        folds[valid] = fold
+        for probe in probes.values():
+            Z = nuisance_block(patient_bank, probe["scope"])
+            probe["predicted"][valid], probe["reference"][valid] = fit_nuisance_score_probe(
+                Z[train], inner_scores, Z[valid], probe["cap"], config.audit_ridge_alpha)
+        selected_params.append({"outer_fold": fold, "params": params,
+                                "inner_auc": float(roc_auc_score(inner_labels, inner_scores)), "threshold": threshold,
+                                "train_patient_ids": patient_bank.patient_ids[train].tolist(),
+                                "validation_patient_ids": patient_bank.patient_ids[valid].tolist(),
+                                "nuisance_training_targets": "selected inner OOF scores from outer-training patients only",
+                                "candidate_search": candidate_audit, "optimizer": optimization})
+    if not np.isfinite(scores).all() or np.any(predictions < 0):
         raise RuntimeError(f"Incomplete OOF predictions for {experiment}")
     metrics = compute_metrics(labels, scores, predictions)
-    return {
-        "experiment": experiment,
-        "seed": seed,
-        "patient_ids": patient_bank.patient_ids.copy(),
-        "labels": labels.copy(),
-        "scores": scores,
-        "predictions": predictions,
-        "thresholds": thresholds,
-        "folds": folds,
-        "selected_params": selected_params,
-        "metrics": metrics,
-    }
+    for name, probe in probes.items():
+        probe["metrics"] = r2_diagnostics(scores, probe["predicted"], probe["reference"])
+        metrics[f"nuisance_{name}_r2"] = probe["metrics"]["r2"]
+        metrics[f"nuisance_{name}_predictive_r2"] = probe["metrics"]["predictive_r2"]
+    cap = max(config.audit_pca_components)
+    for scope in ("export", "anatomy_proxy", "combined"):
+        metrics[f"nuisance_{scope}_r2"] = metrics[f"nuisance_{scope}_pc{cap}_r2"]
+        metrics[f"nuisance_{scope}_predictive_r2"] = metrics[f"nuisance_{scope}_pc{cap}_predictive_r2"]
+    # Keep the familiar name, but document that the audit procedure has changed.
+    metrics["nuisance_score_r2"] = metrics["nuisance_combined_r2"]
+    return {"experiment": experiment, "seed": int(seed), "patient_ids": patient_bank.patient_ids.copy(),
+            "labels": labels.copy(), "scores": scores, "predictions": predictions,
+            "thresholds": thresholds, "folds": folds, "selected_params": selected_params,
+            "metrics": metrics, "nuisance_probes": probes}
 
 
 def compute_metrics(
@@ -3753,348 +3738,241 @@ def bootstrap_auc_interval(
     return float(np.quantile(values, 0.025)), float(np.quantile(values, 0.975))
 
 
-def cross_validated_nuisance_r2(
-        scores: np.ndarray,
-        nuisance: np.ndarray,
-        folds: np.ndarray,
-) -> float:
-    """Measure out-of-fold linear predictability of a model score from nuisance.
-
-    Within each existing outer fold, nuisance scaling, PCA, and Ridge regression
-    are fitted on all other patients and predict the held-out scores.  The final
-    R-squared compares these predictions with the observed OOF score variance.
-    A lower value is desirable for deconfounding, but near-zero linear R-squared
-    cannot rule out nonlinear dependence.
-    """
-
-    predicted = np.full(len(scores), np.nan, dtype=np.float64)
-    for fold in sorted(np.unique(folds)):
-        train = folds != fold
-        valid = folds == fold
-        scaler = StandardScaler().fit(nuisance[train])
-        Z_train = scaler.transform(nuisance[train])
-        Z_valid = scaler.transform(nuisance[valid])
-        maximum = max(1, min(5, Z_train.shape[0] - 2, Z_train.shape[1]))
-        pca = PCA(n_components=maximum, svd_solver="full").fit(Z_train)
-        model = Ridge(alpha=1.0).fit(pca.transform(Z_train), scores[train])
-        predicted[valid] = model.predict(pca.transform(Z_valid))
-    denominator = float(np.sum((scores - scores.mean()) ** 2))
-    return float(1.0 - np.sum((scores - predicted) ** 2) / max(denominator, 1e-12))
-
-
 # =============================================================================
 # 14. RUN, SUMMARIZE, AND SAVE
 # =============================================================================
 
 
 def save_oof_result(result: dict[str, Any], output_dir: Path) -> None:
-    """Save one row per patient and the selected fold parameters for an experiment.
+    """Save disease scores, training-only nuisance forecasts and all selected parameters.
 
-    The CSV supports direct inspection of labels, fold assignments, continuous
-    scores, training-only thresholds, and predictions.  A companion JSON file
-    preserves the chosen hyperparameters and inner AUROC for every outer fold.
+    Called for the main run AND every repeated seed. This makes paired deltas and
+    lambda/rho/tau frequencies reproducible from saved artifacts, not just console
+    medians. Nuisance reference columns are outer-training score means; they are
+    never estimated from the current held-out cohort.
     """
-    path = output_dir / f"oof_{result['experiment']}.csv"
-    with path.open("w", newline="", encoding="utf-8") as file:
-        writer = csv.writer(file)
-        writer.writerow(
-            [
-                "patient_id",
-                "label",
-                "fold",
-                "score",
-                "threshold",
-                "prediction",
-            ]
-        )
-        for row in zip(
-                result["patient_ids"],
-                result["labels"],
-                result["folds"],
-                result["scores"],
-                result["thresholds"],
-                result["predictions"],
-        ):
-            writer.writerow(row)
-    write_json(
-        output_dir / f"selected_params_{result['experiment']}.json",
-        result["selected_params"],
-    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    probes = result["nuisance_probes"]
+    columns = ["patient_id", "label", "fold", "score", "threshold", "prediction"]
+    columns += [f"{name}_{kind}" for name in probes for kind in ("predicted_score", "training_mean_reference")]
+    with (output_dir / f"oof_{result['experiment']}.csv").open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(columns)
+        for i, pid in enumerate(result["patient_ids"]):
+            values = [pid, int(result["labels"][i]), int(result["folds"][i]),
+                      float(result["scores"][i]), float(result["thresholds"][i]), int(result["predictions"][i])]
+            for probe in probes.values():
+                values += [float(probe["predicted"][i]), float(probe["reference"][i])]
+            writer.writerow(values)
+    write_json(output_dir / f"selected_params_{result['experiment']}.json", result["selected_params"])
+    write_json(output_dir / f"metrics_{result['experiment']}.json", result["metrics"])
+
+
+def descriptive_summary(values: Sequence[float | None]) -> dict[str, Any]:
+    """Summarize finite repeated values without treating repeats as independent cohorts."""
+    x = np.asarray([float(v) for v in values if v is not None and np.isfinite(v)], dtype=np.float64)
+    if not len(x):
+        return {"runs": 0, "median": None, "q25": None, "q75": None, "minimum": None, "maximum": None}
+    return {"runs": int(len(x)), "median": float(np.median(x)), "q25": float(np.quantile(x, 0.25)),
+            "q75": float(np.quantile(x, 0.75)), "minimum": float(x.min()), "maximum": float(x.max())}
+
+
+def paired_method_comparison(
+        rows: list[dict[str, Any]],
+        reference: str,
+        comparison: str,
+) -> dict[str, Any]:
+    """Compare same-seed AUROC AND nuisance metrics; lower nuisance delta is preferable.
+
+    Each statistic is computed on per-seed differences, never by subtracting two
+    unrelated medians. Undefined surrogate R2 values remain missing and valid
+    pair counts are reported. Fractions are descriptive, not binomial p-values.
+    """
+    left = {r["seed"]: r for r in rows if r["experiment"] == reference}
+    right = {r["seed"]: r for r in rows if r["experiment"] == comparison}
+    if set(left) != set(right):
+        raise RuntimeError("Paired comparisons require the same repeat seeds.")
+    metrics = ["auc", "nuisance_score_r2", "nuisance_export_r2", "nuisance_anatomy_proxy_r2",
+               "nuisance_combined_predictive_r2", "nuisance_export_predictive_r2"]
+    result = {"reference": reference, "comparison": comparison,
+              "definition": "comparison minus reference on the same repeat seed", "metrics": {}}
+    for metric in metrics:
+        delta = [right[seed][metric] - left[seed][metric] for seed in sorted(left)
+                 if right[seed].get(metric) is not None and left[seed].get(metric) is not None]
+        summary = descriptive_summary(delta)
+        summary["fraction_above_zero"] = float(np.mean(np.asarray(delta) > 0)) if delta else None
+        summary["fraction_below_zero"] = float(np.mean(np.asarray(delta) < 0)) if delta else None
+        result["metrics"][metric] = summary
+    return result
+
+
+def format_metric(value: float | None) -> str:
+    """Format undefined score-dependence diagnostics explicitly in console output."""
+    return "undefined" if value is None or not np.isfinite(value) else f"{value:.4f}"
 
 
 def run_research_portfolio(config: Config) -> dict[str, Any]:
-    """Execute the complete self-contained research portfolio pipeline.
+    """Run the small, auditable portfolio with isolated reports and a reusable cache.
 
-    The orchestration order is deliberate:
-    1. validate configuration and seed generators;
-    2. save configuration/software provenance;
-    3. discover the patient/image manifest;
-    4. load or build the compact frozen series bank;
-    5. pool to patient features and nuisance variables;
-    6. run all seven nested-CV experiments;
-    7. repeat each experiment over predeclared split seeds;
-    8. compute paired deltas and nuisance-score R-squared;
-    9. write ranked summaries and an interpretation-guarded final report.
+    STAGES: validate -> preserve source/config -> audit series grouping -> frozen
+    feature bank -> optional manually reviewed common cells -> separate nuisance
+    blocks -> eight nested-CV experiments -> repeat all diagnostics -> save paired
+    AUROC/R2 deltas. No model is promoted as an external/clinical success here.
 
-    The function returns the same final report that is written to disk.
+    All reports use a fresh run subdirectory to avoid mixing old method names or
+    metrics with this revised protocol. Expensive frozen features are cached in
+    a sibling feature_cache directory. main() still reads no command-line args.
     """
-    # ---------------------------------------------------------------------
-    # STAGE 1 — VALIDATE THE DECLARED EXPERIMENT BEFORE EXPENSIVE WORK
-    # ---------------------------------------------------------------------
-    # A malformed percentile, kernel, fold count, or hyperparameter grid should
-    # fail before model downloads and before a partial cache can be produced.
+    # STAGE 1: fail before downloads or image decoding on malformed configuration.
     validate_config(config)
     seed_everything(config.seed)
-
-    # ---------------------------------------------------------------------
-    # STAGE 2 — CREATE THE OUTPUT ROOT AND FREEZE RUN PROVENANCE
-    # ---------------------------------------------------------------------
-    output_dir = Path(config.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_root = Path(config.output_dir)
+    tag = hashlib.sha256(json.dumps(asdict(config), sort_keys=True).encode()).hexdigest()[:8]
+    run_name = f"run_{time.strftime('%Y%m%dT%H%M%S')}_{time.time_ns() % 1_000_000_000:09d}_{tag}"
+    output_dir = output_root / run_name
+    output_dir.mkdir(parents=True, exist_ok=False)
+    config = replace(config, output_dir=str(output_dir))
+    started = time.perf_counter()
+    print(f"[RUN] revision={PIPELINE_REVISION}; results={output_dir}", flush=True)
+    # STAGE 2: runtime metadata is notebook-safe even when __file__ is absent.
     write_json(output_dir / "configuration.json", asdict(config))
-    source_identity = _runtime_source_identity()
-    write_json(
-        output_dir / "run_metadata.json",
-        {
-            "python": platform.python_version(),
-            "numpy": np.__version__,
-            "opencv": cv2.__version__,
-            "torch": torch.__version__,
-            "torchvision": torchvision.__version__,
-            "scikit_learn": sklearn.__version__,
-            "cuda_available": bool(torch.cuda.is_available()),
-            "cuda_device": (
-                torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
-            ),
-            "runtime_environment": config.runtime_environment,
-            "dataset_path": str(Path(config.dataset_path).resolve()),
-            "dataset_path_source": config.dataset_path_source,
-            "output_directory": str(Path(config.output_dir).resolve(strict=False)),
-            "output_directory_source": config.output_dir_source,
-            **source_identity,
-        },
-    )
-
-    # ---------------------------------------------------------------------
-    # STAGE 3 — DISCOVER THE COMPLETE PATIENT/IMAGE MANIFEST
-    # ---------------------------------------------------------------------
-    # Discovery reads folder and filename structure only.  Pixels are decoded in
-    # the feature-bank stage, after patient and series membership is fixed.
-    records = discover_records(config.dataset_path)
-
-    # ---------------------------------------------------------------------
-    # STAGE 4 — LOAD OR BUILD THE FROZEN SERIES-LEVEL FEATURE BANK
-    # ---------------------------------------------------------------------
-    # This is the only stage that requires MONAI/EfficientNet inference.  On a
-    # cache hit, all downstream mathematical experiments reuse the same frozen
-    # series rows and can execute without decoding images again.
-    series_bank = extract_series_bank(config, records)
-
-    # ---------------------------------------------------------------------
-    # STAGE 5 — POOL SERIES TO ONE ROW PER PATIENT AND BUILD NUISANCE AXES
-    # ---------------------------------------------------------------------
-    patient_bank = build_patient_bank(
-        series_bank,
-        config.nuisance_random_projection_dim,
-        config.nuisance_random_projection_seed,
-    )
-    class_counts = np.bincount(patient_bank.labels, minlength=2)
-    if np.min(class_counts) < config.outer_folds:
-        raise ValueError(
-            "Each class must contain at least outer_folds patients; "
-            f"counts={class_counts.tolist()}."
-        )
+    write_json(output_dir / "run_metadata.json", {
+        "revision": PIPELINE_REVISION, "cache_schema": FEATURE_CACHE_SCHEMA,
+        "python": platform.python_version(), "numpy": np.__version__, "opencv": cv2.__version__,
+        "torch": torch.__version__, "torchvision": torchvision.__version__, "scikit_learn": sklearn.__version__,
+        "cuda_available": bool(torch.cuda.is_available()),
+        "cuda_device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+        "runtime_environment": config.runtime_environment, "dataset_path": str(Path(config.dataset_path).resolve()),
+        "dataset_path_source": config.dataset_path_source, "output_directory": str(output_dir.resolve()),
+        "output_directory_source": config.output_dir_source, **_runtime_source_identity(),
+    })
+    # STAGE 3: freeze membership, and expose every changed series assignment.
+    records = discover_records(config.dataset_path, config.series_grouping)
+    grouping_audit = write_series_grouping_audit(records, config)
+    # STAGE 4: cache depends on pixels/settings/group membership, not classifier grids.
+    cache_config = replace(config, output_dir=str(output_root / "feature_cache"))
+    series_bank = extract_series_bank(cache_config, records)
+    duplicate_path = Path(cache_config.output_dir) / "duplicate_audit.json"
+    if duplicate_path.is_file():
+        write_json(output_dir / "duplicate_audit.json", json.loads(duplicate_path.read_text(encoding="utf-8")))
+    # STAGE 5: manual protocol control is optional and must not be invented.
+    series_bank, annotation_status = apply_reviewed_series_annotations(series_bank, config)
+    patient_bank = build_patient_bank(series_bank, config.nuisance_random_projection_dim, config.nuisance_random_projection_seed)
     if len(patient_bank.patient_ids) != 30:
-        print(
-            f"[WARNING] Expected the validated release to contain 30 patients; "
-            f"discovered {len(patient_bank.patient_ids)}.",
-            flush=True,
-        )
-
-    # ---------------------------------------------------------------------
-    # STAGE 6 — RUN THE LOCKED SEVEN-EXPERIMENT PANEL
-    # ---------------------------------------------------------------------
-    # Every experiment receives the same patients and follows the same nested-CV
-    # boundary.  The baseline and controls differ only in frozen information;
-    # custom methods differ in their fold-local mathematical treatment.
+        print(f"[WARNING] This cohort has {len(patient_bank.patient_ids)} patients, not the historical 30.", flush=True)
+    write_json(output_dir / "nuisance_design.json", {
+        "regularization_scope": config.regularization_nuisance_scope,
+        "blocks": {name: {"shape": list(values.shape)} for name, values in patient_bank.nuisance_blocks.items()},
+        "export_columns": [METADATA_NAMES[i] for i in [0, 1, 2, 3, 4, 5]] +
+                          ["n_series", "n_slices", "mean_series_length", "max_series_length"],
+        "anatomy_proxy": "fixed projections of support/outside embeddings plus MONAI-valid rate and support area",
+        "causal_warning": "No block is certified to contain only non-biological confounders.",
+        "audit_cap_values": list(config.audit_pca_components), "primary_audit_cap": max(config.audit_pca_components),
+        "audit_target_generation": "inner OOF scores inside each outer-training cohort; never global outer OOF targets",
+    })
+    # STAGE 6: evaluate main AND repeated runs, saving parameters/probes each time.
     main_results: dict[str, dict[str, Any]] = {}
-    repeated_rows = []
+    repeated_rows: list[dict[str, Any]] = []
+    parameters_flat: list[dict[str, Any]] = []
     for experiment in EXPERIMENTS:
         print(f"\n[EVALUATION] {experiment}", flush=True)
-        main = nested_cv_once(
-            experiment,
-            patient_bank,
-            series_bank,
-            config,
-            seed=config.seed,
-        )
-        main["metrics"]["nuisance_score_r2"] = cross_validated_nuisance_r2(
-            main["scores"], patient_bank.nuisance, main["folds"]
-        )
-        main["metrics"]["auc_ci_low"], main["metrics"]["auc_ci_high"] = (
-            bootstrap_auc_interval(
-                main["labels"],
-                main["scores"],
-                config.bootstrap_replicates,
-                seed=config.seed + 50_000,
-            )
-        )
-        main_results[experiment] = main
-        save_oof_result(main, output_dir)
-
-        # Repeated splits are generated after the main manifest.  They are not
-        # used to choose a favorable run; all declared repetitions are saved.
+        main_result = nested_cv_once(experiment, patient_bank, series_bank, config, config.seed)
+        low, high = bootstrap_auc_interval(main_result["labels"], main_result["scores"],
+                                           config.bootstrap_replicates, config.seed + 50_000)
+        main_result["metrics"].update(auc_ci_low=low, auc_ci_high=high)
+        main_results[experiment] = main_result
+        save_oof_result(main_result, output_dir)
+        for selected in main_result["selected_params"]:
+            parameters_flat.append({"experiment": experiment, "run_type": "main", "repeat": 0,
+                                    "seed": config.seed, "outer_fold": selected["outer_fold"], "inner_auc": selected["inner_auc"],
+                                    "params_json": json.dumps(selected["params"], sort_keys=True),
+                                    "optimizer_json": json.dumps(selected["optimizer"], sort_keys=True)})
         for repeat in range(config.repeated_cv_runs):
-            repeated = nested_cv_once(
-                experiment,
-                patient_bank,
-                series_bank,
-                config,
-                seed=config.seed + 10_000 + repeat,
-            )
-            repeated_rows.append(
-                {
-                    "experiment": experiment,
-                    "repeat": repeat + 1,
-                    "seed": repeated["seed"],
-                    **repeated["metrics"],
-                }
-            )
-        print(
-            f"[RESULT] AUC={main['metrics']['auc']:.4f}; "
-            f"AUPRC={main['metrics']['auprc']:.4f}; "
-            f"nuisance_score_R2={main['metrics']['nuisance_score_r2']:.4f}",
-            flush=True,
-        )
-
-    # ---------------------------------------------------------------------
-    # STAGE 7 — SAVE EVERY REPEATED RUN BEFORE COMPUTING SUMMARIES
-    # ---------------------------------------------------------------------
-    repeated_path = output_dir / "repeated_cv_results.csv"
-    with repeated_path.open("w", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=list(repeated_rows[0]))
-        writer.writeheader()
-        writer.writerows(repeated_rows)
-
-    # ---------------------------------------------------------------------
-    # STAGE 8 — RANK BY REPEATED-CV MEDIAN, NOT BY ONE FAVORABLE SPLIT
-    # ---------------------------------------------------------------------
+            seed = config.seed + 10_000 + repeat
+            result = nested_cv_once(experiment, patient_bank, series_bank, config, seed)
+            save_oof_result(result, output_dir / "repeated" / f"seed_{seed}")
+            repeated_rows.append({"experiment": experiment, "repeat": repeat + 1, "seed": seed, **result["metrics"]})
+            for selected in result["selected_params"]:
+                parameters_flat.append({"experiment": experiment, "run_type": "repeated", "repeat": repeat + 1,
+                                        "seed": seed, "outer_fold": selected["outer_fold"], "inner_auc": selected["inner_auc"],
+                                        "params_json": json.dumps(selected["params"], sort_keys=True),
+                                        "optimizer_json": json.dumps(selected["optimizer"], sort_keys=True)})
+            if repeat == 0 or (repeat + 1) % 5 == 0 or repeat + 1 == config.repeated_cv_runs:
+                print(f"[REPEAT] {repeat + 1}/{config.repeated_cv_runs} AUROC={result['metrics']['auc']:.4f} "
+                      f"export_R2={format_metric(result['metrics']['nuisance_export_r2'])} "
+                      f"combined_R2={format_metric(result['metrics']['nuisance_score_r2'])}", flush=True)
+        print(f"[RESULT MAIN] AUROC={main_result['metrics']['auc']:.4f}; "
+              f"export_R2={format_metric(main_result['metrics']['nuisance_export_r2'])}; "
+              f"combined_R2={format_metric(main_result['metrics']['nuisance_score_r2'])}", flush=True)
+    # STAGE 7: save raw repeated rows and every selected lambda/rho/tau, not only medians.
+    for filename, rows in (("repeated_cv_results.csv", repeated_rows), ("selected_params_all_runs.csv", parameters_flat)):
+        with (output_dir / filename).open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+    # STAGE 8: keep main and repeated statistics visibly separate in both outputs.
     summary_rows = []
     for experiment in EXPERIMENTS:
-        auc_values = np.asarray(
-            [row["auc"] for row in repeated_rows if row["experiment"] == experiment]
-        )
-        metrics = main_results[experiment]["metrics"]
-        summary_rows.append(
-            {
-                "experiment": experiment,
-                **metrics,
-                "repeated_auc_median": float(np.median(auc_values)),
-                "repeated_auc_q25": float(np.quantile(auc_values, 0.25)),
-                "repeated_auc_q75": float(np.quantile(auc_values, 0.75)),
-                "repeated_auc_min": float(np.min(auc_values)),
-                "repeated_auc_max": float(np.max(auc_values)),
-            }
-        )
-    summary_rows.sort(key=lambda row: -row["repeated_auc_median"])
-
-    with (output_dir / "experiment_summary.csv").open(
-            "w", newline="", encoding="utf-8"
-    ) as file:
-        writer = csv.DictWriter(file, fieldnames=list(summary_rows[0]))
+        repeated = [r for r in repeated_rows if r["experiment"] == experiment]
+        row = {"experiment": experiment, **{f"main_{k}": v for k, v in main_results[experiment]["metrics"].items()}}
+        for metric in ("auc", "auprc", "nuisance_score_r2", "nuisance_export_r2", "nuisance_anatomy_proxy_r2",
+                       "nuisance_combined_predictive_r2", "nuisance_export_predictive_r2"):
+            row.update({f"repeated_{metric}_{k}": v for k, v in descriptive_summary([r[metric] for r in repeated]).items()})
+        summary_rows.append(row)
+    summary_rows.sort(key=lambda r: (-r["repeated_auc_median"], r["experiment"]))
+    with (output_dir / "experiment_summary.csv").open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(summary_rows[0]))
         writer.writeheader()
         writer.writerows(summary_rows)
-
-    # ---------------------------------------------------------------------
-    # STAGE 9 — COMPUTE SAME-SEED PAIRED DELTAS AGAINST BASELINE_A17
-    # ---------------------------------------------------------------------
-    # Pairing by seed removes variation caused solely by using different patient
-    # splits when comparing two methods.
-    lookup = {row["experiment"]: row for row in summary_rows}
-    baseline_auc = lookup["BASELINE_A17"]["repeated_auc_median"]
-    auc_by_experiment_and_seed = {
-        experiment: {
-            int(row["seed"]): float(row["auc"])
-            for row in repeated_rows
-            if row["experiment"] == experiment
-        }
-        for experiment in EXPERIMENTS
-    }
-    paired_repeated_deltas = {}
-    baseline_by_seed = auc_by_experiment_and_seed["BASELINE_A17"]
+    # STAGE 9: paired differences for baseline contrasts and the key optimizer ablation.
+    paired = {experiment: paired_method_comparison(repeated_rows, "BASELINE_A17", experiment)
+              for experiment in EXPERIMENTS if experiment != "BASELINE_A17"}
+    guard_pair = paired_method_comparison(repeated_rows, "CUSTOM_LOGISTIC_NO_GUARD", "CUSTOM_MINIMAX_CONFOUNDER_GUARD")
+    frequency = {}
     for experiment in EXPERIMENTS:
-        if experiment == "BASELINE_A17":
-            continue
-        comparison_by_seed = auc_by_experiment_and_seed[experiment]
-        common_seeds = sorted(set(baseline_by_seed) & set(comparison_by_seed))
-        deltas = np.asarray(
-            [comparison_by_seed[seed] - baseline_by_seed[seed] for seed in common_seeds],
-            dtype=np.float64,
-        )
-        paired_repeated_deltas[experiment] = {
-            "definition": "comparison AUROC minus BASELINE_A17 AUROC",
-            "runs": int(len(deltas)),
-            "median": float(np.median(deltas)),
-            "q25": float(np.quantile(deltas, 0.25)),
-            "q75": float(np.quantile(deltas, 0.75)),
-            "minimum": float(np.min(deltas)),
-            "maximum": float(np.max(deltas)),
-            "fraction_above_zero": float(np.mean(deltas > 0.0)),
-        }
-    # ---------------------------------------------------------------------
-    # STAGE 10 — WRITE AN INTERPRETATION-GUARDED FINAL REPORT
-    # ---------------------------------------------------------------------
-    # The report includes explicit rules that prevent a reader from treating a
-    # high internal AUROC as proof of clinical CAD detection or causal validity.
+        counts: dict[str, int] = defaultdict(int)
+        for row in parameters_flat:
+            if row["experiment"] == experiment and row["run_type"] == "repeated":
+                counts[row["params_json"]] += 1
+        frequency[experiment] = [{"params": json.loads(k), "outer_folds_selected": v} for k, v in sorted(counts.items())]
+    write_json(output_dir / "selected_parameter_frequencies.json", frequency)
+    write_json(output_dir / "paired_comparisons.json", {"versus_baseline": paired, "guard_vs_no_guard": guard_pair})
+    # STAGE 10: record limitations and explicitly distinguish this protocol from v1.
     report = {
-        "research_question": (
-            "Can cardiac-region MRI information outperform exact matched shortcut "
-            "controls, and can fold-local mathematical deconfounding preserve or "
-            "improve patient-level discrimination?"
-        ),
-        "patient_count": int(len(patient_bank.patient_ids)),
-        "series_count": int(len(series_bank.series_ids)),
-        "slice_count": int(len(records)),
+        "revision": PIPELINE_REVISION, "output_directory": str(output_dir),
+        "patient_count": len(patient_bank.patient_ids), "series_count": len(series_bank.series_ids),
+        "discovered_slice_count": len(records), "evaluated_slice_count": int(series_bank.n_slices.sum()),
+        "series_grouping_audit": grouping_audit, "sequence_view_analysis": annotation_status,
         "results_ranked_by_repeated_auc_median": summary_rows,
-        "baseline_minus_controls": {
-            control: float(baseline_auc - lookup[control]["repeated_auc_median"])
-            for control in (
-                "CONTROL_SUPPORT_ONLY",
-                "CONTROL_SHUFFLED_INTENSITY",
-                "CONTROL_OUTSIDE_SUPPORT",
-            )
-        },
-        "custom_minus_baseline": {
-            method: float(lookup[method]["repeated_auc_median"] - baseline_auc)
-            for method in (
-                "CUSTOM_NUISANCE_PROJECTION",
-                "CUSTOM_MINIMAX_CONFOUNDER_GUARD",
-                "CUSTOM_BAYESIAN_SERIES_FUSION",
-            )
-        },
-        "paired_repeated_auc_deltas_vs_baseline": paired_repeated_deltas,
-        "deconfounding_success_rule": (
-            "A custom method is promising only if AUROC is preserved or improved "
-            "and nuisance_score_R2 decreases. AUROC alone is not sufficient."
-        ),
+        "paired_comparisons_vs_baseline": paired, "guard_vs_matched_no_guard": guard_pair,
+        "paired_repeated_auc_deltas_vs_baseline": {k: v["metrics"]["auc"] for k, v in paired.items()},
+        "selected_parameter_frequencies": frequency,
+        "nuisance_audit_protocol": "outer-training-local score targets; 3/5-component probes reported, not selected on test",
+        "nuisance_regularization_scope": config.regularization_nuisance_scope,
+        "external_validation": {"status": "NOT_PERFORMED", "reason": "No independent compatible cohort supplied."},
+        "runtime_seconds": time.perf_counter() - started,
         "interpretation_guardrails": [
-            "The effective labeled sample size is the number of patients, not images.",
-            "Repeated split results are sensitivity analyses, not independent cohorts.",
-            "A high control AUC indicates unresolved dataset structure or confounding.",
-            "External validation and sequence/view matching are required for clinical claims.",
+            "This rerun reuses previously explored patients; it is not independent prospective validation.",
+            "Grouping and evaluation changes prevent attributing old-versus-new AUC differences to one algorithm.",
+            "Repeated seeds describe split sensitivity, not independent patient samples or a significance test.",
+            "A negative R2 indicates failed score prediction by that surrogate, not removal of all confounding.",
+            "Nuisance probes learn scores of inner models and evaluate a larger outer-trained model; mismatch can affect R2.",
+            "Export metadata can correlate with biology; anatomy_proxy explicitly may contain real anatomy.",
+            "The custom guard must be assessed against CUSTOM_LOGISTIC_NO_GUARD, not only sklearn's different solver.",
+            "A reduced model-score R2 does not automatically reduce the separately trained outside-support classifier AUC.",
+            "No model is declared clinically validated or causally deconfounded by this report.",
         ],
     }
     write_json(output_dir / "final_report.json", report)
-
-    print("\nFINAL RANKING BY REPEATED-CV MEDIAN AUC", flush=True)
-    for rank, row in enumerate(summary_rows, start=1):
-        print(
-            f"{rank:>2}. {row['experiment']:<36} "
-            f"median={row['repeated_auc_median']:.4f} "
-            f"IQR=[{row['repeated_auc_q25']:.4f}, {row['repeated_auc_q75']:.4f}] "
-            f"nuisance_R2={row['nuisance_score_r2']:.4f}",
-            flush=True,
-        )
+    print("\nFINAL RANKING BY REPEATED-CV MEDIAN AUROC (ALL R2 BELOW ARE REPEATED MEDIANS)", flush=True)
+    for rank, row in enumerate(summary_rows, 1):
+        print(f"{rank:2d}. {row['experiment']:<43} AUROC={row['repeated_auc_median']:.4f} "
+              f"IQR=[{row['repeated_auc_q25']:.4f}, {row['repeated_auc_q75']:.4f}] "
+              f"export_R2={format_metric(row['repeated_nuisance_export_r2_median'])} "
+              f"combined_R2={format_metric(row['repeated_nuisance_score_r2_median'])}", flush=True)
+    print(f"[PAIRED GUARD - NO GUARD] median dAUROC={guard_pair['metrics']['auc']['median']:+.4f}; "
+          f"median dExport_R2={format_metric(guard_pair['metrics']['nuisance_export_r2']['median'])}", flush=True)
+    print(f"[REPORT] {output_dir / 'final_report.json'}", flush=True)
     return report
 
 
@@ -4137,6 +4015,10 @@ def build_main_config() -> tuple[Config, ResolvedRuntimePaths]:
         repeated_cv_runs=int(MAIN_REPEATED_CV_RUNS),
         force_rebuild_cache=bool(MAIN_FORCE_REBUILD_CACHE),
         use_amp=bool(MAIN_USE_AMP),
+        series_grouping=MAIN_SERIES_GROUPING,
+        regularization_nuisance_scope=MAIN_REGULARIZATION_NUISANCE_SCOPE,
+        audit_pca_components=tuple(MAIN_AUDIT_COMPONENT_CAPS),
+        series_annotations_path=(MAIN_SERIES_ANNOTATION_PATH or os.environ.get("CAD_SERIES_ANNOTATION_CSV") or None),
     )
     return config, paths
 
