@@ -69,7 +69,14 @@
 #
 # plus the shared V6 arrays (labels, patient_ids, series_ids, sample_indices,
 # provenance_features, standardization_features, standardized MONAI QC arrays).
-# Set CAD_V6_FEATURE_CACHE_DIR explicitly if automatic discovery is ambiguous.
+#
+# Cache discovery is session-portable:
+#   1. same-session caches under /kaggle/working are detected automatically;
+#   2. previous V6 notebook outputs attached to a fresh Kaggle session are
+#      searched recursively under /kaggle/input, regardless of dataset slug;
+#   3. CAD_V6_FEATURE_CACHE_DIR may point either to the exact fingerprint folder
+#      OR to any ancestor containing feature_bank_cache;
+#   4. CAD_V6_SEARCH_ROOTS can supply additional os.pathsep-separated ancestors.
 #
 # The script also tries to reuse the V6 patient_fold_manifest.csv. Set
 # CAD_V6_SUITE_DIR explicitly when several V6 suite folders exist.
@@ -253,6 +260,11 @@ V6_OUTPUT_ROOT = Path(
     os.environ.get("CAD_V6_OUTPUT_ROOT", str(DEFAULT_V6_OUTPUT_ROOT))
 )
 V6_FEATURE_CACHE_DIR_OVERRIDE = os.environ.get("CAD_V6_FEATURE_CACHE_DIR")
+V6_SEARCH_ROOTS_OVERRIDE = os.environ.get("CAD_V6_SEARCH_ROOTS")
+# Optional os.pathsep-separated search roots. This is useful when a previous V6
+# notebook output has been attached to a fresh Kaggle session under /kaggle/input.
+# Unlike CAD_V6_FEATURE_CACHE_DIR, each entry may point to any ancestor directory;
+# V7 searches recursively beneath it for a compatible cache contract.
 V6_SUITE_DIR_OVERRIDE = os.environ.get("CAD_V6_SUITE_DIR")
 OUTPUT_ROOT = Path(
     os.environ.get("CAD_V7_OUTPUT_ROOT", str(DEFAULT_V7_OUTPUT_ROOT))
@@ -808,34 +820,214 @@ def cache_has_required_contract(cache_dir: Path) -> tuple[bool, dict[str, Any] |
     return True, metadata
 
 
-def discover_v6_feature_cache() -> tuple[Path, dict[str, Any]]:
-    if V6_FEATURE_CACHE_DIR_OVERRIDE:
-        candidate = Path(V6_FEATURE_CACHE_DIR_OVERRIDE)
-        valid, metadata = cache_has_required_contract(candidate)
-        if not valid or metadata is None:
-            raise FileNotFoundError(
-                "CAD_V6_FEATURE_CACHE_DIR does not contain the required V6 "
-                f"A17/C31/C32/C33 cache contract: {candidate}"
-            )
-        return candidate, metadata
+def _iter_candidate_v6_cache_dirs(root: Path, recursive: bool) -> list[Path]:
+    """Return plausible cache directories below ``root`` without duplicates.
 
-    candidates: list[tuple[float, Path, dict[str, Any]]] = []
-    cache_root = V6_OUTPUT_ROOT / "feature_bank_cache"
-    if cache_root.is_dir():
-        for metadata_path in cache_root.glob("*/metadata.json"):
-            cache_dir = metadata_path.parent
-            valid, metadata = cache_has_required_contract(cache_dir)
-            if valid and metadata is not None:
-                candidates.append((metadata_path.stat().st_mtime, cache_dir, metadata))
+    A Kaggle notebook output attached as an input is mounted under an arbitrary
+    dataset slug, for example::
+
+        /kaggle/input/<slug>/cad_patient_pipeline_outputs/
+            feature_bank_cache/<fingerprint>/metadata.json
+
+    The original V7 implementation searched only ``/kaggle/working`` and
+    therefore could not reuse a cache from a previous Kaggle session. This
+    helper accepts either the exact fingerprint directory, the feature_bank_cache
+    directory, a suite/output directory, or any ancestor mounted under
+    ``/kaggle/input``.
+    """
+
+    root = Path(root)
+    if root.is_file():
+        if root.name == "metadata.json":
+            return [root.parent]
+        return []
+    if not root.is_dir():
+        return []
+
+    found: list[Path] = []
+    seen: set[str] = set()
+
+    def add(candidate: Path):
+        key = str(candidate.resolve()) if candidate.exists() else str(candidate)
+        if key not in seen:
+            seen.add(key)
+            found.append(candidate)
+
+    # Exact cache directory.
+    if (root / "metadata.json").is_file():
+        add(root)
+
+    # Common direct layouts.
+    for pattern in (
+        "*/metadata.json",
+        "feature_bank_cache/*/metadata.json",
+        "cad_patient_pipeline_outputs/feature_bank_cache/*/metadata.json",
+    ):
+        try:
+            for metadata_path in root.glob(pattern):
+                add(metadata_path.parent)
+        except OSError:
+            pass
+
+    if recursive:
+        # Restrict the recursive walk to metadata files and validate each parent
+        # with the exact V6 contract; unrelated metadata.json files are harmless.
+        try:
+            for metadata_path in root.rglob("metadata.json"):
+                # Fast path filter avoids reading most unrelated JSON files.
+                parent_parts = set(metadata_path.parent.parts)
+                if (
+                    "feature_bank_cache" not in parent_parts
+                    and not (metadata_path.parent / "labels.npy").is_file()
+                ):
+                    continue
+                add(metadata_path.parent)
+        except OSError:
+            pass
+
+    return found
+
+
+def _compatible_v6_caches_under(
+    root: Path,
+    recursive: bool,
+    priority: int,
+) -> list[tuple[int, float, Path, dict[str, Any]]]:
+    rows: list[tuple[int, float, Path, dict[str, Any]]] = []
+    for cache_dir in _iter_candidate_v6_cache_dirs(root, recursive=recursive):
+        valid, metadata = cache_has_required_contract(cache_dir)
+        if not valid or metadata is None:
+            continue
+        try:
+            mtime = float((cache_dir / "metadata.json").stat().st_mtime)
+        except OSError:
+            mtime = 0.0
+        rows.append((int(priority), mtime, cache_dir, metadata))
+    return rows
+
+
+def discover_v6_feature_cache() -> tuple[Path, dict[str, Any]]:
+    """Locate a compatible V6 cache in working storage or attached Kaggle inputs.
+
+    Search order is intentionally broad but contract-strict. The cache is not
+    accepted merely because its directory is called ``feature_bank_cache``; it
+    must contain every V7-required V6 feature mode and every row-aligned shared
+    array. This lets a fresh Kaggle session reuse a previous notebook output
+    attached under ``/kaggle/input`` without requiring the user to know the
+    fingerprint directory in advance.
+    """
+
+    searched_roots: list[str] = []
+    candidates: list[tuple[int, float, Path, dict[str, Any]]] = []
+
+    # Explicit override is flexible: exact cache directory OR any ancestor.
+    if V6_FEATURE_CACHE_DIR_OVERRIDE:
+        override = Path(V6_FEATURE_CACHE_DIR_OVERRIDE)
+        searched_roots.append(str(override))
+        candidates.extend(
+            _compatible_v6_caches_under(
+                override,
+                recursive=True,
+                priority=1000,
+            )
+        )
+        if not candidates:
+            raise FileNotFoundError(
+                "CAD_V6_FEATURE_CACHE_DIR was provided, but no compatible V6 "
+                "A17/C31/C32/C33 cache was found at or below: "
+                f"{override}. The value may point to the exact fingerprint "
+                "folder OR to an ancestor such as feature_bank_cache/."
+            )
+
+    # Optional additional roots supplied by the user. These are searched before
+    # automatic locations but after an explicit cache-dir override.
+    if V6_SEARCH_ROOTS_OVERRIDE:
+        for raw_root in V6_SEARCH_ROOTS_OVERRIDE.split(os.pathsep):
+            raw_root = raw_root.strip()
+            if not raw_root:
+                continue
+            root = Path(raw_root)
+            searched_roots.append(str(root))
+            candidates.extend(
+                _compatible_v6_caches_under(
+                    root,
+                    recursive=True,
+                    priority=900,
+                )
+            )
+
+    automatic_roots: list[tuple[Path, bool, int]] = []
+    automatic_roots.append((V6_OUTPUT_ROOT, False, 800))
+
+    if os.path.exists("/kaggle/working"):
+        # Handles a V6 run earlier in the same live Kaggle session, even if the
+        # output root was changed from the default.
+        automatic_roots.append((Path("/kaggle/working"), True, 700))
+
+    if os.path.exists("/kaggle/input"):
+        # Critical fix: prior Kaggle notebook/dataset outputs live here in a new
+        # session. Search recursively because the dataset slug is arbitrary.
+        automatic_roots.append((Path("/kaggle/input"), True, 600))
+
+    # Local/notebook fallbacks.
+    automatic_roots.append((Path.cwd(), True, 500))
+    try:
+        automatic_roots.append((Path(__file__).resolve().parent, True, 500))
+    except NameError:
+        pass
+
+    seen_roots: set[str] = set()
+    for root, recursive, priority in automatic_roots:
+        try:
+            key = str(root.resolve())
+        except OSError:
+            key = str(root)
+        if key in seen_roots:
+            continue
+        seen_roots.add(key)
+        searched_roots.append(str(root))
+        candidates.extend(
+            _compatible_v6_caches_under(
+                root,
+                recursive=recursive,
+                priority=priority,
+            )
+        )
 
     if not candidates:
+        roots_text = "\n  - ".join(searched_roots) if searched_roots else "(none)"
         raise FileNotFoundError(
-            "No compatible V6 feature cache was found. Run V6 first in the same "
-            "Kaggle session, attach its feature_bank_cache as a Kaggle dataset, "
-            "or set CAD_V6_FEATURE_CACHE_DIR to the exact cache folder."
+            "No compatible V6 feature cache was found. V7 needs the frozen V6 "
+            "A17/C31/C32/C33 embeddings; those arrays cannot be reconstructed "
+            "from the V7 mathematics alone.\n\nSearched roots:\n  - "
+            f"{roots_text}\n\nIn a fresh Kaggle session, attach the OUTPUT of "
+            "the completed V6 notebook as a Kaggle input. This fixed V7 version "
+            "will discover feature_bank_cache/<fingerprint> recursively under "
+            "/kaggle/input automatically. Alternatively set "
+            "CAD_V6_FEATURE_CACHE_DIR to either the exact fingerprint directory "
+            "or any ancestor containing feature_bank_cache."
         )
-    candidates.sort(key=lambda row: (row[0], str(row[1])), reverse=True)
-    _, cache_dir, metadata = candidates[0]
+
+    # De-duplicate the same physical cache discovered through overlapping roots.
+    unique: dict[str, tuple[int, float, Path, dict[str, Any]]] = {}
+    for row in candidates:
+        priority, mtime, cache_dir, metadata = row
+        try:
+            key = str(cache_dir.resolve())
+        except OSError:
+            key = str(cache_dir)
+        previous = unique.get(key)
+        if previous is None or (priority, mtime) > (previous[0], previous[1]):
+            unique[key] = row
+
+    candidates = list(unique.values())
+    # Prefer explicit/search-root matches, then same-session working caches, then
+    # attached read-only inputs. Within the same priority use newest metadata.
+    candidates.sort(
+        key=lambda row: (row[0], row[1], str(row[2])),
+        reverse=True,
+    )
+    _, _, cache_dir, metadata = candidates[0]
     return cache_dir, metadata
 
 
