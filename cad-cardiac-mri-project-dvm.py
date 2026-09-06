@@ -986,6 +986,9 @@ MAIN_CHECK_PATHS_ONLY = False
 
 
 # Set MAIN_CHECK_PATHS_ONLY=True for a fast path diagnostic that loads no model.
+# Notebook/Kaggle-cell safety: ``main()`` and run metadata never require
+# ``__file__``.  When source code is executed directly from a cell, the script
+# path/hash are recorded as unavailable instead of raising NameError.
 
 
 @dataclass(frozen=True)
@@ -1019,6 +1022,57 @@ def _script_directory() -> Path:
         return Path(__file__).resolve().parent
     except NameError:
         return Path.cwd().resolve()
+
+
+def _runtime_source_identity() -> dict[str, str | None]:
+    """Return notebook-safe source provenance without requiring ``__file__``.
+
+    WHY THIS HELPER EXISTS
+    ----------------------
+    A normal ``python script.py`` execution defines ``__file__``.  Kaggle,
+    Colab and Jupyter also allow the entire source to be pasted/executed as a
+    notebook cell; in that execution mode ``__file__`` is not defined at all.
+    Reading ``Path(__file__)`` directly would therefore raise ``NameError``
+    *after* expensive setup, even though the scientific pipeline itself is
+    otherwise valid.
+
+    The source-file hash is reproducibility metadata, not a model input.  When
+    a real source file exists we save its absolute path and SHA-256.  When code
+    is running from an in-memory notebook cell, we record that fact explicitly
+    and use ``None`` for the unavailable file path/hash.  No synthetic path or
+    misleading checksum is invented.
+
+    Returns
+    -------
+    dict
+        ``script_path`` and ``script_sha256`` when a regular file is available,
+        plus ``script_identity_source`` describing how provenance was resolved.
+    """
+
+    try:
+        candidate = Path(__file__).resolve(strict=False)
+    except NameError:
+        return {
+            "script_path": None,
+            "script_sha256": None,
+            "script_identity_source": "notebook_cell_without___file__",
+        }
+
+    if candidate.is_file():
+        return {
+            "script_path": str(candidate),
+            "script_sha256": sha256_file(candidate),
+            "script_identity_source": "__file__",
+        }
+
+    # Some interactive launchers may technically define ``__file__`` to a
+    # pseudo-name that is not a real file.  Treat it as notebook-style source
+    # rather than failing or hashing a nonexistent path.
+    return {
+        "script_path": str(candidate),
+        "script_sha256": None,
+        "script_identity_source": "__file___not_a_regular_file",
+    }
 
 
 def _is_kaggle_runtime() -> bool:
@@ -3798,6 +3852,7 @@ def run_research_portfolio(config: Config) -> dict[str, Any]:
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     write_json(output_dir / "configuration.json", asdict(config))
+    source_identity = _runtime_source_identity()
     write_json(
         output_dir / "run_metadata.json",
         {
@@ -3816,7 +3871,7 @@ def run_research_portfolio(config: Config) -> dict[str, Any]:
             "dataset_path_source": config.dataset_path_source,
             "output_directory": str(Path(config.output_dir).resolve(strict=False)),
             "output_directory_source": config.output_dir_source,
-            "script_sha256": sha256_file(Path(__file__).resolve()),
+            **source_identity,
         },
     )
 
