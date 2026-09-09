@@ -1,5 +1,5 @@
 #%% ============================================================
-# 🧠 CAD Detection from Cardiac MRI – Focused Research Validation Pipeline V7 (Single File)
+# 🧠 CAD Detection from Cardiac MRI – Focused Research Validation Pipeline V7.1 (Single File)
 # ============================================================
 
 # ============================================================================
@@ -430,8 +430,11 @@
 #   audits/series_annotation_template.csv
 #   audits/series_annotation_label_key.csv
 #   audits/focused_row_contract.json
-#   audits/monai_qc_by_patient.csv
-#   audits/standardized_monai_qc_by_patient.csv
+#   audits/monai_qc_availability.json
+#   audits/monai_gate_class_comparison.json
+#   audits/monai_qc_by_patient.csv                     (only when computed)
+#   audits/standardized_monai_qc_availability.json
+#   audits/standardized_monai_qc_by_patient.csv        (only when computed)
 #   audits/patient_provenance_features.csv
 #   experiments/<experiment_id>/patient_oof_predictions.csv
 #   experiments/<experiment_id>/fold_metrics.csv
@@ -721,8 +724,15 @@ class ExperimentConfig:
 # ---------------------------------------------------------------------------
 # FOCUSED RESEARCH PANEL
 # ---------------------------------------------------------------------------
-FOCUSED_SUITE_VERSION = "7.0"
+FOCUSED_SUITE_VERSION = "7.1"
 FOCUSED_SUITE_PROFILE = "compact_reproducibility_and_validity_evidence"
+MONAI_QC_MISSING_BRANCH_POLICY = "explicit_skip_without_imputation_v1"
+# The focused V7 panel requests only standardized image representations. The
+# original-canvas MONAI branch is therefore intentionally not executed during
+# feature extraction. Missing QC from an unexecuted branch must be reported as
+# SKIPPED_NOT_COMPUTED; it must never be converted to zeros or imputed medians,
+# because those invented values would create a misleading QC classifier.
+
 # This profile is designed for a concise research supplement or portfolio. It
 # prioritizes falsifiable controls and robustness over a large model leaderboard.
 # The executable registry contains only the sixteen essential experiments plus
@@ -1921,6 +1931,7 @@ _selected_experiments_for_identity = [
 _suite_identity = {
     "focused_suite_version": FOCUSED_SUITE_VERSION,
     "focused_suite_profile": FOCUSED_SUITE_PROFILE,
+    "monai_qc_missing_branch_policy": MONAI_QC_MISSING_BRANCH_POLICY,
     "experiments": _selected_experiments_for_identity,
     "essential_experiment_ids": ESSENTIAL_EXPERIMENT_IDS,
     "future_candidate_experiment_ids": FUTURE_CANDIDATE_EXPERIMENT_IDS,
@@ -2301,6 +2312,13 @@ def validate_configuration():
     experiments = get_enabled_experiments()
     if not experiments:
         raise ValueError("At least one experiment must be enabled.")
+    if MONAI_QC_MISSING_BRANCH_POLICY != (
+        "explicit_skip_without_imputation_v1"
+    ):
+        raise ValueError(
+            "Unsupported MONAI_QC_MISSING_BRANCH_POLICY. Missing branches "
+            "must be skipped explicitly and must not be imputed."
+        )
 
     experiment_ids = [experiment.experiment_id for experiment in experiments]
     if len(experiment_ids) != len(set(experiment_ids)):
@@ -5660,6 +5678,54 @@ def required_efficientnet_feature_modes(experiments):
     return tuple(mode for mode in canonical_order if mode in requested)
 
 
+# MONAI inference is requested not only by image representations but also by a
+# future tabular QC-only experiment. Keeping this requirement in one helper
+# prevents a reduced registry from silently leaving the requested QC branch as
+# an all-NaN sentinel.
+ORIGINAL_MONAI_IMAGE_MODES = frozenset({"monai_roi", "outside_heart"})
+STANDARDIZED_MONAI_IMAGE_MODES = frozenset(
+    {
+        "standardized_monai_roi",
+        "standardized_center_crop",
+        "standardized_roi_zero_background",
+        "standardized_roi_zero_bg_center_fallback",
+        "standardized_roi_bbox",
+        "standardized_outside_large_bbox",
+        "standardized_soft_monai_mask_only",
+        "standardized_hard_monai_mask_only",
+        "standardized_monai_bbox_mask_only",
+        "standardized_soft_monai_histogram_only",
+        "standardized_soft_monai_block_shuffled",
+        "standardized_canonical_hard_monai_mask_only",
+        "standardized_canonical_soft_monai_mask_only",
+        "standardized_heart_centered_fixed_fov_region_norm",
+        "standardized_hard_support_region_norm",
+        "standardized_a17_exact_support_mask_only",
+        "standardized_a17_support_intensity_affine_shuffled",
+        "standardized_a17_exact_support_complement_region_norm",
+        "standardized_outside_whole_heart_region_norm",
+    }
+)
+
+
+def required_monai_qc_branches(experiments):
+    """Return which original/standardized MONAI inference branches are needed."""
+
+    experiments = tuple(experiments)
+    image_modes = set(required_efficientnet_feature_modes(experiments))
+    all_feature_modes = {experiment.feature_mode for experiment in experiments}
+    return {
+        "original": bool(
+            image_modes.intersection(ORIGINAL_MONAI_IMAGE_MODES)
+            or "monai_qc_only" in all_feature_modes
+        ),
+        "standardized": bool(
+            image_modes.intersection(STANDARDIZED_MONAI_IMAGE_MODES)
+            or "standardized_monai_qc_only" in all_feature_modes
+        ),
+    }
+
+
 def feature_bank_fingerprint(samples, dataset_root):
     """Hash the dataset inventory and every setting that changes cached features."""
 
@@ -5893,6 +5959,24 @@ def load_feature_bank(cache_dir, expected_fingerprint, required_modes):
                 f"Feature bank mode {mode!r} has unexpected shape "
                 f"{features.shape}."
             )
+
+    requested_qc_branches = required_monai_qc_branches(
+        get_enabled_experiments()
+    )
+    for standardized, requirement_key in ((False, "original"), (True, "standardized")):
+        if not requested_qc_branches[requirement_key]:
+            continue
+        availability = inspect_monai_qc_branch_availability(
+            bank, standardized=standardized
+        )
+        if availability["status"] != "AVAILABLE":
+            print(
+                "[FEATURE BANK] Cached MONAI-QC branch does not satisfy the "
+                f"current registry ({requirement_key}: "
+                f"{availability['status']}); a clean rebuild is required.",
+                flush=True,
+            )
+            return None
 
     print(
         "[FEATURE BANK] Cache hit loaded in "
@@ -7214,36 +7298,15 @@ def extract_feature_bank(
     if not required_modes:
         raise ValueError("At least one EfficientNet feature mode is required.")
 
-    # MONAI is loaded only when an enabled image view actually needs its mask.
-    # The full-image and border-only controls can otherwise run without MONAI.
-    original_monai_modes = {"monai_roi", "outside_heart"}
-    standardized_monai_modes = {
-        "standardized_monai_roi",
-        "standardized_center_crop",
-        "standardized_roi_zero_background",
-        "standardized_roi_zero_bg_center_fallback",
-        "standardized_roi_bbox",
-        "standardized_outside_large_bbox",
-        "standardized_soft_monai_mask_only",
-        "standardized_hard_monai_mask_only",
-        "standardized_monai_bbox_mask_only",
-        "standardized_soft_monai_histogram_only",
-        "standardized_soft_monai_block_shuffled",
-        "standardized_canonical_hard_monai_mask_only",
-        "standardized_canonical_soft_monai_mask_only",
-        "standardized_heart_centered_fixed_fov_region_norm",
-        "standardized_hard_support_region_norm",
-        "standardized_a17_exact_support_mask_only",
-        "standardized_a17_support_intensity_affine_shuffled",
-        "standardized_a17_exact_support_complement_region_norm",
-        "standardized_outside_whole_heart_region_norm",
-    }
-    need_original_monai = any(
-        mode in original_monai_modes for mode in required_modes
+    # MONAI is loaded only when an enabled image view or a declared tabular
+    # MONAI-QC control requires that preprocessing branch. The focused V7.1
+    # panel needs only the standardized branch; the original branch therefore
+    # remains intentionally uncomputed and is reported as SKIPPED downstream.
+    monai_requirements = required_monai_qc_branches(
+        get_enabled_experiments()
     )
-    need_standardized_monai = any(
-        mode in standardized_monai_modes for mode in required_modes
-    )
+    need_original_monai = bool(monai_requirements["original"])
+    need_standardized_monai = bool(monai_requirements["standardized"])
     need_monai = need_original_monai or need_standardized_monai
     if need_monai and monai_segmenter is None:
         raise RuntimeError(
@@ -7362,7 +7425,10 @@ def extract_feature_bank(
     print(
         f"[FEATURE BANK] slices={n_slices}, batches={total_batches}, "
         f"batch_size={BATCH_SIZE}, modes={list(required_modes)}, "
-        f"MONAI_required={need_monai}, device={DEVICE}",
+        f"MONAI_required={need_monai}, "
+        f"original_MONAI_QC={need_original_monai}, "
+        f"standardized_MONAI_QC={need_standardized_monai}, "
+        f"device={DEVICE}",
         flush=True,
     )
 
@@ -7989,6 +8055,13 @@ def extract_feature_bank(
         "provenance_feature_names": list(PROVENANCE_FEATURE_NAMES),
         "standardization_feature_names": list(
             STANDARDIZATION_FEATURE_NAMES
+        ),
+        "original_monai_qc_computed": bool(need_original_monai),
+        "standardized_monai_qc_computed": bool(
+            need_standardized_monai
+        ),
+        "monai_qc_missing_branch_policy": (
+            MONAI_QC_MISSING_BRANCH_POLICY
         ),
         "monai_runtime_source": MONAI_RUNTIME_SOURCE,
         "monai_runtime_artifact_path": MONAI_RUNTIME_ARTIFACT_PATH,
@@ -8882,9 +8955,36 @@ def write_patient_fold_manifest(output_path, rows):
 
 
 def write_cohort_manifest(output_path, samples, bank, fold_manifest_rows):
-    """Write one auditable row per image including folds and provenance fields."""
+    """Write one auditable row per image including folds and provenance fields.
+
+    An uncomputed MONAI branch is represented by an explicit branch-status
+    column and empty QC cells, not by ``False`` gate values plus ``nan`` numeric
+    cells. The latter would incorrectly imply that inference ran and every mask
+    failed. Partial non-finite branches remain errors because they can indicate a
+    damaged cache or numerical failure.
+    """
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    original_qc_availability = inspect_monai_qc_branch_availability(
+        bank, standardized=False
+    )
+    standardized_qc_availability = inspect_monai_qc_branch_availability(
+        bank, standardized=True
+    )
+    for availability, standardized in (
+        (original_qc_availability, False),
+        (standardized_qc_availability, True),
+    ):
+        if availability["status"] == "PARTIAL_NONFINITE":
+            _require_available_monai_qc_branch(
+                bank, standardized=standardized
+            )
+
+    original_qc_available = bool(original_qc_availability["available"])
+    standardized_qc_available = bool(
+        standardized_qc_availability["available"]
+    )
+
     fold_by_patient = {
         row["patient_id"]: row["outer_fold"] for row in fold_manifest_rows
     }
@@ -8903,11 +9003,13 @@ def write_cohort_manifest(output_path, samples, bank, fold_manifest_rows):
         "duplicate_component_id",
         "decoded_pixel_sha256",
         "perceptual_hash",
+        "original_monai_qc_status",
         "monai_gate_valid",
         "monai_area_ratio",
         "monai_peak_probability",
         "monai_mean_foreground_probability",
         "roi_slice_std_score",
+        "standardized_monai_qc_status",
         "standardized_monai_gate_valid",
         "standardized_monai_area_ratio",
         "standardized_monai_peak_probability",
@@ -8933,29 +9035,65 @@ def write_cohort_manifest(output_path, samples, bank, fold_manifest_rows):
                 "duplicate_component_id": component_by_patient[str(patient_id)],
                 "decoded_pixel_sha256": str(bank["decoded_pixel_hashes"][index]),
                 "perceptual_hash": str(bank["perceptual_hashes"][index]),
-                "monai_gate_valid": int(bool(bank["monai_valid"][index])),
-                "monai_area_ratio": float(bank["area_ratios"][index]),
-                "monai_peak_probability": float(
-                    bank["peak_probabilities"][index]
+                "original_monai_qc_status": original_qc_availability[
+                    "status"
+                ],
+                "monai_gate_valid": (
+                    int(bool(bank["monai_valid"][index]))
+                    if original_qc_available
+                    else ""
                 ),
-                "monai_mean_foreground_probability": float(
-                    bank["mean_foreground_probabilities"][index]
+                "monai_area_ratio": (
+                    float(bank["area_ratios"][index])
+                    if original_qc_available
+                    else ""
                 ),
-                "roi_slice_std_score": float(bank["roi_slice_scores"][index]),
-                "standardized_monai_gate_valid": int(
-                    bool(bank["standardized_monai_valid"][index])
+                "monai_peak_probability": (
+                    float(bank["peak_probabilities"][index])
+                    if original_qc_available
+                    else ""
                 ),
-                "standardized_monai_area_ratio": float(
-                    bank["standardized_area_ratios"][index]
+                "monai_mean_foreground_probability": (
+                    float(bank["mean_foreground_probabilities"][index])
+                    if original_qc_available
+                    else ""
                 ),
-                "standardized_monai_peak_probability": float(
-                    bank["standardized_peak_probabilities"][index]
+                "roi_slice_std_score": (
+                    float(bank["roi_slice_scores"][index])
+                    if original_qc_available
+                    else ""
                 ),
-                "standardized_monai_mean_foreground_probability": float(
-                    bank["standardized_mean_foreground_probabilities"][index]
+                "standardized_monai_qc_status": (
+                    standardized_qc_availability["status"]
                 ),
-                "standardized_roi_slice_std_score": float(
-                    bank["standardized_roi_slice_scores"][index]
+                "standardized_monai_gate_valid": (
+                    int(bool(bank["standardized_monai_valid"][index]))
+                    if standardized_qc_available
+                    else ""
+                ),
+                "standardized_monai_area_ratio": (
+                    float(bank["standardized_area_ratios"][index])
+                    if standardized_qc_available
+                    else ""
+                ),
+                "standardized_monai_peak_probability": (
+                    float(bank["standardized_peak_probabilities"][index])
+                    if standardized_qc_available
+                    else ""
+                ),
+                "standardized_monai_mean_foreground_probability": (
+                    float(
+                        bank[
+                            "standardized_mean_foreground_probabilities"
+                        ][index]
+                    )
+                    if standardized_qc_available
+                    else ""
+                ),
+                "standardized_roi_slice_std_score": (
+                    float(bank["standardized_roi_slice_scores"][index])
+                    if standardized_qc_available
+                    else ""
                 ),
             }
             for feature_name, value in zip(
@@ -9758,16 +9896,152 @@ def build_provenance_component_control_sets(provenance_set):
     }
 
 
-def aggregate_patient_monai_qc_features(bank):
-    """Aggregate MONAI gate diagnostics to one label-free patient feature row."""
+def inspect_monai_qc_branch_availability(bank, standardized=False):
+    """Inspect whether one MONAI-QC branch was actually computed.
+
+    The compact focused suite needs standardized MONAI masks for A17 and its
+    controls, but no active experiment needs the historical original-canvas
+    MONAI branch. During extraction the unused original QC arrays are therefore
+    deliberately stored as all-NaN sentinels. Treating those sentinels as failed
+    measurements would be incorrect, while replacing them with zeros would
+    fabricate a QC signal. This helper distinguishes three cases:
+
+      AVAILABLE
+          every slice has finite area/confidence/foreground diagnostics;
+      SKIPPED_NOT_COMPUTED
+          all three diagnostic arrays contain no finite values, which is the
+          expected sentinel state for an intentionally unexecuted branch;
+      PARTIAL_NONFINITE
+          some but not all diagnostics are finite. This indicates numerical or
+          cache corruption and remains a hard error rather than being imputed.
+    """
+
+    prefix = "standardized_" if standardized else ""
+    branch_name = "standardized" if standardized else "original"
+    key_map = {
+        "valid": f"{prefix}monai_valid",
+        "area": f"{prefix}area_ratios",
+        "peak": f"{prefix}peak_probabilities",
+        "foreground": f"{prefix}mean_foreground_probabilities",
+    }
+
+    missing_keys = [key for key in key_map.values() if key not in bank]
+    if missing_keys:
+        raise RuntimeError(
+            f"{branch_name.capitalize()} MONAI-QC arrays are missing from the "
+            f"feature bank: {missing_keys}."
+        )
+
+    n_rows = int(len(np.asarray(bank["labels"])))
+    arrays = {
+        name: np.asarray(bank[key])
+        for name, key in key_map.items()
+    }
+    for name, array in arrays.items():
+        if array.ndim != 1 or len(array) != n_rows:
+            raise RuntimeError(
+                f"{branch_name.capitalize()} MONAI-QC array {name!r} has "
+                f"shape {array.shape}; expected ({n_rows},)."
+            )
+
+    finite = {
+        name: np.isfinite(np.asarray(arrays[name], dtype=np.float64))
+        for name in ("area", "peak", "foreground")
+    }
+    row_all_finite = finite["area"] & finite["peak"] & finite["foreground"]
+    row_any_finite = finite["area"] | finite["peak"] | finite["foreground"]
+    n_all_finite = int(np.sum(row_all_finite))
+    n_any_finite = int(np.sum(row_any_finite))
+
+    metadata_key = (
+        "standardized_monai_qc_computed"
+        if standardized
+        else "original_monai_qc_computed"
+    )
+    metadata_value = bank.get("metadata", {}).get(metadata_key)
+
+    if n_all_finite == n_rows:
+        status = "AVAILABLE"
+        available = True
+        reason = (
+            f"All {n_rows} slice rows contain finite {branch_name} MONAI-QC "
+            "diagnostics."
+        )
+    elif n_any_finite == 0:
+        status = "SKIPPED_NOT_COMPUTED"
+        available = False
+        reason = (
+            f"The {branch_name} MONAI inference branch was not executed by the "
+            "active focused feature modes; its saved QC arrays contain the "
+            "documented all-NaN sentinel values."
+        )
+    else:
+        status = "PARTIAL_NONFINITE"
+        available = False
+        reason = (
+            f"Only {n_all_finite}/{n_rows} rows have all finite diagnostics "
+            f"and {n_any_finite}/{n_rows} have at least one finite diagnostic."
+        )
+
+    return {
+        "status": status,
+        "available": bool(available),
+        "preprocessing_branch": branch_name,
+        "n_slice_rows": n_rows,
+        "n_rows_all_diagnostics_finite": n_all_finite,
+        "n_rows_any_diagnostic_finite": n_any_finite,
+        "n_nonfinite_area": int(np.sum(~finite["area"])),
+        "n_nonfinite_peak": int(np.sum(~finite["peak"])),
+        "n_nonfinite_foreground": int(np.sum(~finite["foreground"])),
+        "metadata_declared_computed": metadata_value,
+        "missing_branch_policy": MONAI_QC_MISSING_BRANCH_POLICY,
+        "reason": reason,
+    }
+
+
+def _require_available_monai_qc_branch(bank, standardized=False):
+    """Return availability metadata or fail on partial/non-finite corruption."""
+
+    availability = inspect_monai_qc_branch_availability(
+        bank, standardized=standardized
+    )
+    if availability["status"] == "PARTIAL_NONFINITE":
+        branch_name = availability["preprocessing_branch"]
+        raise RuntimeError(
+            f"{branch_name.capitalize()} MONAI-QC arrays are partially "
+            "non-finite. This is not the expected all-NaN sentinel for an "
+            "uncomputed branch and may indicate numerical failure or an "
+            f"incomplete/corrupt cache. Diagnostics: {availability}."
+        )
+    if not availability["available"]:
+        branch_name = availability["preprocessing_branch"]
+        raise RuntimeError(
+            f"{branch_name.capitalize()} MONAI-QC was not computed. "
+            f"Diagnostics: {availability}."
+        )
+    return availability
+
+
+def _aggregate_available_patient_monai_qc_features(bank, standardized=False):
+    """Aggregate one fully available MONAI-QC branch to patient rows.
+
+    No NaN-aware statistic is used here. Once a branch is declared AVAILABLE,
+    every slice-level diagnostic must be finite. This prevents NumPy's
+    ``All-NaN slice`` warnings and prevents silent omission or imputation of
+    failed measurements.
+    """
+
+    _require_available_monai_qc_branch(bank, standardized=standardized)
+    prefix = "standardized_" if standardized else ""
+    branch_name = "standardized" if standardized else "original"
 
     labels = np.asarray(bank["labels"], dtype=np.int64)
     patient_ids = np.asarray(bank["patient_ids"])
-    valid = np.asarray(bank["monai_valid"], dtype=bool)
-    area = np.asarray(bank["area_ratios"], dtype=np.float32)
-    peak = np.asarray(bank["peak_probabilities"], dtype=np.float32)
+    valid = np.asarray(bank[f"{prefix}monai_valid"], dtype=bool)
+    area = np.asarray(bank[f"{prefix}area_ratios"], dtype=np.float32)
+    peak = np.asarray(bank[f"{prefix}peak_probabilities"], dtype=np.float32)
     foreground = np.asarray(
-        bank["mean_foreground_probabilities"],
+        bank[f"{prefix}mean_foreground_probabilities"],
         dtype=np.float32,
     )
 
@@ -9790,29 +10064,52 @@ def aggregate_patient_monai_qc_features(bank):
         label_values = np.unique(labels[indices])
         if len(label_values) != 1:
             raise RuntimeError(
-                f"Patient {patient_id} has inconsistent MONAI-QC labels."
+                f"Patient {patient_id} has inconsistent {branch_name} "
+                "MONAI-QC labels."
             )
+
+        patient_area = area[indices]
+        patient_peak = peak[indices]
+        patient_foreground = foreground[indices]
+        if not (
+            np.all(np.isfinite(patient_area))
+            and np.all(np.isfinite(patient_peak))
+            and np.all(np.isfinite(patient_foreground))
+        ):
+            raise RuntimeError(
+                f"Patient {patient_id} contains non-finite {branch_name} "
+                "MONAI-QC values after branch availability validation."
+            )
+
         patient_labels.append(int(label_values[0]))
         rows.append(
             [
                 float(np.mean(valid[indices])),
-                float(np.nanmedian(area[indices])),
-                float(np.nanstd(area[indices])),
-                float(np.nanmedian(peak[indices])),
-                float(np.nanstd(peak[indices])),
-                float(np.nanmedian(foreground[indices])),
-                float(np.nanstd(foreground[indices])),
+                float(np.median(patient_area)),
+                float(np.std(patient_area)),
+                float(np.median(patient_peak)),
+                float(np.std(patient_peak)),
+                float(np.median(patient_foreground)),
+                float(np.std(patient_foreground)),
             ]
         )
 
     X = np.asarray(rows, dtype=np.float32)
     if not np.all(np.isfinite(X)):
         raise RuntimeError(
-            "MONAI-QC patient features contain non-finite values."
+            f"{branch_name.capitalize()} MONAI-QC patient features contain "
+            "non-finite values after validated aggregation."
         )
     y = np.asarray(patient_labels, dtype=np.int64)
     return X, y, ordered_patients, feature_names
 
+
+def aggregate_patient_monai_qc_features(bank):
+    """Aggregate original-canvas MONAI QC when that branch was computed."""
+
+    return _aggregate_available_patient_monai_qc_features(
+        bank, standardized=False
+    )
 
 
 def aggregate_patient_standardization_features(bank):
@@ -9876,61 +10173,11 @@ def aggregate_patient_standardization_features(bank):
 
 
 def aggregate_patient_standardized_monai_qc_features(bank):
-    """Aggregate MONAI QC after label-blind preprocessing to one patient row."""
+    """Aggregate standardized MONAI QC when that branch was computed."""
 
-    labels = np.asarray(bank["labels"], dtype=np.int64)
-    patient_ids = np.asarray(bank["patient_ids"])
-    valid = np.asarray(bank["standardized_monai_valid"], dtype=bool)
-    area = np.asarray(bank["standardized_area_ratios"], dtype=np.float32)
-    peak = np.asarray(
-        bank["standardized_peak_probabilities"], dtype=np.float32
+    return _aggregate_available_patient_monai_qc_features(
+        bank, standardized=True
     )
-    foreground = np.asarray(
-        bank["standardized_mean_foreground_probabilities"],
-        dtype=np.float32,
-    )
-
-    mapping = _patient_indices(patient_ids)
-    ordered_patients = np.asarray(sorted(mapping))
-    patient_labels = []
-    rows = []
-    feature_names = (
-        "plausible_mask_rate",
-        "median_area_ratio",
-        "std_area_ratio",
-        "median_peak_probability",
-        "std_peak_probability",
-        "median_mean_foreground_probability",
-        "std_mean_foreground_probability",
-    )
-
-    for patient_id in ordered_patients:
-        indices = np.asarray(mapping[str(patient_id)], dtype=np.int64)
-        label_values = np.unique(labels[indices])
-        if len(label_values) != 1:
-            raise RuntimeError(
-                f"Patient {patient_id} has inconsistent standardized MONAI-QC labels."
-            )
-        patient_labels.append(int(label_values[0]))
-        rows.append(
-            [
-                float(np.mean(valid[indices])),
-                float(np.nanmedian(area[indices])),
-                float(np.nanstd(area[indices])),
-                float(np.nanmedian(peak[indices])),
-                float(np.nanstd(peak[indices])),
-                float(np.nanmedian(foreground[indices])),
-                float(np.nanstd(foreground[indices])),
-            ]
-        )
-
-    X = np.asarray(rows, dtype=np.float32)
-    if not np.all(np.isfinite(X)):
-        raise RuntimeError(
-            "Standardized MONAI-QC patient features contain non-finite values."
-        )
-    y = np.asarray(patient_labels, dtype=np.int64)
-    return X, y, ordered_patients, feature_names
 
 
 def bootstrap_difference_in_means(values, labels, n_bootstrap, random_state):
@@ -9959,10 +10206,62 @@ def bootstrap_difference_in_means(values, labels, n_bootstrap, random_state):
     )
 
 
+def _write_monai_qc_unavailable_status(output_dir, availability, standardized):
+    """Write an explicit machine-readable SKIPPED status for missing QC."""
+
+    prefix = "standardized_" if standardized else ""
+    branch_name = availability["preprocessing_branch"]
+    comparison = {
+        "status": "SKIPPED_NOT_COMPUTED",
+        "preprocessing_branch": branch_name,
+        "reason": availability["reason"],
+        "availability": availability,
+        "patient_level_normal_mean_gate_rate": None,
+        "patient_level_sick_mean_gate_rate": None,
+        "patient_level_sick_minus_normal_difference": None,
+        "patient_level_difference_ci": None,
+        "slice_level_normal_gate_rate_descriptive": None,
+        "slice_level_sick_gate_rate_descriptive": None,
+        "warning_threshold_absolute_difference": (
+            MONAI_GATE_RATE_DIFFERENCE_WARNING
+        ),
+        "warning_triggered": False,
+        "interpretation": (
+            "This branch was intentionally not computed by the focused feature "
+            "panel. No zeros, medians, or values from the other preprocessing "
+            "branch were substituted."
+        ),
+    }
+    (output_dir / f"{prefix}monai_qc_availability.json").write_text(
+        json.dumps(availability, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    (output_dir / f"{prefix}monai_gate_class_comparison.json").write_text(
+        json.dumps(comparison, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    print(
+        f"[{branch_name.upper()} MONAI QC] SKIPPED_NOT_COMPUTED: "
+        f"{availability['reason']}",
+        flush=True,
+    )
+    return comparison, None
+
+
 def write_monai_qc_outputs(output_dir, bank):
-    """Write patient-level gate statistics and class-specific comparison."""
+    """Write original-canvas MONAI QC, or explicitly skip if uncomputed."""
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    availability = inspect_monai_qc_branch_availability(
+        bank, standardized=False
+    )
+    if availability["status"] == "SKIPPED_NOT_COMPUTED":
+        return _write_monai_qc_unavailable_status(
+            output_dir, availability, standardized=False
+        )
+    if availability["status"] != "AVAILABLE":
+        _require_available_monai_qc_branch(bank, standardized=False)
+
     X_qc, y_qc, patient_ids, feature_names = (
         aggregate_patient_monai_qc_features(bank)
     )
@@ -9997,6 +10296,9 @@ def write_monai_qc_outputs(output_dir, bank):
     slice_sick_rate = float(np.mean(slice_valid[slice_labels == 1]))
 
     comparison = {
+        "status": "OK",
+        "preprocessing_branch": "original",
+        "availability": availability,
         "patient_level_normal_mean_gate_rate": normal_mean,
         "patient_level_sick_mean_gate_rate": sick_mean,
         "patient_level_sick_minus_normal_difference": difference,
@@ -10014,6 +10316,10 @@ def write_monai_qc_outputs(output_dir, bank):
             "confounding; it is not segmentation-accuracy evidence."
         ),
     }
+    (output_dir / "monai_qc_availability.json").write_text(
+        json.dumps(availability, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
     (output_dir / "monai_gate_class_comparison.json").write_text(
         json.dumps(comparison, indent=2, sort_keys=True),
         encoding="utf-8",
@@ -10038,9 +10344,19 @@ def write_monai_qc_outputs(output_dir, bank):
 
 
 def write_standardized_monai_qc_outputs(output_dir, bank):
-    """Write the same gate audit after label-blind image standardization."""
+    """Write standardized MONAI QC, or explicitly skip if uncomputed."""
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    availability = inspect_monai_qc_branch_availability(
+        bank, standardized=True
+    )
+    if availability["status"] == "SKIPPED_NOT_COMPUTED":
+        return _write_monai_qc_unavailable_status(
+            output_dir, availability, standardized=True
+        )
+    if availability["status"] != "AVAILABLE":
+        _require_available_monai_qc_branch(bank, standardized=True)
+
     X_qc, y_qc, patient_ids, feature_names = (
         aggregate_patient_standardized_monai_qc_features(bank)
     )
@@ -10075,7 +10391,9 @@ def write_standardized_monai_qc_outputs(output_dir, bank):
     slice_sick_rate = float(np.mean(slice_valid[slice_labels == 1]))
 
     comparison = {
+        "status": "OK",
         "preprocessing_branch": "label_blind_standardized",
+        "availability": availability,
         "patient_level_normal_mean_gate_rate": normal_mean,
         "patient_level_sick_mean_gate_rate": sick_mean,
         "patient_level_sick_minus_normal_difference": difference,
@@ -10089,14 +10407,16 @@ def write_standardized_monai_qc_outputs(output_dir, bank):
             abs(difference) >= MONAI_GATE_RATE_DIFFERENCE_WARNING
         ),
         "interpretation": (
-            "A large class difference after label-blind standardization may "
-            "still reflect sequence/protocol differences; it is not "
-            "segmentation-accuracy evidence."
+            "A large class difference after standardization may still reflect "
+            "sequence/protocol/export confounding; it is not segmentation-"
+            "accuracy evidence."
         ),
     }
-    (
-        output_dir / "standardized_monai_gate_class_comparison.json"
-    ).write_text(
+    (output_dir / "standardized_monai_qc_availability.json").write_text(
+        json.dumps(availability, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    (output_dir / "standardized_monai_gate_class_comparison.json").write_text(
         json.dumps(comparison, indent=2, sort_keys=True),
         encoding="utf-8",
     )
@@ -10111,7 +10431,8 @@ def write_standardized_monai_qc_outputs(output_dir, bank):
     if comparison["warning_triggered"]:
         print(
             "[WARNING] The standardized class-specific MONAI gate-rate "
-            "difference exceeds the configured threshold.",
+            f"difference exceeds {MONAI_GATE_RATE_DIFFERENCE_WARNING:.0%}. "
+            "Protocol/export confounding must be investigated.",
             flush=True,
         )
 
@@ -14977,6 +15298,9 @@ def collect_suite_metadata(
         "suite_configuration_tag": SUITE_CONFIGURATION_TAG,
         "focused_suite_version": FOCUSED_SUITE_VERSION,
         "focused_suite_profile": FOCUSED_SUITE_PROFILE,
+        "monai_qc_missing_branch_policy": (
+            MONAI_QC_MISSING_BRANCH_POLICY
+        ),
         "active_experiment_ids": list(EXPERIMENTS_TO_RUN),
         "essential_experiment_ids": list(ESSENTIAL_EXPERIMENT_IDS),
         "future_candidate_experiment_ids": list(
@@ -15196,6 +15520,12 @@ def write_suite_configuration(output_path, experiments):
         "suite_configuration_tag": SUITE_CONFIGURATION_TAG,
         "focused_suite_version": FOCUSED_SUITE_VERSION,
         "focused_suite_profile": FOCUSED_SUITE_PROFILE,
+        "monai_qc_missing_branch_policy": (
+            MONAI_QC_MISSING_BRANCH_POLICY
+        ),
+        "monai_qc_branch_requirements": required_monai_qc_branches(
+            experiments
+        ),
         "essential_experiment_ids": list(ESSENTIAL_EXPERIMENT_IDS),
         "future_candidate_experiment_ids": list(
             FUTURE_CANDIDATE_EXPERIMENT_IDS
@@ -15471,7 +15801,7 @@ def main():
     experiments = get_enabled_experiments()
 
     print("\n" + "#" * 100, flush=True)
-    print("CAD CARDIAC MRI — FOCUSED PATIENT-LEVEL RESEARCH SUITE V7", flush=True)
+    print("CAD CARDIAC MRI — FOCUSED PATIENT-LEVEL RESEARCH SUITE V7.1", flush=True)
     print("#" * 100, flush=True)
     print(f"[SUITE] Dataset: {DATASET_PATH}", flush=True)
     print(f"[SUITE] Output: {OUTPUT_DIR}", flush=True)
@@ -15722,8 +16052,13 @@ def main():
     # anatomical texture. Standardization-QC controls use only crop/padding and
     # robust-range metadata produced by the fixed label-blind preprocessing.
     # Original and standardized MONAI-QC controls summarize gate rate, mask
-    # area, confidence and fallback behavior. All tables are saved descriptively
-    # and evaluated through the same outer folds. A high control AUC indicates
+    # area, confidence and fallback behavior. The focused registry computes only
+    # the standardized MONAI branch; the historical original branch therefore
+    # carries intentional all-NaN sentinels in the shared cache and is written as
+    # SKIPPED_NOT_COMPUTED rather than imputed. A future original-MONAI-QC
+    # experiment automatically requests that branch and forces a compatible
+    # cache rebuild. All available tables are saved descriptively and evaluated
+    # through the same outer folds. A high control AUC indicates
     # that Normal/Sick may be predictable from acquisition/export/protocol
     # provenance rather than exclusively from CAD-related anatomy.
     stage_started = _print_stage_start(
@@ -15779,31 +16114,40 @@ def main():
         standardization_set[1],
         standardization_set[3],
     )
-    write_tabular_class_summary(
-        OUTPUT_DIR / "audits" / "monai_qc_class_summary.csv",
-        monai_qc_set[0],
-        monai_qc_set[1],
-        monai_qc_set[3],
-    )
-    write_tabular_class_summary(
-        OUTPUT_DIR / "audits" / "standardized_monai_qc_class_summary.csv",
-        standardized_monai_qc_set[0],
-        standardized_monai_qc_set[1],
-        standardized_monai_qc_set[3],
-    )
+    if monai_qc_set is not None:
+        write_tabular_class_summary(
+            OUTPUT_DIR / "audits" / "monai_qc_class_summary.csv",
+            monai_qc_set[0],
+            monai_qc_set[1],
+            monai_qc_set[3],
+        )
+    if standardized_monai_qc_set is not None:
+        write_tabular_class_summary(
+            OUTPUT_DIR / "audits" / "standardized_monai_qc_class_summary.csv",
+            standardized_monai_qc_set[0],
+            standardized_monai_qc_set[1],
+            standardized_monai_qc_set[3],
+        )
+
     tabular_feature_sets = {
         "provenance_only": provenance_set,
-        "monai_qc_only": monai_qc_set,
         "standardization_qc_only": standardization_set,
-        "standardized_monai_qc_only": standardized_monai_qc_set,
         **provenance_component_sets,
     }
+    if monai_qc_set is not None:
+        tabular_feature_sets["monai_qc_only"] = monai_qc_set
+    if standardized_monai_qc_set is not None:
+        tabular_feature_sets[
+            "standardized_monai_qc_only"
+        ] = standardized_monai_qc_set
     stage_durations["07 QC/provenance controls"] = _print_stage_complete(
         7,
         "Build and save provenance, standardization and MONAI-QC controls",
         stage_started,
-        "Patient-level control matrices are ready for broad and decomposed "
-        "provenance, original/standardized MONAI QC, and standardization geometry.",
+        "Patient-level control matrices are ready for provenance and "
+        "standardization; original MONAI QC is explicitly skipped when its "
+        "historical branch was not computed, while standardized MONAI QC is "
+        "retained for the focused cardiac representations.",
     )
 
     # ======================================================================
@@ -16524,7 +16868,7 @@ if __name__ == "__main__":
 # 1. A cardiac-MRI-pretrained encoder comparison requires a public checkpoint
 #    whose exact 2D/temporal input contract can be reconstructed from these
 #    released files. Repeating one JPEG as a fake cine clip is not valid.
-# 2. Automatic sequence/view inference remains prohibited. V7 can run an
+# 2. Automatic sequence/view inference remains prohibited. V7.1 can run an
 #    optional balanced subset analysis only after a reviewer completes the blinded CSV;
 #    SR_* and series* names alone are never treated as validated sequence labels.
 # 3. True external validation requires an independent cohort adapter with a
