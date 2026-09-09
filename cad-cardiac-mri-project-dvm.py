@@ -726,7 +726,7 @@ class ExperimentConfig:
 # ---------------------------------------------------------------------------
 # FOCUSED RESEARCH PANEL
 # ---------------------------------------------------------------------------
-FOCUSED_SUITE_VERSION = "7.2"
+FOCUSED_SUITE_VERSION = "7.3"
 
 # ---------------------------------------------------------------------------
 # AUTOMATIC CROSS-CLASS SERIES HARMONIZATION — V7.2
@@ -16978,7 +16978,7 @@ def main():
     experiments = get_enabled_experiments()
 
     print("\n" + "#" * 100, flush=True)
-    print("CAD CARDIAC MRI — FOCUSED SERIES-HARMONIZED RESEARCH SUITE V7.2", flush=True)
+    print("CAD CARDIAC MRI — FOCUSED FOLD-LOCAL SERIES-HARMONIZED RESEARCH SUITE V7.3", flush=True)
     print("#" * 100, flush=True)
     print(f"[SUITE] Dataset: {DATASET_PATH}", flush=True)
     print(f"[SUITE] Output: {OUTPUT_DIR}", flush=True)
@@ -18041,8 +18041,8 @@ def run_with_console_logging():
             sys.stderr = original_stderr
 
 
-if __name__ == "__main__":
-    run_with_console_logging()
+# V7.3 builder note: the original V7.2 entry point is deferred until
+# the fold-local extension has overridden the global selection policy.
 
 # ============================================================================
 # EXPERIMENTS DELIBERATELY NOT AUTOMATED IN THIS FILE
@@ -18058,3 +18058,2870 @@ if __name__ == "__main__":
 #    comparable CAD endpoint, patient unit and locked preprocessing contract.
 #
 # These are recorded as scientific next steps rather than silently approximated.
+
+# ============================================================================
+# GENERATED V7.3 EXTENSION BELOW
+# Source: cad_mri_focused_research_suite_v7_2_series_harmonized.py
+# Detected V7.2 harmonizer: harmonize_cross_class_series
+# ============================================================================
+
+# ============================================================================
+# V7.3 FOLD-LOCAL SERIES HARMONIZATION EXTENSION
+# ============================================================================
+#
+# This block is appended by ``build_cad_mri_focused_v7_3_fold_local.py`` to the
+# exact V7.2 source. The original detailed comments and functions remain in the
+# generated file. Only the execution policy changes:
+#
+#   1. V7.2's global cross-class harmonization is retained as a DESCRIPTIVE
+#      descriptor-building audit, but its globally filtered sample list is not
+#      used for modelling.
+#   2. The shared frozen feature bank is built for every discovered image row.
+#   3. Series harmonization is fitted separately inside each outer-training and
+#      inner-training patient partition.
+#   4. Validation series are assigned to training-fitted cluster centres and
+#      filtered without consulting validation labels.
+#   5. The same label-dependent support decision is recomputed after every
+#      label permutation. Unsupervised cluster geometry is cached conditional on
+#      the fixed patient partitions because it does not use labels.
+#
+# The primary scientific outputs are written under:
+#
+#   fold_local_series_harmonization/
+#
+# Results produced earlier by the unchanged V7.2 orchestration are explicitly
+# labelled unharmonized/full-cohort references. They are not the primary V7.3
+# estimate.
+# ============================================================================
+
+import copy as _v73_copy
+import csv as _v73_csv
+import hashlib as _v73_hashlib
+import inspect as _v73_inspect
+import json as _v73_json
+import math as _v73_math
+import os as _v73_os
+import time as _v73_time
+import traceback as _v73_traceback
+from collections import Counter as _V73Counter
+from pathlib import Path as _V73Path
+
+import cv2 as _v73_cv2
+import numpy as _v73_np
+from sklearn.cluster import KMeans as _V73KMeans
+from sklearn.decomposition import PCA as _V73PCA
+from sklearn.linear_model import LogisticRegression as _V73LogisticRegression
+from sklearn.metrics import (
+    average_precision_score as _v73_average_precision_score,
+    confusion_matrix as _v73_confusion_matrix,
+    roc_auc_score as _v73_roc_auc_score,
+    roc_curve as _v73_roc_curve,
+)
+from sklearn.model_selection import StratifiedKFold as _V73StratifiedKFold
+from sklearn.pipeline import Pipeline as _V73Pipeline
+from sklearn.preprocessing import StandardScaler as _V73StandardScaler
+
+
+V73_FOLD_LOCAL_VERSION = "7.3"
+V73_CLUSTER_COUNTS = (53, 71, 89)
+V73_REFERENCE_PATIENT_COUNT = 30
+V73_SHARED_RESOLUTION_VOTES_REQUIRED = 2
+V73_MIN_SERIES_PER_CLASS = 2
+V73_MIN_PATIENTS_PER_CLASS = 2
+V73_DISTANCE_QUANTILE = 0.975
+V73_DESCRIPTOR_WINSOR_LOWER_QUANTILE = 0.01
+V73_DESCRIPTOR_WINSOR_UPPER_QUANTILE = 0.99
+V73_KMEANS_N_INIT = 1
+V73_KMEANS_MAX_ITER = 100
+V73_KMEANS_TOLERANCE = 1e-3
+V73_MIN_EXPECTED_SERIES_PER_CLUSTER = 16
+# A common cluster must contain evidence from both classes and multiple patients.
+# Capping K so the training set has at least roughly sixteen series per cluster
+# prevents small inner folds from being fragmented into families that cannot
+# possibly satisfy that support contract.
+V73_MAX_COVERAGE_RESCUE_FRACTION = 0.25
+V73_C_SELECTION_AUC_TOLERANCE = 0.01
+V73_REPEATED_CV_REPEATS = int(
+    _v73_os.environ.get("CAD_V73_REPEATED_CV_REPEATS", "50")
+)
+V73_LABEL_PERMUTATIONS = int(
+    _v73_os.environ.get("CAD_V73_LABEL_PERMUTATIONS", "200")
+)
+V73_BOOTSTRAP_REPLICATES = int(
+    _v73_os.environ.get("CAD_V73_BOOTSTRAP_REPLICATES", "2000")
+)
+V73_PAIRED_BOOTSTRAP_REPLICATES = int(
+    _v73_os.environ.get("CAD_V73_PAIRED_BOOTSTRAP_REPLICATES", "2000")
+)
+V73_RANDOM_SEED = int(_v73_os.environ.get("CAD_V73_RANDOM_SEED", "42073"))
+V73_QUICK_PROFILE = _v73_os.environ.get("CAD_V73_QUICK_PROFILE", "0") == "1"
+
+if V73_QUICK_PROFILE:
+    # This profile validates paths/contracts. It must not be used as the final
+    # research result because its uncertainty estimates are intentionally coarse.
+    V73_REPEATED_CV_REPEATS = min(V73_REPEATED_CV_REPEATS, 3)
+    V73_LABEL_PERMUTATIONS = min(V73_LABEL_PERMUTATIONS, 10)
+    V73_BOOTSTRAP_REPLICATES = min(V73_BOOTSTRAP_REPLICATES, 200)
+    V73_PAIRED_BOOTSTRAP_REPLICATES = min(
+        V73_PAIRED_BOOTSTRAP_REPLICATES, 200
+    )
+
+if V73_REPEATED_CV_REPEATS <= 0:
+    raise ValueError("CAD_V73_REPEATED_CV_REPEATS must be positive.")
+if V73_LABEL_PERMUTATIONS <= 0:
+    raise ValueError("CAD_V73_LABEL_PERMUTATIONS must be positive.")
+
+
+# ---------------------------------------------------------------------------
+# V7.2 GLOBAL-HARMONIZATION INTERCEPTION
+# ---------------------------------------------------------------------------
+# ``harmonize_cross_class_series`` is replaced by the builder with the exact function
+# name called by V7.2 main(). The original function is still executed once so it
+# can decode the sampled JPEGs and write the descriptor audit. Its filtered list
+# is then replaced with the complete input sample list before control returns to
+# V7.2 main(). Consequently the feature bank contains all 63,425 rows in the
+# validated release, while the global selection remains available only as a
+# descriptive sensitivity reference.
+
+_V73_ALL_SAMPLES = None
+_V73_GLOBAL_AUDIT_RESULT = None
+_V73_GLOBAL_AUDIT_SUMMARY = None
+_V72_ORIGINAL_SERIES_HARMONIZER = harmonize_cross_class_series
+
+
+def _v73_looks_like_sample_sequence(value):
+    if not isinstance(value, (list, tuple)) or not value:
+        return False
+    first = value[0]
+    return (
+        isinstance(first, (list, tuple))
+        and len(first) >= 4
+        and isinstance(first[0], (str, _V73Path))
+        and isinstance(first[2], str)
+        and isinstance(first[3], str)
+    )
+
+
+def _v73_find_original_samples(args, kwargs):
+    for value in args:
+        if _v73_looks_like_sample_sequence(value):
+            return list(value)
+    for value in kwargs.values():
+        if _v73_looks_like_sample_sequence(value):
+            return list(value)
+    raise RuntimeError(
+        "V7.3 could not identify the complete sample list passed to the V7.2 "
+        "series harmonizer. The V7.2 source contract may have changed."
+    )
+
+
+def _v73_replace_filtered_samples_in_result(result, original_samples):
+    """Preserve V7.2's return shape while restoring the complete sample list."""
+
+    global _V73_GLOBAL_AUDIT_SUMMARY
+
+    if _v73_looks_like_sample_sequence(result):
+        return original_samples
+
+    if isinstance(result, tuple):
+        values = list(result)
+        replaced = False
+        for index, value in enumerate(values):
+            if _v73_looks_like_sample_sequence(value):
+                values[index] = original_samples
+                replaced = True
+                break
+        for value in values:
+            if isinstance(value, dict):
+                _V73_GLOBAL_AUDIT_SUMMARY = value
+                value.update(
+                    {
+                        "v73_status": "GLOBAL_REFERENCE_ONLY_NOT_USED_FOR_MODELLING",
+                        "v73_feature_bank_uses_all_discovered_samples": True,
+                        "v73_fold_local_harmonization_runs_after_full_feature_bank": True,
+                        "v73_statistical_warning": (
+                            "The global V7.2 support decision is retained only as "
+                            "an audit. All primary V7.3 scores refit harmonization "
+                            "inside training partitions and never use validation labels."
+                        ),
+                    }
+                )
+        if not replaced:
+            raise RuntimeError(
+                "V7.3 could not locate the filtered sample sequence in the V7.2 "
+                "harmonizer return value."
+            )
+        return tuple(values)
+
+    if isinstance(result, list):
+        values = list(result)
+        for index, value in enumerate(values):
+            if _v73_looks_like_sample_sequence(value):
+                values[index] = original_samples
+                return values
+        raise RuntimeError(
+            "V7.3 could not locate the filtered sample list in the harmonizer result."
+        )
+
+    if isinstance(result, dict):
+        _V73_GLOBAL_AUDIT_SUMMARY = result
+        for key in (
+            "samples",
+            "filtered_samples",
+            "selected_samples",
+            "retained_samples",
+        ):
+            if key in result and _v73_looks_like_sample_sequence(result[key]):
+                result[key] = original_samples
+                result["v73_status"] = (
+                    "GLOBAL_REFERENCE_ONLY_NOT_USED_FOR_MODELLING"
+                )
+                return result
+
+    raise RuntimeError(
+        "Unsupported V7.2 harmonizer return contract. V7.3 did not silently "
+        "guess because using the wrong sample list would invalidate the analysis."
+    )
+
+
+def harmonize_cross_class_series(*args, **kwargs):
+    global _V73_ALL_SAMPLES, _V73_GLOBAL_AUDIT_RESULT
+
+    original_samples = _v73_find_original_samples(args, kwargs)
+    _V73_ALL_SAMPLES = original_samples
+    result = _V72_ORIGINAL_SERIES_HARMONIZER(*args, **kwargs)
+    _V73_GLOBAL_AUDIT_RESULT = result
+    restored = _v73_replace_filtered_samples_in_result(
+        result,
+        original_samples,
+    )
+    print(
+        "[V7.3 FOLD-LOCAL HARMONIZATION] The global V7.2 selection was "
+        "computed for descriptor/audit continuity but was NOT applied to the "
+        "feature bank. All discovered image rows will be encoded. Validation "
+        "labels will be hidden when fold-local support is fitted.",
+        flush=True,
+    )
+    return restored
+
+
+# Disable the expensive V7.2 repeated/permutation analyses. V7.3 reruns these
+# operations through its own fold-local path after the full feature bank exists.
+# The ordinary sixteen single-manifest V7.2 experiments remain as transparent
+# unharmonized references and reuse the same frozen embeddings.
+RUN_REPEATED_NESTED_CV_STABILITY = False
+RUN_PATIENT_LABEL_PERMUTATION_TEST = False
+RUN_NESTED_MODEL_SELECTION_AUDIT = False
+RUN_REPEATED_MODEL_SELECTION_STABILITY = False
+RUN_SELECTION_ADJUSTED_PERMUTATION_TEST = False
+RUN_ANNOTATED_SERIES_SUBSET_ANALYSIS = False
+RUN_EXTERNAL_VALIDATION = False
+EXTERNAL_VALIDATION_ENABLED = False
+# The unchanged V7.2 external adapter is disabled because it does not know how
+# to fit/apply the V7.3 training-only harmonizer. A future external cohort must
+# receive one harmonizer frozen from the complete development cohort before its
+# labels are opened.
+
+
+# ---------------------------------------------------------------------------
+# GENERIC FILE AND TABLE HELPERS
+# ---------------------------------------------------------------------------
+
+def _v73_write_csv(path, rows, fieldnames=None):
+    path = _V73Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows = list(rows)
+    if fieldnames is None:
+        fieldnames = list(rows[0].keys()) if rows else ("status",)
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = _v73_csv.DictWriter(handle, fieldnames=list(fieldnames))
+        writer.writeheader()
+        if rows:
+            writer.writerows(rows)
+
+
+def _v73_write_json(path, payload):
+    path = _V73Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        _v73_json.dumps(payload, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+
+def _v73_parse_float(value):
+    try:
+        result = float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return result if _v73_np.isfinite(result) else None
+
+
+def _v73_find_column(fieldnames, candidates, required=True):
+    lowered = {str(name).strip().lower(): name for name in fieldnames}
+    for candidate in candidates:
+        if candidate.lower() in lowered:
+            return lowered[candidate.lower()]
+    if required:
+        raise RuntimeError(
+            f"None of the required columns {candidates} are present in "
+            f"{list(fieldnames)}."
+        )
+    return None
+
+
+# ---------------------------------------------------------------------------
+# FEATURE-BANK AND SERIES-DESCRIPTOR LOADING
+# ---------------------------------------------------------------------------
+
+def _v73_locate_complete_feature_bank(required_modes, expected_rows):
+    output_dir = _V73Path(OUTPUT_DIR)
+    search_roots = [
+        output_dir.parent / "feature_bank_cache",
+        _V73Path("/kaggle/working/cad_patient_pipeline_outputs/feature_bank_cache"),
+    ]
+    extra_roots = _v73_os.environ.get("CAD_V73_FEATURE_CACHE_ROOTS", "")
+    for token in extra_roots.split(_v73_os.pathsep):
+        if token.strip():
+            search_roots.append(_V73Path(token.strip()))
+
+    candidates = []
+    seen = set()
+    for root in search_roots:
+        if not root.exists():
+            continue
+        for metadata_path in root.rglob("metadata.json"):
+            cache_dir = metadata_path.parent.resolve()
+            if cache_dir in seen:
+                continue
+            seen.add(cache_dir)
+            try:
+                metadata = _v73_json.loads(
+                    metadata_path.read_text(encoding="utf-8")
+                )
+            except Exception:
+                continue
+            if int(metadata.get("n_slices", -1)) != int(expected_rows):
+                continue
+            completed = set(metadata.get("completed_modes", ()))
+            if not set(required_modes).issubset(completed):
+                continue
+            candidates.append((metadata_path.stat().st_mtime_ns, cache_dir, metadata))
+
+    if not candidates:
+        raise RuntimeError(
+            "V7.3 could not locate a complete feature bank containing all "
+            f"{expected_rows} image rows and modes {required_modes}. The V7.2 "
+            "global filter may still have been applied, or the full bank failed "
+            "to build."
+        )
+
+    _, cache_dir, metadata = sorted(candidates, reverse=True)[0]
+    fingerprint = str(metadata.get("fingerprint", ""))
+    if not fingerprint:
+        raise RuntimeError(f"Feature bank {cache_dir} has no fingerprint.")
+    bank = load_feature_bank(cache_dir, fingerprint, tuple(required_modes))
+    if bank is None:
+        raise RuntimeError(f"Matching feature bank could not be loaded: {cache_dir}")
+    print(
+        f"[V7.3] Loaded complete feature bank: {cache_dir}; rows={expected_rows}.",
+        flush=True,
+    )
+    return bank, cache_dir, metadata
+
+
+V73_DESCRIPTOR_IMAGES_PER_SERIES = 7
+V73_DESCRIPTOR_HISTOGRAM_BINS = 16
+V73_DESCRIPTOR_DCT_SIDE = 4
+V73_DESCRIPTOR_VERSION = "sampled-native-jpeg-v1"
+
+
+def _v73_uniform_sample_indices(length, maximum):
+    length = int(length)
+    maximum = int(maximum)
+    if length <= 0:
+        return []
+    if length <= maximum:
+        return list(range(length))
+    return sorted(
+        set(
+            int(round(value))
+            for value in _v73_np.linspace(0, length - 1, maximum)
+        )
+    )
+
+
+def _v73_image_descriptor(image, image_path):
+    """Return one deterministic, label-free native-JPEG descriptor.
+
+    The descriptor intentionally characterizes acquisition/export appearance
+    rather than disease labels. It combines native geometry/container size,
+    intensity distribution, low-frequency DCT structure, gradients, border and
+    coarse regional statistics. No MONAI output, EfficientNet embedding,
+    patient label, fold assignment or model score is used.
+    """
+
+    if image is None or image.ndim != 2 or image.size == 0:
+        raise RuntimeError(f"Unreadable descriptor image: {image_path}")
+    image_u8 = _v73_np.asarray(image, dtype=_v73_np.uint8)
+    image_f = image_u8.astype(_v73_np.float32)
+    height, width = image_u8.shape
+    pixel_count = max(int(image_u8.size), 1)
+    file_size = int(_V73Path(image_path).stat().st_size)
+
+    histogram = _v73_np.histogram(
+        image_u8,
+        bins=V73_DESCRIPTOR_HISTOGRAM_BINS,
+        range=(0, 256),
+    )[0].astype(_v73_np.float64)
+    histogram /= max(float(histogram.sum()), 1.0)
+    entropy_histogram = _v73_np.bincount(
+        image_u8.reshape(-1), minlength=256
+    ).astype(_v73_np.float64)
+    entropy_histogram /= max(float(entropy_histogram.sum()), 1.0)
+    positive = entropy_histogram > 0
+    entropy = float(
+        -_v73_np.sum(
+            entropy_histogram[positive]
+            * _v73_np.log2(entropy_histogram[positive])
+        )
+    )
+
+    resized = _v73_cv2.resize(
+        image_f,
+        (32, 32),
+        interpolation=_v73_cv2.INTER_AREA,
+    )
+    dct = _v73_cv2.dct(resized)
+    dct_block = dct[:V73_DESCRIPTOR_DCT_SIDE, :V73_DESCRIPTOR_DCT_SIDE].reshape(-1)
+    dct_scale = max(float(abs(dct_block[0])), 1.0)
+    dct_normalized = dct_block / dct_scale
+
+    grad_x = _v73_cv2.Sobel(
+        image_f, _v73_cv2.CV_32F, 1, 0, ksize=3
+    )
+    grad_y = _v73_cv2.Sobel(
+        image_f, _v73_cv2.CV_32F, 0, 1, ksize=3
+    )
+    gradient = _v73_np.sqrt(grad_x * grad_x + grad_y * grad_y)
+    border_width = max(1, int(round(min(height, width) * 0.10)))
+    border_mask = _v73_np.zeros((height, width), dtype=bool)
+    border_mask[:border_width, :] = True
+    border_mask[-border_width:, :] = True
+    border_mask[:, :border_width] = True
+    border_mask[:, -border_width:] = True
+    centre = image_f[
+        height // 4 : max(height // 4 + 1, 3 * height // 4),
+        width // 4 : max(width // 4 + 1, 3 * width // 4),
+    ]
+    quadrants = (
+        image_f[: height // 2, : width // 2],
+        image_f[: height // 2, width // 2 :],
+        image_f[height // 2 :, : width // 2],
+        image_f[height // 2 :, width // 2 :],
+    )
+    percentiles = _v73_np.percentile(
+        image_f, (5, 25, 50, 75, 95)
+    ).astype(_v73_np.float64)
+    laplacian_variance = float(
+        _v73_cv2.Laplacian(image_f, _v73_cv2.CV_32F).var()
+    )
+
+    names = [
+        "native_height",
+        "native_width",
+        "native_aspect_ratio",
+        "log_file_size_bytes",
+        "bytes_per_native_pixel",
+        "mean_intensity",
+        "std_intensity",
+        "p05_intensity",
+        "p25_intensity",
+        "p50_intensity",
+        "p75_intensity",
+        "p95_intensity",
+        "entropy_bits",
+        "near_black_fraction",
+        "near_white_fraction",
+        "gradient_mean",
+        "gradient_std",
+        "gradient_p90",
+        "border_mean",
+        "border_std",
+        "centre_mean",
+        "centre_std",
+        "laplacian_variance",
+        "quadrant_00_mean",
+        "quadrant_01_mean",
+        "quadrant_10_mean",
+        "quadrant_11_mean",
+    ]
+    values = [
+        float(height),
+        float(width),
+        float(width / max(height, 1)),
+        float(_v73_np.log1p(file_size)),
+        float(file_size / pixel_count),
+        float(image_f.mean()),
+        float(image_f.std()),
+        *percentiles.tolist(),
+        entropy,
+        float(_v73_np.mean(image_u8 <= 8)),
+        float(_v73_np.mean(image_u8 >= 247)),
+        float(gradient.mean()),
+        float(gradient.std()),
+        float(_v73_np.percentile(gradient, 90)),
+        float(image_f[border_mask].mean()),
+        float(image_f[border_mask].std()),
+        float(centre.mean()),
+        float(centre.std()),
+        laplacian_variance,
+        *[float(region.mean()) for region in quadrants],
+    ]
+    for index, value in enumerate(histogram.tolist()):
+        names.append(f"histogram_bin_{index:02d}")
+        values.append(float(value))
+    for index, value in enumerate(dct_normalized.tolist()):
+        names.append(f"dct_low_frequency_{index:02d}")
+        values.append(float(value))
+    vector = _v73_np.asarray(values, dtype=_v73_np.float64)
+    if not _v73_np.all(_v73_np.isfinite(vector)):
+        raise RuntimeError(f"Non-finite descriptor for image: {image_path}")
+    return tuple(names), vector
+
+
+def _v73_build_or_load_raw_series_descriptor_csv(samples, cache_fingerprint):
+    cache_root = _V73Path(OUTPUT_DIR).parent / "series_descriptor_cache"
+    cache_root.mkdir(parents=True, exist_ok=True)
+    stem = (
+        f"raw_series_descriptors__{str(cache_fingerprint)[:16]}__"
+        f"{V73_DESCRIPTOR_VERSION}"
+    )
+    csv_path = cache_root / f"{stem}.csv"
+    metadata_path = cache_root / f"{stem}.json"
+
+    grouped = {}
+    for sample in samples:
+        image_path, label, patient_id, series_id = sample[:4]
+        grouped.setdefault(str(series_id), []).append(
+            (str(image_path), int(label), str(patient_id))
+        )
+    expected_series = len(grouped)
+    expected_images = len(samples)
+    if csv_path.is_file() and metadata_path.is_file():
+        try:
+            metadata = _v73_json.loads(metadata_path.read_text(encoding="utf-8"))
+            if (
+                metadata.get("descriptor_version") == V73_DESCRIPTOR_VERSION
+                and int(metadata.get("n_series", -1)) == expected_series
+                and int(metadata.get("n_images", -1)) == expected_images
+                and str(metadata.get("feature_bank_fingerprint", ""))
+                == str(cache_fingerprint)
+            ):
+                print(
+                    f"[V7.3 DESCRIPTORS] Cache hit: {csv_path}",
+                    flush=True,
+                )
+                return csv_path
+        except Exception:
+            pass
+
+    started = _v73_time.perf_counter()
+    rows = []
+    feature_names = None
+    progress_step = max(1, expected_series // 20)
+    for position, series_id in enumerate(sorted(grouped), start=1):
+        entries = sorted(grouped[series_id], key=lambda row: row[0])
+        patient_ids = {entry[2] for entry in entries}
+        labels = {entry[1] for entry in entries}
+        if len(patient_ids) != 1 or len(labels) != 1:
+            raise RuntimeError(
+                f"Series {series_id} has inconsistent patient/label metadata."
+            )
+        sampled_positions = _v73_uniform_sample_indices(
+            len(entries),
+            V73_DESCRIPTOR_IMAGES_PER_SERIES,
+        )
+        image_vectors = []
+        for sampled_position in sampled_positions:
+            image_path = entries[sampled_position][0]
+            image = _v73_cv2.imread(
+                image_path,
+                _v73_cv2.IMREAD_GRAYSCALE,
+            )
+            names, vector = _v73_image_descriptor(image, image_path)
+            if feature_names is None:
+                feature_names = names
+            elif names != feature_names:
+                raise RuntimeError("Inconsistent per-image descriptor schema.")
+            image_vectors.append(vector)
+        matrix = _v73_np.stack(image_vectors, axis=0)
+        mean_values = matrix.mean(axis=0)
+        std_values = matrix.std(axis=0)
+        row = {
+            "series_id": series_id,
+            "patient_id": next(iter(patient_ids)),
+            # The label is carried only for later training-partition support
+            # counts; it is never used in descriptor calculation.
+            "label": next(iter(labels)),
+            "series_image_count": int(len(entries)),
+            "sampled_image_count": int(len(sampled_positions)),
+            "log_series_image_count": float(_v73_np.log1p(len(entries))),
+        }
+        for name, value in zip(feature_names, mean_values):
+            row[f"mean__{name}"] = float(value)
+        for name, value in zip(feature_names, std_values):
+            row[f"std__{name}"] = float(value)
+        rows.append(row)
+        if position == 1 or position % progress_step == 0 or position == expected_series:
+            print(
+                f"[V7.3 DESCRIPTORS] {position}/{expected_series} "
+                f"series ({100.0 * position / expected_series:.1f}%)",
+                flush=True,
+            )
+
+    _v73_write_csv(csv_path, rows)
+    metadata = {
+        "descriptor_version": V73_DESCRIPTOR_VERSION,
+        "feature_bank_fingerprint": str(cache_fingerprint),
+        "n_series": int(expected_series),
+        "n_images": int(expected_images),
+        "images_sampled_per_series_maximum": V73_DESCRIPTOR_IMAGES_PER_SERIES,
+        "image_descriptor_feature_count": len(feature_names or ()),
+        "aggregated_descriptor_feature_count": (
+            3 + 2 * len(feature_names or ())
+        ),
+        "label_used_to_compute_descriptor": False,
+        "runtime_seconds": float(_v73_time.perf_counter() - started),
+        "csv_sha256": _v73_hashlib.sha256(csv_path.read_bytes()).hexdigest(),
+    }
+    _v73_write_json(metadata_path, metadata)
+    print(
+        f"[V7.3 DESCRIPTORS] Built raw descriptor cache in "
+        f"{metadata['runtime_seconds'] / 60.0:.1f} min: {csv_path}",
+        flush=True,
+    )
+    return csv_path
+
+
+def _v73_locate_descriptor_csv():
+    audit_dir = _V73Path(OUTPUT_DIR) / "audits"
+    explicit = _v73_os.environ.get("CAD_V73_SERIES_DESCRIPTOR_CSV", "").strip()
+    candidates = []
+    if explicit:
+        candidates.append(_V73Path(explicit))
+    candidates.extend(
+        [
+            audit_dir / "series_harmonization_descriptors.csv",
+            *sorted(audit_dir.glob("*series*descriptor*.csv")),
+        ]
+    )
+    for path in candidates:
+        if path.is_file():
+            return path
+    raise RuntimeError(
+        "V7.3 could not find the label-blind series descriptor CSV written by "
+        "the V7.2 harmonization audit."
+    )
+
+
+def _v73_load_series_descriptors(bank, descriptor_path=None):
+    descriptor_path = (
+        _V73Path(descriptor_path)
+        if descriptor_path is not None
+        else _v73_locate_descriptor_csv()
+    )
+    with open(descriptor_path, newline="", encoding="utf-8") as handle:
+        reader = _v73_csv.DictReader(handle)
+        rows = list(reader)
+        fieldnames = tuple(reader.fieldnames or ())
+    if not rows:
+        raise RuntimeError(f"Series descriptor file is empty: {descriptor_path}")
+
+    series_column = _v73_find_column(
+        fieldnames,
+        ("series_id", "series_proxy_id", "series_proxy"),
+    )
+    patient_column = _v73_find_column(
+        fieldnames,
+        ("patient_id", "directory_id", "directory"),
+        required=False,
+    )
+
+    exact_exclusions = {
+        str(series_column).lower(),
+        "patient_id",
+        "directory_id",
+        "directory",
+        "label",
+        "class_label",
+        "class_name",
+        "folder_class",
+        "retained",
+        "coverage_rescue",
+        "decision_reason",
+    }
+    excluded_prefixes = (
+        "cluster_",
+        "shared_cluster_",
+        "distance_",
+        "distance_inlier_",
+        "shared_resolution_",
+        "retention_",
+        "decision_",
+        "coverage_",
+    )
+
+    numeric_columns = []
+    for name in fieldnames:
+        normalized = str(name).strip().lower()
+        if normalized in exact_exclusions or normalized.startswith(excluded_prefixes):
+            continue
+        parsed = [_v73_parse_float(row.get(name, "")) for row in rows]
+        if all(value is not None for value in parsed):
+            numeric_columns.append(name)
+
+    if len(numeric_columns) < 8:
+        raise RuntimeError(
+            "Too few finite descriptor columns were found. Detected columns: "
+            f"{numeric_columns}. The V7.2 descriptor schema may have changed."
+        )
+
+    bank_series = _v73_np.asarray(bank["series_ids"]).astype(str)
+    bank_patients = _v73_np.asarray(bank["patient_ids"]).astype(str)
+    bank_labels = _v73_np.asarray(bank["labels"], dtype=_v73_np.int64)
+    bank_series_set = set(bank_series.tolist())
+
+    series_to_patient = {}
+    series_to_label = {}
+    for series_id in sorted(bank_series_set):
+        mask = bank_series == series_id
+        patients = _v73_np.unique(bank_patients[mask])
+        labels = _v73_np.unique(bank_labels[mask])
+        if len(patients) != 1 or len(labels) != 1:
+            raise RuntimeError(
+                f"Series {series_id!r} is not patient/label-consistent in the bank."
+            )
+        series_to_patient[series_id] = str(patients[0])
+        series_to_label[series_id] = int(labels[0])
+
+    descriptor_by_series = {}
+    descriptor_patient_by_series = {}
+    for row in rows:
+        series_id = str(row[series_column])
+        if series_id in descriptor_by_series:
+            raise RuntimeError(f"Duplicate descriptor row for series {series_id!r}.")
+        descriptor_by_series[series_id] = _v73_np.asarray(
+            [float(row[name]) for name in numeric_columns],
+            dtype=_v73_np.float64,
+        )
+        if patient_column is not None:
+            descriptor_patient_by_series[series_id] = str(row[patient_column])
+
+    missing = sorted(bank_series_set - set(descriptor_by_series))
+    if missing:
+        raise RuntimeError(
+            f"Descriptor CSV is missing {len(missing)} bank series, e.g. {missing[:5]}."
+        )
+
+    ordered_series = _v73_np.asarray(sorted(bank_series_set))
+    ordered_patients = _v73_np.asarray(
+        [series_to_patient[series_id] for series_id in ordered_series]
+    )
+    ordered_labels = _v73_np.asarray(
+        [series_to_label[series_id] for series_id in ordered_series],
+        dtype=_v73_np.int64,
+    )
+    descriptors = _v73_np.stack(
+        [descriptor_by_series[series_id] for series_id in ordered_series],
+        axis=0,
+    )
+    if not _v73_np.all(_v73_np.isfinite(descriptors)):
+        raise RuntimeError("Series descriptor matrix contains non-finite values.")
+
+    for series_id, descriptor_patient in descriptor_patient_by_series.items():
+        if series_id in series_to_patient and descriptor_patient != series_to_patient[series_id]:
+            raise RuntimeError(
+                f"Descriptor patient mismatch for {series_id}: "
+                f"{descriptor_patient!r} != {series_to_patient[series_id]!r}."
+            )
+
+    print(
+        f"[V7.3] Loaded descriptors: series={len(ordered_series)}, "
+        f"features={descriptors.shape[1]}, file={descriptor_path}.",
+        flush=True,
+    )
+    return {
+        "descriptor_path": descriptor_path,
+        "series_ids": ordered_series,
+        "patient_ids": ordered_patients,
+        "labels": ordered_labels,
+        "X": descriptors,
+        "feature_names": tuple(numeric_columns),
+    }
+
+
+# ---------------------------------------------------------------------------
+# LABEL-BLIND, PATIENT-BALANCED FOLD-LOCAL CLUSTER GEOMETRY
+# ---------------------------------------------------------------------------
+
+def _v73_patient_balanced_weights(patient_ids):
+    patient_ids = _v73_np.asarray(patient_ids).astype(str)
+    counts = _V73Counter(patient_ids.tolist())
+    weights = _v73_np.asarray(
+        [1.0 / counts[patient_id] for patient_id in patient_ids],
+        dtype=_v73_np.float64,
+    )
+    weights *= len(patient_ids) / max(float(weights.sum()), 1e-12)
+    return weights
+
+
+def _v73_fit_weighted_winsor_scaler(X, patient_ids):
+    """Fit a training-only robust-ish scaler with equal patient mass.
+
+    Quantile clipping is label-blind and fitted only on training series. After
+    clipping, each patient contributes equal total weight to the location and
+    scale estimates even when one patient has hundreds more exported folders.
+    """
+
+    X = _v73_np.asarray(X, dtype=_v73_np.float64)
+    weights = _v73_patient_balanced_weights(patient_ids)
+    lower = _v73_np.quantile(
+        X,
+        V73_DESCRIPTOR_WINSOR_LOWER_QUANTILE,
+        axis=0,
+    )
+    upper = _v73_np.quantile(
+        X,
+        V73_DESCRIPTOR_WINSOR_UPPER_QUANTILE,
+        axis=0,
+    )
+    clipped = _v73_np.clip(X, lower, upper)
+    total_weight = max(float(weights.sum()), 1e-12)
+    mean = _v73_np.sum(clipped * weights[:, None], axis=0) / total_weight
+    variance = (
+        _v73_np.sum(((clipped - mean) ** 2) * weights[:, None], axis=0)
+        / total_weight
+    )
+    scale = _v73_np.sqrt(_v73_np.maximum(variance, 1e-12))
+    scale[scale < 1e-6] = 1.0
+    return {
+        "lower": lower,
+        "upper": upper,
+        "mean": mean,
+        "scale": scale,
+    }
+
+
+def _v73_apply_weighted_winsor_scaler(X, scaler):
+    X = _v73_np.asarray(X, dtype=_v73_np.float64)
+    clipped = _v73_np.clip(X, scaler["lower"], scaler["upper"])
+    transformed = (clipped - scaler["mean"]) / scaler["scale"]
+    if not _v73_np.all(_v73_np.isfinite(transformed)):
+        raise RuntimeError("Fold-local descriptor scaling produced non-finite values.")
+    return transformed
+
+
+def _v73_scaled_cluster_count(base_count, n_training_patients, n_training_series):
+    # Scaling the V7.2 30-patient values by training-patient fraction preserves
+    # approximately the same granularity without asking a 16-patient inner fold
+    # to support 89 independent families.
+    scaled = int(
+        round(
+            float(base_count)
+            * float(n_training_patients)
+            / float(V73_REFERENCE_PATIENT_COUNT)
+        )
+    )
+    occupancy_cap = max(
+        8,
+        int(n_training_series // V73_MIN_EXPECTED_SERIES_PER_CLUSTER),
+    )
+    return int(max(8, min(scaled, occupancy_cap, n_training_series - 1)))
+
+
+def _v73_fit_unsupervised_geometry(series_table, training_patient_ids, seed):
+    training_patient_ids = tuple(sorted(map(str, training_patient_ids)))
+    train_mask = _v73_np.isin(
+        series_table["patient_ids"],
+        _v73_np.asarray(training_patient_ids),
+    )
+    train_indices = _v73_np.flatnonzero(train_mask)
+    if len(train_indices) < 20:
+        raise RuntimeError(
+            "Too few training series for fold-local harmonization: "
+            f"{len(train_indices)}."
+        )
+
+    X_train = series_table["X"][train_indices]
+    train_patients_per_series = series_table["patient_ids"][train_indices]
+    scaler = _v73_fit_weighted_winsor_scaler(
+        X_train,
+        train_patients_per_series,
+    )
+    X_all_scaled = _v73_apply_weighted_winsor_scaler(series_table["X"], scaler)
+    X_train_scaled = X_all_scaled[train_indices]
+    sample_weights = _v73_patient_balanced_weights(train_patients_per_series)
+
+    resolutions = []
+    for resolution_index, base_count in enumerate(V73_CLUSTER_COUNTS):
+        effective_count = _v73_scaled_cluster_count(
+            base_count,
+            len(training_patient_ids),
+            len(train_indices),
+        )
+        model = _V73KMeans(
+            n_clusters=effective_count,
+            n_init=V73_KMEANS_N_INIT,
+            max_iter=V73_KMEANS_MAX_ITER,
+            tol=V73_KMEANS_TOLERANCE,
+            random_state=int(seed + 1009 * resolution_index + base_count),
+            algorithm="lloyd",
+        )
+        model.fit(X_train_scaled, sample_weight=sample_weights)
+        assignments_all = model.predict(X_all_scaled).astype(_v73_np.int32)
+        centres_for_all = model.cluster_centers_[assignments_all]
+        distances_all = _v73_np.linalg.norm(
+            X_all_scaled - centres_for_all,
+            axis=1,
+        )
+
+        assignments_train = assignments_all[train_indices]
+        distances_train = distances_all[train_indices]
+        thresholds = _v73_np.full(effective_count, _v73_np.inf, dtype=_v73_np.float64)
+        cluster_sizes = _v73_np.zeros(effective_count, dtype=_v73_np.int64)
+        for cluster_id in range(effective_count):
+            values = distances_train[assignments_train == cluster_id]
+            cluster_sizes[cluster_id] = int(len(values))
+            if len(values) == 0:
+                thresholds[cluster_id] = -_v73_np.inf
+            elif len(values) < 8:
+                thresholds[cluster_id] = float(values.max() * 1.05 + 1e-9)
+            else:
+                thresholds[cluster_id] = float(
+                    _v73_np.quantile(values, V73_DISTANCE_QUANTILE)
+                )
+
+        resolutions.append(
+            {
+                "base_cluster_count": int(base_count),
+                "effective_cluster_count": int(effective_count),
+                "assignments_all": assignments_all,
+                "distances_all": distances_all,
+                "thresholds": thresholds,
+                "cluster_sizes": cluster_sizes,
+                "inertia": float(model.inertia_),
+                "n_iter": int(model.n_iter_),
+            }
+        )
+
+    return {
+        "training_patient_ids": training_patient_ids,
+        "training_series_mask": train_mask,
+        "training_series_indices": train_indices,
+        "scaler": scaler,
+        "resolutions": resolutions,
+        "seed": int(seed),
+    }
+
+
+def _v73_label_map(patient_ids, labels):
+    patient_ids = _v73_np.asarray(patient_ids).astype(str)
+    labels = _v73_np.asarray(labels, dtype=_v73_np.int64)
+    if len(patient_ids) != len(labels):
+        raise ValueError("patient_ids and labels must have equal lengths.")
+    mapping = {}
+    for patient_id, label in zip(patient_ids, labels):
+        previous = mapping.get(patient_id)
+        if previous is not None and previous != int(label):
+            raise RuntimeError(f"Inconsistent label for patient {patient_id}.")
+        mapping[patient_id] = int(label)
+    return mapping
+
+
+def _v73_derive_fold_local_retention(
+    series_table,
+    geometry,
+    training_label_by_patient,
+    target_patient_ids,
+    target_role,
+):
+    """Derive common-support retention without consulting target labels.
+
+    ``training_label_by_patient`` must contain labels only for the patients used
+    to fit the harmonizer. Validation patient IDs are supplied only to identify
+    which rows require a decision; their labels are neither accepted nor read.
+    """
+
+    training_patient_set = set(geometry["training_patient_ids"])
+    if set(training_label_by_patient) != training_patient_set:
+        missing = sorted(training_patient_set - set(training_label_by_patient))
+        extra = sorted(set(training_label_by_patient) - training_patient_set)
+        raise RuntimeError(
+            "Fold-local support received the wrong training-label mapping: "
+            f"missing={missing}, extra={extra}."
+        )
+
+    target_patient_ids = tuple(sorted(map(str, target_patient_ids)))
+    target_mask = _v73_np.isin(
+        series_table["patient_ids"],
+        _v73_np.asarray(target_patient_ids),
+    )
+    train_indices = geometry["training_series_indices"]
+    train_series_patients = series_table["patient_ids"][train_indices]
+    train_series_labels = _v73_np.asarray(
+        [training_label_by_patient[str(pid)] for pid in train_series_patients],
+        dtype=_v73_np.int64,
+    )
+
+    votes = _v73_np.zeros(len(series_table["series_ids"]), dtype=_v73_np.int16)
+    best_normalized_distance = _v73_np.full(
+        len(series_table["series_ids"]),
+        _v73_np.inf,
+        dtype=_v73_np.float64,
+    )
+    resolution_audits = []
+
+    for resolution in geometry["resolutions"]:
+        assignments_all = resolution["assignments_all"]
+        assignments_train = assignments_all[train_indices]
+        distances_all = resolution["distances_all"]
+        thresholds = resolution["thresholds"]
+        n_clusters = resolution["effective_cluster_count"]
+        shared = _v73_np.zeros(n_clusters, dtype=bool)
+        support_rows = []
+
+        for cluster_id in range(n_clusters):
+            member_mask = assignments_train == cluster_id
+            member_labels = train_series_labels[member_mask]
+            member_patients = train_series_patients[member_mask]
+            normal_series = int(_v73_np.sum(member_labels == 0))
+            sick_series = int(_v73_np.sum(member_labels == 1))
+            normal_patients = int(
+                len(_v73_np.unique(member_patients[member_labels == 0]))
+            )
+            sick_patients = int(
+                len(_v73_np.unique(member_patients[member_labels == 1]))
+            )
+            is_shared = (
+                normal_series >= V73_MIN_SERIES_PER_CLASS
+                and sick_series >= V73_MIN_SERIES_PER_CLASS
+                and normal_patients >= V73_MIN_PATIENTS_PER_CLASS
+                and sick_patients >= V73_MIN_PATIENTS_PER_CLASS
+            )
+            shared[cluster_id] = is_shared
+            support_rows.append(
+                {
+                    "cluster_id": int(cluster_id),
+                    "normal_series": normal_series,
+                    "sick_series": sick_series,
+                    "normal_patients": normal_patients,
+                    "sick_patients": sick_patients,
+                    "shared": bool(is_shared),
+                    "distance_threshold": float(thresholds[cluster_id]),
+                }
+            )
+
+        assigned_thresholds = thresholds[assignments_all]
+        distance_inlier = distances_all <= assigned_thresholds
+        shared_assignment = shared[assignments_all]
+        accepted = shared_assignment & distance_inlier
+        votes += accepted.astype(_v73_np.int16)
+
+        valid_threshold = assigned_thresholds > 0
+        normalized_distance = _v73_np.full(len(votes), _v73_np.inf)
+        normalized_distance[valid_threshold] = (
+            distances_all[valid_threshold] / assigned_thresholds[valid_threshold]
+        )
+        normalized_distance[~shared_assignment] += 10.0
+        best_normalized_distance = _v73_np.minimum(
+            best_normalized_distance,
+            normalized_distance,
+        )
+        resolution_audits.append(
+            {
+                "base_cluster_count": resolution["base_cluster_count"],
+                "effective_cluster_count": resolution["effective_cluster_count"],
+                "shared_cluster_count": int(shared.sum()),
+                "cluster_support": support_rows,
+            }
+        )
+
+    retained = target_mask & (
+        votes >= V73_SHARED_RESOLUTION_VOTES_REQUIRED
+    )
+    rescue = _v73_np.zeros(len(retained), dtype=bool)
+    rescue_rows = []
+    for patient_id in target_patient_ids:
+        patient_indices = _v73_np.flatnonzero(
+            series_table["patient_ids"] == patient_id
+        )
+        patient_target_indices = patient_indices[target_mask[patient_indices]]
+        if len(patient_target_indices) == 0:
+            raise RuntimeError(f"Target patient {patient_id} has no descriptor rows.")
+        if _v73_np.any(retained[patient_target_indices]):
+            continue
+        # This rescue is label-blind for both training and validation patients.
+        # Rank first by cross-resolution support votes, then by distance from the
+        # closest training-defined shared family, then by stable series ID.
+        ranked = sorted(
+            patient_target_indices.tolist(),
+            key=lambda index: (
+                -int(votes[index]),
+                float(best_normalized_distance[index]),
+                str(series_table["series_ids"][index]),
+            ),
+        )
+        selected = int(ranked[0])
+        retained[selected] = True
+        rescue[selected] = True
+        rescue_rows.append(
+            {
+                "patient_id": patient_id,
+                "series_id": str(series_table["series_ids"][selected]),
+                "votes": int(votes[selected]),
+                "best_normalized_distance": float(
+                    best_normalized_distance[selected]
+                ),
+            }
+        )
+
+    rescue_limit = max(
+        1,
+        int(
+            _v73_math.ceil(
+                len(target_patient_ids) * V73_MAX_COVERAGE_RESCUE_FRACTION
+            )
+        ),
+    )
+    if len(rescue_rows) > rescue_limit:
+        raise RuntimeError(
+            f"Fold-local harmonization needed {len(rescue_rows)} coverage rescues "
+            f"for {len(target_patient_ids)} {target_role} patients, exceeding "
+            f"the predeclared limit {rescue_limit}. The common-support rule is "
+            "too aggressive for this fold."
+        )
+
+    return {
+        "target_role": str(target_role),
+        "target_patient_ids": target_patient_ids,
+        "retained_series_mask": retained,
+        "coverage_rescue_mask": rescue,
+        "votes": votes,
+        "best_normalized_distance": best_normalized_distance,
+        "resolution_audits": resolution_audits,
+        "n_target_series": int(target_mask.sum()),
+        "n_retained_series": int(retained.sum()),
+        "n_coverage_rescues": int(len(rescue_rows)),
+        "coverage_rescues": rescue_rows,
+    }
+
+
+# ---------------------------------------------------------------------------
+# SERIES-LEVEL REPRESENTATION PRECOMPUTATION
+# ---------------------------------------------------------------------------
+
+def _v73_build_series_index(bank, series_table):
+    bank_series = _v73_np.asarray(bank["series_ids"]).astype(str)
+    series_to_index = {
+        str(series_id): int(index)
+        for index, series_id in enumerate(series_table["series_ids"])
+    }
+    missing = sorted(set(bank_series.tolist()) - set(series_to_index))
+    if missing:
+        raise RuntimeError(f"Bank series are missing descriptors: {missing[:5]}.")
+    slice_series_indices = _v73_np.asarray(
+        [series_to_index[series_id] for series_id in bank_series],
+        dtype=_v73_np.int32,
+    )
+    series_slice_indices = []
+    for series_index in range(len(series_table["series_ids"])):
+        series_slice_indices.append(
+            _v73_np.flatnonzero(slice_series_indices == series_index)
+        )
+    return slice_series_indices, tuple(series_slice_indices)
+
+
+def _v73_exact_dedup_mask(bank):
+    patient_ids = _v73_np.asarray(bank["patient_ids"]).astype(str)
+    series_ids = _v73_np.asarray(bank["series_ids"]).astype(str)
+    hashes = _v73_np.asarray(bank["decoded_pixel_hashes"]).astype(str)
+    sample_indices = _v73_np.asarray(bank["sample_indices"], dtype=_v73_np.int64)
+    if "deterministic_exact_within_patient_deduplication_mask" in globals():
+        return deterministic_exact_within_patient_deduplication_mask(
+            patient_ids,
+            series_ids,
+            hashes,
+            sample_indices,
+        )
+    order = _v73_np.argsort(sample_indices)
+    keep = _v73_np.zeros(len(sample_indices), dtype=bool)
+    seen = set()
+    for index in order.tolist():
+        key = (str(patient_ids[index]), str(hashes[index]))
+        if key in seen:
+            continue
+        seen.add(key)
+        keep[index] = True
+    return keep
+
+
+def _v73_dropout_mask(bank, rate):
+    patient_ids = _v73_np.asarray(bank["patient_ids"]).astype(str)
+    series_ids = _v73_np.asarray(bank["series_ids"]).astype(str)
+    if "deterministic_series_preserving_slice_dropout_mask" in globals():
+        return deterministic_series_preserving_slice_dropout_mask(
+            patient_ids,
+            series_ids,
+            float(rate),
+        )
+    sample_indices = _v73_np.asarray(bank["sample_indices"], dtype=_v73_np.int64)
+    keep = _v73_np.zeros(len(sample_indices), dtype=bool)
+    for series_id in _v73_np.unique(series_ids):
+        indices = _v73_np.flatnonzero(series_ids == series_id)
+        ranked = sorted(
+            indices.tolist(),
+            key=lambda index: _v73_hashlib.sha256(
+                f"{V73_RANDOM_SEED}|{series_id}|{sample_indices[index]}".encode()
+            ).hexdigest(),
+        )
+        n_keep = max(1, int(_v73_math.ceil(len(ranked) * (1.0 - rate))))
+        keep[ranked[:n_keep]] = True
+    return keep
+
+
+def _v73_experiment_slice_mask(experiment, bank):
+    n_rows = len(bank["labels"])
+    mask = _v73_np.ones(n_rows, dtype=bool)
+    if str(getattr(experiment, "slice_filter", "all")) == (
+        "standardized_monai_valid"
+    ):
+        mask &= _v73_np.asarray(bank["standardized_monai_valid"], dtype=bool)
+    if bool(getattr(experiment, "deduplicate_exact_within_patient", False)):
+        mask &= _v73_exact_dedup_mask(bank)
+    dropout_rate = float(getattr(experiment, "slice_dropout_rate", 0.0))
+    if dropout_rate > 0:
+        mask &= _v73_dropout_mask(bank, dropout_rate)
+    return mask
+
+
+def _v73_precompute_series_representations(
+    experiments,
+    bank,
+    series_table,
+    series_slice_indices,
+):
+    representation_cache = {}
+    experiment_representations = {}
+    for experiment in experiments:
+        if str(experiment.strategy) != "patient_embedding":
+            continue
+        key = (
+            str(experiment.feature_mode),
+            str(getattr(experiment, "slice_filter", "all")),
+            bool(getattr(experiment, "deduplicate_exact_within_patient", False)),
+            float(getattr(experiment, "slice_dropout_rate", 0.0)),
+        )
+        if key in representation_cache:
+            experiment_representations[experiment.experiment_id] = (
+                representation_cache[key]
+            )
+            continue
+
+        features = _v73_np.asarray(
+            bank["features"][experiment.feature_mode],
+            dtype=_v73_np.float32,
+        )
+        slice_mask = _v73_experiment_slice_mask(experiment, bank)
+        series_vectors = _v73_np.full(
+            (len(series_slice_indices), features.shape[1]),
+            _v73_np.nan,
+            dtype=_v73_np.float32,
+        )
+        available = _v73_np.zeros(len(series_slice_indices), dtype=bool)
+        for series_index, indices in enumerate(series_slice_indices):
+            selected = indices[slice_mask[indices]]
+            if len(selected) == 0:
+                continue
+            series_vectors[series_index] = _v73_np.mean(
+                features[selected],
+                axis=0,
+                dtype=_v73_np.float64,
+            ).astype(_v73_np.float32)
+            available[series_index] = True
+        representation = {
+            "series_vectors": series_vectors,
+            "available": available,
+            "slice_mask": slice_mask,
+            "source_rows": int(slice_mask.sum()),
+        }
+        representation_cache[key] = representation
+        experiment_representations[experiment.experiment_id] = representation
+        print(
+            f"[V7.3 PRECOMPUTE] {experiment.experiment_id}: "
+            f"available_series={int(available.sum())}/"
+            f"{len(available)}, source_slices={int(slice_mask.sum())}.",
+            flush=True,
+        )
+    return experiment_representations
+
+
+# ---------------------------------------------------------------------------
+# FOLD-SPECIFIC PATIENT MATRICES
+# ---------------------------------------------------------------------------
+
+def _v73_select_best_available_series(
+    patient_series_indices,
+    available,
+    retention,
+):
+    candidates = [
+        int(index)
+        for index in patient_series_indices
+        if bool(available[index])
+    ]
+    if not candidates:
+        raise RuntimeError("A patient has no available series for this experiment.")
+    return sorted(
+        candidates,
+        key=lambda index: (
+            -int(retention["votes"][index]),
+            float(retention["best_normalized_distance"][index]),
+            index,
+        ),
+    )[0]
+
+
+def _v73_aggregate_image_experiment(
+    experiment,
+    patient_ids,
+    label_by_patient,
+    series_table,
+    retention,
+    representation,
+):
+    patient_ids = _v73_np.asarray(sorted(map(str, patient_ids)))
+    retained = retention["retained_series_mask"]
+    available = representation["available"]
+    vectors = representation["series_vectors"]
+    rows = []
+    labels = []
+    experiment_rescues = []
+    for patient_id in patient_ids:
+        patient_series = _v73_np.flatnonzero(
+            series_table["patient_ids"] == patient_id
+        )
+        selected = patient_series[retained[patient_series] & available[patient_series]]
+        if len(selected) == 0:
+            rescued = _v73_select_best_available_series(
+                patient_series,
+                available,
+                retention,
+            )
+            selected = _v73_np.asarray([rescued], dtype=_v73_np.int64)
+            experiment_rescues.append(
+                {
+                    "patient_id": patient_id,
+                    "series_id": str(series_table["series_ids"][rescued]),
+                    "experiment_id": str(experiment.experiment_id),
+                }
+            )
+        rows.append(
+            _v73_np.mean(vectors[selected], axis=0, dtype=_v73_np.float64)
+        )
+        labels.append(int(label_by_patient[patient_id]))
+    X = _v73_np.asarray(rows, dtype=_v73_np.float32)
+    y = _v73_np.asarray(labels, dtype=_v73_np.int64)
+    if not _v73_np.all(_v73_np.isfinite(X)):
+        raise RuntimeError(
+            f"{experiment.experiment_id}: patient matrix contains non-finite values."
+        )
+    return X, y, patient_ids, experiment_rescues
+
+
+def _v73_provenance_feature_indices(bank):
+    names = tuple(
+        bank.get("metadata", {}).get(
+            "provenance_feature_names",
+            globals().get("PROVENANCE_FEATURE_NAMES", ()),
+        )
+    )
+    if not names:
+        names = tuple(globals().get("PROVENANCE_FEATURE_NAMES", ()))
+    if not names:
+        raise RuntimeError("Provenance feature names are unavailable.")
+    classifier_names = tuple(
+        globals().get(
+            "PROVENANCE_CLASSIFIER_FEATURE_NAMES",
+            (
+                "native_height",
+                "native_width",
+                "aspect_ratio_width_over_height",
+                "file_size_bytes",
+                "bytes_per_native_pixel",
+                "near_black_fraction",
+                "near_white_fraction",
+                "border_mean_intensity",
+                "border_std_intensity",
+                "border_near_black_fraction",
+            ),
+        )
+    )
+    missing = [name for name in classifier_names if name not in names]
+    if missing:
+        raise RuntimeError(f"Missing provenance columns: {missing}.")
+    return names, classifier_names, [names.index(name) for name in classifier_names]
+
+
+def _v73_aggregate_tabular_experiment(
+    experiment,
+    patient_ids,
+    label_by_patient,
+    bank,
+    series_table,
+    retention,
+    slice_series_indices,
+):
+    patient_ids = _v73_np.asarray(sorted(map(str, patient_ids)))
+    retained_series = retention["retained_series_mask"]
+    bank_patients = _v73_np.asarray(bank["patient_ids"]).astype(str)
+    bank_series = _v73_np.asarray(bank["series_ids"]).astype(str)
+    provenance = _v73_np.asarray(bank["provenance_features"], dtype=_v73_np.float32)
+    feature_names, classifier_names, selected_indices = (
+        _v73_provenance_feature_indices(bank)
+    )
+    selected_provenance = provenance[:, selected_indices]
+
+    broad_names = [
+        "n_slices",
+        "n_series_proxies",
+        "mean_series_length",
+        "max_series_length",
+    ]
+    for name in classifier_names:
+        broad_names.extend(
+            [f"mean__{name}", f"median__{name}", f"std__{name}"]
+        )
+
+    rows = []
+    labels = []
+    for patient_id in patient_ids:
+        patient_series_indices = _v73_np.flatnonzero(
+            series_table["patient_ids"] == patient_id
+        )
+        selected_series_indices = patient_series_indices[
+            retained_series[patient_series_indices]
+        ]
+        if len(selected_series_indices) == 0:
+            raise RuntimeError(
+                f"Patient {patient_id} has no retained series for tabular aggregation."
+            )
+        selected_series_ids = set(
+            series_table["series_ids"][selected_series_indices].tolist()
+        )
+        slice_mask = (bank_patients == patient_id) & _v73_np.isin(
+            bank_series,
+            _v73_np.asarray(sorted(selected_series_ids)),
+        )
+        slice_indices = _v73_np.flatnonzero(slice_mask)
+        if len(slice_indices) == 0:
+            raise RuntimeError(f"Patient {patient_id} has no retained image rows.")
+        _, series_lengths = _v73_np.unique(
+            bank_series[slice_indices],
+            return_counts=True,
+        )
+        values = selected_provenance[slice_indices]
+        broad_row = [
+            float(len(slice_indices)),
+            float(len(series_lengths)),
+            float(_v73_np.mean(series_lengths)),
+            float(_v73_np.max(series_lengths)),
+        ]
+        for column_index in range(values.shape[1]):
+            column = values[:, column_index]
+            broad_row.extend(
+                [
+                    float(_v73_np.mean(column)),
+                    float(_v73_np.median(column)),
+                    float(_v73_np.std(column)),
+                ]
+            )
+        broad_row = _v73_np.asarray(broad_row, dtype=_v73_np.float32)
+
+        mode = str(experiment.feature_mode)
+        if mode == "provenance_only":
+            row = broad_row
+        elif mode == "n_series_only":
+            row = broad_row[[broad_names.index("n_series_proxies")]]
+        elif mode == "native_geometry_only":
+            indices = [
+                index
+                for index, name in enumerate(broad_names)
+                if any(
+                    token in name
+                    for token in (
+                        "native_height",
+                        "native_width",
+                        "aspect_ratio_width_over_height",
+                    )
+                )
+            ]
+            row = broad_row[indices]
+        elif mode == "file_size_only":
+            indices = [
+                index
+                for index, name in enumerate(broad_names)
+                if any(
+                    token in name
+                    for token in ("file_size_bytes", "bytes_per_native_pixel")
+                )
+            ]
+            row = broad_row[indices]
+        else:
+            raise ValueError(
+                f"Unsupported fold-local tabular mode: {experiment.feature_mode}."
+            )
+        rows.append(row)
+        labels.append(int(label_by_patient[patient_id]))
+
+    X = _v73_np.asarray(rows, dtype=_v73_np.float32)
+    y = _v73_np.asarray(labels, dtype=_v73_np.int64)
+    if not _v73_np.all(_v73_np.isfinite(X)):
+        raise RuntimeError(
+            f"{experiment.experiment_id}: fold-local tabular matrix is non-finite."
+        )
+    return X, y, patient_ids, []
+
+
+def _v73_patient_matrix(
+    experiment,
+    patient_ids,
+    label_by_patient,
+    bank,
+    series_table,
+    retention,
+    experiment_representations,
+    slice_series_indices,
+):
+    if str(experiment.strategy) == "patient_embedding":
+        return _v73_aggregate_image_experiment(
+            experiment,
+            patient_ids,
+            label_by_patient,
+            series_table,
+            retention,
+            experiment_representations[experiment.experiment_id],
+        )
+    if str(experiment.strategy) == "patient_tabular":
+        return _v73_aggregate_tabular_experiment(
+            experiment,
+            patient_ids,
+            label_by_patient,
+            bank,
+            series_table,
+            retention,
+            slice_series_indices,
+        )
+    raise ValueError(
+        f"V7.3 focused fold-local analysis does not support strategy "
+        f"{experiment.strategy!r}."
+    )
+
+
+# ---------------------------------------------------------------------------
+# PATIENT SPLITS AND HARMONIZATION PLANS
+# ---------------------------------------------------------------------------
+
+def _v73_primary_patient_table(bank):
+    patient_ids = _v73_np.asarray(bank["patient_ids"]).astype(str)
+    labels = _v73_np.asarray(bank["labels"], dtype=_v73_np.int64)
+    mapping = _v73_label_map(patient_ids, labels)
+    ordered = _v73_np.asarray(sorted(mapping))
+    y = _v73_np.asarray([mapping[pid] for pid in ordered], dtype=_v73_np.int64)
+    return ordered, y
+
+
+def _v73_fold_assignments(patient_ids, labels, seed, manifest_path=None):
+    patient_ids = _v73_np.asarray(patient_ids).astype(str)
+    labels = _v73_np.asarray(labels, dtype=_v73_np.int64)
+    if manifest_path is not None and _V73Path(manifest_path).is_file():
+        with open(manifest_path, newline="", encoding="utf-8") as handle:
+            rows = list(_v73_csv.DictReader(handle))
+        fold_by_patient = {}
+        for row in rows:
+            patient_key = _v73_find_column(
+                row.keys(),
+                ("patient_id", "directory_id"),
+            )
+            fold_key = _v73_find_column(
+                row.keys(),
+                ("outer_fold", "fold"),
+            )
+            fold_by_patient[str(row[patient_key])] = int(row[fold_key])
+        if set(fold_by_patient) == set(patient_ids.tolist()):
+            return _v73_np.asarray(
+                [fold_by_patient[patient_id] for patient_id in patient_ids],
+                dtype=_v73_np.int64,
+            )
+
+    splitter = _V73StratifiedKFold(
+        n_splits=int(globals().get("N_SPLITS", 5)),
+        shuffle=True,
+        random_state=int(seed),
+    )
+    folds = _v73_np.zeros(len(patient_ids), dtype=_v73_np.int64)
+    for fold_index, (_, valid_indices) in enumerate(
+        splitter.split(patient_ids, labels),
+        start=1,
+    ):
+        folds[valid_indices] = fold_index
+    return folds
+
+
+def _v73_partition_signature(training_patient_ids, seed):
+    payload = "|".join(sorted(map(str, training_patient_ids))) + f"|{int(seed)}"
+    return _v73_hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _v73_build_geometry_plan(series_table, patient_ids, labels, folds, seed):
+    patient_ids = _v73_np.asarray(patient_ids).astype(str)
+    labels = _v73_np.asarray(labels, dtype=_v73_np.int64)
+    folds = _v73_np.asarray(folds, dtype=_v73_np.int64)
+    plan = {"outer_folds": []}
+    for outer_fold in sorted(_v73_np.unique(folds).tolist()):
+        outer_train = patient_ids[folds != outer_fold]
+        outer_valid = patient_ids[folds == outer_fold]
+        outer_train_labels = labels[folds != outer_fold]
+        outer_geometry = _v73_fit_unsupervised_geometry(
+            series_table,
+            outer_train,
+            seed=int(seed + 10_000 * outer_fold),
+        )
+
+        inner_splitter = _V73StratifiedKFold(
+            n_splits=int(globals().get("INNER_CV_SPLITS", 3)),
+            shuffle=True,
+            random_state=int(
+                globals().get("INNER_CV_RANDOM_STATE", 1042)
+                + seed
+                + outer_fold
+            ),
+        )
+        inner_rows = []
+        for inner_fold, (inner_train_indices, inner_valid_indices) in enumerate(
+            inner_splitter.split(outer_train, outer_train_labels),
+            start=1,
+        ):
+            inner_train = outer_train[inner_train_indices]
+            inner_valid = outer_train[inner_valid_indices]
+            geometry = _v73_fit_unsupervised_geometry(
+                series_table,
+                inner_train,
+                seed=int(
+                    seed
+                    + 10_000 * outer_fold
+                    + 100 * inner_fold
+                ),
+            )
+            inner_rows.append(
+                {
+                    "inner_fold": int(inner_fold),
+                    "train_patients": inner_train,
+                    "valid_patients": inner_valid,
+                    "geometry": geometry,
+                }
+            )
+
+        plan["outer_folds"].append(
+            {
+                "outer_fold": int(outer_fold),
+                "train_patients": outer_train,
+                "valid_patients": outer_valid,
+                "geometry": outer_geometry,
+                "inner_folds": inner_rows,
+            }
+        )
+    return plan
+
+
+def _v73_materialize_label_dependent_plan(series_table, geometry_plan, label_map):
+    materialized = {"outer_folds": []}
+    for outer in geometry_plan["outer_folds"]:
+        outer_train_map = {
+            str(pid): int(label_map[str(pid)]) for pid in outer["train_patients"]
+        }
+        outer_train_retention = _v73_derive_fold_local_retention(
+            series_table,
+            outer["geometry"],
+            outer_train_map,
+            outer["train_patients"],
+            "outer_train",
+        )
+        outer_valid_retention = _v73_derive_fold_local_retention(
+            series_table,
+            outer["geometry"],
+            outer_train_map,
+            outer["valid_patients"],
+            "outer_validation_labels_hidden",
+        )
+        inner_materialized = []
+        for inner in outer["inner_folds"]:
+            inner_train_map = {
+                str(pid): int(label_map[str(pid)])
+                for pid in inner["train_patients"]
+            }
+            inner_materialized.append(
+                {
+                    **inner,
+                    "train_retention": _v73_derive_fold_local_retention(
+                        series_table,
+                        inner["geometry"],
+                        inner_train_map,
+                        inner["train_patients"],
+                        "inner_train",
+                    ),
+                    "valid_retention": _v73_derive_fold_local_retention(
+                        series_table,
+                        inner["geometry"],
+                        inner_train_map,
+                        inner["valid_patients"],
+                        "inner_validation_labels_hidden",
+                    ),
+                }
+            )
+        materialized["outer_folds"].append(
+            {
+                **outer,
+                "train_retention": outer_train_retention,
+                "valid_retention": outer_valid_retention,
+                "inner_folds": inner_materialized,
+            }
+        )
+    return materialized
+
+
+# ---------------------------------------------------------------------------
+# FOLD-LOCAL CLASSIFICATION
+# ---------------------------------------------------------------------------
+
+def _v73_balanced_weights(labels):
+    labels = _v73_np.asarray(labels, dtype=_v73_np.int64)
+    counts = _v73_np.bincount(labels, minlength=2).astype(_v73_np.float64)
+    if _v73_np.any(counts == 0):
+        raise RuntimeError("A training partition contains only one class.")
+    return len(labels) / (2.0 * counts[labels])
+
+
+def _v73_build_classifier(experiment, c_value):
+    steps = [("scaler", _V73StandardScaler())]
+    if bool(getattr(experiment, "use_pca", False)):
+        steps.append(
+            (
+                "pca",
+                _V73PCA(
+                    n_components=float(
+                        globals().get("PATIENT_PCA_EXPLAINED_VARIANCE", 0.95)
+                    ),
+                    svd_solver="full",
+                ),
+            )
+        )
+    steps.append(
+        (
+            "classifier",
+            _V73LogisticRegression(
+                C=float(c_value),
+                max_iter=int(globals().get("LOGISTIC_MAX_ITER", 4000)),
+                solver="liblinear",
+                random_state=int(globals().get("RANDOM_SEED", 42)),
+            ),
+        )
+    )
+    return _V73Pipeline(steps)
+
+
+def _v73_fit_classifier(model, X, y):
+    model.fit(
+        X,
+        y,
+        scaler__sample_weight=_v73_np.ones(len(y), dtype=_v73_np.float64),
+        classifier__sample_weight=_v73_balanced_weights(y),
+    )
+    return model
+
+
+def _v73_select_threshold(y, scores):
+    fpr, tpr, thresholds = _v73_roc_curve(y, scores)
+    finite = _v73_np.isfinite(thresholds)
+    if not _v73_np.any(finite):
+        return 0.5
+    objective = tpr - fpr
+    objective[~finite] = -_v73_np.inf
+    best = _v73_np.flatnonzero(objective == _v73_np.max(objective))
+    # Prefer the greatest training-only threshold among exact ties, yielding a
+    # conservative deterministic operating point.
+    return float(_v73_np.max(thresholds[best]))
+
+
+def _v73_matrix_for_split(
+    experiment,
+    patients,
+    label_map,
+    retention,
+    context,
+):
+    return _v73_patient_matrix(
+        experiment,
+        patients,
+        label_map,
+        context["bank"],
+        context["series_table"],
+        retention,
+        context["experiment_representations"],
+        context["slice_series_indices"],
+    )
+
+
+def _v73_evaluate_experiment(
+    experiment,
+    materialized_plan,
+    label_map,
+    context,
+    collect_threshold_metrics=True,
+):
+    c_grid = tuple(
+        float(value) for value in globals().get("CLASSIFIER_C_GRID", (0.01, 0.1, 1.0, 10.0))
+    )
+    patient_score = {}
+    patient_prediction = {}
+    patient_threshold = {}
+    patient_fold = {}
+    fold_rows = []
+    all_rescues = []
+
+    for outer in materialized_plan["outer_folds"]:
+        inner_predictions_by_c = {
+            c_value: {} for c_value in c_grid
+        }
+        inner_labels = {}
+        for inner in outer["inner_folds"]:
+            X_train, y_train, train_ids, rescues_train = _v73_matrix_for_split(
+                experiment,
+                inner["train_patients"],
+                label_map,
+                inner["train_retention"],
+                context,
+            )
+            X_valid, y_valid, valid_ids, rescues_valid = _v73_matrix_for_split(
+                experiment,
+                inner["valid_patients"],
+                label_map,
+                inner["valid_retention"],
+                context,
+            )
+            all_rescues.extend(rescues_train)
+            all_rescues.extend(rescues_valid)
+            for patient_id, label in zip(valid_ids, y_valid):
+                inner_labels[str(patient_id)] = int(label)
+            for c_value in c_grid:
+                model = _v73_build_classifier(experiment, c_value)
+                _v73_fit_classifier(model, X_train, y_train)
+                scores = model.predict_proba(X_valid)[:, 1]
+                for patient_id, score in zip(valid_ids, scores):
+                    inner_predictions_by_c[c_value][str(patient_id)] = float(score)
+
+        ordered_inner_patients = _v73_np.asarray(sorted(inner_labels))
+        y_inner = _v73_np.asarray(
+            [inner_labels[pid] for pid in ordered_inner_patients],
+            dtype=_v73_np.int64,
+        )
+        auc_by_c = {}
+        scores_by_c = {}
+        for c_value in c_grid:
+            scores = _v73_np.asarray(
+                [
+                    inner_predictions_by_c[c_value][pid]
+                    for pid in ordered_inner_patients
+                ],
+                dtype=_v73_np.float64,
+            )
+            scores_by_c[c_value] = scores
+            auc_by_c[c_value] = float(_v73_roc_auc_score(y_inner, scores))
+        best_auc = max(auc_by_c.values())
+        eligible = [
+            c_value
+            for c_value in sorted(c_grid)
+            if auc_by_c[c_value] >= best_auc - V73_C_SELECTION_AUC_TOLERANCE
+        ]
+        selected_c = float(eligible[0])
+        threshold = _v73_select_threshold(y_inner, scores_by_c[selected_c])
+
+        X_train, y_train, train_ids, rescues_train = _v73_matrix_for_split(
+            experiment,
+            outer["train_patients"],
+            label_map,
+            outer["train_retention"],
+            context,
+        )
+        X_valid, y_valid, valid_ids, rescues_valid = _v73_matrix_for_split(
+            experiment,
+            outer["valid_patients"],
+            label_map,
+            outer["valid_retention"],
+            context,
+        )
+        all_rescues.extend(rescues_train)
+        all_rescues.extend(rescues_valid)
+        model = _v73_build_classifier(experiment, selected_c)
+        _v73_fit_classifier(model, X_train, y_train)
+        scores = model.predict_proba(X_valid)[:, 1]
+        predictions = (scores >= threshold).astype(_v73_np.int64)
+        held_out_auc = (
+            float(_v73_roc_auc_score(y_valid, scores))
+            if len(_v73_np.unique(y_valid)) == 2
+            else None
+        )
+        for patient_id, score, prediction in zip(valid_ids, scores, predictions):
+            patient_id = str(patient_id)
+            patient_score[patient_id] = float(score)
+            patient_prediction[patient_id] = int(prediction)
+            patient_threshold[patient_id] = float(threshold)
+            patient_fold[patient_id] = int(outer["outer_fold"])
+        fold_rows.append(
+            {
+                "outer_fold": int(outer["outer_fold"]),
+                "selected_c": selected_c,
+                "selected_inner_auc": float(auc_by_c[selected_c]),
+                "best_inner_auc": float(best_auc),
+                "training_only_threshold": float(threshold),
+                "held_out_auc": held_out_auc,
+                "outer_train_retained_series": int(
+                    outer["train_retention"]["n_retained_series"]
+                ),
+                "outer_valid_retained_series": int(
+                    outer["valid_retention"]["n_retained_series"]
+                ),
+                "outer_train_coverage_rescues": int(
+                    outer["train_retention"]["n_coverage_rescues"]
+                ),
+                "outer_valid_coverage_rescues": int(
+                    outer["valid_retention"]["n_coverage_rescues"]
+                ),
+                "inner_auc_by_c_json": _v73_json.dumps(auc_by_c, sort_keys=True),
+            }
+        )
+
+    ordered_patients = _v73_np.asarray(sorted(patient_score))
+    y = _v73_np.asarray(
+        [label_map[pid] for pid in ordered_patients],
+        dtype=_v73_np.int64,
+    )
+    scores = _v73_np.asarray(
+        [patient_score[pid] for pid in ordered_patients],
+        dtype=_v73_np.float64,
+    )
+    predictions = _v73_np.asarray(
+        [patient_prediction[pid] for pid in ordered_patients],
+        dtype=_v73_np.int64,
+    )
+    if len(_v73_np.unique(y)) == 2:
+        auc = float(_v73_roc_auc_score(y, scores))
+        auprc = float(_v73_average_precision_score(y, scores))
+    else:
+        # One-fold helper calls used by candidate selection can encounter a
+        # single-class outer-validation subset under a permuted label vector.
+        # The combined OOF vector across all folds still contains both classes;
+        # fold-local AUC is therefore left undefined rather than fabricated.
+        auc = float("nan")
+        auprc = float("nan")
+    tn, fp, fn, tp = _v73_confusion_matrix(y, predictions, labels=[0, 1]).ravel()
+    sensitivity = float(tp / max(tp + fn, 1))
+    specificity = float(tn / max(tn + fp, 1))
+    f1 = float(2 * tp / max(2 * tp + fp + fn, 1))
+    return {
+        "experiment_id": str(experiment.experiment_id),
+        "patient_ids": ordered_patients,
+        "labels": y,
+        "scores": scores,
+        "predictions": predictions,
+        "thresholds": _v73_np.asarray(
+            [patient_threshold[pid] for pid in ordered_patients],
+            dtype=_v73_np.float64,
+        ),
+        "folds": _v73_np.asarray(
+            [patient_fold[pid] for pid in ordered_patients],
+            dtype=_v73_np.int64,
+        ),
+        "fold_rows": fold_rows,
+        "auc": auc,
+        "auprc": auprc,
+        "sensitivity": sensitivity,
+        "specificity": specificity,
+        "f1": f1,
+        "experiment_level_rescues": all_rescues,
+    }
+
+
+def _v73_bootstrap_auc_interval(y, scores, seed, replicates):
+    rng = _v73_np.random.default_rng(int(seed))
+    y = _v73_np.asarray(y, dtype=_v73_np.int64)
+    scores = _v73_np.asarray(scores, dtype=_v73_np.float64)
+    values = []
+    for _ in range(int(replicates)):
+        indices = rng.integers(0, len(y), size=len(y))
+        if len(_v73_np.unique(y[indices])) < 2:
+            continue
+        values.append(float(_v73_roc_auc_score(y[indices], scores[indices])))
+    if not values:
+        return [None, None]
+    return [
+        float(_v73_np.quantile(values, 0.025)),
+        float(_v73_np.quantile(values, 0.975)),
+    ]
+
+
+def _v73_paired_bootstrap_delta(reference, comparison, seed, replicates):
+    if not _v73_np.array_equal(reference["patient_ids"], comparison["patient_ids"]):
+        raise RuntimeError("Paired bootstrap requires identical patient ordering.")
+    y = reference["labels"]
+    rng = _v73_np.random.default_rng(int(seed))
+    deltas = []
+    for _ in range(int(replicates)):
+        indices = rng.integers(0, len(y), size=len(y))
+        if len(_v73_np.unique(y[indices])) < 2:
+            continue
+        deltas.append(
+            float(
+                _v73_roc_auc_score(y[indices], comparison["scores"][indices])
+                - _v73_roc_auc_score(y[indices], reference["scores"][indices])
+            )
+        )
+    values = _v73_np.asarray(deltas, dtype=_v73_np.float64)
+    return {
+        "delta_auc": float(comparison["auc"] - reference["auc"]),
+        "ci_lower": float(_v73_np.quantile(values, 0.025)),
+        "ci_upper": float(_v73_np.quantile(values, 0.975)),
+        "probability_above_zero": float(_v73_np.mean(values > 0)),
+    }
+
+
+# ---------------------------------------------------------------------------
+# OUTPUTS AND PRIMARY FOLD-LOCAL RUN
+# ---------------------------------------------------------------------------
+
+def _v73_write_retention_audit(output_dir, series_table, materialized_plan):
+    rows = []
+    summary_rows = []
+    inner_summary_rows = []
+    for outer in materialized_plan["outer_folds"]:
+        effective_counts = [
+            int(row["effective_cluster_count"])
+            for row in outer["geometry"]["resolutions"]
+        ]
+        for role, retention in (
+            ("outer_train", outer["train_retention"]),
+            ("outer_validation_labels_hidden", outer["valid_retention"]),
+        ):
+            target_set = set(retention["target_patient_ids"])
+            for index, series_id in enumerate(series_table["series_ids"]):
+                patient_id = str(series_table["patient_ids"][index])
+                if patient_id not in target_set:
+                    continue
+                rows.append(
+                    {
+                        "outer_fold": int(outer["outer_fold"]),
+                        "role": role,
+                        "series_id": str(series_id),
+                        "patient_id": patient_id,
+                        # Labels are intentionally blank for validation rows.
+                        "training_label_if_used": (
+                            int(series_table["labels"][index])
+                            if role == "outer_train"
+                            else ""
+                        ),
+                        "shared_resolution_votes": int(retention["votes"][index]),
+                        "best_normalized_distance": float(
+                            retention["best_normalized_distance"][index]
+                        ),
+                        "retained": int(
+                            retention["retained_series_mask"][index]
+                        ),
+                        "coverage_rescue": int(
+                            retention["coverage_rescue_mask"][index]
+                        ),
+                    }
+                )
+            summary_rows.append(
+                {
+                    "outer_fold": int(outer["outer_fold"]),
+                    "role": role,
+                    "patients": len(retention["target_patient_ids"]),
+                    "target_series": int(retention["n_target_series"]),
+                    "retained_series": int(retention["n_retained_series"]),
+                    "retained_fraction": float(
+                        retention["n_retained_series"]
+                        / max(retention["n_target_series"], 1)
+                    ),
+                    "coverage_rescues": int(retention["n_coverage_rescues"]),
+                    "effective_cluster_counts": _v73_json.dumps(effective_counts),
+                    "validation_labels_used": False,
+                }
+            )
+        for inner in outer["inner_folds"]:
+            inner_effective_counts = [
+                int(row["effective_cluster_count"])
+                for row in inner["geometry"]["resolutions"]
+            ]
+            for role, retention in (
+                ("inner_train", inner["train_retention"]),
+                ("inner_validation_labels_hidden", inner["valid_retention"]),
+            ):
+                inner_summary_rows.append(
+                    {
+                        "outer_fold": int(outer["outer_fold"]),
+                        "inner_fold": int(inner["inner_fold"]),
+                        "role": role,
+                        "patients": len(retention["target_patient_ids"]),
+                        "target_series": int(retention["n_target_series"]),
+                        "retained_series": int(retention["n_retained_series"]),
+                        "retained_fraction": float(
+                            retention["n_retained_series"]
+                            / max(retention["n_target_series"], 1)
+                        ),
+                        "coverage_rescues": int(
+                            retention["n_coverage_rescues"]
+                        ),
+                        "effective_cluster_counts": _v73_json.dumps(
+                            inner_effective_counts
+                        ),
+                        "validation_labels_used": False,
+                    }
+                )
+    _v73_write_csv(output_dir / "outer_fold_series_decisions.csv", rows)
+    _v73_write_csv(output_dir / "outer_fold_retention_summary.csv", summary_rows)
+    _v73_write_csv(output_dir / "inner_fold_retention_summary.csv", inner_summary_rows)
+    return {
+        "outer": summary_rows,
+        "inner": inner_summary_rows,
+    }
+
+
+def _v73_write_experiment_result(output_dir, result):
+    experiment_dir = output_dir / "experiments" / result["experiment_id"]
+    prediction_rows = []
+    for row in zip(
+        result["patient_ids"],
+        result["labels"],
+        result["folds"],
+        result["scores"],
+        result["thresholds"],
+        result["predictions"],
+    ):
+        prediction_rows.append(
+            {
+                "patient_id": str(row[0]),
+                "true_label": int(row[1]),
+                "outer_fold": int(row[2]),
+                "oof_score": float(row[3]),
+                "training_only_threshold": float(row[4]),
+                "predicted_label": int(row[5]),
+            }
+        )
+    _v73_write_csv(experiment_dir / "patient_oof_predictions.csv", prediction_rows)
+    _v73_write_csv(experiment_dir / "fold_metrics.csv", result["fold_rows"])
+    interval = _v73_bootstrap_auc_interval(
+        result["labels"],
+        result["scores"],
+        V73_RANDOM_SEED
+        + int(
+            _v73_hashlib.sha256(
+                result["experiment_id"].encode("utf-8")
+            ).hexdigest()[:8],
+            16,
+        )
+        % 100_000,
+        V73_BOOTSTRAP_REPLICATES,
+    )
+    summary = {
+        "experiment_id": result["experiment_id"],
+        "auc": float(result["auc"]),
+        "auc_bootstrap_95_ci": interval,
+        "auprc": float(result["auprc"]),
+        "sensitivity": float(result["sensitivity"]),
+        "specificity": float(result["specificity"]),
+        "f1": float(result["f1"]),
+        "n_patients": int(len(result["labels"])),
+        "statistical_contract": (
+            "Every outer and inner validation row was filtered by a harmonizer "
+            "fitted only on the corresponding training patients. Validation "
+            "labels were not supplied to series retention."
+        ),
+    }
+    _v73_write_json(experiment_dir / "summary.json", summary)
+    return summary
+
+
+def _v73_run_primary_fold_local_analysis(context, patient_ids, labels, folds):
+    output_dir = context["output_dir"] / "primary_cv"
+    label_map = _v73_label_map(patient_ids, labels)
+    geometry_plan = _v73_build_geometry_plan(
+        context["series_table"],
+        patient_ids,
+        labels,
+        folds,
+        seed=V73_RANDOM_SEED,
+    )
+    materialized = _v73_materialize_label_dependent_plan(
+        context["series_table"],
+        geometry_plan,
+        label_map,
+    )
+    retention_summary = _v73_write_retention_audit(
+        context["output_dir"] / "audits",
+        context["series_table"],
+        materialized,
+    )
+    for row in retention_summary["outer"]:
+        print(
+            f"[V7.3 HARMONIZATION] outer={row['outer_fold']} "
+            f"role={row['role']}: series={row['retained_series']}/"
+            f"{row['target_series']} ({100.0 * row['retained_fraction']:.1f}%), "
+            f"rescues={row['coverage_rescues']}, "
+            f"K={row['effective_cluster_counts']}.",
+            flush=True,
+        )
+
+    results = {}
+    summaries = []
+    for index, experiment in enumerate(context["experiments"], start=1):
+        started = _v73_time.perf_counter()
+        print(
+            f"[V7.3 PRIMARY] {index}/{len(context['experiments'])}: "
+            f"{experiment.experiment_id}",
+            flush=True,
+        )
+        result = _v73_evaluate_experiment(
+            experiment,
+            materialized,
+            label_map,
+            context,
+        )
+        results[experiment.experiment_id] = result
+        summary = _v73_write_experiment_result(output_dir, result)
+        summary["runtime_seconds"] = float(
+            _v73_time.perf_counter() - started
+        )
+        summaries.append(summary)
+        print(
+            f"[V7.3 PRIMARY] COMPLETED {experiment.experiment_id}: "
+            f"AUC={result['auc']:.4f}, AUPRC={result['auprc']:.4f}.",
+            flush=True,
+        )
+
+    summaries.sort(key=lambda row: (-row["auc"], row["experiment_id"]))
+    _v73_write_csv(output_dir / "comparison" / "experiment_summary.csv", summaries)
+
+    primary_id = str(PRIMARY_CANDIDATE_EXPERIMENT_ID)
+    primary = results[primary_id]
+    paired_rows = []
+    for experiment_id, comparison in sorted(results.items()):
+        if experiment_id == primary_id:
+            continue
+        delta = _v73_paired_bootstrap_delta(
+            comparison,
+            primary,
+            seed=V73_RANDOM_SEED + len(paired_rows) * 101,
+            replicates=V73_PAIRED_BOOTSTRAP_REPLICATES,
+        )
+        paired_rows.append(
+            {
+                "comparison_name": f"{experiment_id}_VS_{primary_id}",
+                "reference_experiment_id": experiment_id,
+                "comparison_experiment_id": primary_id,
+                "reference_auc": float(comparison["auc"]),
+                "comparison_auc": float(primary["auc"]),
+                "comparison_minus_reference_auc": delta["delta_auc"],
+                "paired_bootstrap_ci_lower": delta["ci_lower"],
+                "paired_bootstrap_ci_upper": delta["ci_upper"],
+                "bootstrap_probability_above_zero": delta[
+                    "probability_above_zero"
+                ],
+            }
+        )
+    _v73_write_csv(output_dir / "comparison" / "paired_auc_comparisons.csv", paired_rows)
+    _v73_write_json(
+        output_dir / "primary_fold_local_summary.json",
+        {
+            "status": "OK",
+            "version": V73_FOLD_LOCAL_VERSION,
+            "primary_candidate_experiment_id": primary_id,
+            "primary_candidate_auc": float(primary["auc"]),
+            "primary_candidate_auprc": float(primary["auprc"]),
+            "n_patients": int(len(patient_ids)),
+            "retention_summary": retention_summary,
+            "statistical_contract": {
+                "outer_harmonizer_fit": "outer-training patients only",
+                "inner_harmonizer_fit": "inner-training patients only",
+                "validation_label_use": False,
+                "feature_bank_scope": "all discovered image rows",
+                "global_v72_selection_used_for_modelling": False,
+            },
+        },
+    )
+    return results, geometry_plan, materialized
+
+
+# ---------------------------------------------------------------------------
+# REPEATED FOLD-LOCAL NESTED CV
+# ---------------------------------------------------------------------------
+
+def _v73_run_repeated_fold_local_analysis(context, patient_ids, labels):
+    output_dir = context["output_dir"] / "stability"
+    run_rows = []
+    auc_by_experiment = {
+        experiment.experiment_id: [] for experiment in context["experiments"]
+    }
+    for repeat_index in range(V73_REPEATED_CV_REPEATS):
+        seed = V73_RANDOM_SEED + 100_000 + repeat_index
+        folds = _v73_fold_assignments(patient_ids, labels, seed)
+        geometry_plan = _v73_build_geometry_plan(
+            context["series_table"],
+            patient_ids,
+            labels,
+            folds,
+            seed=seed,
+        )
+        label_map = _v73_label_map(patient_ids, labels)
+        materialized = _v73_materialize_label_dependent_plan(
+            context["series_table"],
+            geometry_plan,
+            label_map,
+        )
+        for experiment in context["experiments"]:
+            result = _v73_evaluate_experiment(
+                experiment,
+                materialized,
+                label_map,
+                context,
+                collect_threshold_metrics=False,
+            )
+            auc_by_experiment[experiment.experiment_id].append(result["auc"])
+            run_rows.append(
+                {
+                    "repeat_index": int(repeat_index + 1),
+                    "outer_cv_random_state": int(seed),
+                    "experiment_id": str(experiment.experiment_id),
+                    "auc": float(result["auc"]),
+                    "auprc": float(result["auprc"]),
+                }
+            )
+        print(
+            f"[V7.3 STABILITY] repeat={repeat_index + 1}/"
+            f"{V73_REPEATED_CV_REPEATS} complete; "
+            f"A17={auc_by_experiment[str(PRIMARY_CANDIDATE_EXPERIMENT_ID)][-1]:.4f}.",
+            flush=True,
+        )
+
+    ranking = []
+    for experiment in context["experiments"]:
+        values = _v73_np.asarray(
+            auc_by_experiment[experiment.experiment_id],
+            dtype=_v73_np.float64,
+        )
+        ranking.append(
+            {
+                "experiment_id": str(experiment.experiment_id),
+                "role": str(getattr(experiment, "role", "")),
+                "repeats": int(len(values)),
+                "auc_mean": float(_v73_np.mean(values)),
+                "auc_median": float(_v73_np.median(values)),
+                "auc_std": float(_v73_np.std(values)),
+                "auc_q25": float(_v73_np.quantile(values, 0.25)),
+                "auc_q75": float(_v73_np.quantile(values, 0.75)),
+                "auc_minimum": float(_v73_np.min(values)),
+                "auc_maximum": float(_v73_np.max(values)),
+                "is_primary": int(
+                    experiment.experiment_id == PRIMARY_CANDIDATE_EXPERIMENT_ID
+                ),
+            }
+        )
+    ranking.sort(key=lambda row: (-row["auc_median"], row["experiment_id"]))
+    for rank, row in enumerate(ranking, start=1):
+        row["rank"] = int(rank)
+
+    primary_values = _v73_np.asarray(
+        auc_by_experiment[str(PRIMARY_CANDIDATE_EXPERIMENT_ID)],
+        dtype=_v73_np.float64,
+    )
+    paired = []
+    for experiment in context["experiments"]:
+        if experiment.experiment_id == PRIMARY_CANDIDATE_EXPERIMENT_ID:
+            continue
+        reference_values = _v73_np.asarray(
+            auc_by_experiment[experiment.experiment_id],
+            dtype=_v73_np.float64,
+        )
+        delta = primary_values - reference_values
+        paired.append(
+            {
+                "reference_experiment_id": str(experiment.experiment_id),
+                "comparison_experiment_id": str(PRIMARY_CANDIDATE_EXPERIMENT_ID),
+                "median_delta_auc": float(_v73_np.median(delta)),
+                "delta_q25": float(_v73_np.quantile(delta, 0.25)),
+                "delta_q75": float(_v73_np.quantile(delta, 0.75)),
+                "comparison_better_fraction": float(_v73_np.mean(delta > 0)),
+                "comparison_not_worse_fraction": float(_v73_np.mean(delta >= 0)),
+            }
+        )
+
+    _v73_write_csv(output_dir / "repeated_nested_cv_runs.csv", run_rows)
+    _v73_write_csv(output_dir / "repeated_nested_cv_ranking.csv", ranking)
+    _v73_write_csv(output_dir / "paired_repeated_auc_deltas.csv", paired)
+    _v73_write_json(
+        output_dir / "repeated_nested_cv_summary.json",
+        {
+            "status": "OK",
+            "repeats": int(V73_REPEATED_CV_REPEATS),
+            "ranking": ranking,
+            "paired_primary_deltas": paired,
+            "interpretation": (
+                "Repeated split results are sensitivity analyses on the same 30 "
+                "patients, not independent cohorts. Every repeat refits the "
+                "unsupervised geometry and training-label common support inside "
+                "its own outer and inner training partitions."
+            ),
+        },
+    )
+    return ranking, paired
+
+
+# ---------------------------------------------------------------------------
+# CANDIDATE SELECTION AND CONDITIONAL PERMUTATION
+# ---------------------------------------------------------------------------
+
+def _v73_select_candidate_by_outer_training(
+    candidate_experiments,
+    materialized_plan,
+    label_map,
+    context,
+):
+    patient_scores = {}
+    selected_rows = []
+    for outer_index, outer in enumerate(materialized_plan["outer_folds"]):
+        candidate_results = []
+        for priority, experiment in enumerate(candidate_experiments):
+            # Evaluate only this outer fold by wrapping it in a one-fold plan.
+            result = _v73_evaluate_experiment(
+                experiment,
+                {"outer_folds": [outer]},
+                label_map,
+                context,
+                collect_threshold_metrics=False,
+            )
+            inner_auc = float(result["fold_rows"][0]["selected_inner_auc"])
+            candidate_results.append(
+                (priority, experiment, inner_auc, result)
+            )
+        best_inner_auc = max(row[2] for row in candidate_results)
+        eligible = [
+            row
+            for row in candidate_results
+            if row[2] >= best_inner_auc - V73_C_SELECTION_AUC_TOLERANCE
+        ]
+        selected = sorted(eligible, key=lambda row: row[0])[0]
+        _, experiment, inner_auc, result = selected
+        for patient_id, score in zip(result["patient_ids"], result["scores"]):
+            patient_scores[str(patient_id)] = float(score)
+        selected_rows.append(
+            {
+                "outer_fold": int(outer["outer_fold"]),
+                "selected_experiment_id": str(experiment.experiment_id),
+                "selected_inner_auc": float(inner_auc),
+                "best_candidate_inner_auc": float(best_inner_auc),
+            }
+        )
+    ordered = _v73_np.asarray(sorted(patient_scores))
+    y = _v73_np.asarray([label_map[pid] for pid in ordered], dtype=_v73_np.int64)
+    scores = _v73_np.asarray([patient_scores[pid] for pid in ordered])
+    return {
+        "patient_ids": ordered,
+        "labels": y,
+        "scores": scores,
+        "auc": float(_v73_roc_auc_score(y, scores)),
+        "auprc": float(_v73_average_precision_score(y, scores)),
+        "selected_rows": selected_rows,
+    }
+
+
+def _v73_valid_permuted_label_map(patient_ids, permuted_labels, geometry_plan):
+    mapping = _v73_label_map(patient_ids, permuted_labels)
+    for outer in geometry_plan["outer_folds"]:
+        outer_labels = [mapping[str(pid)] for pid in outer["train_patients"]]
+        if len(set(outer_labels)) < 2:
+            return None
+        for inner in outer["inner_folds"]:
+            inner_labels = [mapping[str(pid)] for pid in inner["train_patients"]]
+            if len(set(inner_labels)) < 2:
+                return None
+    return mapping
+
+
+def _v73_run_candidate_selection_and_permutation(
+    context,
+    patient_ids,
+    labels,
+    primary_geometry_plan,
+    primary_materialized,
+    primary_results,
+):
+    output_dir = context["output_dir"] / "permutation"
+    candidate_ids = (
+        str(PRIMARY_CANDIDATE_EXPERIMENT_ID),
+        "A20_HARD_SUPPORT_REGION_NORM_VALID_ONLY_HIER_LR_PCA",
+        "A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA",
+    )
+    experiment_by_id = {
+        experiment.experiment_id: experiment for experiment in context["experiments"]
+    }
+    candidate_experiments = [experiment_by_id[eid] for eid in candidate_ids]
+    label_map = _v73_label_map(patient_ids, labels)
+    observed_selection = _v73_select_candidate_by_outer_training(
+        candidate_experiments,
+        primary_materialized,
+        label_map,
+        context,
+    )
+    _v73_write_csv(
+        context["output_dir"]
+        / "candidate_selection"
+        / "outer_fold_selected_models.csv",
+        observed_selection["selected_rows"],
+    )
+    _v73_write_json(
+        context["output_dir"] / "candidate_selection" / "summary.json",
+        {
+            "status": "OK",
+            "candidate_ids_in_priority_order": list(candidate_ids),
+            "selection_aware_auc": float(observed_selection["auc"]),
+            "selection_aware_auprc": float(observed_selection["auprc"]),
+            "selected_model_counts": dict(
+                _V73Counter(
+                    row["selected_experiment_id"]
+                    for row in observed_selection["selected_rows"]
+                )
+            ),
+            "selection_rule": (
+                "Choose the first prospectively ordered candidate within 0.01 "
+                "inner AUC of the best candidate, using outer-training data only."
+            ),
+        },
+    )
+
+    observed_a17_auc = float(
+        primary_results[str(PRIMARY_CANDIDATE_EXPERIMENT_ID)]["auc"]
+    )
+    observed_selection_auc = float(observed_selection["auc"])
+    rng = _v73_np.random.default_rng(V73_RANDOM_SEED + 900_000)
+    permutation_rows = []
+    accepted = 0
+    attempts = 0
+    maximum_attempts = V73_LABEL_PERMUTATIONS * 20
+    while accepted < V73_LABEL_PERMUTATIONS and attempts < maximum_attempts:
+        attempts += 1
+        permuted = rng.permutation(labels)
+        permuted_map = _v73_valid_permuted_label_map(
+            patient_ids,
+            permuted,
+            primary_geometry_plan,
+        )
+        if permuted_map is None:
+            continue
+        try:
+            materialized = _v73_materialize_label_dependent_plan(
+                context["series_table"],
+                primary_geometry_plan,
+                permuted_map,
+            )
+            a17_result = _v73_evaluate_experiment(
+                experiment_by_id[str(PRIMARY_CANDIDATE_EXPERIMENT_ID)],
+                materialized,
+                permuted_map,
+                context,
+                collect_threshold_metrics=False,
+            )
+            selection_result = _v73_select_candidate_by_outer_training(
+                candidate_experiments,
+                materialized,
+                permuted_map,
+                context,
+            )
+        except RuntimeError:
+            # Some permutations can make the common-support criterion too sparse
+            # for an inner fold. They are rejected before observing any AUC and
+            # the attempt count is reported.
+            continue
+        accepted += 1
+        permutation_rows.append(
+            {
+                "permutation_index": int(accepted),
+                "attempt_index": int(attempts),
+                "a17_auc": float(a17_result["auc"]),
+                "selection_aware_auc": float(selection_result["auc"]),
+            }
+        )
+        if accepted == 1 or accepted % max(1, V73_LABEL_PERMUTATIONS // 10) == 0:
+            print(
+                f"[V7.3 PERMUTATION] {accepted}/{V73_LABEL_PERMUTATIONS}; "
+                f"A17={a17_result['auc']:.4f}, "
+                f"selection={selection_result['auc']:.4f}.",
+                flush=True,
+            )
+
+    if accepted < V73_LABEL_PERMUTATIONS:
+        raise RuntimeError(
+            f"Only {accepted}/{V73_LABEL_PERMUTATIONS} valid fold-local "
+            "permutations were obtained after {attempts} attempts."
+        )
+    null_a17 = _v73_np.asarray([row["a17_auc"] for row in permutation_rows])
+    null_selection = _v73_np.asarray(
+        [row["selection_aware_auc"] for row in permutation_rows]
+    )
+    a17_p = float(
+        (1 + _v73_np.sum(null_a17 >= observed_a17_auc))
+        / (len(null_a17) + 1)
+    )
+    selection_p = float(
+        (1 + _v73_np.sum(null_selection >= observed_selection_auc))
+        / (len(null_selection) + 1)
+    )
+    summary = {
+        "status": "OK",
+        "accepted_permutations": int(accepted),
+        "attempted_permutations": int(attempts),
+        "outer_and_inner_patient_partitions_fixed": True,
+        "unsupervised_cluster_geometry_cached_conditional_on_partitions": True,
+        "training_label_shared_cluster_support_recomputed_each_permutation": True,
+        "validation_labels_used_for_series_filtering": False,
+        "a17": {
+            "observed_auc": observed_a17_auc,
+            "null_median": float(_v73_np.median(null_a17)),
+            "null_q025": float(_v73_np.quantile(null_a17, 0.025)),
+            "null_q975": float(_v73_np.quantile(null_a17, 0.975)),
+            "empirical_one_sided_p_value": a17_p,
+        },
+        "selection_aware": {
+            "observed_auc": observed_selection_auc,
+            "null_median": float(_v73_np.median(null_selection)),
+            "null_q025": float(_v73_np.quantile(null_selection, 0.025)),
+            "null_q975": float(_v73_np.quantile(null_selection, 0.975)),
+            "empirical_one_sided_p_value": selection_p,
+        },
+        "interpretation": (
+            "This is a conditional permutation test with fixed patient split "
+            "partitions. The label-independent scaler/KMeans geometry is cached, "
+            "while every training-label-dependent shared-cluster decision, "
+            "series mask, classifier C and candidate choice is recomputed."
+        ),
+    }
+    _v73_write_csv(output_dir / "fold_local_permutation_runs.csv", permutation_rows)
+    _v73_write_json(output_dir / "fold_local_permutation_summary.json", summary)
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# TOP-LEVEL V7.3 ANALYSIS
+# ---------------------------------------------------------------------------
+
+def run_v73_fold_local_harmonization_analysis():
+    started = _v73_time.perf_counter()
+    output_dir = _V73Path(OUTPUT_DIR) / "fold_local_series_harmonization"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print("\n" + "#" * 100, flush=True)
+    print(
+        "CAD CARDIAC MRI — FOCUSED FOLD-LOCAL SERIES-HARMONIZED SUITE V7.3",
+        flush=True,
+    )
+    print("#" * 100, flush=True)
+    print(
+        "[V7.3] Primary contract: all image rows enter the frozen feature bank; "
+        "series scaler, clusters, common support and inlier radii are fitted "
+        "only inside each outer/inner training partition.",
+        flush=True,
+    )
+
+    if _V73_ALL_SAMPLES is None:
+        raise RuntimeError(
+            "V7.3 did not capture the complete V7.2 sample list. The global "
+            "harmonization interception did not run."
+        )
+
+    experiments = list(get_enabled_experiments())
+    unsupported = [
+        experiment.experiment_id
+        for experiment in experiments
+        if str(experiment.strategy) not in {"patient_embedding", "patient_tabular"}
+    ]
+    if unsupported:
+        raise RuntimeError(
+            "V7.3 focused fold-local evaluator supports patient-level experiments "
+            f"only; unsupported IDs: {unsupported}."
+        )
+    required_modes = required_efficientnet_feature_modes(experiments)
+    bank, cache_dir, cache_metadata = _v73_locate_complete_feature_bank(
+        required_modes,
+        expected_rows=len(_V73_ALL_SAMPLES),
+    )
+    raw_descriptor_path = _v73_build_or_load_raw_series_descriptor_csv(
+        _V73_ALL_SAMPLES,
+        cache_metadata.get("fingerprint", ""),
+    )
+    series_table = _v73_load_series_descriptors(
+        bank,
+        descriptor_path=raw_descriptor_path,
+    )
+    slice_series_indices, series_slice_indices = _v73_build_series_index(
+        bank,
+        series_table,
+    )
+    experiment_representations = _v73_precompute_series_representations(
+        experiments,
+        bank,
+        series_table,
+        series_slice_indices,
+    )
+    patient_ids, labels = _v73_primary_patient_table(bank)
+    manifest_path = _V73Path(OUTPUT_DIR) / "manifests" / "patient_fold_manifest.csv"
+    folds = _v73_fold_assignments(
+        patient_ids,
+        labels,
+        seed=int(globals().get("CV_RANDOM_STATE", 42)),
+        manifest_path=manifest_path,
+    )
+
+    context = {
+        "output_dir": output_dir,
+        "experiments": experiments,
+        "bank": bank,
+        "series_table": series_table,
+        "slice_series_indices": slice_series_indices,
+        "series_slice_indices": series_slice_indices,
+        "experiment_representations": experiment_representations,
+    }
+    _v73_write_json(
+        output_dir / "fold_local_harmonization_configuration.json",
+        {
+            "version": V73_FOLD_LOCAL_VERSION,
+            "global_v72_selection_used_for_modelling": False,
+            "full_feature_bank_cache": str(cache_dir),
+            "full_feature_bank_fingerprint": str(
+                cache_metadata.get("fingerprint", "")
+            ),
+            "full_feature_bank_rows": int(len(bank["labels"])),
+            "descriptor_csv": str(series_table["descriptor_path"]),
+            "descriptor_source": (
+                "V7.3 independently recomputed raw sampled-JPEG descriptors; "
+                "the globally scaled/clustered V7.2 audit is not used"
+            ),
+            "descriptor_version": V73_DESCRIPTOR_VERSION,
+            "descriptor_csv_sha256": _v73_hashlib.sha256(
+                _V73Path(series_table["descriptor_path"]).read_bytes()
+            ).hexdigest(),
+            "descriptor_features": list(series_table["feature_names"]),
+            "cluster_counts_at_30_patients": list(V73_CLUSTER_COUNTS),
+            "cluster_counts_scaled_by_training_patient_fraction": True,
+            "patient_balanced_kmeans_sample_weight": True,
+            "descriptor_scaling": (
+                "training-only 1/99 percent winsorization followed by "
+                "patient-balanced weighted mean/std"
+            ),
+            "shared_resolution_votes_required": (
+                V73_SHARED_RESOLUTION_VOTES_REQUIRED
+            ),
+            "minimum_series_per_class": V73_MIN_SERIES_PER_CLASS,
+            "minimum_patients_per_class": V73_MIN_PATIENTS_PER_CLASS,
+            "distance_quantile": V73_DISTANCE_QUANTILE,
+            "minimum_expected_training_series_per_cluster": (
+                V73_MIN_EXPECTED_SERIES_PER_CLUSTER
+            ),
+            "validation_labels_used": False,
+            "repeated_cv_repeats": V73_REPEATED_CV_REPEATS,
+            "permutations": V73_LABEL_PERMUTATIONS,
+            "conditional_permutation_fixed_partitions": True,
+            "quick_profile": V73_QUICK_PROFILE,
+            "experiments": [experiment.experiment_id for experiment in experiments],
+        },
+    )
+
+    primary_results, geometry_plan, materialized = (
+        _v73_run_primary_fold_local_analysis(
+            context,
+            patient_ids,
+            labels,
+            folds,
+        )
+    )
+    ranking, paired = _v73_run_repeated_fold_local_analysis(
+        context,
+        patient_ids,
+        labels,
+    )
+    permutation = _v73_run_candidate_selection_and_permutation(
+        context,
+        patient_ids,
+        labels,
+        geometry_plan,
+        materialized,
+        primary_results,
+    )
+
+    primary_id = str(PRIMARY_CANDIDATE_EXPERIMENT_ID)
+    primary_ranking = next(
+        row for row in ranking if row["experiment_id"] == primary_id
+    )
+    final_summary = {
+        "status": "OK",
+        "version": V73_FOLD_LOCAL_VERSION,
+        "primary_candidate_experiment_id": primary_id,
+        "primary_oof_auc": float(primary_results[primary_id]["auc"]),
+        "primary_repeated_median_auc": float(primary_ranking["auc_median"]),
+        "primary_repeated_iqr": [
+            float(primary_ranking["auc_q25"]),
+            float(primary_ranking["auc_q75"]),
+        ],
+        "fold_local_permutation": permutation,
+        "global_v72_harmonization_audit_summary_not_used_for_modelling": (
+            _V73_GLOBAL_AUDIT_SUMMARY
+        ),
+        "runtime_seconds": float(_v73_time.perf_counter() - started),
+        "claim_boundary": (
+            "This is leakage-controlled internal validation on 30 released "
+            "Directory_* patients. It is not external validation and cannot by "
+            "itself establish clinical CAD specificity."
+        ),
+    }
+    _v73_write_json(output_dir / "final_fold_local_report.json", final_summary)
+    print(
+        "[V7.3] COMPLETED fold-local analysis: "
+        f"A17 OOF AUC={final_summary['primary_oof_auc']:.4f}; "
+        f"repeated median={final_summary['primary_repeated_median_auc']:.4f}; "
+        f"runtime={final_summary['runtime_seconds'] / 60.0:.1f} min.",
+        flush=True,
+    )
+    return final_summary
+
+
+# ---------------------------------------------------------------------------
+# WRAP THE UNCHANGED V7.2 MAIN AND DEFER THE ORIGINAL ENTRY POINT
+# ---------------------------------------------------------------------------
+
+_V72_ORIGINAL_MAIN = main
+
+
+def main():
+    _V72_ORIGINAL_MAIN()
+    run_v73_fold_local_harmonization_analysis()
+
+
+if __name__ == "__main__":
+    run_with_console_logging()
