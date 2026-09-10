@@ -726,7 +726,7 @@ class ExperimentConfig:
 # ---------------------------------------------------------------------------
 # FOCUSED RESEARCH PANEL
 # ---------------------------------------------------------------------------
-FOCUSED_SUITE_VERSION = '7.2-SB1'
+FOCUSED_SUITE_VERSION = '7.2-SB1.1'
 
 # ---------------------------------------------------------------------------
 # AUTOMATIC CROSS-CLASS SERIES HARMONIZATION — V7.2
@@ -16931,16 +16931,19 @@ def write_suite_configuration(*args, **kwargs):
 # the harmonizer inside each outer/inner training partition and apply the frozen
 # rule to validation patients without using their labels.
 #
-# The filter never deletes a Directory_* patient silently. It either selects the
-# same target number of series for every patient or fails before neural-network
-# extraction with a detailed diagnostic.
+# The filter never deletes a Directory_* patient silently. It first searches for
+# the largest exact per-patient target that passes every strict guard. If no
+# target passes, SB1.1 can continue with the best attainable exact-count
+# candidate while writing the failed guards explicitly. This fallback prevents
+# an avoidable Kaggle abort, but it must be reported as BEST_ATTAINABLE rather
+# than as evidence that every strict balance guard was satisfied.
 
 from sklearn.cluster import KMeans as _SB1KMeans
 from sklearn.decomposition import PCA as _SB1PCA
 from sklearn.neighbors import NearestNeighbors as _SB1NearestNeighbors
 from sklearn.preprocessing import RobustScaler as _SB1RobustScaler
 
-STRICT_SERIES_BALANCE_VERSION = "v7.2-sb1-opposite-class-overlap-v1"
+STRICT_SERIES_BALANCE_VERSION = "v7.2-sb1.1-safe-fallback-v2"
 STRICT_SERIES_DESCRIPTOR_SAMPLE_COUNT = 7
 STRICT_SERIES_CLUSTER_COUNTS = (47, 59, 71, 83, 97)
 STRICT_SERIES_REQUIRED_SHARED_VOTES = 4
@@ -16965,6 +16968,20 @@ STRICT_SERIES_PATIENT_SMD_MEDIAN_LIMIT = 0.35
 STRICT_SERIES_PATIENT_SMD_Q90_LIMIT = 0.90
 STRICT_SERIES_PATIENT_SMD_MAX_LIMIT = 1.75
 STRICT_SERIES_RANDOM_STATE = RANDOM_SEED + 73_000
+
+# SB1.1 keeps all original numerical guards but avoids terminating the complete
+# run when their joint intersection is empty. The selected fallback is the
+# feasible exact-count target with the smallest normalized guard violation; no
+# AUC, model score, or downstream result enters this choice.
+STRICT_SERIES_ALLOW_BEST_ATTAINABLE_FALLBACK = True
+
+# A high-dimensional SMD maximum is unstable when a descriptor coordinate is
+# nearly constant across all 30 patients. Globally constant dimensions carry no
+# balancing information and are excluded; the denominator for varying
+# dimensions receives a small total-variation floor. A genuinely class-separated
+# coordinate remains strongly penalized rather than being hidden.
+STRICT_SERIES_SMD_MIN_TOTAL_STD = 1e-5
+STRICT_SERIES_SMD_POOLED_STD_FLOOR_FRACTION = 0.10
 
 # Only the scientifically necessary models and falsification controls are run.
 # Definitions and explanatory comments for the omitted experiments remain in
@@ -17158,7 +17175,16 @@ def _sb1_effective_cluster_count(requested, n_series):
 
 
 def _sb1_patient_level_balance(descriptors, labels, patients, selected_mask):
-    """Measure class imbalance at the actual patient-level evaluation unit."""
+    """Measure class imbalance at the actual patient-level evaluation unit.
+
+    SB1 used an absolute ``1e-6`` denominator floor for every descriptor. With
+    108 correlated coordinates and only 30 patients, a globally almost-constant
+    coordinate could therefore create an enormous maximum SMD from numerical
+    noise and make every target fail. SB1.1 excludes only globally constant
+    coordinates and regularizes the denominator by a small fraction of total
+    patient-level variation. Genuine low-variance class separation remains
+    visible and can still fail the guard.
+    """
 
     selected_indices = np.flatnonzero(selected_mask)
     selected_patients = sorted(set(patients[selected_indices].tolist()))
@@ -17178,12 +17204,36 @@ def _sb1_patient_level_balance(descriptors, labels, patients, selected_mask):
     patient_labels = np.asarray(patient_labels, dtype=np.int64)
     class_zero = patient_rows[patient_labels == 0]
     class_one = patient_rows[patient_labels == 1]
+    if len(class_zero) < 2 or len(class_one) < 2:
+        raise RuntimeError(
+            "Strict balance requires at least two retained patients per class."
+        )
+
     pooled_std = np.sqrt(
-        0.5 * (np.var(class_zero, axis=0) + np.var(class_one, axis=0))
+        0.5
+        * (
+            np.var(class_zero, axis=0, ddof=1)
+            + np.var(class_one, axis=0, ddof=1)
+        )
     )
-    standardized_difference = np.abs(
+    total_std = np.std(patient_rows, axis=0, ddof=1)
+    informative = total_std > STRICT_SERIES_SMD_MIN_TOTAL_STD
+    denominator = np.maximum(
+        pooled_std,
+        STRICT_SERIES_SMD_POOLED_STD_FLOOR_FRACTION * total_std,
+    )
+    denominator = np.maximum(denominator, STRICT_SERIES_SMD_MIN_TOTAL_STD)
+    mean_gap = np.abs(
         np.mean(class_one, axis=0) - np.mean(class_zero, axis=0)
-    ) / np.maximum(pooled_std, 1e-6)
+    )
+    standardized_difference = np.zeros(patient_rows.shape[1], dtype=np.float64)
+    standardized_difference[informative] = (
+        mean_gap[informative] / denominator[informative]
+    )
+    if not np.all(np.isfinite(standardized_difference)):
+        raise RuntimeError("Strict patient-level SMDs contain non-finite values.")
+
+    maximum_index = int(np.argmax(standardized_difference))
     return {
         "median_absolute_patient_smd": float(
             np.median(standardized_difference)
@@ -17192,9 +17242,88 @@ def _sb1_patient_level_balance(descriptors, labels, patients, selected_mask):
             np.quantile(standardized_difference, 0.90)
         ),
         "maximum_absolute_patient_smd": float(
-            np.max(standardized_difference)
+            standardized_difference[maximum_index]
         ),
+        "maximum_absolute_patient_smd_descriptor_index": maximum_index,
+        "informative_descriptor_dimensions": int(np.sum(informative)),
+        "total_descriptor_dimensions": int(patient_rows.shape[1]),
         "absolute_patient_smd": standardized_difference,
+    }
+
+
+def _sb1_guard_diagnostics(
+    balance,
+    rescue_fraction,
+    rescue_patients,
+    retained_fraction,
+):
+    """Return strict pass/fail flags and a deterministic violation score."""
+
+    checks = {
+        "rescue_fraction": (
+            float(rescue_fraction) <= STRICT_SERIES_MAX_RESCUE_FRACTION
+        ),
+        "rescue_patients": (
+            int(rescue_patients) <= STRICT_SERIES_MAX_RESCUE_PATIENTS
+        ),
+        "median_absolute_patient_smd": (
+            balance["median_absolute_patient_smd"]
+            <= STRICT_SERIES_PATIENT_SMD_MEDIAN_LIMIT
+        ),
+        "q90_absolute_patient_smd": (
+            balance["q90_absolute_patient_smd"]
+            <= STRICT_SERIES_PATIENT_SMD_Q90_LIMIT
+        ),
+        "maximum_absolute_patient_smd": (
+            balance["maximum_absolute_patient_smd"]
+            <= STRICT_SERIES_PATIENT_SMD_MAX_LIMIT
+        ),
+        "minimum_retained_fraction": (
+            retained_fraction >= STRICT_SERIES_MIN_RETAINED_FRACTION_OF_V72
+        ),
+        "maximum_retained_fraction": (
+            retained_fraction <= STRICT_SERIES_MAX_RETAINED_FRACTION_OF_V72
+        ),
+    }
+    ratios = np.asarray(
+        [
+            float(rescue_fraction)
+            / max(STRICT_SERIES_MAX_RESCUE_FRACTION, 1e-12),
+            float(rescue_patients)
+            / max(STRICT_SERIES_MAX_RESCUE_PATIENTS, 1e-12),
+            balance["median_absolute_patient_smd"]
+            / max(STRICT_SERIES_PATIENT_SMD_MEDIAN_LIMIT, 1e-12),
+            balance["q90_absolute_patient_smd"]
+            / max(STRICT_SERIES_PATIENT_SMD_Q90_LIMIT, 1e-12),
+            balance["maximum_absolute_patient_smd"]
+            / max(STRICT_SERIES_PATIENT_SMD_MAX_LIMIT, 1e-12),
+            (
+                STRICT_SERIES_MIN_RETAINED_FRACTION_OF_V72
+                / max(retained_fraction, 1e-12)
+                if retained_fraction
+                < STRICT_SERIES_MIN_RETAINED_FRACTION_OF_V72
+                else 1.0
+            ),
+            (
+                retained_fraction
+                / max(STRICT_SERIES_MAX_RETAINED_FRACTION_OF_V72, 1e-12)
+                if retained_fraction
+                > STRICT_SERIES_MAX_RETAINED_FRACTION_OF_V72
+                else 1.0
+            ),
+        ],
+        dtype=np.float64,
+    )
+    excess = np.maximum(ratios - 1.0, 0.0)
+    return {
+        "strict_guard_passed": bool(all(checks.values())),
+        "checks": checks,
+        "violated_guards": sorted(
+            name for name, passed in checks.items() if not passed
+        ),
+        "normalized_guard_violation_score": float(
+            100.0 * np.sum(excess**2) + np.sum(ratios)
+        ),
     }
 
 
@@ -17545,10 +17674,58 @@ def apply_strict_balanced_series_refinement(samples, output_dir):
     chosen_rescue = None
     chosen_balance = None
     chosen_target = None
+    chosen_guard = None
+    selection_status = None
+    selection_policy = None
     candidate_diagnostics = []
+    best_feasible_candidate = None
+
+    # Retention is part of the target decision, not a second independent failure
+    # after a target has already been accepted. This also exposes the latent SB1
+    # incompatibility between a low exact target and the 20% retention floor.
+    n_patients = int(len(set(patients.tolist())))
+    minimum_target_from_retention = int(
+        np.ceil(
+            STRICT_SERIES_MIN_RETAINED_FRACTION_OF_V72
+            * len(records)
+            / max(1, n_patients)
+        )
+    )
+    search_minimum = max(
+        STRICT_SERIES_MIN_PER_PATIENT,
+        minimum_target_from_retention,
+    )
+    maximum_target_from_retention = int(
+        np.floor(
+            STRICT_SERIES_MAX_RETAINED_FRACTION_OF_V72
+            * len(records)
+            / max(1, n_patients)
+        )
+    )
+    fallback_counts = np.asarray(
+        [
+            int(np.sum(fallback_mask[patients == patient_id]))
+            for patient_id in sorted(set(patients.tolist()))
+        ],
+        dtype=np.int64,
+    )
+    search_maximum = min(
+        STRICT_SERIES_MAX_PER_PATIENT,
+        maximum_target_from_retention,
+        int(np.min(fallback_counts)),
+    )
+    # The original proposed target came only from the strict-count quartile. If
+    # it lies below the retention-derived minimum, evaluate the minimum safe
+    # target rather than producing an empty Python range and jumping directly to
+    # the emergency pool.
+    first_target = min(
+        search_maximum,
+        max(proposed_target, search_minimum),
+    )
+
     for target in range(
-        proposed_target,
-        STRICT_SERIES_MIN_PER_PATIENT - 1,
+        first_target,
+        search_minimum - 1,
         -1,
     ):
         try:
@@ -17567,28 +17744,30 @@ def apply_strict_balanced_series_refinement(samples, output_dir):
 
         rescue_fraction = float(np.sum(rescue)) / float(np.sum(selected))
         rescue_patients = int(len(set(patients[rescue].tolist())))
+        retained_fraction = float(np.sum(selected)) / float(len(records))
         balance = _sb1_patient_level_balance(
             scaled,
             labels,
             patients,
             selected,
         )
-        balance_ok = (
-            rescue_fraction <= STRICT_SERIES_MAX_RESCUE_FRACTION
-            and rescue_patients <= STRICT_SERIES_MAX_RESCUE_PATIENTS
-            and balance["median_absolute_patient_smd"]
-            <= STRICT_SERIES_PATIENT_SMD_MEDIAN_LIMIT
-            and balance["q90_absolute_patient_smd"]
-            <= STRICT_SERIES_PATIENT_SMD_Q90_LIMIT
-            and balance["maximum_absolute_patient_smd"]
-            <= STRICT_SERIES_PATIENT_SMD_MAX_LIMIT
+        guard = _sb1_guard_diagnostics(
+            balance,
+            rescue_fraction,
+            rescue_patients,
+            retained_fraction,
         )
         candidate_diagnostics.append(
             {
                 "target": int(target),
-                "status": "ACCEPTABLE" if balance_ok else "BALANCE_GUARD_FAILED",
+                "status": (
+                    "ACCEPTABLE"
+                    if guard["strict_guard_passed"]
+                    else "BALANCE_GUARD_FAILED"
+                ),
                 "rescue_fraction": rescue_fraction,
                 "rescue_patients": rescue_patients,
+                "retained_fraction_of_v72": retained_fraction,
                 "median_absolute_patient_smd": balance[
                     "median_absolute_patient_smd"
                 ],
@@ -17598,14 +17777,135 @@ def apply_strict_balanced_series_refinement(samples, output_dir):
                 "maximum_absolute_patient_smd": balance[
                     "maximum_absolute_patient_smd"
                 ],
+                "maximum_absolute_patient_smd_descriptor_index": balance[
+                    "maximum_absolute_patient_smd_descriptor_index"
+                ],
+                "informative_descriptor_dimensions": balance[
+                    "informative_descriptor_dimensions"
+                ],
+                "violated_guards": guard["violated_guards"],
+                "normalized_guard_violation_score": guard[
+                    "normalized_guard_violation_score"
+                ],
             }
         )
-        if balance_ok:
+
+        candidate = {
+            "policy": "configured_fallback",
+            "selected": selected.copy(),
+            "rescue": rescue.copy(),
+            "balance": balance,
+            "target": int(target),
+            "guard": guard,
+            "retained_fraction": retained_fraction,
+        }
+        if (
+            best_feasible_candidate is None
+            or (
+                guard["normalized_guard_violation_score"],
+                len(guard["violated_guards"]),
+                -int(target),
+            )
+            < (
+                best_feasible_candidate["guard"][
+                    "normalized_guard_violation_score"
+                ],
+                len(best_feasible_candidate["guard"]["violated_guards"]),
+                -int(best_feasible_candidate["target"]),
+            )
+        ):
+            best_feasible_candidate = candidate
+
+        if guard["strict_guard_passed"]:
             chosen = selected
             chosen_rescue = rescue
             chosen_balance = balance
             chosen_target = target
+            chosen_guard = guard
+            selection_status = "OK_STRICT_GUARDS_PASSED"
+            selection_policy = "configured_fallback"
             break
+
+    # If the original strict/fallback pool cannot supply any target in the safe
+    # retention range, construct one exact-count emergency candidate from the
+    # already V7.2-harmonized series. It remains fully audited and is never
+    # labelled a strict pass.
+    if best_feasible_candidate is None:
+        total_counts = np.asarray(
+            [
+                int(np.sum(patients == patient_id))
+                for patient_id in sorted(set(patients.tolist()))
+            ],
+            dtype=np.int64,
+        )
+        emergency_maximum = min(
+            STRICT_SERIES_MAX_PER_PATIENT,
+            maximum_target_from_retention,
+            int(np.min(total_counts)),
+        )
+        emergency_target = min(
+            emergency_maximum,
+            max(search_minimum, proposed_target),
+        )
+        if emergency_target < 1:
+            raise RuntimeError(
+                "No Directory_* patient has a series available for strict "
+                "balance fallback."
+            )
+        all_series_mask = np.ones(len(records), dtype=bool)
+        selected, rescue = _sb1_select_exact_count_per_patient(
+            records,
+            strict_mask,
+            all_series_mask,
+            ranking_score,
+            emergency_target,
+        )
+        rescue_fraction = float(np.sum(rescue)) / float(np.sum(selected))
+        rescue_patients = int(len(set(patients[rescue].tolist())))
+        retained_fraction = float(np.sum(selected)) / float(len(records))
+        balance = _sb1_patient_level_balance(
+            scaled,
+            labels,
+            patients,
+            selected,
+        )
+        guard = _sb1_guard_diagnostics(
+            balance,
+            rescue_fraction,
+            rescue_patients,
+            retained_fraction,
+        )
+        best_feasible_candidate = {
+            "policy": "all_v72_series_emergency",
+            "selected": selected,
+            "rescue": rescue,
+            "balance": balance,
+            "target": int(emergency_target),
+            "guard": guard,
+            "retained_fraction": retained_fraction,
+        }
+        candidate_diagnostics.append(
+            {
+                "target": int(emergency_target),
+                "status": "EMERGENCY_ALL_V72_SERIES_CANDIDATE",
+                "rescue_fraction": rescue_fraction,
+                "rescue_patients": rescue_patients,
+                "retained_fraction_of_v72": retained_fraction,
+                "median_absolute_patient_smd": balance[
+                    "median_absolute_patient_smd"
+                ],
+                "q90_absolute_patient_smd": balance[
+                    "q90_absolute_patient_smd"
+                ],
+                "maximum_absolute_patient_smd": balance[
+                    "maximum_absolute_patient_smd"
+                ],
+                "violated_guards": guard["violated_guards"],
+                "normalized_guard_violation_score": guard[
+                    "normalized_guard_violation_score"
+                ],
+            }
+        )
 
     if chosen is None:
         diagnostic_path = output_dir / (
@@ -17615,24 +17915,63 @@ def apply_strict_balanced_series_refinement(samples, output_dir):
             json.dumps(candidate_diagnostics, indent=2, sort_keys=True),
             encoding="utf-8",
         )
-        raise RuntimeError(
-            "No exact per-patient target satisfied the predeclared strict "
-            "cross-class balance guards. See " + str(diagnostic_path)
+        if not STRICT_SERIES_ALLOW_BEST_ATTAINABLE_FALLBACK:
+            raise RuntimeError(
+                "No exact per-patient target satisfied every strict guard and "
+                "best-attainable fallback is disabled. See "
+                + str(diagnostic_path)
+            )
+
+        chosen = best_feasible_candidate["selected"]
+        chosen_rescue = best_feasible_candidate["rescue"]
+        chosen_balance = best_feasible_candidate["balance"]
+        chosen_target = best_feasible_candidate["target"]
+        chosen_guard = best_feasible_candidate["guard"]
+        selection_status = "OK_BEST_ATTAINABLE_BALANCE"
+        selection_policy = best_feasible_candidate["policy"]
+        print(
+            "[STRICT SERIES BALANCE][BEST-ATTAINABLE WARNING] No exact "
+            "per-patient target passed every predeclared guard. Continuing "
+            "with the feasible target having the smallest normalized guard "
+            "violation. Do not describe this run as strictly balanced.",
+            flush=True,
         )
+        print(
+            "[STRICT SERIES BALANCE][BEST-ATTAINABLE WARNING] "
+            f"policy={selection_policy}, target={chosen_target}, violated_guards="
+            f"{chosen_guard['violated_guards']}, normalized_violation_score="
+            f"{chosen_guard['normalized_guard_violation_score']:.4f}.",
+            flush=True,
+        )
+
+    (output_dir / "strict_series_balance_target_diagnostics.json").write_text(
+        json.dumps(candidate_diagnostics, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
 
     retained_series = set(series_ids[chosen].tolist())
     filtered_samples = [
         row for row in samples if str(row[3]) in retained_series
     ]
     retained_fraction = float(np.sum(chosen)) / float(len(records))
-    if not (
+    retention_guard_passed = bool(
         STRICT_SERIES_MIN_RETAINED_FRACTION_OF_V72
         <= retained_fraction
         <= STRICT_SERIES_MAX_RETAINED_FRACTION_OF_V72
+    )
+    if not retention_guard_passed and selection_status == (
+        "OK_STRICT_GUARDS_PASSED"
     ):
         raise RuntimeError(
-            "Strict series retention fraction is outside the predeclared safe "
-            f"range: {retained_fraction:.3f}."
+            "Internal error: a strict target violated the retained-fraction "
+            f"guard ({retained_fraction:.3f})."
+        )
+    if not retention_guard_passed:
+        print(
+            "[STRICT SERIES BALANCE][BEST-ATTAINABLE WARNING] Retained "
+            "fraction lies outside the strict configured interval: "
+            f"{retained_fraction:.3f}.",
+            flush=True,
         )
 
     original_patient_set = set(patients.tolist())
@@ -17697,12 +18036,29 @@ def apply_strict_balanced_series_refinement(samples, output_dir):
         selection_digest.update((series_id + "\n").encode("utf-8"))
 
     absolute_smd = chosen_balance.pop("absolute_patient_smd")
+    strict_guard_passed = bool(
+        selection_status == "OK_STRICT_GUARDS_PASSED"
+        and chosen_guard["strict_guard_passed"]
+    )
     summary = {
-        "status": "OK",
+        "status": selection_status,
         "version": STRICT_SERIES_BALANCE_VERSION,
+        "strict_guard_passed": strict_guard_passed,
+        "selection_policy": selection_policy,
+        "selection_guard_checks": chosen_guard["checks"],
+        "violated_guards": list(chosen_guard["violated_guards"]),
+        "normalized_guard_violation_score": float(
+            chosen_guard["normalized_guard_violation_score"]
+        ),
         "statistical_scope": (
             "Global label-informed cross-class common-support sensitivity "
-            "analysis; not external validation and not fold-local."
+            "analysis; not external validation and not fold-local. "
+            + (
+                "Every strict guard passed."
+                if strict_guard_passed
+                else "The best-attainable fallback was used; strict balance "
+                "was not achieved and must not be claimed."
+            )
         ),
         "series_before_strict_refinement": int(len(records)),
         "series_after_strict_refinement": int(np.sum(chosen)),
@@ -17740,6 +18096,15 @@ def apply_strict_balanced_series_refinement(samples, output_dir):
         "patient_level_descriptor_balance": chosen_balance,
         "selection_signature_sha256": selection_digest.hexdigest(),
         "candidate_target_diagnostics": candidate_diagnostics,
+        "minimum_target_from_retention_guard": int(
+            minimum_target_from_retention
+        ),
+        "maximum_target_from_retention_guard": int(
+            maximum_target_from_retention
+        ),
+        "configured_fallback_minimum_series_for_any_patient": int(
+            np.min(fallback_counts)
+        ),
         "essential_experiment_ids": list(
             STRICT_BALANCED_ESSENTIAL_EXPERIMENT_IDS
         ),
@@ -17752,6 +18117,9 @@ def apply_strict_balanced_series_refinement(samples, output_dir):
         and isinstance(value, (str, int, float, bool, tuple))
     }
     config["statistical_warning"] = summary["statistical_scope"]
+    config["selection_status"] = selection_status
+    config["selection_policy"] = selection_policy
+    config["strict_guard_passed"] = strict_guard_passed
     (output_dir / "strict_series_balance_configuration.json").write_text(
         json.dumps(config, indent=2, sort_keys=True),
         encoding="utf-8",
@@ -17793,6 +18161,11 @@ def apply_strict_balanced_series_refinement(samples, output_dir):
 
     print("[STRICT SERIES BALANCE] Selection summary", flush=True)
     print(
+        f"  Status: {selection_status}; policy={selection_policy}; "
+        f"strict_guard_passed={strict_guard_passed}",
+        flush=True,
+    )
+    print(
         f"  Series: {len(records)} -> {int(np.sum(chosen))} "
         f"(removed {len(records) - int(np.sum(chosen))})",
         flush=True,
@@ -17816,8 +18189,10 @@ def apply_strict_balanced_series_refinement(samples, output_dir):
     )
     print(
         "[STRICT SERIES BALANCE][STATISTICAL WARNING] The retained set was "
-        "balanced using both class folders globally. Treat this as a strict "
-        "common-support sensitivity analysis, not external or fold-local validation.",
+        "selected using both class folders globally. Treat this as a common-"
+        "support sensitivity analysis, not external or fold-local validation. "
+        "When strict_guard_passed=False, report it specifically as the best "
+        "attainable exact-count selection rather than strict balance.",
         flush=True,
     )
     return filtered_samples, summary
@@ -17831,7 +18206,7 @@ def main():
     experiments = get_enabled_experiments()
 
     print("\n" + "#" * 100, flush=True)
-    print("CAD CARDIAC MRI — FOCUSED STRICT-BALANCED SERIES-HARMONIZED RESEARCH SUITE V7.2-SB1", flush=True)
+    print("CAD CARDIAC MRI — FOCUSED STRICT-BALANCED SERIES-HARMONIZED RESEARCH SUITE V7.2-SB1.1", flush=True)
     print("#" * 100, flush=True)
     print(f"[SUITE] Dataset: {DATASET_PATH}", flush=True)
     print(f"[SUITE] Output: {OUTPUT_DIR}", flush=True)
