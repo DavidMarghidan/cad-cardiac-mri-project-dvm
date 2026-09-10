@@ -1,5 +1,5 @@
 #%% ============================================================
-# 🧠 CAD Detection from Cardiac MRI – Focused Research Validation Pipeline V7.2 strict_balanced_fixed (Single File)
+# 🧠 CAD Detection from Cardiac MRI – Focused Series-Harmonized Expanded-Heart Pipeline V7.3 (Single File)
 # ============================================================
 
 # ============================================================================
@@ -40,8 +40,9 @@
 #      MONAI, historical classifier views and post-localization regional scaling
 #   4. A pinned pretrained MONAI ventricular segmenter used only for anatomical
 #      localization and fixed plausibility-gate diagnostics
-#   5. A17 hard cardiac support with additional fixed dilation, content-mask
-#      intersection, center fallback and no soft-confidence intensity modulation
+#   5. A17 hard cardiac support with a larger second-stage 31x31 expansion for
+#      MONAI-compatible slices, content-mask intersection, exact image-center
+#      fallback for incompatible slices and no soft-confidence modulation
 #   6. Region-only robust intensity normalization after the final visible support
 #      is defined, preventing excluded pixels from controlling its intensity scale
 #   7. Explicitly pinned ImageNet EfficientNet-B0 feature extraction with the
@@ -185,12 +186,15 @@
 #    ↓
 # Run the pinned MONAI ventricular segmenter on the standardized min-max canvas
 #    ↓
-# Convert ventricular channels to a hard mask, apply the fixed plausibility gate
-# and fixed additional dilation
+# Convert ventricular channels to a hard mask and apply the fixed plausibility gate
+#    ↓
+# For a gate-valid MONAI result, apply the larger second-stage 31x31 expansion;
+# for a gate-invalid result, ignore the mask and use the geometric image center
 #    ↓
 # Build one exact A17 support:
-#   valid MONAI mask → dilated binary support
-#   invalid MONAI mask → fixed central square fallback
+#   valid MONAI mask → twice-expanded binary cardiac support
+#       (MONAI-stage dilation on 256x256 + larger 31x31 A17 expansion on 224x224)
+#   invalid MONAI mask → fixed 65% square at the geometric image center
 #   both cases → intersect with retained non-padding content
 #    ↓
 # Estimate 1st/99th-percentile limits only from visible A17-support pixels,
@@ -275,9 +279,10 @@
 #          aligned ROI probability : [B, 1, 224, 224]
 #          valid_mask              : [B], one plausibility decision per slice
 #
-#      A failed plausibility check does not use validation labels. A17 replaces
-#      the unreliable support with one fixed central square; A20 excludes the
-#      same gate-invalid row as a sensitivity analysis.
+#      A failed plausibility check does not use validation labels. A17 ignores
+#      the unreliable mask completely and uses one fixed square at the geometric
+#      image center; A20 excludes the same gate-invalid row as a sensitivity
+#      analysis. Valid rows use the larger expanded MONAI support.
 #
 #   E. EfficientNet output
 #
@@ -371,7 +376,7 @@
 # distinct role in the evidence chain:
 #
 #   PRIMARY AND SENSITIVITY
-#   A17  Locked hard-support, region-normalized candidate
+#   A17  Locked expanded hard-support, region-normalized candidate
 #   A20  A17 restricted to MONAI gate-valid rows
 #   A21  A17 after exact within-patient decoded-pixel deduplication
 #   R4   A17 after deterministic 50% within-series slice dropout
@@ -726,16 +731,16 @@ class ExperimentConfig:
 # ---------------------------------------------------------------------------
 # FOCUSED RESEARCH PANEL
 # ---------------------------------------------------------------------------
-FOCUSED_SUITE_VERSION = '7.2-SB1.1'
+FOCUSED_SUITE_VERSION = "7.3"
 
 # ---------------------------------------------------------------------------
-# AUTOMATIC CROSS-CLASS SERIES HARMONIZATION — V7.2
+# AUTOMATIC CROSS-CLASS SERIES HARMONIZATION — INHERITED UNCHANGED FROM V7.2
 # ---------------------------------------------------------------------------
 #
 # The released JPEG cohort contains folder-defined series proxies rather than
 # validated DICOM SeriesInstanceUIDs or sequence/view labels. The previous
 # focused run demonstrated that export geometry, file size, number of series,
-# support masks and extracardiac pixels remain predictive. V7.2 therefore adds
+# support masks and extracardiac pixels remain predictive. The V7.2 component retained in V7.3 adds
 # one PREDECLARED cohort-harmonization stage before any MONAI/EfficientNet
 # extraction:
 #
@@ -885,7 +890,13 @@ ESSENTIAL_EXPERIMENT_IDS = (
     "C20_FILE_SIZE_ONLY_LR",
 )
 
-EXPERIMENTS_TO_RUN = ('A17_HARD_SUPPORT_REGION_NORM_HIER_LR_PCA', 'A20_HARD_SUPPORT_REGION_NORM_VALID_ONLY_HIER_LR_PCA', 'A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA', 'A16_HEART_CENTERED_FIXED_FOV_REGION_NORM_HIER_LR_PCA', 'A9_STANDARDIZED_FULL_HIER_LR_PCA', 'C31_A17_EXACT_SUPPORT_MASK_ONLY_HIER_LR_PCA', 'C32_A17_SUPPORT_INTENSITY_AFFINE_SHUFFLED_HIER_LR_PCA', 'C33_A17_EXACT_SUPPORT_COMPLEMENT_REGION_NORM_HIER_LR_PCA', 'C29_FIXED_PERIPHERY_REGION_NORM_HIER_LR_PCA', 'C17_N_SERIES_ONLY_LR', 'C19_NATIVE_GEOMETRY_ONLY_LR', 'C20_FILE_SIZE_ONLY_LR')
+EXPERIMENTS_TO_RUN = tuple(
+    dict.fromkeys(
+        ESSENTIAL_EXPERIMENT_IDS
+        + FUTURE_CANDIDATE_EXPERIMENT_IDS
+        + FUTURE_CONTROL_EXPERIMENT_IDS
+    )
+)
 
 EXPERIMENT_REGISTRY = (
     # ======================================================================
@@ -899,10 +910,11 @@ EXPERIMENT_REGISTRY = (
     ExperimentConfig(
         experiment_id="A17_HARD_SUPPORT_REGION_NORM_HIER_LR_PCA",
         description=(
-            "Prospectively locked focused candidate: binary dilated cardiac "
-            "support, fixed-center fallback, content-mask intersection and "
-            "region-only robust scaling. MONAI soft confidence is not "
-            "multiplied into MRI intensity."
+            "Prospectively locked focused candidate: gate-valid MONAI masks "
+            "receive a larger second-stage 31x31 expansion; gate-invalid masks "
+            "are ignored and replaced by a fixed geometric-center square. The "
+            "support is intersected with content and region-normalized without "
+            "multiplying soft MONAI confidence into MRI intensity."
         ),
         feature_mode="standardized_hard_support_region_norm",
         strategy="patient_embedding",
@@ -916,9 +928,9 @@ EXPERIMENT_REGISTRY = (
     ExperimentConfig(
         experiment_id="A20_HARD_SUPPORT_REGION_NORM_VALID_ONLY_HIER_LR_PCA",
         description=(
-            "A17 restricted to standardized MONAI gate-valid slices. This "
-            "tests whether the main result depends on fixed-center fallback "
-            "slices."
+            "Expanded-support A17 restricted to standardized MONAI gate-valid "
+            "slices. This tests whether the main result depends on geometric-"
+            "center fallback slices rather than the expanded MONAI branch."
         ),
         feature_mode="standardized_hard_support_region_norm",
         strategy="patient_embedding",
@@ -933,9 +945,9 @@ EXPERIMENT_REGISTRY = (
     ExperimentConfig(
         experiment_id="A21_HARD_SUPPORT_REGION_NORM_DEDUP_HIER_LR_PCA",
         description=(
-            "A17 after deterministic exact decoded-pixel deduplication inside "
-            "each Directory_* patient. This verifies that repeated identical "
-            "exports do not create the candidate's apparent performance."
+            "Expanded-support A17 after deterministic exact decoded-pixel "
+            "deduplication inside each Directory_* patient. This verifies that "
+            "repeated identical exports do not create the candidate's result."
         ),
         feature_mode="standardized_hard_support_region_norm",
         strategy="patient_embedding",
@@ -950,9 +962,9 @@ EXPERIMENT_REGISTRY = (
     ExperimentConfig(
         experiment_id="R4_HARD_SUPPORT_REGION_NORM_DROP50_HIER_LR_PCA",
         description=(
-            "A17 after deterministic 50% within-series slice dropout, with at "
-            "least one slice retained per series proxy. This is the single "
-            "high-severity sampling robustness test kept by the focused suite."
+            "Expanded-support A17 after deterministic 50% within-series slice "
+            "dropout, with at least one slice retained per series proxy. This is "
+            "the focused suite's high-severity sampling robustness test."
         ),
         feature_mode="standardized_hard_support_region_norm",
         strategy="patient_embedding",
@@ -1037,9 +1049,9 @@ EXPERIMENT_REGISTRY = (
     ExperimentConfig(
         experiment_id="C31_A17_EXACT_SUPPORT_MASK_ONLY_HIER_LR_PCA",
         description=(
-            "Exact binary support used by A17, including dilation, content-mask "
-            "intersection and fixed-center fallback, but with all MRI intensity "
-            "removed. It isolates support geometry."
+            "Exact binary support used by expanded-region A17, including the "
+            "larger valid-MONAI expansion, content-mask intersection and exact "
+            "geometric-center fallback, but with MRI intensity removed."
         ),
         feature_mode="standardized_a17_exact_support_mask_only",
         strategy="patient_embedding",
@@ -1372,7 +1384,11 @@ FUTURE_MATCHED_CONTROL_COMPARISONS = tuple(
     )
 )
 
-PRIMARY_ABLATION_COMPARISONS = (('A12_REFERENCE_VS_A17_PRIMARY', 'A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA', 'A17_HARD_SUPPORT_REGION_NORM_HIER_LR_PCA', 'Does the prospectively locked hard-support candidate remain stronger than the independently established A12 reference after strict series balancing?'), ('A9_FULL_IMAGE_VS_A17_PRIMARY', 'A9_STANDARDIZED_FULL_HIER_LR_PCA', 'A17_HARD_SUPPORT_REGION_NORM_HIER_LR_PCA', 'Does cardiac localization retain value over the standardized full image after strict series balancing?'), ('A16_SHAPE_SUPPRESSED_CROP_VS_A17_SUPPORT', 'A16_HEART_CENTERED_FIXED_FOV_REGION_NORM_HIER_LR_PCA', 'A17_HARD_SUPPORT_REGION_NORM_HIER_LR_PCA', 'Does A17 outperform a heart-centred crop that does not expose the exact support silhouette?'), ('A17_ALL_SLICES_VS_A20_VALID_ONLY', 'A17_HARD_SUPPORT_REGION_NORM_HIER_LR_PCA', 'A20_HARD_SUPPORT_REGION_NORM_VALID_ONLY_HIER_LR_PCA', 'Does the candidate depend on slices receiving the fixed-centre fallback after an invalid standardized MONAI gate?'), ('C31_EXACT_SUPPORT_MASK_ONLY_VS_A17', 'C31_A17_EXACT_SUPPORT_MASK_ONLY_HIER_LR_PCA', 'A17_HARD_SUPPORT_REGION_NORM_HIER_LR_PCA', "How much does MRI intensity add beyond A17's exact support geometry?"), ('C32_SHUFFLED_INTENSITY_VS_A17', 'C32_A17_SUPPORT_INTENSITY_AFFINE_SHUFFLED_HIER_LR_PCA', 'A17_HARD_SUPPORT_REGION_NORM_HIER_LR_PCA', 'How much does intact spatial texture add beyond the same support and visible intensity multiset?'), ('C33_EXACT_COMPLEMENT_VS_A17', 'C33_A17_EXACT_SUPPORT_COMPLEMENT_REGION_NORM_HIER_LR_PCA', 'A17_HARD_SUPPORT_REGION_NORM_HIER_LR_PCA', 'Does the exact A17 support remain more predictive than its independently normalized retained-content complement?'), ('C29_FIXED_PERIPHERY_VS_A17', 'C29_FIXED_PERIPHERY_REGION_NORM_HIER_LR_PCA', 'A17_HARD_SUPPORT_REGION_NORM_HIER_LR_PCA', 'Does the cardiac candidate remain stronger than a MONAI-independent fixed peripheral image control?'), ('C17_SERIES_COUNT_VS_A17', 'C17_N_SERIES_ONLY_LR', 'A17_HARD_SUPPORT_REGION_NORM_HIER_LR_PCA', 'Does exact per-patient series balancing remove the former series-count shortcut while preserving the cardiac candidate?'), ('C19_NATIVE_GEOMETRY_VS_A17', 'C19_NATIVE_GEOMETRY_ONLY_LR', 'A17_HARD_SUPPORT_REGION_NORM_HIER_LR_PCA', 'Does the candidate remain stronger than native image geometry after stricter cross-class overlap selection?'), ('C20_FILE_SIZE_VS_A17', 'C20_FILE_SIZE_ONLY_LR', 'A17_HARD_SUPPORT_REGION_NORM_HIER_LR_PCA', 'Does the candidate remain stronger than file-size and compression proxies after stricter cross-class overlap selection?'))
+PRIMARY_ABLATION_COMPARISONS = (
+    FOCUSED_BASE_COMPARISONS
+    + FUTURE_CANDIDATE_COMPARISONS
+    + FUTURE_MATCHED_CONTROL_COMPARISONS
+)
 
 N_SPLITS = 5
 CV_RANDOM_STATE = RANDOM_SEED
@@ -1406,7 +1422,7 @@ PROGRESS_PRINT_EVERY_N_BATCHES = 25
 
 USE_FEATURE_CACHE = True
 FORCE_REBUILD_FEATURE_CACHE = False
-FEATURE_CACHE_SCHEMA_VERSION = "2026-09-09-focused-research-v7-v1"
+FEATURE_CACHE_SCHEMA_VERSION = "2026-09-10-focused-research-v7-v3-expanded-heart-region-v1"
 EFFICIENTNET_FEATURE_DIM = 1280
 FEATURE_MODES_PER_ENCODER_CALL = 4
 # Several image variants can be concatenated along the batch dimension and
@@ -1436,7 +1452,34 @@ OUTSIDE_MONAI_BBOX_CONTEXT_FRACTION = 0.30
 # FOCUSED V7 CARDIAC / EXTRACARDIAC REPRESENTATIONS
 # ---------------------------------------------------------------------------
 FOCUSED_FIXED_HEART_FOV_FRACTION = 0.65
-FOCUSED_HARD_SUPPORT_EXTRA_DILATION_KERNEL = 15
+
+FOCUSED_HARD_SUPPORT_EXTRA_DILATION_KERNEL = 31
+# For a MONAI-compatible slice, ``predict_monai_heart_masks`` has already
+# expanded the ventricular hard mask with MONAI_ROI_DILATION_KERNEL on the
+# 256x256 segmentation canvas. A17 then applies this second 31x31 dilation on
+# the aligned 224x224 classifier canvas. Relative to V7.2's 15x15 second stage,
+# this increases the additional contextual radius from 7 to 15 pixels while
+# preserving the exact MONAI-derived location and the label-blind gate.
+#
+# The purpose is not to claim whole-heart segmentation. It is to retain more
+# myocardium, pericardial vicinity and immediately adjacent cardiac context when
+# the short-axis MONAI output is plausible, rather than cutting the candidate
+# too tightly around the predicted ventricular structures.
+
+FOCUSED_INVALID_MONAI_CENTER_FRACTION = 0.65
+# When the fixed MONAI plausibility gate fails, no part of the predicted mask is
+# trusted. The candidate and its exact matched controls therefore use only one
+# deterministic square centered on the geometric image center. The side length
+# is 65% of the 224x224 classifier canvas, intersected with retained non-padding
+# content. It does not depend on the failed mask, class label, fold, or score.
+
+FOCUSED_HEART_SUPPORT_POLICY_VERSION = (
+    "valid-monai-expanded-k31__invalid-fixed-center-065-v1"
+)
+# This explicit policy identifier is included in the suite configuration and
+# feature-bank fingerprint. It prevents a V7.2 cache made with the narrower
+# support from being reused as though it contained the expanded V7.3 pixels.
+
 FOCUSED_WHOLE_HEART_EXCLUSION_CENTER_FRACTION = 0.75
 FOCUSED_WHOLE_HEART_EXCLUSION_BBOX_CONTEXT_FRACTION = 0.65
 FOCUSED_FIXED_PERIPHERY_EXCLUSION_FRACTION = 0.75
@@ -1548,7 +1591,22 @@ _FUTURE_IMAGE_EXPERIMENT_IDS = tuple(
     )
 )
 
-ANNOTATED_SERIES_EXPERIMENT_IDS = ('A17_HARD_SUPPORT_REGION_NORM_HIER_LR_PCA', 'A20_HARD_SUPPORT_REGION_NORM_VALID_ONLY_HIER_LR_PCA', 'A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA', 'A16_HEART_CENTERED_FIXED_FOV_REGION_NORM_HIER_LR_PCA', 'A9_STANDARDIZED_FULL_HIER_LR_PCA', 'C31_A17_EXACT_SUPPORT_MASK_ONLY_HIER_LR_PCA', 'C32_A17_SUPPORT_INTENSITY_AFFINE_SHUFFLED_HIER_LR_PCA', 'C33_A17_EXACT_SUPPORT_COMPLEMENT_REGION_NORM_HIER_LR_PCA', 'C29_FIXED_PERIPHERY_REGION_NORM_HIER_LR_PCA')
+ANNOTATED_SERIES_EXPERIMENT_IDS = tuple(
+    dict.fromkeys(
+        (
+            PRIMARY_CANDIDATE_EXPERIMENT_ID,
+            VALID_ONLY_CANDIDATE_EXPERIMENT_ID,
+            V4_LOCKED_REFERENCE_EXPERIMENT_ID,
+            "A16_HEART_CENTERED_FIXED_FOV_REGION_NORM_HIER_LR_PCA",
+            "C31_A17_EXACT_SUPPORT_MASK_ONLY_HIER_LR_PCA",
+            "C32_A17_SUPPORT_INTENSITY_AFFINE_SHUFFLED_HIER_LR_PCA",
+            "C33_A17_EXACT_SUPPORT_COMPLEMENT_REGION_NORM_HIER_LR_PCA",
+            "C28_OUTSIDE_WHOLE_HEART_REGION_NORM_HIER_LR_PCA",
+            "C29_FIXED_PERIPHERY_REGION_NORM_HIER_LR_PCA",
+        )
+        + _FUTURE_IMAGE_EXPERIMENT_IDS
+    )
+)
 # The pipeline never infers sequence or view from SR_*/series* folder names.
 # When this optional stage is enabled, the user must point to a completed copy
 # of the blinded series_annotation_template.csv stored outside the current run
@@ -1564,7 +1622,38 @@ C_SELECTION_AUC_TOLERANCE = 0.01
 RUN_REPEATED_NESTED_CV_STABILITY = True
 REPEATED_NESTED_CV_REPEATS = 50
 REPEATED_NESTED_CV_RANDOM_STATE = RANDOM_SEED + 20_000
-STABILITY_EXPERIMENT_IDS = ('A17_HARD_SUPPORT_REGION_NORM_HIER_LR_PCA', 'A20_HARD_SUPPORT_REGION_NORM_VALID_ONLY_HIER_LR_PCA', 'A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA', 'A16_HEART_CENTERED_FIXED_FOV_REGION_NORM_HIER_LR_PCA', 'A9_STANDARDIZED_FULL_HIER_LR_PCA', 'C31_A17_EXACT_SUPPORT_MASK_ONLY_HIER_LR_PCA', 'C32_A17_SUPPORT_INTENSITY_AFFINE_SHUFFLED_HIER_LR_PCA', 'C33_A17_EXACT_SUPPORT_COMPLEMENT_REGION_NORM_HIER_LR_PCA', 'C29_FIXED_PERIPHERY_REGION_NORM_HIER_LR_PCA', 'C17_N_SERIES_ONLY_LR', 'C19_NATIVE_GEOMETRY_ONLY_LR', 'C20_FILE_SIZE_ONLY_LR')
+STABILITY_EXPERIMENT_IDS = tuple(
+    dict.fromkeys(
+        (
+            PRIMARY_CANDIDATE_EXPERIMENT_ID,
+            VALID_ONLY_CANDIDATE_EXPERIMENT_ID,
+            "A21_HARD_SUPPORT_REGION_NORM_DEDUP_HIER_LR_PCA",
+            "R4_HARD_SUPPORT_REGION_NORM_DROP50_HIER_LR_PCA",
+            V4_LOCKED_REFERENCE_EXPERIMENT_ID,
+            "A16_HEART_CENTERED_FIXED_FOV_REGION_NORM_HIER_LR_PCA",
+            DEVELOPMENT_BASELINE_EXPERIMENT_ID,
+            "C31_A17_EXACT_SUPPORT_MASK_ONLY_HIER_LR_PCA",
+            "C32_A17_SUPPORT_INTENSITY_AFFINE_SHUFFLED_HIER_LR_PCA",
+            "C33_A17_EXACT_SUPPORT_COMPLEMENT_REGION_NORM_HIER_LR_PCA",
+            "C28_OUTSIDE_WHOLE_HEART_REGION_NORM_HIER_LR_PCA",
+            "C29_FIXED_PERIPHERY_REGION_NORM_HIER_LR_PCA",
+            "C3_EXPORT_PROVENANCE_ONLY_LR",
+            "C17_N_SERIES_ONLY_LR",
+            "C19_NATIVE_GEOMETRY_ONLY_LR",
+            "C20_FILE_SIZE_ONLY_LR",
+        )
+        + FUTURE_CANDIDATE_EXPERIMENT_IDS
+        + tuple(
+            experiment_id
+            for experiment_id in FUTURE_CONTROL_EXPERIMENT_IDS
+            if experiment_id in {
+                experiment.experiment_id
+                for experiment in EXPERIMENT_REGISTRY
+                if experiment.strategy == "patient_embedding"
+            }
+        )
+    )
+)
 
 # Every active repeated comparison uses the exact same outer split seeds. The
 # first model is the reference and the second is the changed configuration, so
@@ -1713,19 +1802,32 @@ FUTURE_MATCHED_CONTROL_REPEATED_COMPARISONS = tuple(
     if control_id in STABILITY_EXPERIMENT_IDS
 )
 
-REPEATED_STABILITY_COMPARISONS = (('A12_REFERENCE_VS_A17_PRIMARY', 'A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA', 'A17_HARD_SUPPORT_REGION_NORM_HIER_LR_PCA', 'Does the prospectively locked hard-support candidate remain stronger than the independently established A12 reference after strict series balancing?'), ('A9_FULL_IMAGE_VS_A17_PRIMARY', 'A9_STANDARDIZED_FULL_HIER_LR_PCA', 'A17_HARD_SUPPORT_REGION_NORM_HIER_LR_PCA', 'Does cardiac localization retain value over the standardized full image after strict series balancing?'), ('A16_SHAPE_SUPPRESSED_CROP_VS_A17_SUPPORT', 'A16_HEART_CENTERED_FIXED_FOV_REGION_NORM_HIER_LR_PCA', 'A17_HARD_SUPPORT_REGION_NORM_HIER_LR_PCA', 'Does A17 outperform a heart-centred crop that does not expose the exact support silhouette?'), ('A17_ALL_SLICES_VS_A20_VALID_ONLY', 'A17_HARD_SUPPORT_REGION_NORM_HIER_LR_PCA', 'A20_HARD_SUPPORT_REGION_NORM_VALID_ONLY_HIER_LR_PCA', 'Does the candidate depend on slices receiving the fixed-centre fallback after an invalid standardized MONAI gate?'), ('C31_EXACT_SUPPORT_MASK_ONLY_VS_A17', 'C31_A17_EXACT_SUPPORT_MASK_ONLY_HIER_LR_PCA', 'A17_HARD_SUPPORT_REGION_NORM_HIER_LR_PCA', "How much does MRI intensity add beyond A17's exact support geometry?"), ('C32_SHUFFLED_INTENSITY_VS_A17', 'C32_A17_SUPPORT_INTENSITY_AFFINE_SHUFFLED_HIER_LR_PCA', 'A17_HARD_SUPPORT_REGION_NORM_HIER_LR_PCA', 'How much does intact spatial texture add beyond the same support and visible intensity multiset?'), ('C33_EXACT_COMPLEMENT_VS_A17', 'C33_A17_EXACT_SUPPORT_COMPLEMENT_REGION_NORM_HIER_LR_PCA', 'A17_HARD_SUPPORT_REGION_NORM_HIER_LR_PCA', 'Does the exact A17 support remain more predictive than its independently normalized retained-content complement?'), ('C29_FIXED_PERIPHERY_VS_A17', 'C29_FIXED_PERIPHERY_REGION_NORM_HIER_LR_PCA', 'A17_HARD_SUPPORT_REGION_NORM_HIER_LR_PCA', 'Does the cardiac candidate remain stronger than a MONAI-independent fixed peripheral image control?'), ('C17_SERIES_COUNT_VS_A17', 'C17_N_SERIES_ONLY_LR', 'A17_HARD_SUPPORT_REGION_NORM_HIER_LR_PCA', 'Does exact per-patient series balancing remove the former series-count shortcut while preserving the cardiac candidate?'), ('C19_NATIVE_GEOMETRY_VS_A17', 'C19_NATIVE_GEOMETRY_ONLY_LR', 'A17_HARD_SUPPORT_REGION_NORM_HIER_LR_PCA', 'Does the candidate remain stronger than native image geometry after stricter cross-class overlap selection?'), ('C20_FILE_SIZE_VS_A17', 'C20_FILE_SIZE_ONLY_LR', 'A17_HARD_SUPPORT_REGION_NORM_HIER_LR_PCA', 'Does the candidate remain stronger than file-size and compression proxies after stricter cross-class overlap selection?'))
+REPEATED_STABILITY_COMPARISONS = (
+    FOCUSED_REPEATED_STABILITY_COMPARISONS
+    + FUTURE_REPEATED_STABILITY_COMPARISONS
+    + FUTURE_MATCHED_CONTROL_REPEATED_COMPARISONS
+)
 
 
 RUN_PATIENT_LABEL_PERMUTATION_TEST = True
 LABEL_PERMUTATION_REPLICATES = 1000
 LABEL_PERMUTATION_RANDOM_STATE = RANDOM_SEED + 40_000
-PERMUTATION_EXPERIMENT_IDS = ('A17_HARD_SUPPORT_REGION_NORM_HIER_LR_PCA',)
+PERMUTATION_EXPERIMENT_IDS = (PRIMARY_CANDIDATE_EXPERIMENT_ID,)
 # The ordinary null repeats the complete patient-level nested fitting path for
 # the prospectively locked A17 representation.
 
 RUN_NESTED_MODEL_SELECTION_AUDIT = True
 RUN_REPEATED_MODEL_SELECTION_STABILITY = True
-MODEL_SELECTION_CANDIDATE_EXPERIMENT_IDS = ('A17_HARD_SUPPORT_REGION_NORM_HIER_LR_PCA', 'A20_HARD_SUPPORT_REGION_NORM_VALID_ONLY_HIER_LR_PCA', 'A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA')
+MODEL_SELECTION_CANDIDATE_EXPERIMENT_IDS = tuple(
+    dict.fromkeys(
+        (
+            PRIMARY_CANDIDATE_EXPERIMENT_ID,
+            VALID_ONLY_CANDIDATE_EXPERIMENT_ID,
+            V4_LOCKED_REFERENCE_EXPERIMENT_ID,
+        )
+        + FUTURE_CANDIDATE_EXPERIMENT_IDS
+    )
+)
 MODEL_SELECTION_AUC_TOLERANCE = 0.01
 # Representation identity and classifier C are selected only inside each outer
 # training cohort. Candidates within 0.01 AUC of the best inner result follow
@@ -2015,6 +2117,12 @@ _suite_identity = {
     "focused_fixed_heart_fov_fraction": FOCUSED_FIXED_HEART_FOV_FRACTION,
     "focused_hard_support_extra_dilation_kernel": (
         FOCUSED_HARD_SUPPORT_EXTRA_DILATION_KERNEL
+    ),
+    "focused_invalid_monai_center_fraction": (
+        FOCUSED_INVALID_MONAI_CENTER_FRACTION
+    ),
+    "focused_heart_support_policy_version": (
+        FOCUSED_HEART_SUPPORT_POLICY_VERSION
     ),
     "focused_whole_heart_exclusion_center_fraction": (
         FOCUSED_WHOLE_HEART_EXCLUSION_CENTER_FRACTION
@@ -2864,6 +2972,14 @@ def validate_configuration():
     ):
         raise ValueError(
             "FOCUSED_HARD_SUPPORT_EXTRA_DILATION_KERNEL must be a positive odd integer."
+        )
+    if not 0.0 < FOCUSED_INVALID_MONAI_CENTER_FRACTION <= 1.0:
+        raise ValueError(
+            "FOCUSED_INVALID_MONAI_CENTER_FRACTION must lie in (0,1]."
+        )
+    if not str(FOCUSED_HEART_SUPPORT_POLICY_VERSION).strip():
+        raise ValueError(
+            "FOCUSED_HEART_SUPPORT_POLICY_VERSION must be non-empty."
         )
     if not (
         0.0 <= FOCUSED_REGION_NORM_LOWER_PERCENTILE
@@ -5747,7 +5863,7 @@ def required_monai_qc_branches(experiments):
 
 
 # =============================================================================
-# AUTOMATIC CROSS-CLASS SERIES HARMONIZATION — V7.2 IMPLEMENTATION
+# AUTOMATIC CROSS-CLASS SERIES HARMONIZATION — V7.2 IMPLEMENTATION RETAINED IN V7.3
 # =============================================================================
 
 
@@ -6783,6 +6899,12 @@ def feature_bank_fingerprint(samples, dataset_root):
         "focused_hard_support_extra_dilation_kernel": (
             FOCUSED_HARD_SUPPORT_EXTRA_DILATION_KERNEL
         ),
+        "focused_invalid_monai_center_fraction": (
+            FOCUSED_INVALID_MONAI_CENTER_FRACTION
+        ),
+        "focused_heart_support_policy_version": (
+            FOCUSED_HEART_SUPPORT_POLICY_VERSION
+        ),
         "focused_whole_heart_exclusion_center_fraction": (
             FOCUSED_WHOLE_HEART_EXCLUSION_CENTER_FRACTION
         ),
@@ -7499,10 +7621,25 @@ def create_focused_heart_centered_fixed_fov_images(
 def create_focused_a17_exact_support_mask(hard_mask, valid_mask, content_mask):
     """Return the exact final support shared by A17, C31, C32 and C33.
 
-    Valid slices use the standardized MONAI hard mask after one fixed additional
-    dilation. Invalid slices use the fixed central-square fallback. The result
-    is intersected with retained image content so square-canvas padding is never
-    part of the candidate or its exact matched controls.
+    The function deliberately has two mutually exclusive branches:
+
+    1. MONAI-compatible / gate-valid slice
+       The standardized MONAI hard mask is trusted for localization and receives
+       one larger fixed second-stage dilation. The first expansion already took
+       place inside ``predict_monai_heart_masks`` on the 256x256 MONAI canvas;
+       this second expansion occurs after nearest-neighbor alignment to 224x224.
+       The resulting support is therefore a superset of the MONAI region and
+       includes more immediately adjacent cardiac context.
+
+    2. MONAI-incompatible / gate-invalid slice
+       The predicted mask is ignored completely, even if it contains foreground
+       pixels. A fixed square centered on the geometric image center is used
+       instead. This implements a deterministic center fallback without allowing
+       an unreliable off-center segmentation to steer the representation.
+
+    Both branches are finally intersected with retained image content, so the
+    pipeline-added square-canvas padding is never part of A17 or its exact
+    matched controls C31-C33.
     """
 
     if hard_mask.ndim != 4 or hard_mask.shape[1] != 1:
@@ -7512,25 +7649,34 @@ def create_focused_a17_exact_support_mask(hard_mask, valid_mask, content_mask):
     if valid_mask.ndim != 1 or valid_mask.shape[0] != hard_mask.shape[0]:
         raise ValueError("valid_mask must contain one value per image.")
 
-    kernel = int(FOCUSED_HARD_SUPPORT_EXTRA_DILATION_KERNEL)
-    support = (hard_mask > 0.5).to(hard_mask.dtype)
-    support = F.max_pool2d(
-        support, kernel_size=kernel, stride=1, padding=kernel // 2
+    expansion_kernel = int(FOCUSED_HARD_SUPPORT_EXTRA_DILATION_KERNEL)
+    monai_localized_support = (hard_mask > 0.5).to(hard_mask.dtype)
+    expanded_monai_support = F.max_pool2d(
+        monai_localized_support,
+        kernel_size=expansion_kernel,
+        stride=1,
+        padding=expansion_kernel // 2,
     )
-    batch_size, _, height, width = support.shape
-    final_support = torch.zeros_like(support)
+    batch_size, _, height, width = expanded_monai_support.shape
+    final_support = torch.zeros_like(expanded_monai_support)
     for index in range(batch_size):
+        # A gate-valid mask controls location only after the fixed enlargement.
+        # The branch is independent of labels, folds, classifier outputs and
+        # patient-level performance.
         if bool(valid_mask[index].item()) and bool(
-            torch.any(support[index, 0] > 0.5).item()
+            torch.any(expanded_monai_support[index, 0] > 0.5).item()
         ):
-            final_support[index, 0] = support[index, 0]
+            final_support[index, 0] = expanded_monai_support[index, 0]
         else:
+            # For an invalid MONAI result, use only the geometric image center.
+            # No centroid, bounding box, probability, or foreground pixel from
+            # the failed segmentation is consulted by this fallback branch.
             top, bottom, left, right = _focused_fixed_square_bounds(
                 height,
                 width,
                 (height - 1) / 2.0,
                 (width - 1) / 2.0,
-                FOCUSED_FIXED_HEART_FOV_FRACTION,
+                FOCUSED_INVALID_MONAI_CENTER_FRACTION,
             )
             final_support[index, 0, top:bottom, left:right] = 1.0
     return (
@@ -7545,7 +7691,12 @@ def create_focused_a17_images(
     content_mask,
     exact_support=None,
 ):
-    """Create A17 from raw MRI intensities and the exact binary support."""
+    """Create A17 from raw MRI intensities and the exact conditional support.
+
+    Gate-valid rows use the enlarged MONAI-localized region; gate-invalid rows
+    use the fixed geometric-center square. Region-only robust scaling is applied
+    after this decision, so excluded pixels cannot set A17's intensity limits.
+    """
 
     if exact_support is None:
         exact_support = create_focused_a17_exact_support_mask(
@@ -7555,7 +7706,12 @@ def create_focused_a17_images(
 
 
 def create_focused_a17_support_only_images(exact_support):
-    """Create C31 by removing all MRI intensities from A17's support."""
+    """Create C31 by removing all MRI intensities from A17's exact support.
+
+    Because C31 receives the same expanded-valid / centered-invalid support as
+    A17, their comparison continues to isolate MRI intensity from support
+    geometry after the V7.3 change.
+    """
 
     if exact_support.ndim != 4 or exact_support.shape[1] != 1:
         raise ValueError("exact_support must have shape [B,1,H,W].")
@@ -7767,8 +7923,10 @@ def validate_focused_transform_contract():
     hard_mask = torch.zeros(batch_size, 1, height, width)
     hard_mask[0, 0, 18:38, 20:42] = 1.0
     hard_mask[1, 0, 24:45, 10:31] = 1.0
-    # The third row deliberately has no trusted mask and exercises the fixed
-    # central fallback used by A17 and every exact matched control.
+    # The third row deliberately contains a non-empty but off-center mask while
+    # its gate flag is False. This verifies that an unsuitable MONAI output is
+    # ignored completely rather than influencing the fallback location.
+    hard_mask[2, 0, 4:9, 54:59] = 1.0
     valid_mask = torch.tensor([True, True, False], dtype=torch.bool)
     content_mask = torch.ones(batch_size, 1, height, width)
     content_mask[:, :, :3, :] = 0.0
@@ -7781,6 +7939,69 @@ def validate_focused_transform_contract():
         valid_mask,
         content_mask,
     )
+
+    # For gate-valid images, the final support must equal the predeclared larger
+    # second-stage dilation intersected with retained content. This checks both
+    # that the valid MONAI region was actually expanded and that the expansion
+    # did not enter square-canvas padding.
+    expected_expanded_valid_support = F.max_pool2d(
+        (hard_mask > 0.5).to(hard_mask.dtype),
+        kernel_size=FOCUSED_HARD_SUPPORT_EXTRA_DILATION_KERNEL,
+        stride=1,
+        padding=FOCUSED_HARD_SUPPORT_EXTRA_DILATION_KERNEL // 2,
+    ) * content_mask
+    if not torch.equal(
+        exact_support[:2] > 0.5,
+        expected_expanded_valid_support[:2] > 0.5,
+    ):
+        raise RuntimeError(
+            "Gate-valid A17 rows do not use the configured expanded MONAI support."
+        )
+    for index in (0, 1):
+        original_visible = (
+            (hard_mask[index:index + 1] > 0.5)
+            & (content_mask[index:index + 1] > 0.5)
+        )
+        if not torch.all(
+            (exact_support[index:index + 1] > 0.5)[original_visible]
+        ):
+            raise RuntimeError(
+                "Expanded MONAI support is not a superset of the trusted mask."
+            )
+        if int(exact_support[index].sum().item()) <= int(
+            original_visible.sum().item()
+        ):
+            raise RuntimeError(
+                "The configured valid-MONAI expansion did not enlarge support."
+            )
+
+    # For a gate-invalid image, the expected support is exactly one fixed square
+    # centered on the image, intersected with content. The deliberately placed
+    # off-center failed mask must have no effect.
+    fallback_top, fallback_bottom, fallback_left, fallback_right = (
+        _focused_fixed_square_bounds(
+            height,
+            width,
+            (height - 1) / 2.0,
+            (width - 1) / 2.0,
+            FOCUSED_INVALID_MONAI_CENTER_FRACTION,
+        )
+    )
+    expected_center_fallback = torch.zeros_like(exact_support[2:3])
+    expected_center_fallback[
+        0,
+        0,
+        fallback_top:fallback_bottom,
+        fallback_left:fallback_right,
+    ] = 1.0
+    expected_center_fallback *= content_mask[2:3]
+    if not torch.equal(
+        exact_support[2:3] > 0.5,
+        expected_center_fallback > 0.5,
+    ):
+        raise RuntimeError(
+            "Gate-invalid A17 row did not use the exact geometric-center fallback."
+        )
     a17 = create_focused_a17_images(
         raw_images,
         hard_mask,
@@ -7881,6 +8102,13 @@ def validate_focused_transform_contract():
     return {
         "status": "PASS",
         "batch_size": int(batch_size),
+        "heart_support_policy_version": FOCUSED_HEART_SUPPORT_POLICY_VERSION,
+        "valid_monai_extra_dilation_kernel": int(
+            FOCUSED_HARD_SUPPORT_EXTRA_DILATION_KERNEL
+        ),
+        "invalid_monai_center_fraction": float(
+            FOCUSED_INVALID_MONAI_CENTER_FRACTION
+        ),
         "support_pixel_counts": [
             int(value)
             for value in exact_support.flatten(1).sum(dim=1).tolist()
@@ -8318,7 +8546,7 @@ def extract_feature_bank(
         raise ValueError("At least one EfficientNet feature mode is required.")
 
     # MONAI is loaded only when an enabled image view or a declared tabular
-    # MONAI-QC control requires that preprocessing branch. The focused V7.1
+    # MONAI-QC control requires that preprocessing branch. The focused V7.3
     # panel needs only the standardized branch; the original branch therefore
     # remains intentionally uncomputed and is reported as SKIPPED downstream.
     monai_requirements = required_monai_qc_branches(
@@ -16648,6 +16876,12 @@ def write_suite_configuration(output_path, experiments):
         "focused_hard_support_extra_dilation_kernel": (
             FOCUSED_HARD_SUPPORT_EXTRA_DILATION_KERNEL
         ),
+        "focused_invalid_monai_center_fraction": (
+            FOCUSED_INVALID_MONAI_CENTER_FRACTION
+        ),
+        "focused_heart_support_policy_version": (
+            FOCUSED_HEART_SUPPORT_POLICY_VERSION
+        ),
         "focused_whole_heart_exclusion_center_fraction": (
             FOCUSED_WHOLE_HEART_EXCLUSION_CENTER_FRACTION
         ),
@@ -16815,7 +17049,7 @@ def write_suite_configuration(output_path, experiments):
 
 
 # ---------------------------------------------------------------------------
-# V7.2 EXTENSION OF THE PREDECLARED SUITE CONFIGURATION
+# V7.3 EXTENSION OF THE PREDECLARED SUITE CONFIGURATION
 # ---------------------------------------------------------------------------
 # The original writer and every original field are preserved. This wrapper adds
 # the series-harmonization contract to suite_configuration.json before image
@@ -16834,7 +17068,7 @@ def write_suite_configuration(*args, **kwargs):
     if output_path is None:
         raise RuntimeError(
             "Could not identify suite_configuration.json output path in the "
-            "V7.2 series-harmonization wrapper."
+            "V7.3 series-harmonization and expanded-heart wrapper."
         )
     output_path = Path(output_path)
     if not output_path.is_file():
@@ -16901,1303 +17135,6 @@ def write_suite_configuration(*args, **kwargs):
     return result
 
 
-
-# =============================================================================
-# V7.2-SB1 STRICT CROSS-CLASS SERIES OVERLAP REFINEMENT
-# =============================================================================
-#
-# This block is intentionally additive. It runs AFTER V7.2's original
-# multi-resolution series harmonization and BEFORE the feature bank is built.
-# The existing image preprocessing, MONAI/EfficientNet representations,
-# patient-level pooling, CV, controls, reports and detailed comments remain
-# unchanged.
-#
-# WHY A SECOND, STRICTER FILTER?
-# -----------------------------
-# V7.2 retained 2,673 of 2,859 folder-defined series proxies and materially
-# reduced the series-count, geometry, provenance and peripheral controls, but
-# several controls remained predictive. Presence in a shared KMeans cluster is
-# therefore not sufficient. V7.2-SB1 additionally requires each retained series
-# to have close opposite-class support and then selects exactly the same number
-# of series for every Directory_* patient.
-#
-# LABEL-USE / VALIDITY WARNING
-# ----------------------------
-# Per-series descriptors, robust scaling, PCA and KMeans are label-blind. Class
-# labels are nevertheless used globally to decide whether clusters are shared,
-# find opposite-class neighbours, and audit/balance class distributions. This is
-# a PREDECLARED GLOBAL SENSITIVITY ANALYSIS, not independent validation and not
-# a leakage-free estimate for unseen patients. A definitive analysis must fit
-# the harmonizer inside each outer/inner training partition and apply the frozen
-# rule to validation patients without using their labels.
-#
-# The filter never deletes a Directory_* patient silently. It first searches for
-# the largest exact per-patient target that passes every strict guard. If no
-# target passes, SB1.1 can continue with the best attainable exact-count
-# candidate while writing the failed guards explicitly. This fallback prevents
-# an avoidable Kaggle abort, but it must be reported as BEST_ATTAINABLE rather
-# than as evidence that every strict balance guard was satisfied.
-
-from sklearn.cluster import KMeans as _SB1KMeans
-from sklearn.decomposition import PCA as _SB1PCA
-from sklearn.neighbors import NearestNeighbors as _SB1NearestNeighbors
-from sklearn.preprocessing import RobustScaler as _SB1RobustScaler
-
-STRICT_SERIES_BALANCE_VERSION = "v7.2-sb1.1-safe-fallback-v2"
-STRICT_SERIES_DESCRIPTOR_SAMPLE_COUNT = 7
-STRICT_SERIES_CLUSTER_COUNTS = (47, 59, 71, 83, 97)
-STRICT_SERIES_REQUIRED_SHARED_VOTES = 4
-STRICT_SERIES_MIN_PATIENTS_PER_CLASS_PER_CLUSTER = 3
-STRICT_SERIES_MIN_SERIES_PER_CLASS_PER_CLUSTER = 5
-STRICT_SERIES_MIN_CLASS_SUPPORT_RATIO = 0.60
-STRICT_SERIES_MAX_CLASS_CENTROID_GAP = 0.70
-STRICT_SERIES_MAX_DISTANCE_MEDIAN_RATIO = 1.50
-STRICT_SERIES_CLUSTER_DISTANCE_QUANTILE = 0.70
-STRICT_SERIES_LENGTH_LOWER_QUANTILE = 0.15
-STRICT_SERIES_LENGTH_UPPER_QUANTILE = 0.85
-STRICT_SERIES_PCA_COMPONENTS = 24
-STRICT_SERIES_OPPOSITE_NEIGHBOUR_QUANTILE = 0.70
-STRICT_SERIES_MIN_PER_PATIENT = 12
-STRICT_SERIES_MAX_PER_PATIENT = 32
-STRICT_SERIES_TARGET_QUANTILE = 0.25
-STRICT_SERIES_MAX_RESCUE_FRACTION = 0.10
-STRICT_SERIES_MAX_RESCUE_PATIENTS = 6
-STRICT_SERIES_MIN_RETAINED_FRACTION_OF_V72 = 0.20
-STRICT_SERIES_MAX_RETAINED_FRACTION_OF_V72 = 0.75
-STRICT_SERIES_PATIENT_SMD_MEDIAN_LIMIT = 0.35
-STRICT_SERIES_PATIENT_SMD_Q90_LIMIT = 0.90
-STRICT_SERIES_PATIENT_SMD_MAX_LIMIT = 1.75
-STRICT_SERIES_RANDOM_STATE = RANDOM_SEED + 73_000
-
-# SB1.1 keeps all original numerical guards but avoids terminating the complete
-# run when their joint intersection is empty. The selected fallback is the
-# feasible exact-count target with the smallest normalized guard violation; no
-# AUC, model score, or downstream result enters this choice.
-STRICT_SERIES_ALLOW_BEST_ATTAINABLE_FALLBACK = True
-
-# A high-dimensional SMD maximum is unstable when a descriptor coordinate is
-# nearly constant across all 30 patients. Globally constant dimensions carry no
-# balancing information and are excluded; the denominator for varying
-# dimensions receives a small total-variation floor. A genuinely class-separated
-# coordinate remains strongly penalized rather than being hidden.
-STRICT_SERIES_SMD_MIN_TOTAL_STD = 1e-5
-STRICT_SERIES_SMD_POOLED_STD_FLOOR_FRACTION = 0.10
-
-# Only the scientifically necessary models and falsification controls are run.
-# Definitions and explanatory comments for the omitted experiments remain in
-# the source for provenance; EXPERIMENTS_TO_RUN controls execution only.
-STRICT_BALANCED_ESSENTIAL_EXPERIMENT_IDS = (
-    "A17_HARD_SUPPORT_REGION_NORM_HIER_LR_PCA",
-    "A20_HARD_SUPPORT_REGION_NORM_VALID_ONLY_HIER_LR_PCA",
-    "A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA",
-    "A16_HEART_CENTERED_FIXED_FOV_REGION_NORM_HIER_LR_PCA",
-    "A9_STANDARDIZED_FULL_HIER_LR_PCA",
-    "C31_A17_EXACT_SUPPORT_MASK_ONLY_HIER_LR_PCA",
-    "C32_A17_SUPPORT_INTENSITY_AFFINE_SHUFFLED_HIER_LR_PCA",
-    "C33_A17_EXACT_SUPPORT_COMPLEMENT_REGION_NORM_HIER_LR_PCA",
-    "C29_FIXED_PERIPHERY_REGION_NORM_HIER_LR_PCA",
-    "C17_N_SERIES_ONLY_LR",
-    "C19_NATIVE_GEOMETRY_ONLY_LR",
-    "C20_FILE_SIZE_ONLY_LR",
-)
-
-
-def _sb1_evenly_spaced_indices(length, maximum_count):
-    """Return deterministic unique indices spanning an ordered series."""
-
-    length = int(length)
-    maximum_count = int(maximum_count)
-    if length <= 0 or maximum_count <= 0:
-        raise ValueError("Series sampling requires positive lengths/counts.")
-    if length <= maximum_count:
-        return np.arange(length, dtype=np.int64)
-    return np.unique(
-        np.rint(np.linspace(0, length - 1, maximum_count)).astype(np.int64)
-    )
-
-
-def _sb1_image_descriptor(image_path):
-    """Create one label-blind image/export descriptor from a grayscale JPEG."""
-
-    path = Path(image_path)
-    image = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
-    if image is None or image.ndim != 2 or image.size == 0:
-        raise RuntimeError(
-            f"Strict series harmonization could not decode: {path}"
-        )
-
-    height, width = image.shape
-    file_size = float(path.stat().st_size)
-    native_pixels = float(max(1, height * width))
-    small = cv2.resize(image, (64, 64), interpolation=cv2.INTER_AREA)
-    values = small.astype(np.float32) / 255.0
-
-    quantiles = np.quantile(values, [0.05, 0.25, 0.50, 0.75, 0.95])
-    histogram, _ = np.histogram(values, bins=16, range=(0.0, 1.0))
-    histogram = histogram.astype(np.float64)
-    histogram /= max(1.0, float(histogram.sum()))
-    nonzero_histogram = histogram[histogram > 0.0]
-    entropy = float(
-        -np.sum(nonzero_histogram * np.log2(nonzero_histogram))
-    )
-
-    gradient_x = cv2.Sobel(values, cv2.CV_32F, 1, 0, ksize=3)
-    gradient_y = cv2.Sobel(values, cv2.CV_32F, 0, 1, ksize=3)
-    gradient_magnitude = np.sqrt(gradient_x**2 + gradient_y**2)
-
-    center = values[16:48, 16:48]
-    border_mask = np.ones((64, 64), dtype=bool)
-    border_mask[8:56, 8:56] = False
-    border = values[border_mask]
-    quadrants = (
-        values[:32, :32],
-        values[:32, 32:],
-        values[32:, :32],
-        values[32:, 32:],
-    )
-
-    standardized = (values - float(values.mean())) / (
-        float(values.std()) + 1e-6
-    )
-    dct = cv2.dct(standardized.astype(np.float32))
-    low_frequency_dct = (dct[:4, :4].reshape(-1)[1:] / 64.0).astype(
-        np.float64
-    )
-
-    descriptor = np.concatenate(
-        [
-            np.asarray(
-                [
-                    np.log1p(height),
-                    np.log1p(width),
-                    np.log(max(width / max(height, 1), 1e-6)),
-                    np.log1p(native_pixels),
-                    np.log1p(file_size),
-                    np.log1p(file_size / native_pixels),
-                    float(values.mean()),
-                    float(values.std()),
-                    *[float(value) for value in quantiles],
-                    entropy,
-                    float(gradient_magnitude.mean()),
-                    float(gradient_magnitude.std()),
-                    float(center.mean()),
-                    float(border.mean()),
-                    *[float(region.mean()) for region in quadrants],
-                ],
-                dtype=np.float64,
-            ),
-            histogram,
-            low_frequency_dct,
-        ]
-    )
-    if not np.all(np.isfinite(descriptor)):
-        raise RuntimeError(f"Non-finite strict descriptor for {path}.")
-    return descriptor
-
-
-def _sb1_series_descriptor(series_rows):
-    """Aggregate sampled image descriptors to one robust series descriptor."""
-
-    ordered_rows = sorted(series_rows, key=lambda row: str(row[0]))
-    sample_indices = _sb1_evenly_spaced_indices(
-        len(ordered_rows),
-        STRICT_SERIES_DESCRIPTOR_SAMPLE_COUNT,
-    )
-    image_descriptors = np.stack(
-        [
-            _sb1_image_descriptor(ordered_rows[int(index)][0])
-            for index in sample_indices
-        ],
-        axis=0,
-    )
-    median = np.median(image_descriptors, axis=0)
-    iqr = np.quantile(image_descriptors, 0.75, axis=0) - np.quantile(
-        image_descriptors, 0.25, axis=0
-    )
-    descriptor = np.concatenate(
-        [
-            median,
-            iqr,
-            np.asarray(
-                [
-                    np.log1p(len(ordered_rows)),
-                    float(len(sample_indices))
-                    / float(len(ordered_rows)),
-                ],
-                dtype=np.float64,
-            ),
-        ]
-    )
-    return descriptor
-
-
-def _sb1_group_samples_by_series(samples):
-    """Group rows and verify that every series has one patient and one label."""
-
-    grouped = defaultdict(list)
-    for row in samples:
-        if len(row) < 4:
-            raise ValueError(
-                "Expected sample rows (image_path, label, patient_id, series_id)."
-            )
-        grouped[str(row[3])].append(row)
-
-    records = []
-    for series_id in sorted(grouped):
-        rows = grouped[series_id]
-        labels = {int(row[1]) for row in rows}
-        patients = {str(row[2]) for row in rows}
-        if len(labels) != 1 or len(patients) != 1:
-            raise RuntimeError(
-                f"Series {series_id!r} has inconsistent labels/patients."
-            )
-        records.append(
-            {
-                "series_id": series_id,
-                "patient_id": next(iter(patients)),
-                "label": next(iter(labels)),
-                "rows": rows,
-                "n_images": int(len(rows)),
-            }
-        )
-    return records
-
-
-def _sb1_effective_cluster_count(requested, n_series):
-    """Keep synthetic/small-cohort tests feasible without changing real k."""
-
-    maximum_supported = max(
-        2,
-        int(n_series)
-        // max(2, 2 * STRICT_SERIES_MIN_SERIES_PER_CLASS_PER_CLUSTER),
-    )
-    return int(max(2, min(int(requested), maximum_supported, n_series - 1)))
-
-
-def _sb1_patient_level_balance(descriptors, labels, patients, selected_mask):
-    """Measure class imbalance at the actual patient-level evaluation unit.
-
-    SB1 used an absolute ``1e-6`` denominator floor for every descriptor. With
-    108 correlated coordinates and only 30 patients, a globally almost-constant
-    coordinate could therefore create an enormous maximum SMD from numerical
-    noise and make every target fail. SB1.1 excludes only globally constant
-    coordinates and regularizes the denominator by a small fraction of total
-    patient-level variation. Genuine low-variance class separation remains
-    visible and can still fail the guard.
-    """
-
-    selected_indices = np.flatnonzero(selected_mask)
-    selected_patients = sorted(set(patients[selected_indices].tolist()))
-    patient_rows = []
-    patient_labels = []
-    for patient_id in selected_patients:
-        indices = selected_indices[patients[selected_indices] == patient_id]
-        label_values = np.unique(labels[indices])
-        if len(label_values) != 1:
-            raise RuntimeError(
-                f"Patient {patient_id} has inconsistent strict-filter labels."
-            )
-        patient_rows.append(np.mean(descriptors[indices], axis=0))
-        patient_labels.append(int(label_values[0]))
-
-    patient_rows = np.asarray(patient_rows, dtype=np.float64)
-    patient_labels = np.asarray(patient_labels, dtype=np.int64)
-    class_zero = patient_rows[patient_labels == 0]
-    class_one = patient_rows[patient_labels == 1]
-    if len(class_zero) < 2 or len(class_one) < 2:
-        raise RuntimeError(
-            "Strict balance requires at least two retained patients per class."
-        )
-
-    pooled_std = np.sqrt(
-        0.5
-        * (
-            np.var(class_zero, axis=0, ddof=1)
-            + np.var(class_one, axis=0, ddof=1)
-        )
-    )
-    total_std = np.std(patient_rows, axis=0, ddof=1)
-    informative = total_std > STRICT_SERIES_SMD_MIN_TOTAL_STD
-    denominator = np.maximum(
-        pooled_std,
-        STRICT_SERIES_SMD_POOLED_STD_FLOOR_FRACTION * total_std,
-    )
-    denominator = np.maximum(denominator, STRICT_SERIES_SMD_MIN_TOTAL_STD)
-    mean_gap = np.abs(
-        np.mean(class_one, axis=0) - np.mean(class_zero, axis=0)
-    )
-    standardized_difference = np.zeros(patient_rows.shape[1], dtype=np.float64)
-    standardized_difference[informative] = (
-        mean_gap[informative] / denominator[informative]
-    )
-    if not np.all(np.isfinite(standardized_difference)):
-        raise RuntimeError("Strict patient-level SMDs contain non-finite values.")
-
-    maximum_index = int(np.argmax(standardized_difference))
-    return {
-        "median_absolute_patient_smd": float(
-            np.median(standardized_difference)
-        ),
-        "q90_absolute_patient_smd": float(
-            np.quantile(standardized_difference, 0.90)
-        ),
-        "maximum_absolute_patient_smd": float(
-            standardized_difference[maximum_index]
-        ),
-        "maximum_absolute_patient_smd_descriptor_index": maximum_index,
-        "informative_descriptor_dimensions": int(np.sum(informative)),
-        "total_descriptor_dimensions": int(patient_rows.shape[1]),
-        "absolute_patient_smd": standardized_difference,
-    }
-
-
-def _sb1_guard_diagnostics(
-    balance,
-    rescue_fraction,
-    rescue_patients,
-    retained_fraction,
-):
-    """Return strict pass/fail flags and a deterministic violation score."""
-
-    checks = {
-        "rescue_fraction": (
-            float(rescue_fraction) <= STRICT_SERIES_MAX_RESCUE_FRACTION
-        ),
-        "rescue_patients": (
-            int(rescue_patients) <= STRICT_SERIES_MAX_RESCUE_PATIENTS
-        ),
-        "median_absolute_patient_smd": (
-            balance["median_absolute_patient_smd"]
-            <= STRICT_SERIES_PATIENT_SMD_MEDIAN_LIMIT
-        ),
-        "q90_absolute_patient_smd": (
-            balance["q90_absolute_patient_smd"]
-            <= STRICT_SERIES_PATIENT_SMD_Q90_LIMIT
-        ),
-        "maximum_absolute_patient_smd": (
-            balance["maximum_absolute_patient_smd"]
-            <= STRICT_SERIES_PATIENT_SMD_MAX_LIMIT
-        ),
-        "minimum_retained_fraction": (
-            retained_fraction >= STRICT_SERIES_MIN_RETAINED_FRACTION_OF_V72
-        ),
-        "maximum_retained_fraction": (
-            retained_fraction <= STRICT_SERIES_MAX_RETAINED_FRACTION_OF_V72
-        ),
-    }
-    ratios = np.asarray(
-        [
-            float(rescue_fraction)
-            / max(STRICT_SERIES_MAX_RESCUE_FRACTION, 1e-12),
-            float(rescue_patients)
-            / max(STRICT_SERIES_MAX_RESCUE_PATIENTS, 1e-12),
-            balance["median_absolute_patient_smd"]
-            / max(STRICT_SERIES_PATIENT_SMD_MEDIAN_LIMIT, 1e-12),
-            balance["q90_absolute_patient_smd"]
-            / max(STRICT_SERIES_PATIENT_SMD_Q90_LIMIT, 1e-12),
-            balance["maximum_absolute_patient_smd"]
-            / max(STRICT_SERIES_PATIENT_SMD_MAX_LIMIT, 1e-12),
-            (
-                STRICT_SERIES_MIN_RETAINED_FRACTION_OF_V72
-                / max(retained_fraction, 1e-12)
-                if retained_fraction
-                < STRICT_SERIES_MIN_RETAINED_FRACTION_OF_V72
-                else 1.0
-            ),
-            (
-                retained_fraction
-                / max(STRICT_SERIES_MAX_RETAINED_FRACTION_OF_V72, 1e-12)
-                if retained_fraction
-                > STRICT_SERIES_MAX_RETAINED_FRACTION_OF_V72
-                else 1.0
-            ),
-        ],
-        dtype=np.float64,
-    )
-    excess = np.maximum(ratios - 1.0, 0.0)
-    return {
-        "strict_guard_passed": bool(all(checks.values())),
-        "checks": checks,
-        "violated_guards": sorted(
-            name for name, passed in checks.items() if not passed
-        ),
-        "normalized_guard_violation_score": float(
-            100.0 * np.sum(excess**2) + np.sum(ratios)
-        ),
-    }
-
-
-def _sb1_select_exact_count_per_patient(
-    records,
-    strict_mask,
-    fallback_mask,
-    ranking_score,
-    target_per_patient,
-):
-    """Select exactly one common target count for every Directory_* patient."""
-
-    patients = np.asarray([row["patient_id"] for row in records])
-    selected = np.zeros(len(records), dtype=bool)
-    rescue = np.zeros(len(records), dtype=bool)
-
-    for patient_id in sorted(set(patients.tolist())):
-        patient_indices = np.flatnonzero(patients == patient_id)
-        strict_indices = patient_indices[strict_mask[patient_indices]]
-        strict_indices = strict_indices[
-            np.argsort(ranking_score[strict_indices], kind="mergesort")
-        ]
-        chosen = list(strict_indices[:target_per_patient])
-
-        if len(chosen) < target_per_patient:
-            chosen_set = set(chosen)
-            fallback_indices = np.asarray(
-                [
-                    index
-                    for index in patient_indices
-                    if fallback_mask[index] and index not in chosen_set
-                ],
-                dtype=np.int64,
-            )
-            fallback_indices = fallback_indices[
-                np.argsort(ranking_score[fallback_indices], kind="mergesort")
-            ]
-            needed = target_per_patient - len(chosen)
-            rescued = fallback_indices[:needed].tolist()
-            chosen.extend(rescued)
-            rescue[rescued] = True
-
-        if len(chosen) != target_per_patient:
-            raise RuntimeError(
-                f"Patient {patient_id} has only {len(chosen)} eligible/rescue "
-                f"series, below target={target_per_patient}."
-            )
-        selected[np.asarray(chosen, dtype=np.int64)] = True
-
-    return selected, rescue
-
-
-def apply_strict_balanced_series_refinement(samples, output_dir):
-    """Apply strict shared-support and exact per-patient series balancing.
-
-    This function starts from the series already retained by V7.2. It does not
-    alter any selected series internally: every JPEG belonging to a retained
-    folder-defined series proxy remains available to all image representations.
-    """
-
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    records = _sb1_group_samples_by_series(samples)
-    if not records:
-        raise RuntimeError("Strict series refinement received no series.")
-
-    print(
-        "[STRICT SERIES BALANCE] Building descriptors for "
-        f"{len(records)} V7.2-retained series proxies.",
-        flush=True,
-    )
-    descriptors = []
-    progress_step = max(1, len(records) // 20)
-    for index, record in enumerate(records, start=1):
-        descriptors.append(_sb1_series_descriptor(record["rows"]))
-        if index == 1 or index % progress_step == 0 or index == len(records):
-            print(
-                f"[STRICT SERIES BALANCE] descriptors={index}/{len(records)} "
-                f"({100.0 * index / len(records):.1f}%)",
-                flush=True,
-            )
-
-    descriptors = np.asarray(descriptors, dtype=np.float64)
-    labels = np.asarray([row["label"] for row in records], dtype=np.int64)
-    patients = np.asarray([row["patient_id"] for row in records]).astype(str)
-    series_ids = np.asarray([row["series_id"] for row in records]).astype(str)
-    lengths = np.asarray([row["n_images"] for row in records], dtype=np.int64)
-    if set(np.unique(labels).tolist()) != {0, 1}:
-        raise RuntimeError("Strict balancing requires both Normal and Sick series.")
-
-    scaler = _SB1RobustScaler(quantile_range=(25.0, 75.0))
-    scaled = scaler.fit_transform(descriptors)
-    scaled = np.nan_to_num(scaled, nan=0.0, posinf=8.0, neginf=-8.0)
-    scaled = np.clip(scaled, -8.0, 8.0)
-
-    n_components = min(
-        STRICT_SERIES_PCA_COMPONENTS,
-        scaled.shape[1],
-        scaled.shape[0] - 1,
-    )
-    pca = _SB1PCA(
-        n_components=n_components,
-        whiten=True,
-        svd_solver="full",
-    )
-    representation = pca.fit_transform(scaled)
-    representation = np.nan_to_num(
-        representation,
-        nan=0.0,
-        posinf=8.0,
-        neginf=-8.0,
-    )
-
-    opposite_distance = np.full(len(records), np.inf, dtype=np.float64)
-    for source_label, opposite_label in ((0, 1), (1, 0)):
-        source_indices = np.flatnonzero(labels == source_label)
-        opposite_indices = np.flatnonzero(labels == opposite_label)
-        neighbours = _SB1NearestNeighbors(
-            n_neighbors=1,
-            algorithm="auto",
-            metric="euclidean",
-        )
-        neighbours.fit(representation[opposite_indices])
-        distances, _ = neighbours.kneighbors(representation[source_indices])
-        opposite_distance[source_indices] = distances[:, 0]
-
-    class_distance_limits = {
-        label: float(
-            np.quantile(
-                opposite_distance[labels == label],
-                STRICT_SERIES_OPPOSITE_NEIGHBOUR_QUANTILE,
-            )
-        )
-        for label in (0, 1)
-    }
-    common_opposite_distance_limit = min(class_distance_limits.values())
-
-    shared_votes = np.zeros(len(records), dtype=np.int64)
-    inlier_votes = np.zeros(len(records), dtype=np.int64)
-    normalized_cluster_distance_sum = np.zeros(len(records), dtype=np.float64)
-    effective_cluster_counts = []
-    cluster_manifest_rows = []
-    primary_assignments = None
-
-    log_lengths = np.log1p(lengths.astype(np.float64))
-    for resolution_index, requested_k in enumerate(
-        STRICT_SERIES_CLUSTER_COUNTS
-    ):
-        k = _sb1_effective_cluster_count(requested_k, len(records))
-        effective_cluster_counts.append(k)
-        kmeans = _SB1KMeans(
-            n_clusters=k,
-            random_state=STRICT_SERIES_RANDOM_STATE + resolution_index,
-            n_init=20,
-            max_iter=500,
-        )
-        assignments = kmeans.fit_predict(representation)
-        distances = np.linalg.norm(
-            representation - kmeans.cluster_centers_[assignments],
-            axis=1,
-        )
-        if requested_k == STRICT_SERIES_CLUSTER_COUNTS[
-            len(STRICT_SERIES_CLUSTER_COUNTS) // 2
-        ]:
-            primary_assignments = assignments.copy()
-
-        for cluster_id in range(k):
-            cluster_indices = np.flatnonzero(assignments == cluster_id)
-            class_indices = {
-                label: cluster_indices[labels[cluster_indices] == label]
-                for label in (0, 1)
-            }
-            n_series = {label: int(len(class_indices[label])) for label in (0, 1)}
-            n_patients = {
-                label: int(len(set(patients[class_indices[label]].tolist())))
-                for label in (0, 1)
-            }
-            series_ratio = (
-                min(n_series.values()) / max(n_series.values())
-                if max(n_series.values()) > 0
-                else 0.0
-            )
-            patient_ratio = (
-                min(n_patients.values()) / max(n_patients.values())
-                if max(n_patients.values()) > 0
-                else 0.0
-            )
-
-            shared = all(
-                n_patients[label]
-                >= STRICT_SERIES_MIN_PATIENTS_PER_CLASS_PER_CLUSTER
-                and n_series[label]
-                >= STRICT_SERIES_MIN_SERIES_PER_CLASS_PER_CLUSTER
-                for label in (0, 1)
-            )
-            shared = shared and (
-                series_ratio >= STRICT_SERIES_MIN_CLASS_SUPPORT_RATIO
-                and patient_ratio >= STRICT_SERIES_MIN_CLASS_SUPPORT_RATIO
-            )
-
-            if all(n_series[label] > 0 for label in (0, 1)):
-                class_centroid_gap = float(
-                    np.mean(
-                        np.abs(
-                            np.mean(scaled[class_indices[1]], axis=0)
-                            - np.mean(scaled[class_indices[0]], axis=0)
-                        )
-                    )
-                )
-                distance_medians = {
-                    label: float(np.median(distances[class_indices[label]]))
-                    for label in (0, 1)
-                }
-                distance_median_ratio = max(distance_medians.values()) / max(
-                    1e-8, min(distance_medians.values())
-                )
-                lower = max(
-                    float(
-                        np.quantile(
-                            log_lengths[class_indices[label]],
-                            STRICT_SERIES_LENGTH_LOWER_QUANTILE,
-                        )
-                    )
-                    for label in (0, 1)
-                )
-                upper = min(
-                    float(
-                        np.quantile(
-                            log_lengths[class_indices[label]],
-                            STRICT_SERIES_LENGTH_UPPER_QUANTILE,
-                        )
-                    )
-                    for label in (0, 1)
-                )
-                shared = shared and (
-                    class_centroid_gap
-                    <= STRICT_SERIES_MAX_CLASS_CENTROID_GAP
-                    and distance_median_ratio
-                    <= STRICT_SERIES_MAX_DISTANCE_MEDIAN_RATIO
-                    and lower <= upper
-                )
-            else:
-                class_centroid_gap = float("inf")
-                distance_median_ratio = float("inf")
-                lower, upper = 1.0, 0.0
-                shared = False
-
-            if shared:
-                distance_limit = min(
-                    float(
-                        np.quantile(
-                            distances[class_indices[label]],
-                            STRICT_SERIES_CLUSTER_DISTANCE_QUANTILE,
-                        )
-                    )
-                    for label in (0, 1)
-                )
-                eligible = cluster_indices[
-                    (distances[cluster_indices] <= distance_limit)
-                    & (log_lengths[cluster_indices] >= lower)
-                    & (log_lengths[cluster_indices] <= upper)
-                ]
-                shared_votes[eligible] += 1
-                inlier_votes[eligible] += 1
-                normalized_cluster_distance_sum[cluster_indices] += (
-                    distances[cluster_indices] / max(distance_limit, 1e-8)
-                )
-            else:
-                distance_limit = float("nan")
-                normalized_cluster_distance_sum[cluster_indices] += 4.0
-
-            cluster_manifest_rows.append(
-                {
-                    "requested_k": int(requested_k),
-                    "effective_k": int(k),
-                    "cluster_id": int(cluster_id),
-                    "normal_series": n_series[0],
-                    "sick_series": n_series[1],
-                    "normal_patients": n_patients[0],
-                    "sick_patients": n_patients[1],
-                    "series_support_ratio": float(series_ratio),
-                    "patient_support_ratio": float(patient_ratio),
-                    "mean_absolute_scaled_descriptor_gap": (
-                        None
-                        if not np.isfinite(class_centroid_gap)
-                        else float(class_centroid_gap)
-                    ),
-                    "class_distance_median_ratio": (
-                        None
-                        if not np.isfinite(distance_median_ratio)
-                        else float(distance_median_ratio)
-                    ),
-                    "distance_limit": (
-                        None
-                        if not np.isfinite(distance_limit)
-                        else float(distance_limit)
-                    ),
-                    "shared_strict_cluster": bool(shared),
-                }
-            )
-
-    if primary_assignments is None:
-        raise RuntimeError("Strict harmonization did not establish primary clusters.")
-
-    strict_mask = (
-        shared_votes >= STRICT_SERIES_REQUIRED_SHARED_VOTES
-    ) & (opposite_distance <= common_opposite_distance_limit)
-    # A broader, still label-blind-in-descriptor fallback can rescue a small
-    # number of series needed to give every patient an identical series count.
-    fallback_mask = (
-        shared_votes >= max(2, STRICT_SERIES_REQUIRED_SHARED_VOTES - 1)
-    ) & (
-        opposite_distance
-        <= max(
-            float(np.quantile(opposite_distance[labels == 0], 0.85)),
-            float(np.quantile(opposite_distance[labels == 1], 0.85)),
-        )
-    )
-
-    mean_cluster_distance = normalized_cluster_distance_sum / float(
-        len(STRICT_SERIES_CLUSTER_COUNTS)
-    )
-    opposite_scale = max(common_opposite_distance_limit, 1e-8)
-    ranking_score = (
-        opposite_distance / opposite_scale
-        + mean_cluster_distance
-        + 0.10 * np.abs(log_lengths - np.median(log_lengths))
-    )
-
-    strict_counts = np.asarray(
-        [
-            int(np.sum(strict_mask[patients == patient_id]))
-            for patient_id in sorted(set(patients.tolist()))
-        ],
-        dtype=np.int64,
-    )
-    proposed_target = int(
-        np.floor(
-            np.quantile(strict_counts, STRICT_SERIES_TARGET_QUANTILE)
-        )
-    )
-    proposed_target = max(
-        STRICT_SERIES_MIN_PER_PATIENT,
-        min(STRICT_SERIES_MAX_PER_PATIENT, proposed_target),
-    )
-
-    chosen = None
-    chosen_rescue = None
-    chosen_balance = None
-    chosen_target = None
-    chosen_guard = None
-    selection_status = None
-    selection_policy = None
-    candidate_diagnostics = []
-    best_feasible_candidate = None
-
-    # Retention is part of the target decision, not a second independent failure
-    # after a target has already been accepted. This also exposes the latent SB1
-    # incompatibility between a low exact target and the 20% retention floor.
-    n_patients = int(len(set(patients.tolist())))
-    minimum_target_from_retention = int(
-        np.ceil(
-            STRICT_SERIES_MIN_RETAINED_FRACTION_OF_V72
-            * len(records)
-            / max(1, n_patients)
-        )
-    )
-    search_minimum = max(
-        STRICT_SERIES_MIN_PER_PATIENT,
-        minimum_target_from_retention,
-    )
-    maximum_target_from_retention = int(
-        np.floor(
-            STRICT_SERIES_MAX_RETAINED_FRACTION_OF_V72
-            * len(records)
-            / max(1, n_patients)
-        )
-    )
-    fallback_counts = np.asarray(
-        [
-            int(np.sum(fallback_mask[patients == patient_id]))
-            for patient_id in sorted(set(patients.tolist()))
-        ],
-        dtype=np.int64,
-    )
-    search_maximum = min(
-        STRICT_SERIES_MAX_PER_PATIENT,
-        maximum_target_from_retention,
-        int(np.min(fallback_counts)),
-    )
-    # The original proposed target came only from the strict-count quartile. If
-    # it lies below the retention-derived minimum, evaluate the minimum safe
-    # target rather than producing an empty Python range and jumping directly to
-    # the emergency pool.
-    first_target = min(
-        search_maximum,
-        max(proposed_target, search_minimum),
-    )
-
-    for target in range(
-        first_target,
-        search_minimum - 1,
-        -1,
-    ):
-        try:
-            selected, rescue = _sb1_select_exact_count_per_patient(
-                records,
-                strict_mask,
-                fallback_mask,
-                ranking_score,
-                target,
-            )
-        except RuntimeError as error:
-            candidate_diagnostics.append(
-                {"target": int(target), "status": "INFEASIBLE", "reason": str(error)}
-            )
-            continue
-
-        rescue_fraction = float(np.sum(rescue)) / float(np.sum(selected))
-        rescue_patients = int(len(set(patients[rescue].tolist())))
-        retained_fraction = float(np.sum(selected)) / float(len(records))
-        balance = _sb1_patient_level_balance(
-            scaled,
-            labels,
-            patients,
-            selected,
-        )
-        guard = _sb1_guard_diagnostics(
-            balance,
-            rescue_fraction,
-            rescue_patients,
-            retained_fraction,
-        )
-        candidate_diagnostics.append(
-            {
-                "target": int(target),
-                "status": (
-                    "ACCEPTABLE"
-                    if guard["strict_guard_passed"]
-                    else "BALANCE_GUARD_FAILED"
-                ),
-                "rescue_fraction": rescue_fraction,
-                "rescue_patients": rescue_patients,
-                "retained_fraction_of_v72": retained_fraction,
-                "median_absolute_patient_smd": balance[
-                    "median_absolute_patient_smd"
-                ],
-                "q90_absolute_patient_smd": balance[
-                    "q90_absolute_patient_smd"
-                ],
-                "maximum_absolute_patient_smd": balance[
-                    "maximum_absolute_patient_smd"
-                ],
-                "maximum_absolute_patient_smd_descriptor_index": balance[
-                    "maximum_absolute_patient_smd_descriptor_index"
-                ],
-                "informative_descriptor_dimensions": balance[
-                    "informative_descriptor_dimensions"
-                ],
-                "violated_guards": guard["violated_guards"],
-                "normalized_guard_violation_score": guard[
-                    "normalized_guard_violation_score"
-                ],
-            }
-        )
-
-        candidate = {
-            "policy": "configured_fallback",
-            "selected": selected.copy(),
-            "rescue": rescue.copy(),
-            "balance": balance,
-            "target": int(target),
-            "guard": guard,
-            "retained_fraction": retained_fraction,
-        }
-        if (
-            best_feasible_candidate is None
-            or (
-                guard["normalized_guard_violation_score"],
-                len(guard["violated_guards"]),
-                -int(target),
-            )
-            < (
-                best_feasible_candidate["guard"][
-                    "normalized_guard_violation_score"
-                ],
-                len(best_feasible_candidate["guard"]["violated_guards"]),
-                -int(best_feasible_candidate["target"]),
-            )
-        ):
-            best_feasible_candidate = candidate
-
-        if guard["strict_guard_passed"]:
-            chosen = selected
-            chosen_rescue = rescue
-            chosen_balance = balance
-            chosen_target = target
-            chosen_guard = guard
-            selection_status = "OK_STRICT_GUARDS_PASSED"
-            selection_policy = "configured_fallback"
-            break
-
-    # If the original strict/fallback pool cannot supply any target in the safe
-    # retention range, construct one exact-count emergency candidate from the
-    # already V7.2-harmonized series. It remains fully audited and is never
-    # labelled a strict pass.
-    if best_feasible_candidate is None:
-        total_counts = np.asarray(
-            [
-                int(np.sum(patients == patient_id))
-                for patient_id in sorted(set(patients.tolist()))
-            ],
-            dtype=np.int64,
-        )
-        emergency_maximum = min(
-            STRICT_SERIES_MAX_PER_PATIENT,
-            maximum_target_from_retention,
-            int(np.min(total_counts)),
-        )
-        emergency_target = min(
-            emergency_maximum,
-            max(search_minimum, proposed_target),
-        )
-        if emergency_target < 1:
-            raise RuntimeError(
-                "No Directory_* patient has a series available for strict "
-                "balance fallback."
-            )
-        all_series_mask = np.ones(len(records), dtype=bool)
-        selected, rescue = _sb1_select_exact_count_per_patient(
-            records,
-            strict_mask,
-            all_series_mask,
-            ranking_score,
-            emergency_target,
-        )
-        rescue_fraction = float(np.sum(rescue)) / float(np.sum(selected))
-        rescue_patients = int(len(set(patients[rescue].tolist())))
-        retained_fraction = float(np.sum(selected)) / float(len(records))
-        balance = _sb1_patient_level_balance(
-            scaled,
-            labels,
-            patients,
-            selected,
-        )
-        guard = _sb1_guard_diagnostics(
-            balance,
-            rescue_fraction,
-            rescue_patients,
-            retained_fraction,
-        )
-        best_feasible_candidate = {
-            "policy": "all_v72_series_emergency",
-            "selected": selected,
-            "rescue": rescue,
-            "balance": balance,
-            "target": int(emergency_target),
-            "guard": guard,
-            "retained_fraction": retained_fraction,
-        }
-        candidate_diagnostics.append(
-            {
-                "target": int(emergency_target),
-                "status": "EMERGENCY_ALL_V72_SERIES_CANDIDATE",
-                "rescue_fraction": rescue_fraction,
-                "rescue_patients": rescue_patients,
-                "retained_fraction_of_v72": retained_fraction,
-                "median_absolute_patient_smd": balance[
-                    "median_absolute_patient_smd"
-                ],
-                "q90_absolute_patient_smd": balance[
-                    "q90_absolute_patient_smd"
-                ],
-                "maximum_absolute_patient_smd": balance[
-                    "maximum_absolute_patient_smd"
-                ],
-                "violated_guards": guard["violated_guards"],
-                "normalized_guard_violation_score": guard[
-                    "normalized_guard_violation_score"
-                ],
-            }
-        )
-
-    if chosen is None:
-        diagnostic_path = output_dir / (
-            "strict_series_balance_failed_targets.json"
-        )
-        diagnostic_path.write_text(
-            json.dumps(candidate_diagnostics, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
-        if not STRICT_SERIES_ALLOW_BEST_ATTAINABLE_FALLBACK:
-            raise RuntimeError(
-                "No exact per-patient target satisfied every strict guard and "
-                "best-attainable fallback is disabled. See "
-                + str(diagnostic_path)
-            )
-
-        chosen = best_feasible_candidate["selected"]
-        chosen_rescue = best_feasible_candidate["rescue"]
-        chosen_balance = best_feasible_candidate["balance"]
-        chosen_target = best_feasible_candidate["target"]
-        chosen_guard = best_feasible_candidate["guard"]
-        selection_status = "OK_BEST_ATTAINABLE_BALANCE"
-        selection_policy = best_feasible_candidate["policy"]
-        print(
-            "[STRICT SERIES BALANCE][BEST-ATTAINABLE WARNING] No exact "
-            "per-patient target passed every predeclared guard. Continuing "
-            "with the feasible target having the smallest normalized guard "
-            "violation. Do not describe this run as strictly balanced.",
-            flush=True,
-        )
-        print(
-            "[STRICT SERIES BALANCE][BEST-ATTAINABLE WARNING] "
-            f"policy={selection_policy}, target={chosen_target}, violated_guards="
-            f"{chosen_guard['violated_guards']}, normalized_violation_score="
-            f"{chosen_guard['normalized_guard_violation_score']:.4f}.",
-            flush=True,
-        )
-
-    (output_dir / "strict_series_balance_target_diagnostics.json").write_text(
-        json.dumps(candidate_diagnostics, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
-
-    retained_series = set(series_ids[chosen].tolist())
-    filtered_samples = [
-        row for row in samples if str(row[3]) in retained_series
-    ]
-    retained_fraction = float(np.sum(chosen)) / float(len(records))
-    retention_guard_passed = bool(
-        STRICT_SERIES_MIN_RETAINED_FRACTION_OF_V72
-        <= retained_fraction
-        <= STRICT_SERIES_MAX_RETAINED_FRACTION_OF_V72
-    )
-    if not retention_guard_passed and selection_status == (
-        "OK_STRICT_GUARDS_PASSED"
-    ):
-        raise RuntimeError(
-            "Internal error: a strict target violated the retained-fraction "
-            f"guard ({retained_fraction:.3f})."
-        )
-    if not retention_guard_passed:
-        print(
-            "[STRICT SERIES BALANCE][BEST-ATTAINABLE WARNING] Retained "
-            "fraction lies outside the strict configured interval: "
-            f"{retained_fraction:.3f}.",
-            flush=True,
-        )
-
-    original_patient_set = set(patients.tolist())
-    filtered_patient_set = {str(row[2]) for row in filtered_samples}
-    if filtered_patient_set != original_patient_set:
-        missing = sorted(original_patient_set - filtered_patient_set)
-        raise RuntimeError(
-            f"Strict series balancing removed complete patients: {missing}."
-        )
-
-    per_patient_rows = []
-    for patient_id in sorted(original_patient_set):
-        patient_indices = np.flatnonzero(patients == patient_id)
-        selected_indices = patient_indices[chosen[patient_indices]]
-        label_values = np.unique(labels[patient_indices])
-        per_patient_rows.append(
-            {
-                "patient_id": patient_id,
-                "label": int(label_values[0]),
-                "series_before_strict_refinement": int(len(patient_indices)),
-                "strict_eligible_series": int(
-                    np.sum(strict_mask[patient_indices])
-                ),
-                "series_retained": int(len(selected_indices)),
-                "rescue_series_retained": int(
-                    np.sum(chosen_rescue[selected_indices])
-                ),
-                "images_retained": int(np.sum(lengths[selected_indices])),
-            }
-        )
-
-    manifest_rows = []
-    for index, record in enumerate(records):
-        manifest_rows.append(
-            {
-                "series_id": record["series_id"],
-                "patient_id": record["patient_id"],
-                "label": int(record["label"]),
-                "n_images": int(record["n_images"]),
-                "primary_cluster": int(primary_assignments[index]),
-                "shared_inlier_votes": int(shared_votes[index]),
-                "opposite_class_neighbour_distance": float(
-                    opposite_distance[index]
-                ),
-                "strict_eligible": bool(strict_mask[index]),
-                "fallback_eligible": bool(fallback_mask[index]),
-                "ranking_score": float(ranking_score[index]),
-                "retained": bool(chosen[index]),
-                "balance_rescue": bool(chosen_rescue[index]),
-                "decision_reason": (
-                    "strict_shared_opposite_class_overlap"
-                    if chosen[index] and not chosen_rescue[index]
-                    else "limited_balance_rescue"
-                    if chosen[index]
-                    else "removed_atypical_or_redundant"
-                ),
-            }
-        )
-
-    selection_digest = hashlib.sha256()
-    for series_id in sorted(retained_series):
-        selection_digest.update((series_id + "\n").encode("utf-8"))
-
-    absolute_smd = chosen_balance.pop("absolute_patient_smd")
-    strict_guard_passed = bool(
-        selection_status == "OK_STRICT_GUARDS_PASSED"
-        and chosen_guard["strict_guard_passed"]
-    )
-    summary = {
-        "status": selection_status,
-        "version": STRICT_SERIES_BALANCE_VERSION,
-        "strict_guard_passed": strict_guard_passed,
-        "selection_policy": selection_policy,
-        "selection_guard_checks": chosen_guard["checks"],
-        "violated_guards": list(chosen_guard["violated_guards"]),
-        "normalized_guard_violation_score": float(
-            chosen_guard["normalized_guard_violation_score"]
-        ),
-        "statistical_scope": (
-            "Global label-informed cross-class common-support sensitivity "
-            "analysis; not external validation and not fold-local. "
-            + (
-                "Every strict guard passed."
-                if strict_guard_passed
-                else "The best-attainable fallback was used; strict balance "
-                "was not achieved and must not be claimed."
-            )
-        ),
-        "series_before_strict_refinement": int(len(records)),
-        "series_after_strict_refinement": int(np.sum(chosen)),
-        "series_removed_by_strict_refinement": int(
-            len(records) - np.sum(chosen)
-        ),
-        "series_retained_fraction_of_v72": retained_fraction,
-        "images_before_strict_refinement": int(len(samples)),
-        "images_after_strict_refinement": int(len(filtered_samples)),
-        "images_removed_by_strict_refinement": int(
-            len(samples) - len(filtered_samples)
-        ),
-        "patients_retained": int(len(filtered_patient_set)),
-        "normal_patients_retained": int(
-            len(set(patients[(labels == 0) & chosen].tolist()))
-        ),
-        "sick_patients_retained": int(
-            len(set(patients[(labels == 1) & chosen].tolist()))
-        ),
-        "exact_series_target_per_patient": int(chosen_target),
-        "normal_series_per_patient": int(chosen_target),
-        "sick_series_per_patient": int(chosen_target),
-        "rescue_series": int(np.sum(chosen_rescue)),
-        "rescue_fraction": float(np.sum(chosen_rescue) / np.sum(chosen)),
-        "rescue_patients": int(
-            len(set(patients[chosen_rescue].tolist()))
-        ),
-        "requested_cluster_counts": list(STRICT_SERIES_CLUSTER_COUNTS),
-        "effective_cluster_counts": effective_cluster_counts,
-        "required_shared_votes": int(STRICT_SERIES_REQUIRED_SHARED_VOTES),
-        "opposite_class_distance_limits_by_label": class_distance_limits,
-        "common_opposite_class_distance_limit": float(
-            common_opposite_distance_limit
-        ),
-        "patient_level_descriptor_balance": chosen_balance,
-        "selection_signature_sha256": selection_digest.hexdigest(),
-        "candidate_target_diagnostics": candidate_diagnostics,
-        "minimum_target_from_retention_guard": int(
-            minimum_target_from_retention
-        ),
-        "maximum_target_from_retention_guard": int(
-            maximum_target_from_retention
-        ),
-        "configured_fallback_minimum_series_for_any_patient": int(
-            np.min(fallback_counts)
-        ),
-        "essential_experiment_ids": list(
-            STRICT_BALANCED_ESSENTIAL_EXPERIMENT_IDS
-        ),
-    }
-
-    config = {
-        name: value
-        for name, value in globals().items()
-        if name.startswith("STRICT_SERIES_")
-        and isinstance(value, (str, int, float, bool, tuple))
-    }
-    config["statistical_warning"] = summary["statistical_scope"]
-    config["selection_status"] = selection_status
-    config["selection_policy"] = selection_policy
-    config["strict_guard_passed"] = strict_guard_passed
-    (output_dir / "strict_series_balance_configuration.json").write_text(
-        json.dumps(config, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
-    (output_dir / "strict_series_balance_summary.json").write_text(
-        json.dumps(summary, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
-
-    def _write_csv(path, rows):
-        if not rows:
-            Path(path).write_text("\n", encoding="utf-8")
-            return
-        with open(path, "w", newline="", encoding="utf-8") as file:
-            writer = csv.DictWriter(file, fieldnames=list(rows[0]))
-            writer.writeheader()
-            writer.writerows(rows)
-
-    _write_csv(output_dir / "strict_series_balance_manifest.csv", manifest_rows)
-    _write_csv(
-        output_dir / "strict_series_balance_cluster_support.csv",
-        cluster_manifest_rows,
-    )
-    _write_csv(
-        output_dir / "strict_series_balance_patient_counts.csv",
-        per_patient_rows,
-    )
-    smd_rows = [
-        {
-            "descriptor_index": int(index),
-            "absolute_patient_level_smd": float(value),
-        }
-        for index, value in enumerate(absolute_smd)
-    ]
-    _write_csv(
-        output_dir / "strict_series_balance_patient_descriptor_smd.csv",
-        smd_rows,
-    )
-
-    print("[STRICT SERIES BALANCE] Selection summary", flush=True)
-    print(
-        f"  Status: {selection_status}; policy={selection_policy}; "
-        f"strict_guard_passed={strict_guard_passed}",
-        flush=True,
-    )
-    print(
-        f"  Series: {len(records)} -> {int(np.sum(chosen))} "
-        f"(removed {len(records) - int(np.sum(chosen))})",
-        flush=True,
-    )
-    print(
-        f"  Images: {len(samples)} -> {len(filtered_samples)} "
-        f"({100.0 * len(filtered_samples) / len(samples):.1f}% of V7.2 rows retained)",
-        flush=True,
-    )
-    print(
-        f"  Patients: {len(filtered_patient_set)}; exact series/patient="
-        f"{chosen_target}; rescue series={int(np.sum(chosen_rescue))}",
-        flush=True,
-    )
-    print(
-        "  Patient-level descriptor SMD: median="
-        f"{chosen_balance['median_absolute_patient_smd']:.3f}, q90="
-        f"{chosen_balance['q90_absolute_patient_smd']:.3f}, max="
-        f"{chosen_balance['maximum_absolute_patient_smd']:.3f}",
-        flush=True,
-    )
-    print(
-        "[STRICT SERIES BALANCE][STATISTICAL WARNING] The retained set was "
-        "selected using both class folders globally. Treat this as a common-"
-        "support sensitivity analysis, not external or fold-local validation. "
-        "When strict_guard_passed=False, report it specifically as the best "
-        "attainable exact-count selection rather than strict balance.",
-        flush=True,
-    )
-    return filtered_samples, summary
-
-
 def main():
     """Run every enabled experiment and compare the patient-level results."""
 
@@ -18206,7 +17143,7 @@ def main():
     experiments = get_enabled_experiments()
 
     print("\n" + "#" * 100, flush=True)
-    print("CAD CARDIAC MRI — FOCUSED STRICT-BALANCED SERIES-HARMONIZED RESEARCH SUITE V7.2-SB1.1", flush=True)
+    print("CAD CARDIAC MRI — FOCUSED SERIES-HARMONIZED EXPANDED-HEART RESEARCH SUITE V7.3", flush=True)
     print("#" * 100, flush=True)
     print(f"[SUITE] Dataset: {DATASET_PATH}", flush=True)
     print(f"[SUITE] Output: {OUTPUT_DIR}", flush=True)
@@ -18225,6 +17162,14 @@ def main():
         f"[SUITE] Focused profile: {FOCUSED_SUITE_PROFILE}; "
         f"image feature modes="
         f"{len(required_efficientnet_feature_modes(experiments))}.",
+        flush=True,
+    )
+    print(
+        "[SUITE] Heart support policy: gate-valid MONAI masks receive an "
+        f"additional {FOCUSED_HARD_SUPPORT_EXTRA_DILATION_KERNEL}x"
+        f"{FOCUSED_HARD_SUPPORT_EXTRA_DILATION_KERNEL} expansion; gate-invalid "
+        "masks are ignored and replaced by a fixed geometric-center square "
+        f"covering {FOCUSED_INVALID_MONAI_CENTER_FRACTION:.0%} of the image side.",
         flush=True,
     )
     print(
@@ -18317,16 +17262,6 @@ def main():
     samples, series_harmonization_summary = (
         harmonize_cross_class_series(
             all_discovered_samples,
-            OUTPUT_DIR / "audits",
-        )
-    )
-
-    # V7.2-SB1 keeps V7.2's original shared-family filter, then applies
-    # a stricter opposite-class-overlap and exact per-patient count rule.
-    # No downstream image/model/CV implementation is changed.
-    samples, strict_series_balance_summary = (
-        apply_strict_balanced_series_refinement(
-            samples,
             OUTPUT_DIR / "audits",
         )
     )
@@ -19289,7 +18224,7 @@ if __name__ == "__main__":
 # 1. A cardiac-MRI-pretrained encoder comparison requires a public checkpoint
 #    whose exact 2D/temporal input contract can be reconstructed from these
 #    released files. Repeating one JPEG as a fake cine clip is not valid.
-# 2. Automatic sequence/view inference remains prohibited. V7.1 can run an
+# 2. Automatic sequence/view inference remains prohibited. V7.3 can run an
 #    optional balanced subset analysis only after a reviewer completes the blinded CSV;
 #    SR_* and series* names alone are never treated as validated sequence labels.
 # 3. True external validation requires an independent cohort adapter with a
