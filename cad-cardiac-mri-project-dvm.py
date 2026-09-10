@@ -1,5 +1,5 @@
 #%% ============================================================
-# 🧠 CAD Detection from Cardiac MRI – Focused Research Validation Pipeline V7.1 (Single File)
+# 🧠 CAD Detection from Cardiac MRI – Focused Research Validation Pipeline V7.2 strict_balanced_fixed (Single File)
 # ============================================================
 
 # ============================================================================
