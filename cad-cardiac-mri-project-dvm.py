@@ -3,6 +3,19 @@
 # ============================================================
 
 # ============================================================================
+# V7.2 FAST-VALIDATION RUNTIME NOTE
+# ============================================================================
+#
+# The default CAD_VALIDATION_PROFILE is ``fast``:
+#   - 10 repeated nested-CV seeds on a focused 10-experiment MONAI panel;
+#   - 200 ordinary label permutations;
+#   - 100 selection-adjusted candidate-family permutations;
+#   - 10 repeated-CV seeds and 200 permutations for Attention U-Net.
+# Use CAD_VALIDATION_PROFILE=full before executing the script to restore the
+# original 50-repeat / 1000-permutation final-analysis workload.
+
+
+# ============================================================================
 # V7 EXTENSION NOTE
 # ============================================================================
 #
@@ -82,7 +95,7 @@
 #  23. Repeated nested patient-level CV for the locked candidate, direct
 #      localization comparators, pooling/deduplication variants and major
 #      shortcut controls rather than only one favorable split
-#  24. A 1,000-replicate patient-label permutation test for the prospectively
+#  24. A profile-controlled patient-label permutation test for the prospectively
 #      locked V6 A17 candidate, repeating its complete nested fitting path
 #  25. Same-seed paired repeated-CV deltas for A12, A17, A20 and the exact-
 #      support candidate/control panel rather than only one favorable split
@@ -150,11 +163,10 @@
 #     padding, MONAI-independent fixed-center, strict-ROI and outside-box controls;
 #   - decomposes broad provenance into separate count, folder-length, geometry
 #     and file-size controls;
-#   - repeats the locked candidate, direct comparators and shortcut controls
-#     across 50 deterministic outer splits and calculates same-seed paired
-#     delta-AUC distributions;
-#   - repeats the complete A12 patient-level fitting path after 1,000
-#     patient-label permutations to obtain an empirical null AUC distribution;
+#   - repeats a profile-selected candidate/control panel across deterministic
+#     outer splits and calculates same-seed paired delta-AUC distributions;
+#   - repeats the configured patient-level fitting path after a profile-controlled
+#     number of label permutations to obtain an empirical null AUC distribution;
 #   - tests whether A12 depends on folder-proxy pooling, repeated exact exports,
 #     or MONAI mask/box morphology without MRI intensities;
 #   - writes blinded pHash review panels and a blinded series/view annotation
@@ -553,13 +565,12 @@
 # manifest. Classifier C and the decision threshold are selected only from each
 # outer-training cohort through inner patient-level OOF predictions. Linear-SVM
 # margins are calibrated by a sigmoid fitted only to inner OOF training scores.
-# A12, A17, A20, the exact-support V6 controls, prior localization candidates,
-# and principal shortcut/mask-only controls are rerun across 50 identical outer-
-# split seeds. Same-seed delta-AUC distributions are saved. A17 receives a direct
-# 1,000-replicate patient-label permutation test. A separate 1,000-replicate
-# maximum-AUROC test repeats the nested fitting path for A12/A16/A17/A18/A19 and
-# corrects the association sanity test for candidate-family selection. No
-# favorable split or permutation is selected.
+# The active validation profile determines both the repeated-CV panel and the
+# replicate counts. The default fast profile reruns a focused A12/A17/A20 and
+# exact-support/control panel over 10 identical outer-split seeds, uses 200 direct
+# label permutations, and uses 100 candidate-family maximum-AUROC permutations.
+# The full profile restores the original 50/1000/1000 workload. No favorable
+# split or permutation is selected.
 #
 # A single script launch does NOT mean one classifier represents every ablation.
 # It means the expensive operations are shared correctly:
@@ -655,8 +666,9 @@ import sys
 import traceback
 # Saves visible stack traces when one experiment fails while the suite continues.
 
-from collections import defaultdict
-# Efficient grouping for duplicate candidates and patient/series aggregation.
+from collections import OrderedDict, defaultdict
+# ``defaultdict`` supports duplicate/patient/series aggregation. ``OrderedDict``
+# implements the bounded in-process LRU for standardized Attention inputs.
 
 from dataclasses import asdict, dataclass, replace
 # Immutable experiment configurations and reproducible JSON serialization.
@@ -2428,10 +2440,106 @@ C_SELECTION_AUC_TOLERANCE = 0.01
 # absolute tolerance of the best candidate. This prevents tiny inner-CV
 # differences from repeatedly choosing the least regularized edge of the grid.
 
-RUN_REPEATED_NESTED_CV_STABILITY = True
-REPEATED_NESTED_CV_REPEATS = 50
+# ---------------------------------------------------------------------------
+# VALIDATION RUNTIME PROFILE
+# ---------------------------------------------------------------------------
+# ``fast`` is the default for iterative Kaggle development. It preserves the
+# main stability and permutation checks but reduces their repeated fitting cost.
+# ``full`` restores the original publication-oriented 50/1000/1000 workload.
+# ``smoke`` is intended only for code/debug checks and is not adequate for final
+# scientific reporting.
+#
+# Set the profile BEFORE executing this cell/script, for example:
+#
+#   os.environ["CAD_VALIDATION_PROFILE"] = "fast"   # default
+#   os.environ["CAD_VALIDATION_PROFILE"] = "full"   # final analysis
+#   os.environ["CAD_VALIDATION_PROFILE"] = "smoke"  # debugging only
+#
+# Exact counts can be overridden independently with:
+#   CAD_STABILITY_REPEATS
+#   CAD_PERMUTATION_REPLICATES
+#   CAD_SELECTION_ADJUSTED_PERMUTATIONS
+#   CAD_STABILITY_PANEL = focused | full
+#
+# The reduced profile changes only repeated patient-level fitting. It does not
+# change image preprocessing, MONAI/Attention masks, EfficientNet embeddings,
+# primary 5-fold nested-CV experiments, patient grouping, or cached features.
+VALIDATION_RUNTIME_PROFILE = os.environ.get(
+    "CAD_VALIDATION_PROFILE", "fast"
+).strip().lower()
+VALIDATION_RUNTIME_PROFILES = {
+    "smoke": {
+        "stability_repeats": 3,
+        "permutation_replicates": 25,
+        "selection_adjusted_permutations": 25,
+        "stability_panel": "focused",
+    },
+    "fast": {
+        "stability_repeats": 10,
+        "permutation_replicates": 200,
+        "selection_adjusted_permutations": 100,
+        "stability_panel": "focused",
+    },
+    "full": {
+        "stability_repeats": 50,
+        "permutation_replicates": 1000,
+        "selection_adjusted_permutations": 1000,
+        "stability_panel": "full",
+    },
+}
+if VALIDATION_RUNTIME_PROFILE not in VALIDATION_RUNTIME_PROFILES:
+    raise ValueError(
+        "CAD_VALIDATION_PROFILE must be one of: smoke, fast, full. "
+        f"Received {VALIDATION_RUNTIME_PROFILE!r}."
+    )
+_VALIDATION_PROFILE_DEFAULTS = VALIDATION_RUNTIME_PROFILES[
+    VALIDATION_RUNTIME_PROFILE
+]
+
+
+def _validation_env_positive_int(name, default):
+    """Read one strictly positive integer used by repeated analyses."""
+
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        value = int(default)
+    else:
+        try:
+            value = int(str(raw).strip())
+        except ValueError as error:
+            raise ValueError(f"{name} must be an integer, received {raw!r}.") from error
+    if value < 1:
+        raise ValueError(f"{name} must be at least 1, received {value}.")
+    return value
+
+
+def _validation_env_bool(name, default):
+    """Read a conventional Boolean environment flag."""
+
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    token = str(raw).strip().lower()
+    if token in {"1", "true", "yes", "y", "on"}:
+        return True
+    if token in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError(
+        f"{name} must be a Boolean token (0/1, true/false), received {raw!r}."
+    )
+
+
+RUN_REPEATED_NESTED_CV_STABILITY = _validation_env_bool(
+    "CAD_RUN_STABILITY", True
+)
+REPEATED_NESTED_CV_REPEATS = _validation_env_positive_int(
+    "CAD_STABILITY_REPEATS",
+    _VALIDATION_PROFILE_DEFAULTS["stability_repeats"],
+)
 REPEATED_NESTED_CV_RANDOM_STATE = RANDOM_SEED + 20_000
-STABILITY_EXPERIMENT_IDS = (
+
+# The complete panel is retained verbatim for the ``full`` profile.
+FULL_STABILITY_EXPERIMENT_IDS = (
     DEVELOPMENT_BASELINE_EXPERIMENT_ID,
     "A9_STANDARDIZED_FULL_HIER_LR_PCA",
     "A10_STANDARDIZED_ROI_ZERO_BG_HIER_LR_PCA",
@@ -2462,6 +2570,38 @@ STABILITY_EXPERIMENT_IDS = (
     V6_EXACT_SUPPORT_MASK_CONTROL_EXPERIMENT_ID,
     V6_SUPPORT_SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID,
     V6_EXACT_SUPPORT_COMPLEMENT_CONTROL_EXPERIMENT_ID,
+)
+
+# The default fast panel concentrates repeated split-sensitivity analysis on the
+# main historical/current candidates and the controls needed to interpret A17.
+# All other enabled experiments still receive their ordinary nested 5-fold OOF
+# evaluation in stage 8; only their additional repeated-CV reruns are omitted.
+FOCUSED_STABILITY_EXPERIMENT_IDS = (
+    DEVELOPMENT_BASELINE_EXPERIMENT_ID,
+    PRIMARY_CANDIDATE_EXPERIMENT_ID,
+    V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID,
+    V6_VALID_ONLY_ABLATION_EXPERIMENT_ID,
+    V6_EXACT_SUPPORT_MASK_CONTROL_EXPERIMENT_ID,
+    V6_SUPPORT_SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID,
+    V6_EXACT_SUPPORT_COMPLEMENT_CONTROL_EXPERIMENT_ID,
+    "C28_OUTSIDE_WHOLE_HEART_REGION_NORM_HIER_LR_PCA",
+    "C29_FIXED_PERIPHERY_REGION_NORM_HIER_LR_PCA",
+    V5_MATCHED_OUTSIDE_CONTROL_EXPERIMENT_ID,
+)
+
+STABILITY_PANEL = os.environ.get(
+    "CAD_STABILITY_PANEL",
+    _VALIDATION_PROFILE_DEFAULTS["stability_panel"],
+).strip().lower()
+if STABILITY_PANEL not in {"focused", "full"}:
+    raise ValueError(
+        "CAD_STABILITY_PANEL must be 'focused' or 'full', received "
+        f"{STABILITY_PANEL!r}."
+    )
+STABILITY_EXPERIMENT_IDS = (
+    FULL_STABILITY_EXPERIMENT_IDS
+    if STABILITY_PANEL == "full"
+    else FOCUSED_STABILITY_EXPERIMENT_IDS
 )
 
 # All comparisons below use the exact same outer split seeds. The first model
@@ -2670,8 +2810,26 @@ REPEATED_STABILITY_COMPARISONS = (
     ),
 )
 
-RUN_PATIENT_LABEL_PERMUTATION_TEST = True
-LABEL_PERMUTATION_REPLICATES = 1000
+# Preserve the complete paired-comparison registry for full reporting. Under
+# the focused stability panel, keep only comparisons whose two experiments are
+# actually rerun. The ordinary stage-8 paired comparisons remain unchanged.
+FULL_REPEATED_STABILITY_COMPARISONS = REPEATED_STABILITY_COMPARISONS
+if STABILITY_PANEL == "focused":
+    _focused_stability_ids = set(STABILITY_EXPERIMENT_IDS)
+    REPEATED_STABILITY_COMPARISONS = tuple(
+        row
+        for row in FULL_REPEATED_STABILITY_COMPARISONS
+        if row[1] in _focused_stability_ids
+        and row[2] in _focused_stability_ids
+    )
+
+RUN_PATIENT_LABEL_PERMUTATION_TEST = _validation_env_bool(
+    "CAD_RUN_PERMUTATION", True
+)
+LABEL_PERMUTATION_REPLICATES = _validation_env_positive_int(
+    "CAD_PERMUTATION_REPLICATES",
+    _VALIDATION_PROFILE_DEFAULTS["permutation_replicates"],
+)
 LABEL_PERMUTATION_RANDOM_STATE = RANDOM_SEED + 40_000
 PERMUTATION_EXPERIMENT_IDS = (
     V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID,
@@ -2693,8 +2851,17 @@ V6_CANDIDATE_FAMILY_SELECTION_AUC_TOLERANCE = 0.01
 # the untouched outer fold. A17 is listed first as the prospectively preferred
 # simple candidate, so near-ties do not silently favor a more complex branch.
 
-RUN_SELECTION_ADJUSTED_PERMUTATION_TEST = True
-SELECTION_ADJUSTED_PERMUTATION_REPLICATES = 1000
+RUN_SELECTION_ADJUSTED_PERMUTATION_TEST = _validation_env_bool(
+    "CAD_RUN_SELECTION_ADJUSTED_PERMUTATION", True
+)
+SELECTION_ADJUSTED_PERMUTATION_REPLICATES = (
+    _validation_env_positive_int(
+        "CAD_SELECTION_ADJUSTED_PERMUTATIONS",
+        _VALIDATION_PROFILE_DEFAULTS[
+            "selection_adjusted_permutations"
+        ],
+    )
+)
 SELECTION_ADJUSTED_PERMUTATION_RANDOM_STATE = RANDOM_SEED + 60_000
 SELECTION_ADJUSTED_CANDIDATE_EXPERIMENT_IDS = (
     PRIMARY_CANDIDATE_EXPERIMENT_ID,
@@ -3055,6 +3222,8 @@ _suite_identity = {
     "monai_gate_rate_difference_warning": (
         MONAI_GATE_RATE_DIFFERENCE_WARNING
     ),
+    "validation_runtime_profile": VALIDATION_RUNTIME_PROFILE,
+    "stability_panel": STABILITY_PANEL,
     "run_repeated_nested_cv_stability": RUN_REPEATED_NESTED_CV_STABILITY,
     "repeated_nested_cv_repeats": REPEATED_NESTED_CV_REPEATS,
     "repeated_nested_cv_random_state": REPEATED_NESTED_CV_RANDOM_STATE,
@@ -15589,6 +15758,8 @@ def collect_suite_metadata(
     metadata = {
         "suite_name": SUITE_NAME,
         "suite_configuration_tag": SUITE_CONFIGURATION_TAG,
+        "validation_runtime_profile": VALIDATION_RUNTIME_PROFILE,
+        "stability_panel": STABILITY_PANEL,
         "baseline_experiment_id": BASELINE_EXPERIMENT_ID,
         "primary_candidate_experiment_id": PRIMARY_CANDIDATE_EXPERIMENT_ID,
         "v5_candidate_experiment_id": V5_CANDIDATE_EXPERIMENT_ID,
@@ -15795,6 +15966,8 @@ def write_suite_configuration(output_path, experiments):
     configuration = {
         "suite_name": SUITE_NAME,
         "suite_configuration_tag": SUITE_CONFIGURATION_TAG,
+        "validation_runtime_profile": VALIDATION_RUNTIME_PROFILE,
+        "stability_panel": STABILITY_PANEL,
         "baseline_experiment_id": BASELINE_EXPERIMENT_ID,
         "primary_candidate_experiment_id": PRIMARY_CANDIDATE_EXPERIMENT_ID,
         "v5_candidate_experiment_id": V5_CANDIDATE_EXPERIMENT_ID,
@@ -16081,6 +16254,19 @@ def main():
     )
     print(
         "[SUITE] Patient definition is fixed: patient_id = Directory_*.",
+        flush=True,
+    )
+    print(
+        "[SUITE] Validation profile="
+        f"{VALIDATION_RUNTIME_PROFILE}; stability="
+        f"{RUN_REPEATED_NESTED_CV_STABILITY} × "
+        f"{REPEATED_NESTED_CV_REPEATS} repeats × "
+        f"{len(STABILITY_EXPERIMENT_IDS)} experiments "
+        f"(panel={STABILITY_PANEL}); ordinary permutation="
+        f"{RUN_PATIENT_LABEL_PERMUTATION_TEST} × "
+        f"{LABEL_PERMUTATION_REPLICATES}; selection-adjusted permutation="
+        f"{RUN_SELECTION_ADJUSTED_PERMUTATION_TEST} × "
+        f"{SELECTION_ADJUSTED_PERMUTATION_REPLICATES}.",
         flush=True,
     )
 
@@ -17140,13 +17326,16 @@ def run_with_console_logging():
 # These are recorded as scientific next steps rather than silently approximated.
 
 # ============================================================================
-# V7 ATTENTION U-NET EXTENSION
+# V7.2 ATTENTION U-NET EXTENSION — DISK-SAFE KAGGLE CACHE
 # ============================================================================
 #
 # This extension is intentionally appended after the complete V6 MONAI suite.
 # The original V6 functions, experiments, caches and output contracts above are
 # retained. Attention U-Net runs in a separate workspace and comparison folder,
 # so it cannot silently overwrite or reinterpret the MONAI reference results.
+# Standardized 256x256 training inputs are now cached in RAM by default on
+# Kaggle; optional disk copies are transient and never required. This prevents
+# a full V6 feature-bank directory from causing a fatal libpng write error.
 #
 # Available command-line actions:
 #
@@ -17279,11 +17468,89 @@ ATTENTION_TRAIN_WITH_AMP = _env_bool(
 ATTENTION_SAVE_ALL_PREDICTED_MASKS = _env_bool(
     "CAD_ATTENTION_SAVE_ALL_PREDICTED_MASKS", False
 )
+
+# ---------------------------------------------------------------------------
+# ATTENTION IMAGE-CACHE AND STORAGE POLICY
+# ---------------------------------------------------------------------------
+# The V6 multi-view feature bank can consume many gigabytes under
+# /kaggle/working. Caching another 4,715 standardized 256x256 PNG images in the
+# same persistent output filesystem can therefore exhaust Kaggle's write quota.
+# OpenCV then emits only the uninformative message ``libpng error: Write Error``
+# and ``cv2.imwrite`` returns False.
+#
+# V7.2 treats standardized training-image files as an OPTIONAL acceleration
+# cache, never as required scientific output. On Kaggle the default is:
+#
+#   - retain recently/all selected 256x256 uint8 images in an in-process LRU;
+#   - do not write those images under /kaggle/working;
+#   - if disk caching is explicitly enabled, place it under /kaggle/temp;
+#   - if an optional cache write fails, continue from the freshly preprocessed
+#     NumPy image instead of aborting pseudo-mask generation or training.
+#
+# Automatic/manual masks and checkpoints remain required outputs and continue
+# to be written atomically. Their write failures include free-space diagnostics.
+_ATTENTION_RUNNING_ON_KAGGLE = Path("/kaggle/working").exists()
+ATTENTION_CACHE_TRAINING_IMAGES = _env_bool(
+    "CAD_ATTENTION_CACHE_TRAINING_IMAGES",
+    not _ATTENTION_RUNNING_ON_KAGGLE,
+)
+ATTENTION_REMOVE_LEGACY_WORKING_IMAGE_CACHE = _env_bool(
+    "CAD_ATTENTION_REMOVE_LEGACY_WORKING_IMAGE_CACHE",
+    _ATTENTION_RUNNING_ON_KAGGLE,
+)
+ATTENTION_STORE_AUTOMATIC_MASKS_IN_TRANSIENT = _env_bool(
+    "CAD_ATTENTION_STORE_AUTOMATIC_MASKS_IN_TRANSIENT",
+    _ATTENTION_RUNNING_ON_KAGGLE,
+)
+ATTENTION_STORE_PREDICTED_MASKS_IN_TRANSIENT = _env_bool(
+    "CAD_ATTENTION_STORE_PREDICTED_MASKS_IN_TRANSIENT",
+    _ATTENTION_RUNNING_ON_KAGGLE,
+)
+ATTENTION_RAM_IMAGE_CACHE_MB = _env_int(
+    "CAD_ATTENTION_RAM_IMAGE_CACHE_MB",
+    384 if _ATTENTION_RUNNING_ON_KAGGLE else 256,
+    minimum=0,
+)
+ATTENTION_OPTIONAL_DISK_CACHE_MIN_FREE_MB = _env_int(
+    "CAD_ATTENTION_OPTIONAL_DISK_CACHE_MIN_FREE_MB",
+    512,
+    minimum=0,
+)
+ATTENTION_PERSISTENT_FREE_SPACE_WARNING_MB = _env_int(
+    "CAD_ATTENTION_PERSISTENT_FREE_SPACE_WARNING_MB",
+    512,
+    minimum=0,
+)
+ATTENTION_PNG_COMPRESSION = _env_int(
+    "CAD_ATTENTION_PNG_COMPRESSION",
+    9,
+    minimum=0,
+)
+if ATTENTION_PNG_COMPRESSION > 9:
+    raise ValueError("CAD_ATTENTION_PNG_COMPRESSION must be between 0 and 9.")
+ATTENTION_MANIFEST_CHECKPOINT_EVERY_BATCHES = _env_int(
+    "CAD_ATTENTION_MANIFEST_CHECKPOINT_EVERY_BATCHES",
+    10,
+    minimum=1,
+)
+
+ATTENTION_RUN_REPEATED_CV_STABILITY = _env_bool(
+    "CAD_ATTENTION_UNET_RUN_STABILITY",
+    RUN_REPEATED_NESTED_CV_STABILITY,
+)
+ATTENTION_RUN_PERMUTATION_TEST = _env_bool(
+    "CAD_ATTENTION_UNET_RUN_PERMUTATION",
+    RUN_PATIENT_LABEL_PERMUTATION_TEST,
+)
 ATTENTION_REPEATED_CV_REPEATS = _env_int(
-    "CAD_ATTENTION_UNET_REPEATED_CV_REPEATS", 50, minimum=1
+    "CAD_ATTENTION_UNET_REPEATED_CV_REPEATS",
+    REPEATED_NESTED_CV_REPEATS,
+    minimum=1,
 )
 ATTENTION_PERMUTATION_REPLICATES = _env_int(
-    "CAD_ATTENTION_UNET_PERMUTATIONS", 1000, minimum=1
+    "CAD_ATTENTION_UNET_PERMUTATIONS",
+    LABEL_PERMUTATION_REPLICATES,
+    minimum=1,
 )
 ATTENTION_RANDOM_SEED = _env_int(
     "CAD_ATTENTION_UNET_RANDOM_SEED", RANDOM_SEED + 70_000, minimum=0
@@ -17292,7 +17559,7 @@ ATTENTION_EXTERNAL_WEIGHTS = os.environ.get(
     "CAD_ATTENTION_UNET_WEIGHTS", ""
 ).strip()
 ATTENTION_FEATURE_CACHE_SCHEMA = (
-    "2026-09-11-attention-unet-crossfit-patient-v1"
+    "2026-09-11-attention-unet-crossfit-patient-disk-safe-v2"
 )
 ATTENTION_ACTION_CHOICES = (
     "both",
@@ -17323,6 +17590,7 @@ class AttentionWorkspace:
     """Filesystem contract for masks, checkpoints and comparison outputs."""
 
     root: Path
+    transient_root: Path
     automatic_masks: Path
     manual_masks: Path
     predicted_masks: Path
@@ -17336,7 +17604,14 @@ class AttentionWorkspace:
 
 
 def build_attention_workspace(root=None):
-    """Resolve and create the Attention U-Net workspace."""
+    """Resolve persistent and transient Attention U-Net storage.
+
+    Scientific outputs remain under ``root`` so they can be preserved by a
+    Kaggle notebook version. Regenerable standardized training-image cache files
+    live under ``transient_root``. Kaggle's ``/kaggle/temp`` is preferred for
+    these files because filling ``/kaggle/working`` can prevent every later
+    result, checkpoint and mask from being saved.
+    """
 
     if root is None:
         default_root = (
@@ -17349,13 +17624,89 @@ def build_attention_workspace(root=None):
         )
     else:
         root = Path(root)
+
+    if _ATTENTION_RUNNING_ON_KAGGLE:
+        default_transient_root = Path(
+            "/kaggle/temp/cad_attention_unet_transient"
+        )
+    else:
+        default_transient_root = root / "_transient"
+    transient_root = Path(
+        os.environ.get(
+            "CAD_ATTENTION_UNET_TRANSIENT_ROOT",
+            str(default_transient_root),
+        )
+    )
+
+    # A custom or unavailable /kaggle/temp path must not prevent the persistent
+    # workspace itself from being created. The fallback is still safe because
+    # optional disk image caching is disabled by default on Kaggle.
+    try:
+        transient_root.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        fallback = (
+            Path("/tmp/cad_attention_unet_transient")
+            if _ATTENTION_RUNNING_ON_KAGGLE
+            else root / "_transient"
+        )
+        print(
+            "[ATTENTION][STORAGE][WARNING] Could not create transient root "
+            f"{transient_root}: {type(error).__name__}: {error}. "
+            f"Falling back to {fallback}.",
+            flush=True,
+        )
+        transient_root = fallback
+        transient_root.mkdir(parents=True, exist_ok=True)
+
+    # Earlier V7 builds stored all 256x256 training inputs directly under the
+    # persistent workspace. Those files are fully regenerable and may include a
+    # truncated PNG left by the libpng write failure. Remove only that legacy
+    # image-cache directory; automatic/manual masks and checkpoints are never
+    # touched. Set CAD_ATTENTION_REMOVE_LEGACY_WORKING_IMAGE_CACHE=0 to retain it.
+    legacy_cached_images = root / "training_images_256"
+    new_cached_images = transient_root / "training_images_256"
+    if (
+        ATTENTION_REMOVE_LEGACY_WORKING_IMAGE_CACHE
+        and legacy_cached_images.exists()
+        and legacy_cached_images.resolve() != new_cached_images.resolve()
+    ):
+        try:
+            legacy_file_count = sum(
+                1 for path in legacy_cached_images.rglob("*") if path.is_file()
+            )
+            shutil.rmtree(legacy_cached_images)
+            print(
+                "[ATTENTION][CACHE] Removed legacy persistent standardized-"
+                f"image cache ({legacy_file_count} files): "
+                f"{legacy_cached_images}",
+                flush=True,
+            )
+        except OSError as error:
+            print(
+                "[ATTENTION][CACHE][WARNING] Could not remove legacy image "
+                f"cache {legacy_cached_images}: {type(error).__name__}: {error}",
+                flush=True,
+            )
+
+    automatic_masks = (
+        transient_root / "automatic_masks"
+        if ATTENTION_STORE_AUTOMATIC_MASKS_IN_TRANSIENT
+        else root / "automatic_masks"
+    )
+    predicted_masks = (
+        transient_root / "predicted_attention_masks"
+        if ATTENTION_STORE_PREDICTED_MASKS_IN_TRANSIENT
+        else root / "predicted_attention_masks"
+    )
+
     workspace = AttentionWorkspace(
         root=root,
-        automatic_masks=root / "automatic_masks",
+        transient_root=transient_root,
+        automatic_masks=automatic_masks,
         manual_masks=root / "manual_masks",
-        predicted_masks=root / "predicted_attention_masks",
+        predicted_masks=predicted_masks,
         mask_overlays=root / "mask_overlays",
-        cached_images=root / "training_images_256",
+        cached_images=new_cached_images,
         checkpoints=root / "checkpoints",
         manifest_csv=root / "attention_unet_mask_manifest.csv",
         training_summary_json=root / "attention_unet_training_summary.json",
@@ -17364,6 +17715,7 @@ def build_attention_workspace(root=None):
     )
     for directory in (
         workspace.root,
+        workspace.transient_root,
         workspace.automatic_masks,
         workspace.manual_masks,
         workspace.predicted_masks,
@@ -17541,14 +17893,31 @@ def write_attention_manifest(rows, path):
     """Write the stable mask manifest atomically."""
 
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    with open(temporary, "w", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=ATTENTION_MANIFEST_FIELDS)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({field: row.get(field, "") for field in ATTENTION_MANIFEST_FIELDS})
-    temporary.replace(path)
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+    )
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(temporary, "w", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(file, fieldnames=ATTENTION_MANIFEST_FIELDS)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(
+                    {
+                        field: row.get(field, "")
+                        for field in ATTENTION_MANIFEST_FIELDS
+                    }
+                )
+        os.replace(temporary, path)
+    except Exception as error:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise RuntimeError(
+            f"Could not write Attention mask manifest atomically: {path}. "
+            f"{type(error).__name__}: {error}. {_storage_description(path)}"
+        ) from error
 
 
 def read_attention_manifest(workspace):
@@ -17597,20 +17966,333 @@ def _load_attention_canvases(image_path):
     )
 
 
-def ensure_cached_attention_image(row):
-    """Cache the standardized 256x256 segmentation input as an 8-bit PNG."""
+# In-process cache for standardized 256x256 uint8 segmentation inputs. The full
+# 4,715-image training subset occupies roughly 295 MiB before dictionary
+# overhead, so the Kaggle default of 384 MiB can normally retain the complete
+# subset and avoid repeated preprocessing during cross-fitted training.
+_ATTENTION_IMAGE_RAM_CACHE = OrderedDict()
+_ATTENTION_IMAGE_RAM_CACHE_BYTES = 0
+_ATTENTION_OPTIONAL_DISK_CACHE_DISABLED_REASON = None
+_ATTENTION_STORAGE_WARNING_KEYS = set()
+
+
+def _format_storage_bytes(value):
+    """Return a compact binary-size string for storage diagnostics."""
+
+    value = float(value)
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    unit = units[0]
+    for candidate in units:
+        unit = candidate
+        if abs(value) < 1024.0 or candidate == units[-1]:
+            break
+        value /= 1024.0
+    return f"{value:.2f} {unit}"
+
+
+def _existing_parent(path):
+    """Return the nearest existing parent used for disk-usage inspection."""
+
+    path = Path(path)
+    candidate = path if path.is_dir() else path.parent
+    while not candidate.exists() and candidate != candidate.parent:
+        candidate = candidate.parent
+    return candidate
+
+
+def _storage_description(path):
+    """Describe total, used and free bytes for the filesystem containing path."""
+
+    path = Path(path)
+    try:
+        usage = shutil.disk_usage(_existing_parent(path))
+        return (
+            f"filesystem={_existing_parent(path)}, "
+            f"free={_format_storage_bytes(usage.free)}, "
+            f"used={_format_storage_bytes(usage.used)}, "
+            f"total={_format_storage_bytes(usage.total)}"
+        )
+    except OSError as error:
+        return f"storage query failed: {type(error).__name__}: {error}"
+
+
+def _attention_warn_once(key, message):
+    """Print one warning per process for repeated optional-cache failures."""
+
+    key = str(key)
+    if key in _ATTENTION_STORAGE_WARNING_KEYS:
+        return
+    _ATTENTION_STORAGE_WARNING_KEYS.add(key)
+    print(message, flush=True)
+
+
+def report_attention_storage(workspace):
+    """Print persistent/transient storage state before expensive mask work."""
+
+    print(
+        "[ATTENTION][STORAGE] Persistent workspace: "
+        f"{workspace.root} | {_storage_description(workspace.root)}",
+        flush=True,
+    )
+    print(
+        "[ATTENTION][STORAGE] Transient cache root: "
+        f"{workspace.transient_root} | "
+        f"{_storage_description(workspace.transient_root)}",
+        flush=True,
+    )
+    print(
+        "[ATTENTION][STORAGE] standardized-image disk cache="
+        f"{ATTENTION_CACHE_TRAINING_IMAGES}; RAM cache limit="
+        f"{ATTENTION_RAM_IMAGE_CACHE_MB} MiB.",
+        flush=True,
+    )
+    try:
+        persistent_free = shutil.disk_usage(
+            _existing_parent(workspace.root)
+        ).free
+        warning_threshold = (
+            int(ATTENTION_PERSISTENT_FREE_SPACE_WARNING_MB) * 1024 * 1024
+        )
+        if persistent_free < warning_threshold:
+            print(
+                "[ATTENTION][STORAGE][WARNING] Persistent free space is below "
+                f"{ATTENTION_PERSISTENT_FREE_SPACE_WARNING_MB} MiB. Automatic "
+                "masks and image cache are transient, but manual masks, five "
+                "checkpoints, logs and comparison outputs still require "
+                "/kaggle/working space. Remove obsolete feature-bank caches or "
+                "save them as a Kaggle Dataset before training.",
+                flush=True,
+            )
+    except OSError:
+        pass
+
+
+def _atomic_cv2_write(
+    path,
+    image,
+    *,
+    required,
+    purpose,
+    png_compression=ATTENTION_PNG_COMPRESSION,
+    optional_reserve_mb=0,
+):
+    """Encode with OpenCV, then write and atomically replace the final file.
+
+    ``cv2.imwrite`` hides useful operating-system errors and often reports only
+    ``libpng error: Write Error`` when a Kaggle quota is exhausted. Encoding in
+    memory and writing through Python exposes ENOSPC/EDQUOT/EACCES, permits a
+    same-directory temporary file, and avoids leaving a corrupt final PNG.
+
+    Required scientific artifacts raise a diagnostic RuntimeError. Optional
+    acceleration-cache writes return False so the caller can continue from the
+    already decoded NumPy image.
+    """
+
+    path = Path(path)
+    temporary = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        suffix = path.suffix.lower() or ".png"
+        parameters = []
+        if suffix == ".png":
+            parameters = [cv2.IMWRITE_PNG_COMPRESSION, int(png_compression)]
+        elif suffix in {".jpg", ".jpeg"}:
+            parameters = [cv2.IMWRITE_JPEG_QUALITY, 95]
+
+        encoded_ok, encoded = cv2.imencode(suffix, np.asarray(image), parameters)
+        if not encoded_ok or encoded is None:
+            raise RuntimeError(
+                f"OpenCV could not encode {purpose} as {suffix}: {path}"
+            )
+        payload = encoded.tobytes()
+
+        if not required and optional_reserve_mb > 0:
+            free = shutil.disk_usage(_existing_parent(path)).free
+            reserve = int(optional_reserve_mb) * 1024 * 1024
+            if free < len(payload) + reserve:
+                raise OSError(
+                    28,
+                    "optional cache skipped to preserve required-output space; "
+                    f"free={_format_storage_bytes(free)}, "
+                    f"reserve={_format_storage_bytes(reserve)}",
+                )
+
+        temporary = path.with_name(
+            f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+        )
+        with open(temporary, "wb") as file:
+            written = file.write(payload)
+            if written != len(payload):
+                raise OSError(
+                    28,
+                    f"short write: wrote {written}/{len(payload)} bytes",
+                )
+        os.replace(temporary, path)
+        if not path.is_file() or path.stat().st_size <= 0:
+            raise RuntimeError(f"Atomic write produced an empty file: {path}")
+        return True
+
+    except Exception as error:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+        details = (
+            f"Could not save {purpose}: {path}. "
+            f"{type(error).__name__}: {error}. "
+            f"{_storage_description(path)}"
+        )
+        if required:
+            raise RuntimeError(
+                details
+                + " Free space in /kaggle/working or set "
+                + "CAD_ATTENTION_UNET_WORK_ROOT to a writable location."
+            ) from error
+        _attention_warn_once(
+            "optional-image-cache-write-disabled",
+            "[ATTENTION][CACHE][WARNING] "
+            + details
+            + " Optional standardized-image disk caching has been disabled for "
+            + "the rest of this process; preprocessing will continue from RAM/"
+            + "source JPEGs.",
+        )
+        return False
+
+
+def _attention_ram_cache_get(key):
+    """Return and refresh one LRU entry, or None when absent/disabled."""
+
+    if ATTENTION_RAM_IMAGE_CACHE_MB <= 0:
+        return None
+    key = str(key)
+    image = _ATTENTION_IMAGE_RAM_CACHE.pop(key, None)
+    if image is None:
+        return None
+    _ATTENTION_IMAGE_RAM_CACHE[key] = image
+    return image
+
+
+def _attention_ram_cache_put(key, image):
+    """Insert one uint8 image and evict oldest entries above the byte limit."""
+
+    global _ATTENTION_IMAGE_RAM_CACHE_BYTES
+    limit = int(ATTENTION_RAM_IMAGE_CACHE_MB) * 1024 * 1024
+    if limit <= 0:
+        return
+    key = str(key)
+    image = np.ascontiguousarray(image, dtype=np.uint8)
+    if image.nbytes > limit:
+        return
+    previous = _ATTENTION_IMAGE_RAM_CACHE.pop(key, None)
+    if previous is not None:
+        _ATTENTION_IMAGE_RAM_CACHE_BYTES -= int(previous.nbytes)
+    image.setflags(write=False)
+    _ATTENTION_IMAGE_RAM_CACHE[key] = image
+    _ATTENTION_IMAGE_RAM_CACHE_BYTES += int(image.nbytes)
+    while (
+        _ATTENTION_IMAGE_RAM_CACHE
+        and _ATTENTION_IMAGE_RAM_CACHE_BYTES > limit
+    ):
+        _old_key, old_image = _ATTENTION_IMAGE_RAM_CACHE.popitem(last=False)
+        _ATTENTION_IMAGE_RAM_CACHE_BYTES -= int(old_image.nbytes)
+
+
+def clear_attention_image_ram_cache():
+    """Release standardized-image RAM cache before full-dataset inference."""
+
+    global _ATTENTION_IMAGE_RAM_CACHE_BYTES
+    count = len(_ATTENTION_IMAGE_RAM_CACHE)
+    released = int(_ATTENTION_IMAGE_RAM_CACHE_BYTES)
+    _ATTENTION_IMAGE_RAM_CACHE.clear()
+    _ATTENTION_IMAGE_RAM_CACHE_BYTES = 0
+    if count:
+        print(
+            f"[ATTENTION][CACHE] Released {count} RAM-cached images "
+            f"({_format_storage_bytes(released)}).",
+            flush=True,
+        )
+
+
+def load_attention_segmentation_image(row):
+    """Return the standardized 256x256 uint8 image without requiring disk cache.
+
+    Read order:
+
+      1. in-process RAM LRU;
+      2. valid optional PNG cache, when enabled;
+      3. source JPEG plus label-blind standardization.
+
+    Failure to write the optional PNG cache never aborts the pipeline. Corrupt or
+    partial old cache files are removed and regenerated from the source image.
+    """
+
+    global _ATTENTION_OPTIONAL_DISK_CACHE_DISABLED_REASON
+
+    token = str(row.get("image_token", row.get("image_path", "")))
+    cached = _attention_ram_cache_get(token)
+    if cached is not None:
+        return cached
 
     path = Path(row["cached_image_path"])
-    if path.is_file():
-        return path
+    if ATTENTION_CACHE_TRAINING_IMAGES and path.is_file():
+        disk_image = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+        if (
+            disk_image is not None
+            and disk_image.shape == (ATTENTION_INPUT_SIZE, ATTENTION_INPUT_SIZE)
+        ):
+            disk_image = np.ascontiguousarray(disk_image, dtype=np.uint8)
+            _attention_ram_cache_put(token, disk_image)
+            return disk_image
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        _attention_warn_once(
+            "corrupt-standardized-image-cache",
+            "[ATTENTION][CACHE][WARNING] A corrupt/incomplete standardized "
+            "training-image cache file was found and ignored. It will be "
+            "regenerated from the source JPEG.",
+        )
+
     monai_canvas, _raw_224, _content_224 = _load_attention_canvases(
         row["image_path"]
     )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    encoded = np.clip(np.round(monai_canvas * 255.0), 0, 255).astype(np.uint8)
-    if not cv2.imwrite(str(path), encoded):
-        raise RuntimeError(f"Could not save cached training image: {path}")
-    return path
+    encoded = np.clip(
+        np.round(monai_canvas * 255.0), 0, 255
+    ).astype(np.uint8)
+    _attention_ram_cache_put(token, encoded)
+
+    if (
+        ATTENTION_CACHE_TRAINING_IMAGES
+        and _ATTENTION_OPTIONAL_DISK_CACHE_DISABLED_REASON is None
+    ):
+        written = _atomic_cv2_write(
+            path,
+            encoded,
+            required=False,
+            purpose="optional cached standardized training image",
+            optional_reserve_mb=ATTENTION_OPTIONAL_DISK_CACHE_MIN_FREE_MB,
+        )
+        if not written:
+            _ATTENTION_OPTIONAL_DISK_CACHE_DISABLED_REASON = (
+                "first optional cache write failed or reserve threshold was reached"
+            )
+    return encoded
+
+
+def ensure_cached_attention_image(row):
+    """Best-effort compatibility wrapper for the former mandatory PNG cache.
+
+    The image is always prepared and placed in RAM when enabled. A Path is
+    returned only when optional disk caching is enabled and the atomic write
+    succeeds; otherwise ``None`` is returned. Internal datasets no longer depend
+    on this function or on the existence of a cached PNG file.
+    """
+
+    load_attention_segmentation_image(row)
+    path = Path(row["cached_image_path"])
+    return path if path.is_file() else None
 
 
 # ---------------------------------------------------------------------------
@@ -17628,10 +18310,7 @@ class _AttentionManifestImageDataset(Dataset):
 
     def __getitem__(self, index):
         row = self.rows[index]
-        image_path = ensure_cached_attention_image(row)
-        image = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
-        if image is None:
-            raise RuntimeError(f"Could not read cached image: {image_path}")
+        image = load_attention_segmentation_image(row)
         tensor = torch.from_numpy(image.astype(np.float32) / 255.0).unsqueeze(0)
         return tensor, int(index)
 
@@ -17652,14 +18331,30 @@ def _largest_connected_component(mask):
     return (labels == selected_label).astype(np.uint8)
 
 
+def _attention_mask_file_is_readable(path):
+    """Return True only for a non-empty decodable grayscale mask file."""
+
+    path = Path(path)
+    if not path.is_file():
+        return False
+    try:
+        if path.stat().st_size <= 0:
+            return False
+    except OSError:
+        return False
+    mask = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    return bool(mask is not None and mask.size > 0)
+
+
 def generate_attention_pseudo_masks(samples, workspace, monai_segmenter=None):
     """Generate label-blind MONAI pseudo masks for the training/review subset."""
 
     rows = select_attention_training_rows(samples, workspace)
+    report_attention_storage(workspace)
     missing_indices = [
         index
         for index, row in enumerate(rows)
-        if not Path(row["automatic_mask_path"]).is_file()
+        if not _attention_mask_file_is_readable(row["automatic_mask_path"])
         or row.get("monai_valid", "") == ""
     ]
     if not missing_indices:
@@ -17687,52 +18382,91 @@ def generate_attention_pseudo_masks(samples, workspace, monai_segmenter=None):
         flush=True,
     )
 
-    with torch.inference_mode():
-        for images, local_indices in tqdm(loader, desc="MONAI pseudo masks"):
-            images = images.to(DEVICE, non_blocking=True)
-            logits = monai_segmenter(images)
-            if logits.ndim != 4 or logits.shape[1] != 4:
-                raise RuntimeError(
-                    "Unexpected MONAI output while generating pseudo masks: "
-                    f"{tuple(logits.shape)}"
+    completed_batches = 0
+    try:
+        with torch.inference_mode():
+            for batch_number, (images, local_indices) in enumerate(
+                tqdm(loader, desc="MONAI pseudo masks"),
+                start=1,
+            ):
+                images = images.to(DEVICE, non_blocking=True)
+                logits = monai_segmenter(images)
+                if logits.ndim != 4 or logits.shape[1] != 4:
+                    raise RuntimeError(
+                        "Unexpected MONAI output while generating pseudo masks: "
+                        f"{tuple(logits.shape)}"
+                    )
+                probabilities = torch.softmax(logits.float(), dim=1)
+                heart_probability = probabilities[:, 1:].sum(dim=1, keepdim=True)
+                class_map = torch.argmax(probabilities, dim=1, keepdim=True)
+                hard = (class_map > 0).float()
+                area = hard.mean(dim=(1, 2, 3))
+                peak = heart_probability.amax(dim=(1, 2, 3))
+                valid = (
+                    (area >= MONAI_MIN_HEART_AREA_RATIO)
+                    & (area <= MONAI_MAX_HEART_AREA_RATIO)
+                    & (peak >= MONAI_MIN_PEAK_HEART_PROBABILITY)
                 )
-            probabilities = torch.softmax(logits.float(), dim=1)
-            heart_probability = probabilities[:, 1:].sum(dim=1, keepdim=True)
-            class_map = torch.argmax(probabilities, dim=1, keepdim=True)
-            hard = (class_map > 0).float()
-            area = hard.mean(dim=(1, 2, 3))
-            peak = heart_probability.amax(dim=(1, 2, 3))
-            valid = (
-                (area >= MONAI_MIN_HEART_AREA_RATIO)
-                & (area <= MONAI_MAX_HEART_AREA_RATIO)
-                & (peak >= MONAI_MIN_PEAK_HEART_PROBABILITY)
-            )
-            hard = F.max_pool2d(
-                hard,
-                kernel_size=ATTENTION_PSEUDO_MASK_DILATION_KERNEL,
-                stride=1,
-                padding=ATTENTION_PSEUDO_MASK_DILATION_KERNEL // 2,
-            )
+                hard = F.max_pool2d(
+                    hard,
+                    kernel_size=ATTENTION_PSEUDO_MASK_DILATION_KERNEL,
+                    stride=1,
+                    padding=ATTENTION_PSEUDO_MASK_DILATION_KERNEL // 2,
+                )
 
-            for batch_position, subset_index_tensor in enumerate(local_indices):
-                subset_index = int(subset_index_tensor)
-                original_index = missing_indices[subset_index]
-                row = rows[original_index]
-                mask = _largest_connected_component(
-                    hard[batch_position, 0].detach().cpu().numpy() > 0.5
-                )
-                output_path = Path(row["automatic_mask_path"])
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                if not cv2.imwrite(str(output_path), mask * 255):
-                    raise RuntimeError(f"Could not save pseudo mask: {output_path}")
-                row["monai_valid"] = int(bool(valid[batch_position].item()))
-                row["monai_area_ratio"] = float(area[batch_position].item())
-                row["monai_peak_probability"] = float(
-                    peak[batch_position].item()
-                )
-                row["manual_mask_exists"] = int(
-                    Path(row["manual_mask_path"]).is_file()
-                )
+                for batch_position, subset_index_tensor in enumerate(local_indices):
+                    subset_index = int(subset_index_tensor)
+                    original_index = missing_indices[subset_index]
+                    row = rows[original_index]
+                    mask = _largest_connected_component(
+                        hard[batch_position, 0].detach().cpu().numpy() > 0.5
+                    )
+                    output_path = Path(row["automatic_mask_path"])
+                    _atomic_cv2_write(
+                        output_path,
+                        mask.astype(np.uint8) * 255,
+                        required=True,
+                        purpose="MONAI pseudo mask",
+                    )
+                    row["monai_valid"] = int(bool(valid[batch_position].item()))
+                    row["monai_area_ratio"] = float(area[batch_position].item())
+                    row["monai_peak_probability"] = float(
+                        peak[batch_position].item()
+                    )
+                    row["manual_mask_exists"] = int(
+                        Path(row["manual_mask_path"]).is_file()
+                    )
+
+                completed_batches = int(batch_number)
+                if (
+                    batch_number
+                    % ATTENTION_MANIFEST_CHECKPOINT_EVERY_BATCHES
+                    == 0
+                ):
+                    write_attention_manifest(rows, workspace.manifest_csv)
+                    print(
+                        "[ATTENTION][MASKS] Manifest checkpoint saved after "
+                        f"{batch_number}/{len(loader)} batches.",
+                        flush=True,
+                    )
+    except Exception:
+        # Preserve all successfully written mask metadata before propagating the
+        # failure. A subsequent launch then resumes from the remaining rows.
+        try:
+            write_attention_manifest(rows, workspace.manifest_csv)
+            print(
+                "[ATTENTION][MASKS] Progress manifest saved after failure at "
+                f"batch {completed_batches}/{len(loader)}.",
+                flush=True,
+            )
+        except Exception as manifest_error:
+            print(
+                "[ATTENTION][MASKS][WARNING] Could not checkpoint the manifest "
+                f"after failure: {type(manifest_error).__name__}: "
+                f"{manifest_error}",
+                flush=True,
+            )
+        raise
 
     write_attention_manifest(rows, workspace.manifest_csv)
     valid_count = sum(int(str(row["monai_valid"])) for row in rows)
@@ -17820,10 +18554,7 @@ class AttentionMaskEditor:
 
     def load_current(self):
         row = self.rows[self.index]
-        image_path = ensure_cached_attention_image(row)
-        image = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
-        if image is None:
-            raise RuntimeError(f"Could not load editor image: {image_path}")
+        image = load_attention_segmentation_image(row)
         automatic_path = self._automatic_mask_path(row)
         if not automatic_path.is_file():
             raise FileNotFoundError(
@@ -17924,21 +18655,26 @@ class AttentionMaskEditor:
     def save(self):
         row = self.rows[self.index]
         path = Path(row["manual_mask_path"])
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if not cv2.imwrite(str(path), self.mask.astype(np.uint8) * 255):
-            raise RuntimeError(f"Could not save manual mask: {path}")
+        _atomic_cv2_write(
+            path,
+            self.mask.astype(np.uint8) * 255,
+            required=True,
+            purpose="manual Attention U-Net mask",
+        )
         overlay_path = self.workspace.mask_overlays / f"{row['image_token']}.png"
         base = np.stack([self.image] * 3, axis=-1)
         overlay = base.copy()
         overlay[..., 0] = np.maximum(overlay[..., 0], self.mask * 0.90)
         overlay[..., 1] *= (1.0 - 0.45 * self.mask)
         overlay[..., 2] *= (1.0 - 0.45 * self.mask)
-        cv2.imwrite(
-            str(overlay_path),
+        _atomic_cv2_write(
+            overlay_path,
             cv2.cvtColor(
                 np.clip(np.round(overlay * 255.0), 0, 255).astype(np.uint8),
                 cv2.COLOR_RGB2BGR,
             ),
+            required=False,
+            purpose="optional manual-mask review overlay",
         )
         row["manual_mask_exists"] = 1
         write_attention_manifest(self.rows, self.workspace.manifest_csv)
@@ -18133,7 +18869,7 @@ def _resolved_training_mask(row):
 
 
 class AttentionMaskTrainingDataset(Dataset):
-    """Cached images and manual/pseudo masks for one training partition."""
+    """RAM/disk/source images and manual/pseudo masks for one partition."""
 
     def __init__(self, rows, augment=False, seed=0):
         self.rows = list(rows)
@@ -18149,17 +18885,17 @@ class AttentionMaskTrainingDataset(Dataset):
 
     def __getitem__(self, index):
         row = self.rows[index]
-        image_path = ensure_cached_attention_image(row)
+        image = load_attention_segmentation_image(row)
         mask_path, source = _resolved_training_mask(row)
         if mask_path is None:
             raise RuntimeError(
                 f"No manual or valid pseudo mask for {row['image_token']}."
             )
-        image = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
         mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
         if image is None or mask is None:
             raise RuntimeError(
-                f"Could not load training pair: image={image_path}, mask={mask_path}"
+                f"Could not load training pair for {row['image_token']}: "
+                f"mask={mask_path}"
             )
         image = cv2.resize(
             image,
@@ -18788,6 +19524,7 @@ def extract_attention_patient_feature_bank(samples, workspace, checkpoint_map):
     review_tokens = set(review_by_token)
     pool = _StreamingHierarchicalAttentionPool(ATTENTION_FEATURE_MODES)
     slice_qc_rows = []
+    predicted_mask_writes_enabled = True
     encoder = FeatureExtractor().to(DEVICE).eval()
     for parameter in encoder.parameters():
         parameter.requires_grad_(False)
@@ -18902,12 +19639,23 @@ def extract_attention_patient_feature_bank(samples, workspace, checkpoint_map):
                     review_row = review_by_token.get(token)
                     save_prediction = ATTENTION_SAVE_ALL_PREDICTED_MASKS or token in review_tokens
                     predicted_path = workspace.predicted_masks / f"{token}.png"
-                    if save_prediction:
-                        predicted_path.parent.mkdir(parents=True, exist_ok=True)
-                        cv2.imwrite(
-                            str(predicted_path),
+                    prediction_written = False
+                    if save_prediction and predicted_mask_writes_enabled:
+                        prediction_written = _atomic_cv2_write(
+                            predicted_path,
                             hard_cpu[index].astype(np.uint8) * 255,
+                            required=False,
+                            purpose="optional Attention U-Net predicted mask",
                         )
+                        if not prediction_written:
+                            predicted_mask_writes_enabled = False
+                            print(
+                                "[ATTENTION][PREDICTIONS][WARNING] Further "
+                                "optional predicted-mask PNG writes are disabled "
+                                "for this run. Feature extraction and AU1-AU5 "
+                                "evaluation will continue.",
+                                flush=True,
+                            )
                     dice_monai = None
                     dice_manual = None
                     if review_row is not None:
@@ -18938,7 +19686,7 @@ def extract_attention_patient_feature_bank(samples, workspace, checkpoint_map):
                             "dice_vs_monai_pseudo_if_available": dice_monai,
                             "dice_vs_manual_if_available": dice_manual,
                             "predicted_mask_path": (
-                                str(predicted_path) if save_prediction else ""
+                                str(predicted_path) if prediction_written else ""
                             ),
                             "image_token": token,
                             "checkpoint": str(checkpoint_map[target_fold]),
@@ -19024,6 +19772,22 @@ def extract_attention_patient_feature_bank(samples, workspace, checkpoint_map):
         "n_patients": int(len(patient_ids)),
         "n_images": int(len(samples)),
         "feature_modes": list(ATTENTION_FEATURE_MODES),
+        "storage_policy": {
+            "persistent_workspace": str(workspace.root),
+            "transient_root": str(workspace.transient_root),
+            "automatic_masks": str(workspace.automatic_masks),
+            "predicted_masks": str(workspace.predicted_masks),
+            "cached_training_images": str(workspace.cached_images),
+            "training_image_disk_cache_enabled": bool(
+                ATTENTION_CACHE_TRAINING_IMAGES
+            ),
+            "training_image_ram_cache_mb": int(
+                ATTENTION_RAM_IMAGE_CACHE_MB
+            ),
+            "legacy_working_image_cache_auto_remove": bool(
+                ATTENTION_REMOVE_LEGACY_WORKING_IMAGE_CACHE
+            ),
+        },
         "retained_slice_counts": dict(pool.retained_slice_counts),
         "patient_level_fallbacks": dict(pool.patient_level_fallbacks),
         "checkpoints": {str(key): str(value) for key, value in checkpoint_map.items()},
@@ -19238,7 +20002,17 @@ def _find_v6_a17_predictions():
 
 
 def evaluate_attention_feature_bank(samples, workspace, bank):
-    """Run AU1-AU5 nested CV, repeated CV, permutation and MONAI comparison."""
+    """Run AU1-AU5 nested CV plus profile-controlled stability/permutation and MONAI comparison."""
+
+    print(
+        "[ATTENTION][VALIDATION] profile="
+        f"{VALIDATION_RUNTIME_PROFILE}; stability="
+        f"{ATTENTION_RUN_REPEATED_CV_STABILITY} × "
+        f"{ATTENTION_REPEATED_CV_REPEATS} repeats for each AU model; "
+        f"permutation={ATTENTION_RUN_PERMUTATION_TEST} × "
+        f"{ATTENTION_PERMUTATION_REPLICATES} replicates.",
+        flush=True,
+    )
 
     fold_rows, fold_path = _load_or_create_classification_fold_manifest(
         samples, workspace
@@ -19276,22 +20050,44 @@ def evaluate_attention_feature_bank(samples, workspace, bank):
                 evaluation_root / experiment.experiment_id,
             )
             results[experiment.experiment_id] = result
-            stability[experiment.experiment_id] = run_repeated_nested_cv_stability(
-                experiment,
-                prepared,
-                fold_rows,
-                evaluation_root / experiment.experiment_id / "stability",
-            )
+            if ATTENTION_RUN_REPEATED_CV_STABILITY:
+                stability[experiment.experiment_id] = (
+                    run_repeated_nested_cv_stability(
+                        experiment,
+                        prepared,
+                        fold_rows,
+                        evaluation_root
+                        / experiment.experiment_id
+                        / "stability",
+                    )
+                )
+            else:
+                stability[experiment.experiment_id] = {
+                    "status": "SKIPPED_DISABLED",
+                    "experiment_id": experiment.experiment_id,
+                    "configured_repeats": int(
+                        ATTENTION_REPEATED_CV_REPEATS
+                    ),
+                }
 
         au1_id = ATTENTION_EXPERIMENTS[0].experiment_id
         au1_result = results[au1_id]
-        permutation = run_patient_label_permutation_test(
-            ATTENTION_EXPERIMENTS[0],
-            prepared_by_id[au1_id],
-            fold_rows,
-            float(au1_result["summary"]["metrics"]["auc"]),
-            evaluation_root / au1_id / "permutation",
-        )
+        if ATTENTION_RUN_PERMUTATION_TEST:
+            permutation = run_patient_label_permutation_test(
+                ATTENTION_EXPERIMENTS[0],
+                prepared_by_id[au1_id],
+                fold_rows,
+                float(au1_result["summary"]["metrics"]["auc"]),
+                evaluation_root / au1_id / "permutation",
+            )
+        else:
+            permutation = {
+                "status": "SKIPPED_DISABLED",
+                "experiment_id": au1_id,
+                "configured_replicates": int(
+                    ATTENTION_PERMUTATION_REPLICATES
+                ),
+            }
 
     au1 = results[ATTENTION_EXPERIMENTS[0].experiment_id]
     pairwise = {}
@@ -19346,11 +20142,37 @@ def evaluate_attention_feature_bank(samples, workspace, bank):
 
     summary = {
         "status": "OK",
+        "attention_extension_version": "7.2-disk-safe-fast-validation-profile",
+        "storage_policy": {
+            "persistent_workspace": str(workspace.root),
+            "transient_root": str(workspace.transient_root),
+            "automatic_masks": str(workspace.automatic_masks),
+            "predicted_masks": str(workspace.predicted_masks),
+            "training_image_disk_cache_enabled": bool(
+                ATTENTION_CACHE_TRAINING_IMAGES
+            ),
+            "training_image_ram_cache_mb": int(
+                ATTENTION_RAM_IMAGE_CACHE_MB
+            ),
+        },
         "fold_manifest": str(fold_path),
         "feature_bank_fingerprint": bank["fingerprint"],
         "experiments": {
             experiment_id: result["summary"]
             for experiment_id, result in results.items()
+        },
+        "validation_runtime": {
+            "profile": VALIDATION_RUNTIME_PROFILE,
+            "run_repeated_cv": bool(
+                ATTENTION_RUN_REPEATED_CV_STABILITY
+            ),
+            "repeated_cv_repeats": int(
+                ATTENTION_REPEATED_CV_REPEATS
+            ),
+            "run_permutation": bool(ATTENTION_RUN_PERMUTATION_TEST),
+            "permutation_replicates": int(
+                ATTENTION_PERMUTATION_REPLICATES
+            ),
         },
         "repeated_nested_cv": stability,
         "au1_vs_controls": pairwise,
@@ -19423,10 +20245,14 @@ def run_attention_pipeline(samples, workspace, action):
 
     checkpoint_map = train_attention_unet_crossfit(rows, workspace)
     if action == "train-attention":
+        clear_attention_image_ram_cache()
         return {
             "status": "TRAINING_COMPLETED",
             "checkpoints": {str(k): str(v) for k, v in checkpoint_map.items()},
         }
+    # Full-dataset Attention inference does not use the 4,715-image training LRU.
+    # Release it before allocating EfficientNet and AU1-AU5 batch tensors.
+    clear_attention_image_ram_cache()
     bank = extract_attention_patient_feature_bank(samples, workspace, checkpoint_map)
     return evaluate_attention_feature_bank(samples, workspace, bank)
 
@@ -19519,10 +20345,22 @@ def attention_v7_entrypoint(argv=None):
         sys.stderr = TeeStream(original_stderr, log_file)
         try:
             print("\n" + "#" * 100, flush=True)
-            print("CAD CARDIAC MRI — V7 ATTENTION U-NET EXTENSION", flush=True)
+            print(
+                "CAD CARDIAC MRI — V7.2 ATTENTION U-NET EXTENSION "
+                "(DISK-SAFE + PROFILE-CONTROLLED VALIDATION)",
+                flush=True,
+            )
             print("#" * 100, flush=True)
             print(f"[ATTENTION] action={action}", flush=True)
             print(f"[ATTENTION] workspace={workspace.root}", flush=True)
+            print(
+                f"[ATTENTION] transient_root={workspace.transient_root}",
+                flush=True,
+            )
+            print(
+                f"[ATTENTION] automatic_masks={workspace.automatic_masks}",
+                flush=True,
+            )
             print(f"[ATTENTION] comparison_output={workspace.comparison_output}", flush=True)
             summary = run_attention_pipeline(samples, workspace, action)
             print(
