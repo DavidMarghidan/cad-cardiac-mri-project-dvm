@@ -850,24 +850,77 @@ torch.manual_seed(RANDOM_SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(RANDOM_SEED)
 
-# V6 final-reporting runs favor exact reproducibility over the small throughput
-# gain from non-deterministic convolution algorithms or half precision. The
-# warn_only flag prevents an unsupported deterministic kernel from aborting an
-# otherwise valid Kaggle run while still recording a visible warning.
+# V6/V7 final-reporting runs favor exact reproducibility over the small
+# throughput gain from non-deterministic convolution algorithms or reduced
+# float32 precision. PyTorch 2.9 introduced ``fp32_precision`` and deprecated
+# direct access to ``allow_tf32``. Importantly, even ``hasattr(...,
+# "allow_tf32")`` invokes the deprecated property getter and emits the warning
+# seen in recent Kaggle images. Select exactly one API family from the parsed
+# PyTorch major/minor version; never mix the legacy and new TF32 controls.
 torch.backends.cudnn.benchmark = False
 torch.backends.cudnn.deterministic = True
-if hasattr(torch.backends.cudnn, "allow_tf32"):
-    torch.backends.cudnn.allow_tf32 = False
-if hasattr(torch.backends.cuda, "matmul") and hasattr(
-    torch.backends.cuda.matmul,
-    "allow_tf32",
-):
-    torch.backends.cuda.matmul.allow_tf32 = False
-try:
-    torch.set_float32_matmul_precision("highest")
-except (AttributeError, RuntimeError):
-    # Older PyTorch releases may not expose this optional precision control.
-    pass
+
+
+def _leading_version_integer(token):
+    """Return the leading decimal integer from one version component."""
+
+    digits = []
+    for character in str(token):
+        if not character.isdigit():
+            break
+        digits.append(character)
+    return int("".join(digits)) if digits else 0
+
+
+_torch_version_components = str(torch.__version__).split("+", 1)[0].split(".")
+_torch_major = _leading_version_integer(_torch_version_components[0])
+_torch_minor = (
+    _leading_version_integer(_torch_version_components[1])
+    if len(_torch_version_components) > 1
+    else 0
+)
+TORCH_TF32_CONTROL_API = (
+    "fp32_precision" if (_torch_major, _torch_minor) >= (2, 9)
+    else "allow_tf32"
+)
+
+# These immutable values are also written to metadata and cache fingerprints.
+# Keeping the historical Boolean fields at False preserves their exact semantic
+# value without reading the deprecated PyTorch properties later in the run.
+CUDNN_TF32_ENABLED = False
+CUDA_MATMUL_TF32_ENABLED = False
+
+if TORCH_TF32_CONTROL_API == "fp32_precision":
+    try:
+        # ``ieee`` is the new PyTorch 2.9+ spelling for full FP32 internal
+        # computation. Setting both the backend and operation-level controls is
+        # explicit and avoids inheriting a future backend default.
+        torch.backends.cuda.matmul.fp32_precision = "ieee"
+        torch.backends.cudnn.fp32_precision = "ieee"
+        torch.backends.cudnn.conv.fp32_precision = "ieee"
+        torch.backends.cudnn.rnn.fp32_precision = "ieee"
+    except (AttributeError, RuntimeError) as error:
+        raise RuntimeError(
+            "PyTorch reports version 2.9 or newer, but its documented "
+            "fp32_precision TF32-control API could not be configured."
+        ) from error
+else:
+    # Compatibility path for PyTorch releases before 2.9. These properties are
+    # accessed only on versions where they are not deprecated.
+    try:
+        torch.backends.cudnn.allow_tf32 = False
+    except AttributeError:
+        pass
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+    except AttributeError:
+        pass
+    try:
+        torch.set_float32_matmul_precision("highest")
+    except (AttributeError, RuntimeError):
+        # Older PyTorch releases may not expose this optional precision control.
+        pass
+
 try:
     torch.use_deterministic_algorithms(True, warn_only=True)
 except TypeError:
@@ -3123,16 +3176,8 @@ _suite_identity = {
     "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
     "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
     "cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
-    "cudnn_allow_tf32": bool(
-        getattr(torch.backends.cudnn, "allow_tf32", False)
-    ),
-    "cuda_matmul_allow_tf32": bool(
-        getattr(
-            getattr(torch.backends.cuda, "matmul", object()),
-            "allow_tf32",
-            False,
-        )
-    ),
+    "cudnn_allow_tf32": CUDNN_TF32_ENABLED,
+    "cuda_matmul_allow_tf32": CUDA_MATMUL_TF32_ENABLED,
     "device_type": DEVICE,
     "img_size": IMG_SIZE,
     "monai_input_size": MONAI_INPUT_SIZE,
@@ -6844,16 +6889,8 @@ def feature_bank_fingerprint(samples, dataset_root):
         ),
         "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
         "cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
-        "cudnn_allow_tf32": bool(
-            getattr(torch.backends.cudnn, "allow_tf32", False)
-        ),
-        "cuda_matmul_allow_tf32": bool(
-            getattr(
-                getattr(torch.backends.cuda, "matmul", object()),
-                "allow_tf32",
-                False,
-            )
-        ),
+        "cudnn_allow_tf32": CUDNN_TF32_ENABLED,
+        "cuda_matmul_allow_tf32": CUDA_MATMUL_TF32_ENABLED,
         "device_type": DEVICE,
         "img_size": IMG_SIZE,
         "monai_input_size": MONAI_INPUT_SIZE,
@@ -15806,16 +15843,8 @@ def collect_suite_metadata(
             ),
             "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
             "cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
-            "cudnn_allow_tf32": bool(
-                getattr(torch.backends.cudnn, "allow_tf32", False)
-            ),
-            "cuda_matmul_allow_tf32": bool(
-                getattr(
-                    getattr(torch.backends.cuda, "matmul", object()),
-                    "allow_tf32",
-                    False,
-                )
-            ),
+            "cudnn_allow_tf32": CUDNN_TF32_ENABLED,
+            "cuda_matmul_allow_tf32": CUDA_MATMUL_TF32_ENABLED,
             "deterministic_algorithms_requested": True,
             "cuda_amp_enabled": bool(USE_CUDA_AMP),
         },
@@ -16047,16 +16076,8 @@ def write_suite_configuration(output_path, experiments):
             ),
             "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
             "cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
-            "cudnn_allow_tf32": bool(
-                getattr(torch.backends.cudnn, "allow_tf32", False)
-            ),
-            "cuda_matmul_allow_tf32": bool(
-                getattr(
-                    getattr(torch.backends.cuda, "matmul", object()),
-                    "allow_tf32",
-                    False,
-                )
-            ),
+            "cudnn_allow_tf32": CUDNN_TF32_ENABLED,
+            "cuda_matmul_allow_tf32": CUDA_MATMUL_TF32_ENABLED,
             "deterministic_algorithms_requested": True,
         },
         "feature_cache_schema": FEATURE_CACHE_SCHEMA_VERSION,
