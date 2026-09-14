@@ -805,6 +805,8 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.svm import LinearSVC
 # Linear maximum-margin classifier used in the declared SVM ablation.
 
+from IPython.display import display, HTML, Javascript
+
 import matplotlib.pyplot as plt
 # Visualization utility for inspecting:
 #   - the padded input
@@ -17451,10 +17453,10 @@ ATTENTION_PSEUDO_MASK_DILATION_KERNEL = _env_int(
     "CAD_ATTENTION_UNET_PSEUDO_MASK_DILATION_KERNEL", 9, minimum=1
 )
 ATTENTION_MAX_TRAIN_SLICES_PER_SERIES = _env_int(
-    "CAD_ATTENTION_UNET_MAX_TRAIN_SLICES_PER_SERIES", 20, minimum=1
+    "CAD_ATTENTION_UNET_MAX_TRAIN_SLICES_PER_SERIES", 5, minimum=1
 )
 ATTENTION_MAX_TRAIN_SLICES_PER_PATIENT = _env_int(
-    "CAD_ATTENTION_UNET_MAX_TRAIN_SLICES_PER_PATIENT", 160, minimum=1
+    "CAD_ATTENTION_UNET_MAX_TRAIN_SLICES_PER_PATIENT", 40, minimum=1
 )
 ATTENTION_VALIDATION_PATIENT_FRACTION = _env_float(
     "CAD_ATTENTION_UNET_VALIDATION_PATIENT_FRACTION",
@@ -18479,11 +18481,28 @@ def generate_attention_pseudo_masks(samples, workspace, monai_segmenter=None):
 
 
 # ---------------------------------------------------------------------------
-# INTERACTIVE MANUAL MASK EDITOR
+# INTERACTIVE MANUAL MASK EDITOR — V12 TRANSPARENT-MASK RESET FIX
 # ---------------------------------------------------------------------------
 
 class AttentionMaskEditor:
-    """Interactive, label-blind Matplotlib editor for one mask manifest."""
+    """
+    Kaggle-safe manual mask editor.
+
+    This implementation deliberately does NOT use ipympl/jupyter-matplotlib.
+    It uses standard ipywidgets (which Kaggle/JupyterLab supports) plus an
+    HTML5 canvas rendered in an Output widget. The canvas handles mouse
+    drawing/erasing in the browser and synchronizes the mask to a standard
+    Textarea widget, so no custom Jupyter widget model is required.
+
+    Public behavior is kept compatible with the previous editor:
+      Previous / Next / Save manual / Reset to auto / Reset to image (no mask) / Clear
+      brush slider, left-draw/right-erase, D/E keyboard modes, S/R/C/N/P.
+
+    Button semantics:
+      - Reset to auto: restore automatic mask and orange comparison overlay.
+      - Reset to image: show the raw MRI with no mask overlay at all.
+      - Clear: clear only the editable mask while keeping auto mask in orange.
+    """
 
     def __init__(
         self,
@@ -18497,53 +18516,82 @@ class AttentionMaskEditor:
             raise ValueError("The mask editor requires at least one manifest row.")
         if base_source not in {"attention", "monai"}:
             raise ValueError("base_source must be 'attention' or 'monai'.")
+
+        import base64
+        import uuid
+        import ipywidgets as widgets
+        from IPython.display import display, HTML, clear_output
+
         self.rows = list(rows)
         self.workspace = workspace
         self.index = int(np.clip(start_index, 0, len(rows) - 1))
         self.brush_radius = int(max(1, brush_radius))
         self.base_source = base_source
         self.mode = "draw"
-        self.dragging = False
-        self.drag_erase = False
         self.image = None
+        # ``auto_mask`` is the immutable automatic mask loaded from MONAI or
+        # Attention U-Net. ``base_mask`` is only the orange comparison overlay
+        # currently shown by the browser canvas and can temporarily be hidden.
+        self.auto_mask = None
         self.base_mask = None
         self.mask = None
 
-        self.figure, self.axes = plt.subplots(1, 3, figsize=(15, 6))
-        self.figure.subplots_adjust(bottom=0.22)
-        previous_axis = self.figure.add_axes([0.08, 0.06, 0.10, 0.06])
-        next_axis = self.figure.add_axes([0.19, 0.06, 0.10, 0.06])
-        save_axis = self.figure.add_axes([0.33, 0.06, 0.12, 0.06])
-        reset_axis = self.figure.add_axes([0.46, 0.06, 0.12, 0.06])
-        clear_axis = self.figure.add_axes([0.59, 0.06, 0.10, 0.06])
-        self.slider_axis = self.figure.add_axes([0.73, 0.075, 0.20, 0.035])
-        self.previous_button = Button(previous_axis, "Previous")
-        self.next_button = Button(next_axis, "Next")
-        self.save_button = Button(save_axis, "Save manual")
-        self.reset_button = Button(reset_axis, "Reset to auto")
-        self.clear_button = Button(clear_axis, "Clear")
-        self.brush_slider = Slider(
-            self.slider_axis,
-            "Brush",
-            valmin=1,
-            valmax=30,
-            valinit=self.brush_radius,
-            valstep=1,
+        self._base64 = base64
+        self._uuid = uuid.uuid4().hex[:12]
+        self._clear_output = clear_output
+
+        self.output = widgets.Output()
+        self.mask_sync = widgets.Textarea(
+            value="",
+            placeholder=f"CAD_MASK_SYNC_{self._uuid}",
+            layout=widgets.Layout(width="1px", height="1px", display="none"),
         )
-        self.previous_button.on_clicked(lambda _event: self.previous())
-        self.next_button.on_clicked(lambda _event: self.next())
-        self.save_button.on_clicked(lambda _event: self.save())
-        self.reset_button.on_clicked(lambda _event: self.reset())
-        self.clear_button.on_clicked(lambda _event: self.clear())
-        self.brush_slider.on_changed(self._set_brush)
-        self.figure.canvas.mpl_connect("button_press_event", self._on_press)
-        self.figure.canvas.mpl_connect("button_release_event", self._on_release)
-        self.figure.canvas.mpl_connect("motion_notify_event", self._on_motion)
-        self.figure.canvas.mpl_connect("key_press_event", self._on_key)
+
+        self.previous_button = widgets.Button(description="Previous")
+        self.next_button = widgets.Button(description="Next")
+        self.save_button = widgets.Button(description="Save manual")
+        self.reset_button = widgets.Button(description="Reset to auto")
+        self.clear_drawn_button = widgets.Button(description="Reset to image (no mask)")
+        self.clear_button = widgets.Button(description="Clear")
+        self.brush_slider = widgets.IntSlider(
+            description="Brush",
+            value=self.brush_radius,
+            min=1,
+            max=30,
+            step=1,
+            continuous_update=True,
+        )
+        self.status = widgets.HTML()
+
+        self.previous_button.on_click(self._previous_click)
+        self.next_button.on_click(self._next_click)
+        self.save_button.on_click(self._save_click)
+        self.reset_button.on_click(self._reset_click)
+        self.clear_drawn_button.on_click(self._clear_drawn_click)
+        self.clear_button.on_click(self._clear_click)
+        self.brush_slider.observe(self._brush_changed, names="value")
+        self.mask_sync.observe(self._mask_sync_changed, names="value")
+
+        self.controls = widgets.VBox([
+            widgets.HBox([
+                self.previous_button,
+                self.next_button,
+                self.save_button,
+                self.reset_button,
+                self.clear_drawn_button,
+                self.clear_button,
+            ]),
+            widgets.HBox([self.brush_slider, self.status]),
+            self.mask_sync,
+            self.output,
+        ])
+
         self.load_current()
 
-    def _set_brush(self, value):
-        self.brush_radius = int(value)
+    def _brush_changed(self, change):
+        self.brush_radius = int(change["new"])
+        if hasattr(self, "output") and hasattr(self, "mask") and self.mask is not None:
+            self._render()
 
     def _automatic_mask_path(self, row):
         attention_path = Path(row["predicted_attention_mask_path"])
@@ -18560,6 +18608,7 @@ class AttentionMaskEditor:
             raise FileNotFoundError(
                 f"Automatic mask unavailable. Run generate-masks first: {automatic_path}"
             )
+
         automatic = cv2.imread(str(automatic_path), cv2.IMREAD_GRAYSCALE)
         if automatic is None:
             raise RuntimeError(f"Could not load automatic mask: {automatic_path}")
@@ -18568,6 +18617,7 @@ class AttentionMaskEditor:
             (ATTENTION_INPUT_SIZE, ATTENTION_INPUT_SIZE),
             interpolation=cv2.INTER_NEAREST,
         )
+
         manual_path = Path(row["manual_mask_path"])
         if manual_path.is_file():
             manual = cv2.imread(str(manual_path), cv2.IMREAD_GRAYSCALE)
@@ -18581,66 +18631,401 @@ class AttentionMaskEditor:
             current = manual > 127
         else:
             current = automatic > 127
-        self.image = image.astype(np.float32) / 255.0
-        self.base_mask = automatic > 127
-        self.mask = current.astype(np.uint8)
-        self.redraw()
 
-    def redraw(self):
-        row = self.rows[self.index]
-        for axis in self.axes:
-            axis.clear()
-        self.axes[0].imshow(self.image, cmap="gray", vmin=0.0, vmax=1.0)
-        self.axes[0].set_title("Standardized MRI")
-        self.axes[1].imshow(self.image, cmap="gray", vmin=0.0, vmax=1.0)
-        self.axes[1].imshow(self.base_mask, cmap="autumn", alpha=0.40, vmin=0, vmax=1)
-        self.axes[1].set_title(f"Automatic base: {self.base_source}")
-        self.axes[2].imshow(self.image, cmap="gray", vmin=0.0, vmax=1.0)
-        self.axes[2].imshow(self.mask, cmap="spring", alpha=0.42, vmin=0, vmax=1)
-        self.axes[2].set_title(f"Editable mask — mode={self.mode}")
-        for axis in self.axes:
-            axis.axis("off")
-        self.figure.suptitle(
-            f"{self.index + 1}/{len(self.rows)} | {row['patient_id']} | "
-            f"{row['series_id']}\n"
-            "Left drag=draw, right drag=erase; D/E modes; S save; R reset; "
-            "C clear; N/P navigate",
-            fontsize=11,
+        self.image = image.astype(np.float32) / 255.0
+        self.auto_mask = (automatic > 127).astype(np.uint8)
+        self.base_mask = self.auto_mask.copy()
+        self.mask = current.astype(np.uint8)
+        self._render()
+
+    def _png_data_uri(self, rgb_float):
+        arr = np.clip(np.round(rgb_float * 255.0), 0, 255).astype(np.uint8)
+        ok, buf = cv2.imencode(".png", cv2.cvtColor(arr, cv2.COLOR_RGB2BGR))
+        if not ok:
+            raise RuntimeError("Could not encode editor image.")
+        return "data:image/png;base64," + self._base64.b64encode(buf.tobytes()).decode("ascii")
+
+    def _mask_data_uri(self, mask):
+        """Encode a binary mask as a transparent PNG for the HTML canvas.
+
+        A plain grayscale PNG is opaque even where its value is zero. The old
+        canvas code recolored images through ``source-in``, which uses alpha,
+        not grayscale intensity. Consequently, a zero-valued mask still had an
+        opaque alpha channel over the entire 256x256 image and Reset/Clear
+        appeared to create a full-frame mask.
+
+        This encoder makes background pixels transparent black and foreground
+        pixels opaque white. Therefore the orange/magenta overlays are limited
+        to true mask pixels, and an all-zero mask produces no overlay at all.
+        """
+
+        binary = (np.asarray(mask) > 0).astype(np.uint8)
+        bgra = np.zeros((*binary.shape, 4), dtype=np.uint8)
+        foreground = binary * 255
+        bgra[..., 0] = foreground
+        bgra[..., 1] = foreground
+        bgra[..., 2] = foreground
+        bgra[..., 3] = foreground
+        ok, buf = cv2.imencode(".png", bgra)
+        if not ok:
+            raise RuntimeError("Could not encode transparent editor mask.")
+        return (
+            "data:image/png;base64,"
+            + self._base64.b64encode(buf.tobytes()).decode("ascii")
         )
-        self.figure.canvas.draw_idle()
+
+    def _render(self):
+        """Render a Kaggle-safe interactive HTML5 canvas.
+
+        IMPORTANT: JavaScript placed inside HTML output is not reliably executed
+        by Kaggle/JupyterLab. Therefore the canvas markup is emitted as HTML and
+        the event handlers are injected separately with IPython.display.Javascript.
+        This avoids both jupyter-matplotlib/ipympl and inert <script> tags.
+        """
+        row = self.rows[self.index]
+        image_uri = self._png_data_uri(np.stack([self.image] * 3, axis=-1))
+        base_uri = self._mask_data_uri(self.base_mask)
+        mask_uri = self._mask_data_uri(self.mask)
+        sync_placeholder = f"CAD_MASK_SYNC_{self._uuid}"
+        canvas_id = f"cad_canvas_{self._uuid}"
+
+        html = f"""
+        <div id="cad_editor_wrap_{self._uuid}" style="font-family:Arial,sans-serif;max-width:900px">
+          <div style="margin-bottom:6px;font-size:14px">
+            <b>{self.index + 1}/{len(self.rows)}</b>
+            &nbsp;|&nbsp; {row['patient_id']}
+            &nbsp;|&nbsp; {row['series_id']}
+            &nbsp;|&nbsp; base={self.base_source}
+          </div>
+          <canvas id="{canvas_id}" width="{ATTENTION_INPUT_SIZE*3}"
+                  height="{ATTENTION_INPUT_SIZE*3}"
+                  style="width:768px;height:768px;max-width:100%;border:1px solid #999;
+                         cursor:crosshair;image-rendering:auto;touch-action:none;
+                         user-select:none;-webkit-user-select:none;"></canvas>
+          <div style="font-size:12px;margin-top:5px">
+            <b>Left drag = draw</b> &nbsp;|&nbsp; <b>Right drag = erase</b> &nbsp;|&nbsp;
+            D/E = mode &nbsp;|&nbsp; S = save &nbsp;|&nbsp; R = reset &nbsp;|&nbsp;
+            C = clear &nbsp;|&nbsp; N/P = navigate
+          </div>
+        </div>
+        """
+
+        js = f"""
+        (() => {{
+          const canvas = document.getElementById({json.dumps(canvas_id)});
+          if (!canvas) return;
+          const ctx = canvas.getContext('2d');
+          const W = {ATTENTION_INPUT_SIZE};
+          const H = {ATTENTION_INPUT_SIZE};
+          const SCALE = 3;
+          const initialRadius = {int(self.brush_radius)};
+          const syncPlaceholder = {json.dumps(sync_placeholder)};
+          const image = new Image();
+          const base = new Image();
+          const maskCanvas = document.createElement('canvas');
+          maskCanvas.width = W; maskCanvas.height = H;
+          const maskCtx = maskCanvas.getContext('2d', {{willReadFrequently:true}});
+          const initialMask = new Image();
+          const imageUri = {json.dumps(image_uri)};
+          const baseUri = {json.dumps(base_uri)};
+          const maskUri = {json.dumps(mask_uri)};
+
+          let drawing = false;
+          let erase = false;
+          let mode = {json.dumps(self.mode)};
+          let lastPoint = null;
+
+          function findHidden() {{
+            return Array.from(document.querySelectorAll('textarea'))
+              .find(x => x.placeholder === syncPlaceholder);
+          }}
+
+          function initMask() {{
+            maskCtx.clearRect(0, 0, W, H);
+            maskCtx.drawImage(initialMask, 0, 0, W, H);
+            drawScene();
+          }}
+
+          function drawScene() {{
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+
+            const tmp = document.createElement('canvas');
+            tmp.width = canvas.width; tmp.height = canvas.height;
+            const tc = tmp.getContext('2d');
+            tc.globalAlpha = 0.35;
+            tc.drawImage(base, 0, 0, canvas.width, canvas.height);
+            tc.globalCompositeOperation = 'source-in';
+            tc.fillStyle = 'rgb(255,165,0)';
+            tc.fillRect(0, 0, canvas.width, canvas.height);
+            ctx.drawImage(tmp, 0, 0);
+
+            const tmp2 = document.createElement('canvas');
+            tmp2.width = canvas.width; tmp2.height = canvas.height;
+            const t2 = tmp2.getContext('2d');
+            t2.globalAlpha = 0.50;
+            t2.drawImage(maskCanvas, 0, 0, canvas.width, canvas.height);
+            t2.globalCompositeOperation = 'source-in';
+            t2.fillStyle = 'rgb(255,0,200)';
+            t2.fillRect(0, 0, canvas.width, canvas.height);
+            ctx.drawImage(tmp2, 0, 0);
+          }}
+
+          function syncToPython() {{
+            const hidden = findHidden();
+            if (!hidden) return;
+            hidden.value = maskCanvas.toDataURL('image/png').split(',')[1];
+            hidden.dispatchEvent(new Event('input', {{bubbles:true}}));
+            hidden.dispatchEvent(new Event('change', {{bubbles:true}}));
+          }}
+
+          function point(e) {{
+            const r = canvas.getBoundingClientRect();
+            return {{
+              x: Math.max(0, Math.min(W - 1, ((e.clientX - r.left) / r.width) * W)),
+              y: Math.max(0, Math.min(H - 1, ((e.clientY - r.top) / r.height) * H))
+            }};
+          }}
+
+          function paintAt(p, doErase) {{
+            const radius = initialRadius;
+            maskCtx.save();
+            maskCtx.globalCompositeOperation = doErase ? 'destination-out' : 'source-over';
+            maskCtx.fillStyle = 'white';
+            maskCtx.strokeStyle = 'white';
+            maskCtx.lineWidth = radius * 2;
+            maskCtx.lineCap = 'round';
+            maskCtx.lineJoin = 'round';
+            if (lastPoint) {{
+              maskCtx.beginPath();
+              maskCtx.moveTo(lastPoint.x, lastPoint.y);
+              maskCtx.lineTo(p.x, p.y);
+              maskCtx.stroke();
+            }} else {{
+              maskCtx.beginPath();
+              maskCtx.arc(p.x, p.y, radius, 0, 2 * Math.PI);
+              maskCtx.fill();
+            }}
+            maskCtx.restore();
+            lastPoint = p;
+            drawScene();
+          }}
+
+
+          // Explicit mouse/pointer handling.  Kaggle/JupyterLab can treat
+          // ordinary left-button drags specially unless the canvas claims the
+          // pointer immediately.  We therefore handle BOTH Pointer Events and
+          // legacy Mouse Events and use the actual button state.
+          function beginDraw(e) {{
+            if (e.button !== undefined && e.button !== 0 && e.button !== 2) return;
+            e.preventDefault();
+            e.stopPropagation();
+            drawing = true;
+            erase = (e.button === 2) || (mode === 'erase');
+            lastPoint = null;
+            try {{ canvas.setPointerCapture?.(e.pointerId); }} catch (_) {{}}
+            paintAt(point(e), erase);
+          }}
+
+          function moveDraw(e) {{
+            if (!drawing) return;
+            // With Pointer Events, buttons is a bit mask: 1=left, 2=right.
+            if (e.buttons !== undefined && e.buttons === 0) {{
+              finishDraw(e);
+              return;
+            }}
+            e.preventDefault();
+            e.stopPropagation();
+            paintAt(point(e), erase);
+          }}
+
+          function finishDraw(e) {{
+            if (!drawing) return;
+            e.preventDefault?.();
+            e.stopPropagation?.();
+            drawing = false;
+            lastPoint = null;
+            try {{ canvas.releasePointerCapture?.(e.pointerId); }} catch (_) {{}}
+            syncToPython();
+          }}
+
+          canvas.addEventListener('contextmenu', e => {{
+            e.preventDefault();
+            e.stopPropagation();
+          }}, true);
+
+          // Pointer Events: primary path for modern Chrome/Kaggle.
+          canvas.addEventListener('pointerdown', beginDraw, true);
+          canvas.addEventListener('pointermove', moveDraw, true);
+          canvas.addEventListener('pointerup', finishDraw, true);
+          canvas.addEventListener('pointercancel', finishDraw, true);
+
+          // Mouse fallback: this also makes left-button drawing work if the
+          // browser/Jupyter environment does not deliver pointer events.
+          canvas.addEventListener('mousedown', e => {{
+            if (e.button === 0 || e.button === 2) beginDraw(e);
+          }}, true);
+          canvas.addEventListener('mousemove', moveDraw, true);
+          canvas.addEventListener('mouseup', finishDraw, true);
+
+          canvas.addEventListener('mouseleave', e => {{
+            if (drawing && e.buttons === 0) finishDraw(e);
+          }}, true);
+
+          // Prevent browser text selection / drag behavior over the canvas.
+          canvas.addEventListener('dragstart', e => e.preventDefault(), true);
+          canvas.style.userSelect = 'none';
+          canvas.style.webkitUserSelect = 'none';
+
+          window.addEventListener('keydown', e => {{
+            const k = (e.key || '').toLowerCase();
+            if (['d','e','s','r','c','n','p'].includes(k)) e.preventDefault();
+            if (k === 'd') mode = 'draw';
+            else if (k === 'e') mode = 'erase';
+            else if (k === 's') Array.from(document.querySelectorAll('button')).find(x => x.innerText === 'Save manual')?.click();
+            else if (k === 'r') Array.from(document.querySelectorAll('button')).find(x => x.innerText === 'Reset to auto')?.click();
+            else if (k === 'c') Array.from(document.querySelectorAll('button')).find(x => x.innerText === 'Clear')?.click();
+            else if (k === 'n') Array.from(document.querySelectorAll('button')).find(x => x.innerText === 'Next')?.click();
+            else if (k === 'p') Array.from(document.querySelectorAll('button')).find(x => x.innerText === 'Previous')?.click();
+          }});
+
+          function loadDataImage(target, source, label) {{
+            return new Promise((resolve, reject) => {{
+              target.onload = resolve;
+              target.onerror = () => reject(
+                new Error(`Could not load ${{label}} data URI`)
+              );
+              target.src = source;
+            }});
+          }}
+
+          Promise.all([
+            loadDataImage(image, imageUri, 'MRI'),
+            loadDataImage(base, baseUri, 'automatic mask'),
+            loadDataImage(initialMask, maskUri, 'editable mask')
+          ]).then(initMask).catch(error => {{
+            console.error('[ATTENTION][EDITOR] Canvas initialization failed:', error);
+          }});
+        }})();
+        """
+
+        with self.output:
+            self._clear_output(wait=True)
+            display(HTML(html))
+            display(Javascript(js))
+
+        self.status.value = (
+            f"<span style='margin-left:12px'>"
+            f"<b>Mode:</b> {self.mode} &nbsp; "
+            f"<b>Index:</b> {self.index + 1}/{len(self.rows)}</span>"
+        )
+
+    def _sync_mask_to_frontend(self):
+        """Synchronize the current Python mask with the hidden HTML widget.
+
+        The same transparent-PNG contract used by the visible canvas is used
+        here. This prevents a zero mask from acquiring an opaque full-frame
+        background during a Reset/Clear round trip.
+        """
+
+        if self.mask is None:
+            return
+        value = self._mask_data_uri(self.mask).split(",", 1)[1]
+        if self.mask_sync.value != value:
+            self.mask_sync.value = value
+
+    def _mask_sync_changed(self, change):
+        value = change.get("new", "")
+        if not value:
+            return
+        try:
+            raw = self._base64.b64decode(value)
+            decoded = cv2.imdecode(
+                np.frombuffer(raw, np.uint8),
+                cv2.IMREAD_UNCHANGED,
+            )
+            if decoded is None:
+                return
+
+            # Browser canvases export transparent pixels. Use the alpha channel
+            # explicitly when available, so transparent RGB values can never be
+            # interpreted as foreground over the whole image.
+            if decoded.ndim == 3 and decoded.shape[2] == 4:
+                alpha = decoded[..., 3]
+                gray = cv2.cvtColor(decoded[..., :3], cv2.COLOR_BGR2GRAY)
+                binary = ((alpha > 8) & (gray > 127)).astype(np.uint8)
+            elif decoded.ndim == 3:
+                gray = cv2.cvtColor(decoded, cv2.COLOR_BGR2GRAY)
+                binary = (gray > 127).astype(np.uint8)
+            else:
+                binary = (decoded > 127).astype(np.uint8)
+
+            binary = cv2.resize(
+                binary,
+                (ATTENTION_INPUT_SIZE, ATTENTION_INPUT_SIZE),
+                interpolation=cv2.INTER_NEAREST,
+            )
+            self.mask = (binary > 0).astype(np.uint8)
+        except Exception as exc:
+            print(f"[ATTENTION][EDITOR][WARNING] Mask sync failed: {exc}", flush=True)
+
+    def _previous_click(self, _button):
+        self.previous()
+
+    def _next_click(self, _button):
+        self.next()
+
+    def _save_click(self, _button):
+        self.save()
+
+    def _button_error(self, action, error):
+        """Expose callback failures instead of letting ipywidgets hide them."""
+
+        message = f"{action} failed: {type(error).__name__}: {error}"
+        self.status.value = (
+            "<span style='margin-left:12px;color:#b00020'><b>"
+            + message
+            + "</b></span>"
+        )
+        print(f"[ATTENTION][EDITOR][ERROR] {message}", flush=True)
+
+    def _reset_click(self, _button):
+        try:
+            self.reset()
+        except Exception as error:
+            self._button_error("Reset to auto", error)
+
+    def _clear_drawn_click(self, _button):
+        try:
+            self.reset_to_image()
+        except Exception as error:
+            self._button_error("Reset to image", error)
+
+    def _clear_click(self, _button):
+        try:
+            self.clear()
+        except Exception as error:
+            self._button_error("Clear", error)
 
     def _paint(self, event, erase=False):
-        if event.inaxes is not self.axes[2] or event.xdata is None or event.ydata is None:
-            return
-        x = int(round(event.xdata))
-        y = int(round(event.ydata))
-        value = 0 if erase else 1
-        cv2.circle(self.mask, (x, y), self.brush_radius, int(value), thickness=-1)
-        self.redraw()
+        # Retained for API compatibility; browser canvas handles painting.
+        return
 
     def _on_press(self, event):
-        if event.inaxes is not self.axes[2]:
-            return
-        self.dragging = True
-        self.drag_erase = bool(event.button == 3 or self.mode == "erase")
-        self._paint(event, erase=self.drag_erase)
+        return
 
-    def _on_release(self, _event):
-        self.dragging = False
-        self.drag_erase = False
+    def _on_release(self, event):
+        return
 
     def _on_motion(self, event):
-        if self.dragging:
-            self._paint(event, erase=self.drag_erase)
+        return
 
     def _on_key(self, event):
-        key = str(event.key or "").lower()
+        key = str(getattr(event, "key", "") or "").lower()
         if key == "d":
             self.mode = "draw"
-            self.redraw()
         elif key == "e":
             self.mode = "erase"
-            self.redraw()
         elif key == "s":
             self.save()
         elif key == "r":
@@ -18651,6 +19036,9 @@ class AttentionMaskEditor:
             self.next()
         elif key in {"p", "left"}:
             self.previous()
+        self.status.value = (
+            f"<span style='margin-left:12px'><b>Mode:</b> {self.mode}</span>"
+        )
 
     def save(self):
         row = self.rows[self.index]
@@ -18681,23 +19069,61 @@ class AttentionMaskEditor:
         print(f"[ATTENTION][EDITOR] Saved manual mask: {path}", flush=True)
 
     def reset(self):
-        self.mask = self.base_mask.astype(np.uint8).copy()
-        self.redraw()
+        """Restore the immutable automatic mask and its orange reference."""
+
+        if self.auto_mask is None:
+            raise RuntimeError("Automatic mask is not loaded.")
+        self.base_mask = self.auto_mask.copy()
+        self.mask = self.auto_mask.copy()
+        self._sync_mask_to_frontend()
+        self._render()
+        self.status.value = (
+            "<span style='margin-left:12px'><b>Reset:</b> automatic mask "
+            "restored.</span>"
+        )
+
+    def reset_to_image(self):
+        """Show only the raw MRI, hiding automatic and editable overlays."""
+
+        if self.auto_mask is None:
+            raise RuntimeError("Automatic mask is not loaded.")
+        self.base_mask = np.zeros_like(self.auto_mask, dtype=np.uint8)
+        self.mask = np.zeros_like(self.auto_mask, dtype=np.uint8)
+        self._sync_mask_to_frontend()
+        self._render()
+        self.status.value = (
+            "<span style='margin-left:12px'><b>Raw MRI:</b> all mask "
+            "overlays hidden. This is not saved until Save manual is pressed."
+            "</span>"
+        )
 
     def clear(self):
-        self.mask.fill(0)
-        self.redraw()
+        """Clear the editable mask while retaining auto mask as orange guide."""
+
+        if self.auto_mask is None:
+            raise RuntimeError("Automatic mask is not loaded.")
+        self.base_mask = self.auto_mask.copy()
+        self.mask = np.zeros_like(self.auto_mask, dtype=np.uint8)
+        self._sync_mask_to_frontend()
+        self._render()
+        self.status.value = (
+            "<span style='margin-left:12px'><b>Editable mask cleared.</b> "
+            "The automatic mask remains visible in orange as a guide.</span>"
+        )
 
     def next(self):
-        self.index = min(len(self.rows) - 1, self.index + 1)
-        self.load_current()
+        if self.index < len(self.rows) - 1:
+            self.index += 1
+            self.load_current()
 
     def previous(self):
-        self.index = max(0, self.index - 1)
-        self.load_current()
+        if self.index > 0:
+            self.index -= 1
+            self.load_current()
 
     def show(self):
-        plt.show(block=False)
+        from IPython.display import display
+        display(self.controls)
         return self
 
 
@@ -18707,8 +19133,7 @@ def open_attention_mask_editor(
     brush_radius=8,
     base_source="attention",
 ):
-    """Open the editor and keep a global reference for notebook backends."""
-
+    """Open the Kaggle-safe HTML5 canvas editor."""
     rows = read_attention_manifest(workspace)
     global _ACTIVE_ATTENTION_MASK_EDITOR
     _ACTIVE_ATTENTION_MASK_EDITOR = AttentionMaskEditor(
