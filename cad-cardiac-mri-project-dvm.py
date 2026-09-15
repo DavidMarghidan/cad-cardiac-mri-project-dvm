@@ -3,6 +3,21 @@
 # ============================================================
 
 # ============================================================================
+# V13 PAIRED PYTHON / NOTEBOOK SYNCHRONIZATION NOTE
+# ============================================================================
+#
+# This attached Python source already contains the complete V13 full-cohort
+# MONAI / Attention U-Net review extension. It is now explicitly paired with
+# ``cad-cardiac-mri-project-dvm(2)_full_mask_review_v13.ipynb``. No original
+# implementation code or detailed methodological comment was removed.
+#
+# Available V13 actions include:
+#   generate-all-monai-masks, generate-all-attention-masks,
+#   retrain-regenerate-attention, and edit-masks with all/diverse/
+#   unreviewed/invalid/disagreement/manual/reviewed queues.
+# ============================================================================
+
+# ============================================================================
 # V7.2 FAST-VALIDATION RUNTIME NOTE
 # ============================================================================
 #
