@@ -20805,5 +20805,1437 @@ def attention_v7_entrypoint(argv=None):
             sys.stderr = original_stderr
 
 
+# ---------------------------------------------------------------------------
+# ORIGINAL V7.2 STANDALONE ENTRYPOINT (PRESERVED FOR TRACEABILITY)
+# ---------------------------------------------------------------------------
+# The original file ended with the following two lines:
+#
+# if __name__ == "__main__":
+#     attention_v7_entrypoint()
+#
+# They are intentionally moved below the V13 override. Calling the original
+# entrypoint here would start the V7.2 action before the V13 full-cohort review
+# functions, CLI options and iterative editor were defined.
+
+# ============================================================================
+# V13 FULL-COHORT MONAI / ATTENTION U-NET MASK REVIEW EXTENSION
+# ============================================================================
+#
+# This extension is executed AFTER the main V7.2 pipeline-definition cell. It
+# preserves the original segmentation/classification implementation and adds a
+# separate full-cohort review workflow:
+#
+#   * every one of the 63,425 image rows can appear in the HTML editor;
+#   * MONAI masks can be generated for all rows or only for a selected queue;
+#   * cross-fitted Attention U-Net masks can be generated for all rows or only
+#     for a selected queue;
+#   * review queues can be all, diverse, unreviewed, invalid, disagreement,
+#     manually corrected, or previously reviewed;
+#   * manual masks saved anywhere in the full cohort are automatically added to
+#     the next Attention U-Net training manifest, even when they lie outside the
+#     ordinary 5-per-series / 40-per-patient pseudo-label subset;
+#   * each manual-review action is logged by source and review round;
+#   * after manual corrections, ``retrain-regenerate-attention`` retrains stale
+#     folds and regenerates Attention U-Net masks, after which another review
+#     round can be opened.
+#
+# MONAI and Attention predictions are regenerable and remain in the transient
+# workspace by default. Manual masks and review history remain persistent under
+# /kaggle/working/cad_attention_unet_workspace.
+
+from collections import defaultdict as _v13_defaultdict
+from datetime import datetime as _v13_datetime, timezone as _v13_timezone
+
+ATTENTION_FULL_REVIEW_VERSION = "v13-full-cohort-iterative-review"
+ATTENTION_REVIEW_SCOPES = (
+    "all",
+    "diverse",
+    "unreviewed",
+    "invalid",
+    "disagreement",
+    "manual",
+    "reviewed",
+)
+ATTENTION_ACTION_CHOICES = (
+    "both",
+    "monai-only",
+    "attention-only",
+    "generate-masks",
+    "train-attention",
+    "edit-masks",
+    "generate-all-monai-masks",
+    "generate-all-attention-masks",
+    "retrain-regenerate-attention",
+)
+
+ATTENTION_REVIEW_MANIFEST_FIELDS = (
+    "review_index",
+    "image_token",
+    "image_path",
+    "patient_id",
+    "series_id",
+    "segmentation_fold",
+    "cached_image_path",
+    "automatic_mask_path",
+    "manual_mask_path",
+    "predicted_attention_mask_path",
+    "monai_valid",
+    "monai_area_ratio",
+    "monai_peak_probability",
+    "attention_valid",
+    "attention_area_ratio",
+    "attention_peak_probability",
+    "dice_attention_vs_monai",
+    "manual_mask_exists",
+    "attention_checkpoint_fingerprint",
+)
+ATTENTION_REVIEW_HISTORY_FIELDS = (
+    "timestamp_utc",
+    "review_round",
+    "review_source",
+    "action",
+    "image_token",
+    "patient_id",
+    "series_id",
+    "queue_position",
+    "queue_size",
+    "mask_area_ratio",
+    "automatic_mask_path",
+    "manual_mask_path",
+)
+
+
+def attention_full_review_manifest_path(workspace):
+    return Path(workspace.root) / "attention_unet_full_review_manifest.csv"
+
+
+def attention_review_history_path(workspace):
+    return Path(workspace.root) / "attention_unet_review_history.csv"
+
+
+def attention_prediction_generation_path(workspace):
+    return Path(workspace.root) / "attention_unet_prediction_generation.json"
+
+
+def _v13_atomic_csv(rows, path, fieldnames):
+    """Write a CSV atomically without assuming the training-manifest schema."""
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+    )
+    try:
+        with open(temporary, "w", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(file, fieldnames=list(fieldnames))
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({field: row.get(field, "") for field in fieldnames})
+        os.replace(temporary, path)
+    except Exception:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _v13_read_csv_by_token(path):
+    path = Path(path)
+    if not path.is_file():
+        return {}
+    with open(path, newline="", encoding="utf-8") as file:
+        return {
+            str(row.get("image_token", "")): dict(row)
+            for row in csv.DictReader(file)
+            if str(row.get("image_token", "")).strip()
+        }
+
+
+def _v13_to_float(value, default=float("nan")):
+    try:
+        text = str(value).strip()
+        if not text:
+            return float(default)
+        return float(text)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _v13_to_int(value, default=-1):
+    try:
+        text = str(value).strip()
+        if not text:
+            return int(default)
+        return int(float(text))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def build_attention_full_review_manifest(samples, workspace, refresh=False):
+    """Build one label-blind review row for every discovered JPEG image.
+
+    This manifest is separate from ``attention_unet_mask_manifest.csv``. The
+    latter remains the compact segmentation-training manifest, while this file
+    can contain all 63,425 images and is used only for inspection/correction.
+    Existing MONAI/Attention QC values and manual-mask state are preserved.
+    """
+
+    path = attention_full_review_manifest_path(workspace)
+    existing = {} if refresh else _v13_read_csv_by_token(path)
+
+    # Merge QC already known from the compact training manifest.
+    compact = _v13_read_csv_by_token(workspace.manifest_csv)
+    for token, row in compact.items():
+        existing.setdefault(token, {}).update(
+            {
+                key: row.get(key, "")
+                for key in (
+                    "monai_valid",
+                    "monai_area_ratio",
+                    "monai_peak_probability",
+                )
+            }
+        )
+
+    # Merge QC from the most recent full-cohort Attention feature extraction.
+    slice_qc_path = (
+        Path(workspace.comparison_output) / "attention_unet_slice_qc.csv"
+    )
+    if slice_qc_path.is_file():
+        with open(slice_qc_path, newline="", encoding="utf-8") as file:
+            for qc in csv.DictReader(file):
+                token = str(qc.get("image_token", "")).strip()
+                if not token:
+                    continue
+                existing.setdefault(token, {}).update(
+                    {
+                        "attention_valid": qc.get("attention_valid", ""),
+                        "attention_area_ratio": qc.get(
+                            "attention_area_ratio", ""
+                        ),
+                        "attention_peak_probability": qc.get(
+                            "attention_peak_probability", ""
+                        ),
+                        "dice_attention_vs_monai": qc.get(
+                            "dice_vs_monai_pseudo_if_available", ""
+                        ),
+                    }
+                )
+
+    patient_to_fold = build_attention_patient_folds(samples)
+    rows = []
+    for image_path, _label, patient_id, series_id in samples:
+        token = attention_image_token(image_path, patient_id, series_id)
+        old = existing.get(token, {})
+        manual_path = Path(workspace.manual_masks) / f"{token}.png"
+        rows.append(
+            {
+                "image_token": token,
+                "image_path": str(image_path),
+                "patient_id": str(patient_id),
+                "series_id": str(series_id),
+                "segmentation_fold": int(patient_to_fold[str(patient_id)]),
+                "cached_image_path": str(
+                    Path(workspace.cached_images) / f"{token}.png"
+                ),
+                "automatic_mask_path": str(
+                    Path(workspace.automatic_masks) / f"{token}.png"
+                ),
+                "manual_mask_path": str(manual_path),
+                "predicted_attention_mask_path": str(
+                    Path(workspace.predicted_masks) / f"{token}.png"
+                ),
+                "monai_valid": old.get("monai_valid", ""),
+                "monai_area_ratio": old.get("monai_area_ratio", ""),
+                "monai_peak_probability": old.get(
+                    "monai_peak_probability", ""
+                ),
+                "attention_valid": old.get("attention_valid", ""),
+                "attention_area_ratio": old.get(
+                    "attention_area_ratio", ""
+                ),
+                "attention_peak_probability": old.get(
+                    "attention_peak_probability", ""
+                ),
+                "dice_attention_vs_monai": old.get(
+                    "dice_attention_vs_monai", ""
+                ),
+                "manual_mask_exists": int(manual_path.is_file()),
+                "attention_checkpoint_fingerprint": old.get(
+                    "attention_checkpoint_fingerprint", ""
+                ),
+            }
+        )
+
+    rows.sort(
+        key=lambda row: (
+            row["patient_id"],
+            row["series_id"],
+            row["image_token"],
+        )
+    )
+    for index, row in enumerate(rows):
+        row["review_index"] = int(index)
+    _v13_atomic_csv(rows, path, ATTENTION_REVIEW_MANIFEST_FIELDS)
+    print(
+        f"[ATTENTION][REVIEW] Full manifest: {len(rows)} images -> {path}",
+        flush=True,
+    )
+    return rows
+
+
+def read_attention_full_review_manifest(workspace):
+    path = attention_full_review_manifest_path(workspace)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Full Attention review manifest not found: {path}"
+        )
+    with open(path, newline="", encoding="utf-8") as file:
+        rows = list(csv.DictReader(file))
+    missing = sorted(
+        set(ATTENTION_REVIEW_MANIFEST_FIELDS)
+        - set(rows[0].keys() if rows else ())
+    )
+    if missing:
+        raise RuntimeError(f"Full review manifest missing columns: {missing}")
+    return rows
+
+
+def _v13_append_review_event(
+    workspace,
+    row,
+    source,
+    review_round,
+    action,
+    mask=None,
+    queue_position=-1,
+    queue_size=-1,
+):
+    """Append one persistent review action without rewriting 63k CSV rows."""
+
+    path = attention_review_history_path(workspace)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not path.is_file() or path.stat().st_size == 0
+    area = ""
+    if mask is not None:
+        area = float((np.asarray(mask) > 0).mean())
+    event = {
+        "timestamp_utc": _v13_datetime.now(_v13_timezone.utc).isoformat(),
+        "review_round": int(review_round),
+        "review_source": str(source),
+        "action": str(action),
+        "image_token": row.get("image_token", ""),
+        "patient_id": row.get("patient_id", ""),
+        "series_id": row.get("series_id", ""),
+        "queue_position": int(queue_position),
+        "queue_size": int(queue_size),
+        "mask_area_ratio": area,
+        "automatic_mask_path": (
+            row.get("predicted_attention_mask_path", "")
+            if source == "attention"
+            else row.get("automatic_mask_path", "")
+        ),
+        "manual_mask_path": row.get("manual_mask_path", ""),
+    }
+    with open(path, "a", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(
+            file, fieldnames=list(ATTENTION_REVIEW_HISTORY_FIELDS)
+        )
+        if write_header:
+            writer.writeheader()
+        writer.writerow(event)
+
+
+def _v13_reviewed_tokens(workspace, source=None, review_round=None):
+    path = attention_review_history_path(workspace)
+    if not path.is_file():
+        return set()
+    tokens = set()
+    with open(path, newline="", encoding="utf-8") as file:
+        for row in csv.DictReader(file):
+            if source is not None and row.get("review_source") != source:
+                continue
+            if review_round is not None and _v13_to_int(
+                row.get("review_round"), -1
+            ) != int(review_round):
+                continue
+            if row.get("action") in {
+                "save_manual",
+                "accept_auto",
+                "skip",
+                "delete_manual",
+            }:
+                tokens.add(row.get("image_token", ""))
+    return tokens
+
+
+def _v13_round_robin_diverse(rows, limit, source, seed):
+    """Select a deterministic patient/series-balanced high-value queue."""
+
+    rows = list(rows)
+    if limit <= 0 or limit >= len(rows):
+        return rows
+
+    def priority(row):
+        token = row["image_token"]
+        hashed = hashlib.sha256(f"{seed}|{token}".encode()).hexdigest()
+        if source == "attention":
+            valid = _v13_to_int(row.get("attention_valid"), -1)
+            dice = _v13_to_float(row.get("dice_attention_vs_monai"), 1.0)
+            peak = _v13_to_float(
+                row.get("attention_peak_probability"), 1.0
+            )
+            area = _v13_to_float(row.get("attention_area_ratio"), 0.15)
+        else:
+            valid = _v13_to_int(row.get("monai_valid"), -1)
+            dice = 1.0
+            peak = _v13_to_float(row.get("monai_peak_probability"), 1.0)
+            area = _v13_to_float(row.get("monai_area_ratio"), 0.15)
+        # invalid / low agreement / low confidence / extreme-area rows first.
+        return (
+            1 if bool(row.get("_reviewed_current_round", False)) else 0,
+            0 if valid == 0 else 1,
+            dice,
+            peak,
+            -abs(area - 0.15),
+            hashed,
+        )
+
+    by_patient_series = _v13_defaultdict(lambda: _v13_defaultdict(list))
+    for row in rows:
+        by_patient_series[row["patient_id"]][row["series_id"]].append(row)
+    patient_queues = {}
+    for patient_id, series_map in by_patient_series.items():
+        ordered_series = sorted(series_map)
+        for series_id in ordered_series:
+            series_map[series_id].sort(key=priority)
+        queue = []
+        position = 0
+        while True:
+            added = False
+            for series_id in ordered_series:
+                if position < len(series_map[series_id]):
+                    queue.append(series_map[series_id][position])
+                    added = True
+            if not added:
+                break
+            position += 1
+        patient_queues[patient_id] = queue
+
+    patient_ids = sorted(patient_queues)
+    selected = []
+    position = 0
+    while len(selected) < limit:
+        added = False
+        for patient_id in patient_ids:
+            queue = patient_queues[patient_id]
+            if position < len(queue):
+                selected.append(queue[position])
+                added = True
+                if len(selected) >= limit:
+                    break
+        if not added:
+            break
+        position += 1
+    return selected
+
+
+def select_attention_review_rows(
+    rows,
+    workspace,
+    source="monai",
+    scope="diverse",
+    limit=1200,
+    seed=42,
+    review_round=1,
+):
+    """Build a review queue from the full cohort without class labels."""
+
+    source = str(source).lower()
+    scope = str(scope).lower()
+    if source not in {"monai", "attention"}:
+        raise ValueError("review source must be 'monai' or 'attention'.")
+    if scope not in ATTENTION_REVIEW_SCOPES:
+        raise ValueError(
+            f"review scope must be one of {ATTENTION_REVIEW_SCOPES}."
+        )
+
+    rows = [dict(row) for row in rows]
+    reviewed = _v13_reviewed_tokens(workspace, source=source)
+    current_round_reviewed = _v13_reviewed_tokens(
+        workspace, source=source, review_round=review_round
+    )
+
+    if scope == "unreviewed":
+        rows = [row for row in rows if row["image_token"] not in reviewed]
+    elif scope == "reviewed":
+        rows = [row for row in rows if row["image_token"] in reviewed]
+    elif scope == "manual":
+        rows = [
+            row
+            for row in rows
+            if Path(row["manual_mask_path"]).is_file()
+        ]
+    elif scope == "invalid":
+        field = "attention_valid" if source == "attention" else "monai_valid"
+        rows = [row for row in rows if _v13_to_int(row.get(field), -1) == 0]
+    elif scope == "disagreement":
+        if source != "attention":
+            raise ValueError("disagreement scope is available for Attention only.")
+        rows = [
+            row
+            for row in rows
+            if np.isfinite(
+                _v13_to_float(row.get("dice_attention_vs_monai"))
+            )
+        ]
+        rows.sort(
+            key=lambda row: (
+                _v13_to_float(row.get("dice_attention_vs_monai"), 1.0),
+                row["patient_id"],
+                row["series_id"],
+                row["image_token"],
+            )
+        )
+
+    if scope == "diverse":
+        # Prefer rows not yet reviewed in the current round, then balance across
+        # patients and series while prioritizing difficult segmentations.
+        for row in rows:
+            row["_reviewed_current_round"] = (
+                row["image_token"] in current_round_reviewed
+            )
+        rows = _v13_round_robin_diverse(
+            rows, int(limit), source, int(seed)
+        )
+    elif int(limit) > 0:
+        rows = rows[: int(limit)]
+
+    for index, row in enumerate(rows):
+        row["queue_index"] = int(index)
+    print(
+        f"[ATTENTION][REVIEW] source={source}, scope={scope}, "
+        f"round={review_round}, queue={len(rows)}, limit={limit}.",
+        flush=True,
+    )
+    return rows
+
+
+def _v13_manifest_image_loader(rows):
+    return DataLoader(
+        _AttentionManifestImageDataset(rows),
+        batch_size=ATTENTION_INFERENCE_BATCH_SIZE,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=(DEVICE == "cuda"),
+    )
+
+
+def generate_monai_review_masks(
+    samples,
+    workspace,
+    rows=None,
+    force=False,
+):
+    """Generate/reuse MONAI masks for any full-cohort review rows."""
+
+    full_rows = build_attention_full_review_manifest(samples, workspace)
+    full_by_token = {row["image_token"]: row for row in full_rows}
+    target_rows = (
+        full_rows
+        if rows is None
+        else [full_by_token[row["image_token"]] for row in rows]
+    )
+    missing = [
+        row
+        for row in target_rows
+        if force
+        or not _attention_mask_file_is_readable(row["automatic_mask_path"])
+        or str(row.get("monai_valid", "")).strip() == ""
+    ]
+    if not missing:
+        print(
+            f"[ATTENTION][MONAI REVIEW] Reusing {len(target_rows)} masks.",
+            flush=True,
+        )
+        return target_rows
+
+    report_attention_storage(workspace)
+    model = build_monai_segmenter().to(DEVICE).eval()
+    loader = _v13_manifest_image_loader(missing)
+    print(
+        f"[ATTENTION][MONAI REVIEW] Generating {len(missing)} masks "
+        f"for a {len(target_rows)}-row review queue.",
+        flush=True,
+    )
+    completed = 0
+    with torch.inference_mode():
+        for batch_number, (images, local_indices) in enumerate(
+            tqdm(loader, desc="MONAI full-review masks"), start=1
+        ):
+            images = images.to(DEVICE, non_blocking=True)
+            logits = model(images)
+            probabilities = torch.softmax(logits.float(), dim=1)
+            heart_probability = probabilities[:, 1:].sum(dim=1, keepdim=True)
+            class_map = torch.argmax(probabilities, dim=1, keepdim=True)
+            hard = (class_map > 0).float()
+            area = hard.mean(dim=(1, 2, 3))
+            peak = heart_probability.amax(dim=(1, 2, 3))
+            valid = (
+                (area >= MONAI_MIN_HEART_AREA_RATIO)
+                & (area <= MONAI_MAX_HEART_AREA_RATIO)
+                & (peak >= MONAI_MIN_PEAK_HEART_PROBABILITY)
+            )
+            hard = F.max_pool2d(
+                hard,
+                kernel_size=ATTENTION_PSEUDO_MASK_DILATION_KERNEL,
+                stride=1,
+                padding=ATTENTION_PSEUDO_MASK_DILATION_KERNEL // 2,
+            )
+            for batch_position, local_index_tensor in enumerate(local_indices):
+                row = missing[int(local_index_tensor)]
+                mask = _largest_connected_component(
+                    hard[batch_position, 0].detach().cpu().numpy() > 0.5
+                )
+                _atomic_cv2_write(
+                    Path(row["automatic_mask_path"]),
+                    mask.astype(np.uint8) * 255,
+                    required=True,
+                    purpose="full-review MONAI mask",
+                )
+                row["monai_valid"] = int(valid[batch_position].item())
+                row["monai_area_ratio"] = float(area[batch_position].item())
+                row["monai_peak_probability"] = float(
+                    peak[batch_position].item()
+                )
+                completed += 1
+            if batch_number % 50 == 0:
+                _v13_atomic_csv(
+                    full_rows,
+                    attention_full_review_manifest_path(workspace),
+                    ATTENTION_REVIEW_MANIFEST_FIELDS,
+                )
+    _v13_atomic_csv(
+        full_rows,
+        attention_full_review_manifest_path(workspace),
+        ATTENTION_REVIEW_MANIFEST_FIELDS,
+    )
+    del model
+    if DEVICE == "cuda":
+        torch.cuda.empty_cache()
+    print(
+        f"[ATTENTION][MONAI REVIEW] Completed {completed} masks.",
+        flush=True,
+    )
+    refreshed = {row["image_token"]: row for row in full_rows}
+    return [refreshed[row["image_token"]] for row in target_rows]
+
+
+def _v13_checkpoint_fingerprint(checkpoint_map):
+    hasher = hashlib.sha256()
+    for fold in sorted(checkpoint_map):
+        path = Path(checkpoint_map[fold])
+        hasher.update(str(fold).encode("utf-8"))
+        hasher.update(hashlib.sha256(path.read_bytes()).digest())
+    return hasher.hexdigest()
+
+
+def generate_attention_review_masks(
+    samples,
+    workspace,
+    checkpoint_map,
+    rows=None,
+    force=False,
+):
+    """Generate/reuse cross-fitted Attention masks for review, without EfficientNet."""
+
+    full_rows = build_attention_full_review_manifest(samples, workspace)
+    full_by_token = {row["image_token"]: row for row in full_rows}
+    target_rows = (
+        full_rows
+        if rows is None
+        else [full_by_token[row["image_token"]] for row in rows]
+    )
+    fingerprint = _v13_checkpoint_fingerprint(checkpoint_map)
+    metadata_path = attention_prediction_generation_path(workspace)
+    previous_fingerprint = ""
+    if metadata_path.is_file():
+        try:
+            previous_fingerprint = json.loads(
+                metadata_path.read_text(encoding="utf-8")
+            ).get("checkpoint_fingerprint", "")
+        except Exception:
+            previous_fingerprint = ""
+    if previous_fingerprint != fingerprint:
+        force = True
+
+    missing = [
+        row
+        for row in target_rows
+        if force
+        or not _attention_mask_file_is_readable(
+            row["predicted_attention_mask_path"]
+        )
+        or row.get("attention_checkpoint_fingerprint", "") != fingerprint
+    ]
+    if not missing:
+        print(
+            f"[ATTENTION][PREDICTION REVIEW] Reusing {len(target_rows)} "
+            f"predictions for checkpoint {fingerprint[:12]}.",
+            flush=True,
+        )
+        return target_rows
+
+    by_fold = _v13_defaultdict(list)
+    for row in missing:
+        by_fold[int(row["segmentation_fold"])].append(row)
+    print(
+        f"[ATTENTION][PREDICTION REVIEW] Generating {len(missing)} masks "
+        f"for checkpoint {fingerprint[:12]}.",
+        flush=True,
+    )
+    generated = 0
+    for target_fold in sorted(by_fold):
+        fold_rows = by_fold[target_fold]
+        fold_samples = [
+            (
+                row["image_path"],
+                0,
+                row["patient_id"],
+                row["series_id"],
+            )
+            for row in fold_rows
+        ]
+        model, _metadata = _load_attention_model(checkpoint_map[target_fold])
+        loader = DataLoader(
+            AttentionInferenceDataset(fold_samples),
+            batch_size=ATTENTION_INFERENCE_BATCH_SIZE,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=(DEVICE == "cuda"),
+        )
+        with torch.inference_mode():
+            for batch_number, batch in enumerate(
+                tqdm(loader, desc=f"Attention review fold {target_fold}"),
+                start=1,
+            ):
+                attention_inputs = batch[0].to(DEVICE, non_blocking=True)
+                image_tokens = list(batch[8])
+                probability = torch.sigmoid(model(attention_inputs).float())
+                hard = _attention_binary_masks(probability)
+                area = hard.mean(dim=(1, 2, 3))
+                peak = probability.amax(dim=(1, 2, 3))
+                valid = (
+                    (area >= ATTENTION_MIN_HEART_AREA_RATIO)
+                    & (area <= ATTENTION_MAX_HEART_AREA_RATIO)
+                    & (peak >= ATTENTION_MIN_PEAK_PROBABILITY)
+                )
+                hard_np = hard[:, 0].cpu().numpy() > 0.5
+                for position, token in enumerate(image_tokens):
+                    row = full_by_token[str(token)]
+                    _atomic_cv2_write(
+                        Path(row["predicted_attention_mask_path"]),
+                        hard_np[position].astype(np.uint8) * 255,
+                        required=True,
+                        purpose="full-review Attention U-Net mask",
+                    )
+                    row["attention_valid"] = int(valid[position].item())
+                    row["attention_area_ratio"] = float(area[position].item())
+                    row["attention_peak_probability"] = float(
+                        peak[position].item()
+                    )
+                    row["attention_checkpoint_fingerprint"] = fingerprint
+                    monai_path = Path(row["automatic_mask_path"])
+                    if monai_path.is_file():
+                        monai = cv2.imread(
+                            str(monai_path), cv2.IMREAD_GRAYSCALE
+                        )
+                        if monai is not None:
+                            monai = cv2.resize(
+                                monai,
+                                (ATTENTION_INPUT_SIZE, ATTENTION_INPUT_SIZE),
+                                interpolation=cv2.INTER_NEAREST,
+                            ) > 127
+                            row["dice_attention_vs_monai"] = _dice_binary(
+                                hard_np[position], monai
+                            )
+                    generated += 1
+                if batch_number % 50 == 0:
+                    _v13_atomic_csv(
+                        full_rows,
+                        attention_full_review_manifest_path(workspace),
+                        ATTENTION_REVIEW_MANIFEST_FIELDS,
+                    )
+        del model
+        if DEVICE == "cuda":
+            torch.cuda.empty_cache()
+
+    _v13_atomic_csv(
+        full_rows,
+        attention_full_review_manifest_path(workspace),
+        ATTENTION_REVIEW_MANIFEST_FIELDS,
+    )
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "status": "OK",
+                "version": ATTENTION_FULL_REVIEW_VERSION,
+                "checkpoint_fingerprint": fingerprint,
+                "generated_masks": int(generated),
+                "target_rows": int(len(target_rows)),
+                "timestamp_utc": _v13_datetime.now(
+                    _v13_timezone.utc
+                ).isoformat(),
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    print(
+        f"[ATTENTION][PREDICTION REVIEW] Completed {generated} masks.",
+        flush=True,
+    )
+    refreshed = {row["image_token"]: row for row in full_rows}
+    return [refreshed[row["image_token"]] for row in target_rows]
+
+
+# ---------------------------------------------------------------------------
+# TRAINING MANIFEST PATCH: retain compact pseudo subset + every manual mask.
+# ---------------------------------------------------------------------------
+
+
+def select_attention_training_rows(samples, workspace):
+    """Build compact pseudo supervision and include every manual correction.
+
+    The ordinary per-series/per-patient limits continue to bound automatic
+    pseudo supervision. Manual masks saved anywhere in the full review cohort
+    are never discarded merely because their image was outside that subset.
+    """
+
+    existing = _v13_read_csv_by_token(workspace.manifest_csv)
+    review_existing = _v13_read_csv_by_token(
+        attention_full_review_manifest_path(workspace)
+    )
+    all_rows = {}
+    by_series = _v13_defaultdict(list)
+    for image_path, _label, patient_id, series_id in samples:
+        token = attention_image_token(image_path, patient_id, series_id)
+        row = {
+            "image_token": token,
+            "image_path": str(image_path),
+            "patient_id": str(patient_id),
+            "series_id": str(series_id),
+        }
+        all_rows[token] = row
+        by_series[str(series_id)].append(row)
+
+    series_selected = []
+    for series_id in sorted(by_series):
+        ordered = sorted(
+            by_series[series_id], key=lambda row: row["image_token"]
+        )
+        series_selected.extend(
+            _evenly_spaced_subset(
+                ordered, ATTENTION_MAX_TRAIN_SLICES_PER_SERIES
+            )
+        )
+    by_patient = _v13_defaultdict(list)
+    for row in series_selected:
+        by_patient[row["patient_id"]].append(row)
+    selected = {}
+    for patient_id in sorted(by_patient):
+        ordered = sorted(
+            by_patient[patient_id], key=lambda row: row["image_token"]
+        )
+        for row in _evenly_spaced_subset(
+            ordered, ATTENTION_MAX_TRAIN_SLICES_PER_PATIENT
+        ):
+            selected[row["image_token"]] = row
+    base_count = len(selected)
+
+    manual_added = 0
+    for manual_path in Path(workspace.manual_masks).glob("*.png"):
+        token = manual_path.stem
+        if token in all_rows and token not in selected:
+            selected[token] = all_rows[token]
+            manual_added += 1
+
+    patient_to_fold = build_attention_patient_folds(samples)
+    manifest_rows = []
+    for index, row in enumerate(
+        sorted(selected.values(), key=lambda x: x["image_token"])
+    ):
+        token = row["image_token"]
+        old = dict(review_existing.get(token, {}))
+        old.update(existing.get(token, {}))
+        automatic_path = Path(workspace.automatic_masks) / f"{token}.png"
+        manual_path = Path(workspace.manual_masks) / f"{token}.png"
+        predicted_path = Path(workspace.predicted_masks) / f"{token}.png"
+        cached_path = Path(workspace.cached_images) / f"{token}.png"
+        manifest_rows.append(
+            {
+                "manifest_index": int(index),
+                "image_token": token,
+                "image_path": row["image_path"],
+                "patient_id": row["patient_id"],
+                "series_id": row["series_id"],
+                "segmentation_fold": int(
+                    patient_to_fold[row["patient_id"]]
+                ),
+                "cached_image_path": str(cached_path),
+                "automatic_mask_path": str(automatic_path),
+                "manual_mask_path": str(manual_path),
+                "predicted_attention_mask_path": str(predicted_path),
+                "monai_valid": old.get("monai_valid", ""),
+                "monai_area_ratio": old.get("monai_area_ratio", ""),
+                "monai_peak_probability": old.get(
+                    "monai_peak_probability", ""
+                ),
+                "manual_mask_exists": int(manual_path.is_file()),
+            }
+        )
+    write_attention_manifest(manifest_rows, workspace.manifest_csv)
+    print(
+        f"[ATTENTION][TRAIN MANIFEST] automatic subset={base_count}; "
+        f"manual rows added outside subset={manual_added}; "
+        f"total={len(manifest_rows)}.",
+        flush=True,
+    )
+    return manifest_rows
+
+
+# ---------------------------------------------------------------------------
+# HTML EDITOR PATCH: strict source, review log and rapid-review buttons.
+# ---------------------------------------------------------------------------
+
+_AttentionMaskEditorV12 = AttentionMaskEditor
+
+
+class AttentionMaskEditor(_AttentionMaskEditorV12):
+    """Full-cohort iterative editor with persistent review tracking."""
+
+    def __init__(
+        self,
+        rows,
+        workspace,
+        start_index=0,
+        brush_radius=8,
+        base_source="attention",
+        review_round=1,
+        review_scope="all",
+    ):
+        self.review_round = int(review_round)
+        self.review_scope = str(review_scope)
+        super().__init__(
+            rows,
+            workspace,
+            start_index=start_index,
+            brush_radius=brush_radius,
+            base_source=base_source,
+        )
+        import ipywidgets as widgets
+
+        self.save_next_button = widgets.Button(
+            description="Save & Next", button_style="success"
+        )
+        self.accept_button = widgets.Button(
+            description="Accept auto & Next", button_style="info"
+        )
+        self.skip_button = widgets.Button(description="Skip & Next")
+        self.delete_manual_button = widgets.Button(
+            description="Delete manual", button_style="warning"
+        )
+        self.save_next_button.on_click(self._save_next_click)
+        self.accept_button.on_click(self._accept_click)
+        self.skip_button.on_click(self._skip_click)
+        self.delete_manual_button.on_click(self._delete_manual_click)
+
+        self.controls = widgets.VBox(
+            [
+                widgets.HBox(
+                    [
+                        self.previous_button,
+                        self.next_button,
+                        self.save_button,
+                        self.save_next_button,
+                        self.accept_button,
+                        self.skip_button,
+                    ]
+                ),
+                widgets.HBox(
+                    [
+                        self.reset_button,
+                        self.clear_drawn_button,
+                        self.clear_button,
+                        self.delete_manual_button,
+                    ]
+                ),
+                widgets.HBox([self.brush_slider, self.status]),
+                self.mask_sync,
+                self.output,
+            ]
+        )
+        self._update_review_status()
+
+    def _automatic_mask_path(self, row):
+        field = (
+            "predicted_attention_mask_path"
+            if self.base_source == "attention"
+            else "automatic_mask_path"
+        )
+        path = Path(row[field])
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"{self.base_source} mask unavailable for {row['image_token']}: "
+                f"{path}. Generate review masks for this source first."
+            )
+        return path
+
+    def load_current(self):
+        row = self.rows[self.index]
+        image = load_attention_segmentation_image(row)
+        automatic_path = self._automatic_mask_path(row)
+        automatic = cv2.imread(str(automatic_path), cv2.IMREAD_GRAYSCALE)
+        if automatic is None:
+            raise RuntimeError(f"Could not load automatic mask: {automatic_path}")
+        automatic = cv2.resize(
+            automatic,
+            (ATTENTION_INPUT_SIZE, ATTENTION_INPUT_SIZE),
+            interpolation=cv2.INTER_NEAREST,
+        )
+        manual_path = Path(row["manual_mask_path"])
+        if manual_path.is_file():
+            manual = cv2.imread(str(manual_path), cv2.IMREAD_GRAYSCALE)
+            if manual is None:
+                raise RuntimeError(f"Could not load manual mask: {manual_path}")
+            manual = cv2.resize(
+                manual,
+                (ATTENTION_INPUT_SIZE, ATTENTION_INPUT_SIZE),
+                interpolation=cv2.INTER_NEAREST,
+            )
+            current = manual > 127
+        else:
+            current = automatic > 127
+        self.image = image.astype(np.float32) / 255.0
+        self.auto_mask = (automatic > 127).astype(np.uint8)
+        self.base_mask = self.auto_mask.copy()
+        self.mask = current.astype(np.uint8)
+        self._render()
+        if hasattr(self, "status"):
+            self._update_review_status()
+
+    def _update_review_status(self, prefix=""):
+        row = self.rows[self.index]
+        manual = Path(row["manual_mask_path"]).is_file()
+        if self.base_source == "attention":
+            valid = row.get("attention_valid", "")
+            peak = row.get("attention_peak_probability", "")
+            agreement = row.get("dice_attention_vs_monai", "")
+            qc = f"valid={valid}, peak={peak}, Dice-vs-MONAI={agreement}"
+        else:
+            valid = row.get("monai_valid", "")
+            peak = row.get("monai_peak_probability", "")
+            qc = f"valid={valid}, peak={peak}"
+        self.status.value = (
+            f"<span style='margin-left:12px'><b>{prefix}</b> "
+            f"source={self.base_source}; scope={self.review_scope}; "
+            f"round={self.review_round}; index={self.index + 1}/{len(self.rows)}; "
+            f"manual={'yes' if manual else 'no'}; {qc}</span>"
+        )
+
+    def _log(self, action, mask=None):
+        _v13_append_review_event(
+            self.workspace,
+            self.rows[self.index],
+            self.base_source,
+            self.review_round,
+            action,
+            mask=mask,
+            queue_position=self.index,
+            queue_size=len(self.rows),
+        )
+
+    def save(self):
+        row = self.rows[self.index]
+        path = Path(row["manual_mask_path"])
+        _atomic_cv2_write(
+            path,
+            self.mask.astype(np.uint8) * 255,
+            required=True,
+            purpose="manual Attention U-Net mask",
+        )
+        overlay_path = Path(self.workspace.mask_overlays) / (
+            f"{row['image_token']}.png"
+        )
+        base = np.stack([self.image] * 3, axis=-1)
+        overlay = base.copy()
+        overlay[..., 0] = np.maximum(overlay[..., 0], self.mask * 0.90)
+        overlay[..., 1] *= 1.0 - 0.45 * self.mask
+        overlay[..., 2] *= 1.0 - 0.45 * self.mask
+        _atomic_cv2_write(
+            overlay_path,
+            cv2.cvtColor(
+                np.clip(np.round(overlay * 255.0), 0, 255).astype(np.uint8),
+                cv2.COLOR_RGB2BGR,
+            ),
+            required=False,
+            purpose="optional manual-mask review overlay",
+        )
+        row["manual_mask_exists"] = 1
+        self._log("save_manual", self.mask)
+        self._update_review_status("Saved manual.")
+        print(f"[ATTENTION][EDITOR] Saved manual mask: {path}", flush=True)
+
+    def _save_next_click(self, _button):
+        try:
+            self.save()
+            self.next()
+        except Exception as error:
+            self._button_error("Save & Next", error)
+
+    def _accept_click(self, _button):
+        try:
+            # Acceptance records that the automatic mask was inspected. It does
+            # not copy an automatic prediction into manual ground truth.
+            self._log("accept_auto", self.auto_mask)
+            self._update_review_status("Accepted automatic mask.")
+            self.next()
+        except Exception as error:
+            self._button_error("Accept auto", error)
+
+    def _skip_click(self, _button):
+        try:
+            self._log("skip", None)
+            self._update_review_status("Skipped.")
+            self.next()
+        except Exception as error:
+            self._button_error("Skip", error)
+
+    def _delete_manual_click(self, _button):
+        try:
+            row = self.rows[self.index]
+            path = Path(row["manual_mask_path"])
+            path.unlink(missing_ok=True)
+            row["manual_mask_exists"] = 0
+            self._log("delete_manual", None)
+            self.mask = self.auto_mask.copy()
+            self.base_mask = self.auto_mask.copy()
+            self._sync_mask_to_frontend()
+            self._render()
+            self._update_review_status("Deleted manual; automatic restored.")
+        except Exception as error:
+            self._button_error("Delete manual", error)
+
+    def next(self):
+        if self.index < len(self.rows) - 1:
+            self.index += 1
+            self.load_current()
+        else:
+            self._update_review_status("End of review queue.")
+
+    def previous(self):
+        if self.index > 0:
+            self.index -= 1
+            self.load_current()
+
+
+def open_attention_mask_editor(
+    workspace,
+    start_index=0,
+    brush_radius=8,
+    base_source="attention",
+    rows=None,
+    review_round=1,
+    review_scope="all",
+):
+    if rows is None:
+        rows = read_attention_full_review_manifest(workspace)
+    editor = AttentionMaskEditor(
+        rows,
+        workspace,
+        start_index=start_index,
+        brush_radius=brush_radius,
+        base_source=base_source,
+        review_round=review_round,
+        review_scope=review_scope,
+    )
+    global _ACTIVE_ATTENTION_MASK_EDITOR
+    _ACTIVE_ATTENTION_MASK_EDITOR = editor
+    return editor.show()
+
+
+# ---------------------------------------------------------------------------
+# Extended CLI / execution workflow.
+# ---------------------------------------------------------------------------
+
+
+def _parse_attention_arguments(argv=None):
+    parser = argparse.ArgumentParser(
+        description=(
+            "CAD MRI MONAI + Attention U-Net pipeline with full-cohort "
+            "iterative HTML mask review."
+        )
+    )
+    parser.add_argument(
+        "--attention-action",
+        choices=ATTENTION_ACTION_CHOICES,
+        default="both",
+    )
+    parser.add_argument("--attention-work-root", default=None)
+    parser.add_argument("--attention-editor-index", type=int, default=0)
+    parser.add_argument("--attention-brush-radius", type=int, default=8)
+    parser.add_argument(
+        "--attention-editor-base",
+        choices=("attention", "monai"),
+        default="attention",
+    )
+    parser.add_argument(
+        "--attention-editor-scope",
+        choices=ATTENTION_REVIEW_SCOPES,
+        default="diverse",
+        help="all/diverse/unreviewed/invalid/disagreement/manual/reviewed",
+    )
+    parser.add_argument(
+        "--attention-editor-limit",
+        type=int,
+        default=1200,
+        help="0 means every available image; otherwise queue size cap.",
+    )
+    parser.add_argument("--attention-editor-seed", type=int, default=42)
+    parser.add_argument("--attention-review-round", type=int, default=1)
+    parser.add_argument(
+        "--attention-force-regenerate",
+        action="store_true",
+        help="Regenerate masks even when cached files are present.",
+    )
+    parser.add_argument(
+        "--attention-dataset-path",
+        default=str(DATASET_PATH),
+    )
+    args, unknown = parser.parse_known_args(argv)
+    if unknown:
+        print(
+            f"[ATTENTION][CLI] Ignoring unrecognized notebook arguments: {unknown}",
+            flush=True,
+        )
+    if args.attention_editor_limit < 0:
+        raise ValueError("--attention-editor-limit must be >= 0.")
+    if args.attention_review_round < 1:
+        raise ValueError("--attention-review-round must be >= 1.")
+    return args
+
+
+def run_attention_pipeline(samples, workspace, action):
+    """Execute original actions plus full-cohort iterative review actions."""
+
+    validate_attention_extension()
+    if action == "generate-all-monai-masks":
+        rows = generate_monai_review_masks(
+            samples, workspace, rows=None, force=False
+        )
+        return {
+            "status": "ALL_MONAI_REVIEW_MASKS_READY",
+            "n_rows": len(rows),
+            "manifest": str(attention_full_review_manifest_path(workspace)),
+        }
+
+    training_rows = generate_attention_pseudo_masks(samples, workspace)
+    if action == "generate-masks":
+        return {
+            "status": "MASKS_GENERATED",
+            "manifest": str(workspace.manifest_csv),
+        }
+    if action == "edit-masks":
+        return {"status": "EDITOR_READY"}
+
+    checkpoint_map = train_attention_unet_crossfit(training_rows, workspace)
+    if action == "train-attention":
+        clear_attention_image_ram_cache()
+        return {
+            "status": "TRAINING_COMPLETED",
+            "checkpoints": {
+                str(key): str(value) for key, value in checkpoint_map.items()
+            },
+        }
+    if action in {
+        "generate-all-attention-masks",
+        "retrain-regenerate-attention",
+    }:
+        rows = generate_attention_review_masks(
+            samples,
+            workspace,
+            checkpoint_map,
+            rows=None,
+            force=(action == "retrain-regenerate-attention"),
+        )
+        clear_attention_image_ram_cache()
+        return {
+            "status": "ALL_ATTENTION_REVIEW_MASKS_READY",
+            "n_rows": len(rows),
+            "manifest": str(attention_full_review_manifest_path(workspace)),
+        }
+
+    clear_attention_image_ram_cache()
+    bank = extract_attention_patient_feature_bank(
+        samples, workspace, checkpoint_map
+    )
+    return evaluate_attention_feature_bank(samples, workspace, bank)
+
+
+def attention_v7_entrypoint(argv=None):
+    """V13-compatible entrypoint for classification and iterative review."""
+
+    args = _parse_attention_arguments(argv)
+    action = args.attention_action
+    if action in {"both", "monai-only"}:
+        run_with_console_logging()
+        if action == "monai-only":
+            return
+
+    workspace = build_attention_workspace(args.attention_work_root)
+    samples = load_samples(Path(args.attention_dataset_path))
+
+    if action == "edit-masks":
+        validate_attention_extension()
+        full_rows = build_attention_full_review_manifest(samples, workspace)
+
+        # Scopes requiring QC across the whole cohort need complete source masks
+        # before the queue can be ranked accurately.
+        if args.attention_editor_base == "monai" and args.attention_editor_scope == "invalid":
+            full_rows = generate_monai_review_masks(
+                samples,
+                workspace,
+                rows=None,
+                force=args.attention_force_regenerate,
+            )
+        if args.attention_editor_base == "attention" and args.attention_editor_scope == "disagreement":
+            # Disagreement requires both sources on the same complete row set.
+            full_rows = generate_monai_review_masks(
+                samples,
+                workspace,
+                rows=None,
+                force=False,
+            )
+            training_rows = generate_attention_pseudo_masks(samples, workspace)
+            checkpoint_map = train_attention_unet_crossfit(
+                training_rows, workspace
+            )
+            full_rows = generate_attention_review_masks(
+                samples,
+                workspace,
+                checkpoint_map,
+                rows=None,
+                force=args.attention_force_regenerate,
+            )
+
+        queue = select_attention_review_rows(
+            full_rows,
+            workspace,
+            source=args.attention_editor_base,
+            scope=args.attention_editor_scope,
+            limit=args.attention_editor_limit,
+            seed=args.attention_editor_seed,
+            review_round=args.attention_review_round,
+        )
+        if not queue:
+            raise RuntimeError("The requested review queue is empty.")
+
+        if args.attention_editor_base == "monai":
+            queue = generate_monai_review_masks(
+                samples,
+                workspace,
+                rows=queue,
+                force=args.attention_force_regenerate,
+            )
+        else:
+            training_rows = generate_attention_pseudo_masks(samples, workspace)
+            checkpoint_map = train_attention_unet_crossfit(
+                training_rows, workspace
+            )
+            queue = generate_attention_review_masks(
+                samples,
+                workspace,
+                checkpoint_map,
+                rows=queue,
+                force=args.attention_force_regenerate,
+            )
+
+        print(
+            f"[ATTENTION][EDITOR] Opening {args.attention_editor_base} "
+            f"queue row {args.attention_editor_index} of {len(queue)}; "
+            f"scope={args.attention_editor_scope}; "
+            f"round={args.attention_review_round}. Class labels are hidden.",
+            flush=True,
+        )
+        return open_attention_mask_editor(
+            workspace,
+            start_index=args.attention_editor_index,
+            brush_radius=args.attention_brush_radius,
+            base_source=args.attention_editor_base,
+            rows=queue,
+            review_round=args.attention_review_round,
+            review_scope=args.attention_editor_scope,
+        )
+
+    workspace.console_log.parent.mkdir(parents=True, exist_ok=True)
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    with open(
+        workspace.console_log,
+        "a",
+        encoding="utf-8",
+        buffering=1,
+    ) as log_file:
+        sys.stdout = TeeStream(original_stdout, log_file)
+        sys.stderr = TeeStream(original_stderr, log_file)
+        try:
+            print("\n" + "#" * 100, flush=True)
+            print(
+                "CAD CARDIAC MRI — V13 FULL-COHORT ITERATIVE MASK REVIEW",
+                flush=True,
+            )
+            print("#" * 100, flush=True)
+            print(f"[ATTENTION] action={action}", flush=True)
+            print(f"[ATTENTION] workspace={workspace.root}", flush=True)
+            print(
+                f"[ATTENTION] transient_root={workspace.transient_root}",
+                flush=True,
+            )
+            summary = run_attention_pipeline(samples, workspace, action)
+            print(
+                "[ATTENTION] Completed with status="
+                f"{summary.get('status', 'OK')}",
+                flush=True,
+            )
+            return summary
+        except Exception:
+            print("\n[ATTENTION] FATAL ERROR", flush=True)
+            traceback.print_exc(file=sys.stdout)
+            raise
+        finally:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
+
+
+print(
+    "[ATTENTION][V13] Full-cohort MONAI/Attention review extension loaded.",
+    flush=True,
+)
+print(
+    "[ATTENTION][V13] Actions: generate-all-monai-masks, "
+    "generate-all-attention-masks, retrain-regenerate-attention, edit-masks.",
+    flush=True,
+)
+
+
+# ---------------------------------------------------------------------------
+# FINAL V13 STANDALONE ENTRYPOINT
+# ---------------------------------------------------------------------------
+# At this point the V13 definitions above have replaced the V7.2 review
+# entrypoint while preserving the complete original pipeline source.
 if __name__ == "__main__":
     attention_v7_entrypoint()
