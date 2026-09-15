@@ -17468,7 +17468,7 @@ ATTENTION_TRAIN_WITH_AMP = _env_bool(
     "CAD_ATTENTION_UNET_TRAIN_WITH_AMP", True
 )
 ATTENTION_SAVE_ALL_PREDICTED_MASKS = _env_bool(
-    "CAD_ATTENTION_SAVE_ALL_PREDICTED_MASKS", False
+    "CAD_ATTENTION_SAVE_ALL_PREDICTED_MASKS", True
 )
 
 # ---------------------------------------------------------------------------
