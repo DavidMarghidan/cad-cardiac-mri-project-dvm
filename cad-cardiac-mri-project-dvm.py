@@ -3,6 +3,38 @@
 # ============================================================
 
 # ============================================================================
+# V15 STAGED CPU / GPU KAGGLE WORKFLOW NOTE
+# ============================================================================
+#
+# The pipeline can now be executed in explicit device stages:
+#
+#   GPU-only expensive stages:
+#       build-monai-feature-cache
+#       generate-all-monai-masks
+#       train-attention / retrain-regenerate-attention
+#       generate-all-attention-masks
+#       build-attention-feature-cache
+#
+#   CPU-only stages that require existing cached artifacts:
+#       monai-cpu-from-cache
+#       evaluate-attention-cpu
+#       edit-existing-masks
+#
+# ``--runtime-device cpu|cuda|auto`` controls where PyTorch work is placed.
+# ``--feature-cache-device-tag cuda`` lets a CPU evaluation session address a
+# frozen feature bank that was originally created in a GPU session. CPU-only
+# actions refuse to rebuild missing neural caches, so they cannot silently spend
+# hours performing inference on CPU.
+#
+# IMPORTANT KAGGLE QUOTA NOTE:
+# Moving tensors to CPU releases CUDA memory but does not detach the accelerator
+# from the notebook session. To conserve GPU quota, change Kaggle Accelerator to
+# None and restart before the CPU stages; enable GPU and restart only for the GPU
+# stages. Persist automatic/predicted review masks under /kaggle/working when
+# crossing sessions.
+# ============================================================================
+
+# ============================================================================
 # V13 PAIRED PYTHON / NOTEBOOK SYNCHRONIZATION NOTE
 # ============================================================================
 #
@@ -672,6 +704,10 @@
 import csv
 # Standard-library CSV writer used for reproducible machine-readable outputs.
 
+import gc
+# Explicit garbage collection is used when a GPU stage finishes so references
+# can be released before ``torch.cuda.empty_cache()`` is called.
+
 import shutil
 # Removes incomplete feature-bank directories before a deliberate rebuild.
 
@@ -854,8 +890,154 @@ BATCH_SIZE = 8
 # batch, so reduce this value if GPU memory is insufficient. Increase it only
 # after checking GPU memory; batch size changes throughput, not predictions.
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-# Automatically select CUDA when available; otherwise use CPU.
+RUNTIME_DEVICE_CHOICES = ("auto", "cpu", "cuda")
+RUNTIME_DEVICE_POLICY = os.environ.get(
+    "CAD_RUNTIME_DEVICE", "auto"
+).strip().lower()
+if RUNTIME_DEVICE_POLICY not in RUNTIME_DEVICE_CHOICES:
+    raise ValueError(
+        "CAD_RUNTIME_DEVICE must be one of auto/cpu/cuda; received "
+        f"{RUNTIME_DEVICE_POLICY!r}."
+    )
+
+# Keep one deterministic output directory across a GPU-generation session and
+# a later CPU-evaluation session. Set CAD_SUITE_DEVICE_TAG=cuda before loading
+# the source in both sessions when the frozen neural artifacts originate on GPU.
+SUITE_DEVICE_TAG = os.environ.get(
+    "CAD_SUITE_DEVICE_TAG", "auto"
+).strip().lower()
+if SUITE_DEVICE_TAG not in RUNTIME_DEVICE_CHOICES:
+    raise ValueError(
+        "CAD_SUITE_DEVICE_TAG must be auto/cpu/cuda; received "
+        f"{SUITE_DEVICE_TAG!r}."
+    )
+
+
+def resolved_suite_device_tag():
+    return DEVICE if SUITE_DEVICE_TAG == "auto" else SUITE_DEVICE_TAG
+
+
+def _resolve_requested_runtime_device(requested):
+    """Resolve auto/cpu/cuda against the live accelerator state."""
+
+    requested = str(requested or "auto").strip().lower()
+    if requested not in RUNTIME_DEVICE_CHOICES:
+        raise ValueError(
+            "Runtime device must be one of auto/cpu/cuda; received "
+            f"{requested!r}."
+        )
+    if requested == "auto":
+        return requested, ("cuda" if torch.cuda.is_available() else "cpu")
+    return requested, requested
+
+
+DEVICE = "cuda" if (
+    RUNTIME_DEVICE_POLICY != "cpu" and torch.cuda.is_available()
+) else "cpu"
+# ``DEVICE`` remains a string because the original source compares it with
+# ``"cuda"`` in DataLoader, autocast and cache code. The setter below is the
+# authoritative way to change it between notebook stages.
+
+
+def set_runtime_device(
+    requested=None,
+    context="runtime",
+    strict_cuda=False,
+):
+    """Select CPU/GPU explicitly and release stale CUDA allocations safely.
+
+    Parameters
+    ----------
+    requested:
+        ``"auto"``, ``"cpu"`` or ``"cuda"``. When omitted, the current
+        ``CAD_RUNTIME_DEVICE`` environment value is used.
+    context:
+        Human-readable text included in logs.
+    strict_cuda:
+        If True, an explicit CUDA request fails immediately when Kaggle has no
+        live accelerator. If False, it falls back to CPU with a visible warning.
+    """
+
+    global DEVICE, RUNTIME_DEVICE_POLICY
+
+    if requested is None:
+        requested = os.environ.get(
+            "CAD_RUNTIME_DEVICE", RUNTIME_DEVICE_POLICY
+        )
+    policy, resolved = _resolve_requested_runtime_device(requested)
+
+    if resolved == "cuda" and not torch.cuda.is_available():
+        message = (
+            "CUDA was requested, but torch.cuda.is_available() is False. "
+            "Enable a Kaggle GPU accelerator and restart the session before "
+            f"running {context}."
+        )
+        if strict_cuda:
+            raise RuntimeError(message)
+        print(f"[RUNTIME][DEVICE][WARNING] {message} Falling back to CPU.", flush=True)
+        resolved = "cpu"
+
+    previous = str(DEVICE)
+    if previous == "cuda" and resolved != "cuda" and torch.cuda.is_available():
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+        gc.collect()
+        torch.cuda.empty_cache()
+        try:
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
+
+    DEVICE = resolved
+    RUNTIME_DEVICE_POLICY = policy
+    os.environ["CAD_RUNTIME_DEVICE"] = policy
+
+    if previous != resolved or context:
+        print(
+            f"[RUNTIME][DEVICE] context={context}; requested={policy}; "
+            f"resolved={resolved}; cuda_available={torch.cuda.is_available()}.",
+            flush=True,
+        )
+    return torch.device(resolved)
+
+
+def refresh_runtime_device(context="runtime"):
+    """Refresh the current policy against the live Kaggle runtime."""
+
+    return set_runtime_device(
+        requested=os.environ.get(
+            "CAD_RUNTIME_DEVICE", RUNTIME_DEVICE_POLICY
+        ),
+        context=context,
+        strict_cuda=False,
+    )
+
+
+def release_gpu_resources(context="runtime"):
+    """Release Python/CUDA caches after one isolated GPU stage.
+
+    This frees VRAM for later code in the same kernel. It does not detach the
+    accelerator from a Kaggle session; saving GPU quota still requires changing
+    the notebook Accelerator to None and restarting before CPU-only stages.
+    """
+
+    gc.collect()
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+        torch.cuda.empty_cache()
+        try:
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
+    print(
+        f"[RUNTIME][DEVICE] Released GPU caches after {context}.",
+        flush=True,
+    )
 
 RANDOM_SEED = 42
 # Fixed seed for repeatable fold assignment and bootstrap resampling. The frozen
@@ -2266,6 +2448,39 @@ PROGRESS_PRINT_EVERY_N_BATCHES = 25
 
 USE_FEATURE_CACHE = True
 FORCE_REBUILD_FEATURE_CACHE = False
+# CPU evaluation can be instructed to fail on a cache miss rather than silently
+# performing MONAI/EfficientNet inference on CPU.
+REQUIRE_EXISTING_FEATURE_CACHE = False
+
+FEATURE_CACHE_DEVICE_TAG = os.environ.get(
+    "CAD_FEATURE_CACHE_DEVICE_TAG", "auto"
+).strip().lower()
+if FEATURE_CACHE_DEVICE_TAG not in RUNTIME_DEVICE_CHOICES:
+    raise ValueError(
+        "CAD_FEATURE_CACHE_DEVICE_TAG must be auto/cpu/cuda; received "
+        f"{FEATURE_CACHE_DEVICE_TAG!r}."
+    )
+
+
+def set_feature_cache_device_tag(tag="auto"):
+    """Select which extraction device identity is used in cache fingerprints."""
+
+    global FEATURE_CACHE_DEVICE_TAG
+    tag = str(tag).strip().lower()
+    if tag not in RUNTIME_DEVICE_CHOICES:
+        raise ValueError(
+            "Feature-cache device tag must be auto/cpu/cuda; received "
+            f"{tag!r}."
+        )
+    FEATURE_CACHE_DEVICE_TAG = tag
+    os.environ["CAD_FEATURE_CACHE_DEVICE_TAG"] = tag
+    return tag
+
+
+def resolved_feature_cache_device_tag():
+    return DEVICE if FEATURE_CACHE_DEVICE_TAG == "auto" else FEATURE_CACHE_DEVICE_TAG
+
+
 FEATURE_CACHE_SCHEMA_VERSION = "2026-09-05-exact-a17-controls-v6-v1"
 EFFICIENTNET_FEATURE_DIM = 1280
 FEATURE_MODES_PER_ENCODER_CALL = 4
@@ -3150,7 +3365,9 @@ _suite_identity = {
             False,
         )
     ),
-    "device_type": DEVICE,
+    # The suite tag remains stable across staged GPU/CPU sessions. The live
+    # execution device is still written separately to run metadata/logs.
+    "device_type": resolved_suite_device_tag(),
     "img_size": IMG_SIZE,
     "monai_input_size": MONAI_INPUT_SIZE,
     "monai_bundle": MONAI_BUNDLE_NAME,
@@ -3330,7 +3547,9 @@ def _synchronize_timing_device():
     # CUDA kernels are normally asynchronous relative to Python. Without an
     # explicit synchronization, a timer can stop before the GPU has completed
     # the operation being measured. CPU execution requires no synchronization.
-    if DEVICE == "cuda":
+    # The availability guard also protects a notebook whose DEVICE variable was
+    # created before a Kaggle accelerator/session restart.
+    if DEVICE == "cuda" and torch.cuda.is_available():
         torch.cuda.synchronize()
 
 
@@ -5866,85 +6085,149 @@ def ensure_monai_bundle(required_relative_paths=None):
 
 
 def load_and_validate_torchscript_segmenter(path, source_description):
-    """Load TorchScript and validate its fixed inference contract immediately."""
+    """Load TorchScript and validate its fixed inference contract immediately.
 
-    global MONAI_RUNTIME_SOURCE, MONAI_RUNTIME_ARTIFACT_PATH
+    The live runtime device is re-evaluated here. If CUDA is available but the
+    current TorchScript/PyTorch combination cannot execute on it, one explicit
+    CPU retry is attempted before the code falls back to MONAI reconstruction.
+    This prevents a stale notebook ``DEVICE='cuda'`` value from causing an
+    unnecessary ``ModuleNotFoundError: monai`` on a CPU-only Kaggle session.
+    """
+
+    global MONAI_RUNTIME_SOURCE, MONAI_RUNTIME_ARTIFACT_PATH, DEVICE
 
     load_started_at = time.perf_counter()
+    primary_device = refresh_runtime_device(
+        f"loading {source_description}"
+    )
+    attempt_devices = [primary_device]
+    if primary_device.type == "cuda":
+        # CPU is a compatibility fallback only. It is not selected when CUDA
+        # succeeds, and it avoids importing MONAI merely because one CUDA load
+        # or zero-input execution path is incompatible with the current build.
+        attempt_devices.append(torch.device("cpu"))
+
     print(
         f"[MODEL][MONAI] Loading {source_description} from: {path}",
         flush=True,
     )
     print(
-        f"[MODEL][MONAI] Target device: {DEVICE}. A zero-input inference "
-        "sanity check will run immediately after loading.",
+        f"[MODEL][MONAI] Live target device: {primary_device}. A zero-input "
+        "inference sanity check will run immediately after loading.",
         flush=True,
     )
 
-    # Load directly onto the selected runtime device. The subsequent zero-
-    # input test validates executability, output type, shape, and finite values.
-    network = torch.jit.load(
-        str(path),
-        map_location=DEVICE,
+    failures = []
+    for attempt_index, runtime_device in enumerate(attempt_devices, start=1):
+        try:
+            # ``map_location`` must be a device resolved from the CURRENT
+            # runtime, not the stale global string captured by an earlier
+            # notebook session. Calling ``to`` afterwards also relocates any
+            # parameters/buffers not covered by storage remapping.
+            network = torch.jit.load(
+                str(path),
+                map_location=runtime_device,
+            )
+            network = network.to(runtime_device)
+            network.eval()
+
+            try:
+                network.requires_grad_(False)
+            except (AttributeError, RuntimeError):
+                # Some TorchScript module types do not expose this mutator.
+                # Inference is still protected by torch.inference_mode below.
+                pass
+
+            example_input = torch.zeros(
+                1,
+                1,
+                MONAI_INPUT_SIZE,
+                MONAI_INPUT_SIZE,
+                device=runtime_device,
+                dtype=torch.float32,
+            )
+
+            _print_detail(
+                "Running MONAI zero-input shape/finite-value validation on "
+                f"{runtime_device}."
+            )
+            with torch.inference_mode():
+                example_output = network(example_input)
+
+            if not isinstance(example_output, torch.Tensor):
+                raise RuntimeError(
+                    f"{source_description} returned {type(example_output)} "
+                    "instead of a tensor."
+                )
+
+            expected_shape = (
+                1,
+                4,
+                MONAI_INPUT_SIZE,
+                MONAI_INPUT_SIZE,
+            )
+            if tuple(example_output.shape) != expected_shape:
+                raise RuntimeError(
+                    f"{source_description} output shape mismatch: expected "
+                    f"{expected_shape}, got {tuple(example_output.shape)}."
+                )
+            if not torch.isfinite(example_output).all():
+                raise RuntimeError(
+                    f"{source_description} produced non-finite values on a "
+                    "zero-input sanity check."
+                )
+
+            # Downstream code consistently uses the global DEVICE string. Keep
+            # it aligned with the device on which validation actually succeeded.
+            DEVICE = runtime_device.type
+            MONAI_RUNTIME_SOURCE = str(source_description)
+            MONAI_RUNTIME_ARTIFACT_PATH = str(Path(path).resolve())
+
+            if runtime_device.type == "cuda":
+                torch.cuda.synchronize()
+            elapsed = time.perf_counter() - load_started_at
+            print(
+                f"[MODEL][MONAI] Loaded and validated {source_description} on "
+                f"{runtime_device} in {_format_elapsed_time(elapsed)}; "
+                f"output_shape={tuple(example_output.shape)}.",
+                flush=True,
+            )
+            if runtime_device.type == "cpu" and primary_device.type == "cuda":
+                print(
+                    "[MODEL][MONAI][WARNING] CUDA execution failed, so this "
+                    "segmenter will continue on CPU. Mask generation will be "
+                    "slower, but MONAI Python is not required.",
+                    flush=True,
+                )
+            return network
+
+        except Exception as exc:
+            failures.append((str(runtime_device), exc))
+            try:
+                del network
+            except UnboundLocalError:
+                pass
+            if runtime_device.type == "cuda" and torch.cuda.is_available():
+                try:
+                    torch.cuda.empty_cache()
+                except RuntimeError:
+                    pass
+            if attempt_index < len(attempt_devices):
+                print(
+                    "[MODEL][MONAI][WARNING] TorchScript execution failed on "
+                    f"{runtime_device}; retrying the same verified artifact on "
+                    f"{attempt_devices[attempt_index]}. Reason: {exc}",
+                    flush=True,
+                )
+
+    details = "; ".join(
+        f"{device}: {type(error).__name__}: {error}"
+        for device, error in failures
     )
-    network.eval()
-
-    try:
-        network.requires_grad_(False)
-    except (AttributeError, RuntimeError):
-        # Some TorchScript module types do not expose this mutator. Inference is
-        # still protected globally by torch.inference_mode in the caller path.
-        pass
-
-    example_input = torch.zeros(
-        1,
-        1,
-        MONAI_INPUT_SIZE,
-        MONAI_INPUT_SIZE,
-        device=DEVICE,
-        dtype=torch.float32,
-    )
-
-    _print_detail("Running MONAI zero-input shape/finite-value validation.")
-    with torch.inference_mode():
-        example_output = network(example_input)
-
-    if not isinstance(example_output, torch.Tensor):
-        raise RuntimeError(
-            f"{source_description} returned {type(example_output)} instead of "
-            "a tensor."
-        )
-
-    expected_shape = (
-        1,
-        4,
-        MONAI_INPUT_SIZE,
-        MONAI_INPUT_SIZE,
-    )
-
-    if tuple(example_output.shape) != expected_shape:
-        raise RuntimeError(
-            f"{source_description} output shape mismatch: expected "
-            f"{expected_shape}, got {tuple(example_output.shape)}."
-        )
-
-    if not torch.isfinite(example_output).all():
-        raise RuntimeError(
-            f"{source_description} produced non-finite values on a zero-input "
-            "sanity check."
-        )
-
-    MONAI_RUNTIME_SOURCE = str(source_description)
-    MONAI_RUNTIME_ARTIFACT_PATH = str(Path(path).resolve())
-
-    _synchronize_timing_device()
-    elapsed = time.perf_counter() - load_started_at
-    print(
-        f"[MODEL][MONAI] Loaded and validated {source_description} in "
-        f"{_format_elapsed_time(elapsed)}; output_shape={tuple(example_output.shape)}.",
-        flush=True,
-    )
-    return network
+    final_error = failures[-1][1]
+    raise RuntimeError(
+        f"{source_description} failed on every safe runtime device ({details})."
+    ) from final_error
 
 
 def load_checkpoint_state_dict(path):
@@ -6012,6 +6295,8 @@ def build_monai_segmenter():
     recovery and validates the hard-coded architecture against train.json before
     strict weight loading and local TorchScript export.
     """
+
+    refresh_runtime_device("building MONAI segmenter")
 
     build_started_at = time.perf_counter()
     print(
@@ -6135,9 +6420,18 @@ def build_monai_segmenter():
             if official_failure is not None
             else ""
         )
+        runtime_hint = (
+            " Kaggle currently exposes no CUDA device; the verified official "
+            "TorchScript artifact was already retried with CPU map_location."
+            if not torch.cuda.is_available()
+            else ""
+        )
         raise ImportError(
-            "Fallback reconstruction requires MONAI. Install it with: "
-            f"pip install monai==1.6.0.{reason}"
+            "The verified official/local TorchScript paths failed on all safe "
+            "runtime devices, so exceptional model.pt reconstruction now "
+            "requires MONAI. Install it in a separate Kaggle setup cell with: "
+            "%pip install -q monai==1.6.0, restart the session, and rerun the "
+            f"definition cell.{runtime_hint}{reason}"
         ) from exc
 
     print(
@@ -6871,7 +7165,10 @@ def feature_bank_fingerprint(samples, dataset_root):
                 False,
             )
         ),
-        "device_type": DEVICE,
+        # The tag records the device used to create the frozen bank. A CPU
+        # evaluation session may deliberately set this to ``cuda`` in order to
+        # address a matching bank generated during an earlier GPU session.
+        "device_type": resolved_feature_cache_device_tag(),
         "img_size": IMG_SIZE,
         "monai_input_size": MONAI_INPUT_SIZE,
         "monai_bundle": MONAI_BUNDLE_NAME,
@@ -9300,6 +9597,13 @@ def load_or_extract_feature_bank(samples, required_modes, fingerprint, cache_dir
         bank = load_feature_bank(cache_dir, fingerprint, required_modes)
         if bank is not None:
             return bank, "HIT"
+
+    if REQUIRE_EXISTING_FEATURE_CACHE:
+        raise RuntimeError(
+            "A matching frozen feature bank was not found, and this action is "
+            "cache-only. Run build-monai-feature-cache in a GPU session first. "
+            f"Expected cache directory: {cache_dir}"
+        )
 
     print(
         "[FEATURE BANK] Cache miss or forced rebuild; neural-network inference "
@@ -16249,6 +16553,7 @@ def write_suite_configuration(output_path, experiments):
 def main():
     """Run every enabled experiment and compare the patient-level results."""
 
+    refresh_runtime_device("main pipeline")
     pipeline_started_at = time.perf_counter()
     stage_durations = {}
     experiments = get_enabled_experiments()
@@ -20750,6 +21055,7 @@ def _parse_attention_arguments(argv=None):
 def attention_v7_entrypoint(argv=None):
     """Top-level CLI entrypoint for V6 MONAI and the V7 Attention extension."""
 
+    refresh_runtime_device("Attention entrypoint")
     args = _parse_attention_arguments(argv)
     action = args.attention_action
     if action in {"both", "monai-only"}:
@@ -20881,7 +21187,147 @@ ATTENTION_ACTION_CHOICES = (
     "generate-all-monai-masks",
     "generate-all-attention-masks",
     "retrain-regenerate-attention",
+    # V15 staged-device actions.
+    "build-monai-feature-cache",
+    "monai-cpu-from-cache",
+    "build-attention-feature-cache",
+    "evaluate-attention-cpu",
+    "edit-existing-masks",
+    "release-gpu",
 )
+
+GPU_ACCELERATED_ACTIONS = {
+    "both",
+    "monai-only",
+    "attention-only",
+    "generate-masks",
+    "train-attention",
+    "generate-all-monai-masks",
+    "generate-all-attention-masks",
+    "retrain-regenerate-attention",
+    "build-monai-feature-cache",
+    "build-attention-feature-cache",
+}
+CPU_CACHE_ONLY_ACTIONS = {
+    "monai-cpu-from-cache",
+    "evaluate-attention-cpu",
+    "edit-existing-masks",
+    "release-gpu",
+}
+
+
+def build_monai_feature_cache_only(dataset_path=None):
+    """GPU stage: create/reuse the shared V6 frozen feature bank only.
+
+    No patient classifier, stability analysis or permutation test is run here.
+    Those CPU-heavy stages can be executed later through
+    ``monai-cpu-from-cache`` after the Kaggle accelerator is disabled.
+    """
+
+    refresh_runtime_device("build MONAI/EfficientNet feature cache")
+    validate_configuration()
+    experiments = get_enabled_experiments()
+    dataset_path = Path(dataset_path or DATASET_PATH)
+    samples = load_samples(dataset_path)
+    required_modes = required_efficientnet_feature_modes(experiments)
+    fingerprint = feature_bank_fingerprint(samples, dataset_path)
+    cache_dir = FEATURE_CACHE_ROOT / fingerprint[:16]
+    bank, cache_status = load_or_extract_feature_bank(
+        samples,
+        required_modes,
+        fingerprint,
+        cache_dir,
+    )
+    summary = {
+        "status": "MONAI_FEATURE_CACHE_READY",
+        "cache_status": cache_status,
+        "cache_dir": str(bank["cache_dir"]),
+        "fingerprint": fingerprint,
+        "device": DEVICE,
+        "feature_cache_device_tag": resolved_feature_cache_device_tag(),
+        "n_images": len(samples),
+        "modes": list(required_modes),
+    }
+    print(
+        "[STAGED][GPU] MONAI/EfficientNet feature bank ready: "
+        f"{summary['cache_dir']}",
+        flush=True,
+    )
+    return summary
+
+
+def existing_attention_checkpoint_map(workspace):
+    """Return all cross-fitted checkpoints without retraining anything."""
+
+    checkpoint_map = {}
+    missing = []
+    for fold in range(ATTENTION_SEGMENTATION_FOLDS):
+        path = _checkpoint_path(workspace, fold)
+        if path.is_file():
+            checkpoint_map[fold] = path
+        else:
+            missing.append(str(path))
+    if missing:
+        raise FileNotFoundError(
+            "Missing Attention U-Net checkpoints. Run train-attention or "
+            "retrain-regenerate-attention in a GPU session first:\n  "
+            + "\n  ".join(missing)
+        )
+    return checkpoint_map
+
+
+def load_existing_attention_feature_bank(samples, workspace, checkpoint_map):
+    """CPU stage: load an already generated AU1-AU5 patient feature bank."""
+
+    output_dir = workspace.comparison_output
+    npz_path = output_dir / "attention_unet_patient_feature_bank.npz"
+    metadata_path = output_dir / "attention_unet_feature_bank_metadata.json"
+    if not npz_path.is_file() or not metadata_path.is_file():
+        raise FileNotFoundError(
+            "Attention patient feature bank is missing. Run "
+            "build-attention-feature-cache in a GPU session first."
+        )
+    checkpoint_fingerprint = _attention_feature_fingerprint(
+        samples, checkpoint_map
+    )
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if metadata.get("fingerprint") != checkpoint_fingerprint:
+        raise RuntimeError(
+            "The existing Attention feature bank does not match the current "
+            "checkpoints/dataset. Rebuild it in a GPU session with "
+            "build-attention-feature-cache."
+        )
+    loaded = np.load(npz_path, allow_pickle=False)
+    print(
+        f"[STAGED][CPU] Loading Attention patient feature bank: {npz_path}",
+        flush=True,
+    )
+    return {
+        "fingerprint": checkpoint_fingerprint,
+        "patient_ids": loaded["patient_ids"].astype(str),
+        "labels": loaded["labels"].astype(np.int64),
+        "features": {
+            mode: loaded[f"X__{mode}"].astype(np.float32)
+            for mode in ATTENTION_FEATURE_MODES
+        },
+        "metadata": metadata,
+    }
+
+
+def _review_mask_exists(row, source):
+    """Return True when an existing source/manual mask can be opened on CPU."""
+
+    manual = Path(str(row.get("manual_mask_path", "")))
+    if manual.is_file():
+        return True
+    field = (
+        "automatic_mask_path"
+        if source == "monai"
+        else "predicted_attention_mask_path"
+    )
+    path = Path(str(row.get(field, "")))
+    return path.is_file() and path.stat().st_size > 0
+
 
 ATTENTION_REVIEW_MANIFEST_FIELDS = (
     "review_index",
@@ -22029,6 +22475,29 @@ def _parse_attention_arguments(argv=None):
         "--attention-dataset-path",
         default=str(DATASET_PATH),
     )
+    parser.add_argument(
+        "--runtime-device",
+        choices=RUNTIME_DEVICE_CHOICES,
+        default=os.environ.get("CAD_RUNTIME_DEVICE", "auto"),
+        help=(
+            "auto/cpu/cuda. Use cuda only for neural inference/training and "
+            "cpu for review, CV, stability and permutation stages."
+        ),
+    )
+    parser.add_argument(
+        "--feature-cache-device-tag",
+        choices=RUNTIME_DEVICE_CHOICES,
+        default=os.environ.get("CAD_FEATURE_CACHE_DEVICE_TAG", "auto"),
+        help=(
+            "Device identity embedded in the frozen V6 feature-cache key. "
+            "Use cuda during CPU evaluation when the bank was built on GPU."
+        ),
+    )
+    parser.add_argument(
+        "--keep-gpu-memory",
+        action="store_true",
+        help="Do not clear CUDA caches after the selected action finishes.",
+    )
     args, unknown = parser.parse_known_args(argv)
     if unknown:
         print(
@@ -22043,9 +22512,17 @@ def _parse_attention_arguments(argv=None):
 
 
 def run_attention_pipeline(samples, workspace, action):
-    """Execute original actions plus full-cohort iterative review actions."""
+    """Execute original actions plus staged CPU/GPU review actions."""
 
     validate_attention_extension()
+
+    if action == "evaluate-attention-cpu":
+        checkpoint_map = existing_attention_checkpoint_map(workspace)
+        bank = load_existing_attention_feature_bank(
+            samples, workspace, checkpoint_map
+        )
+        return evaluate_attention_feature_bank(samples, workspace, bank)
+
     if action == "generate-all-monai-masks":
         rows = generate_monai_review_masks(
             samples, workspace, rows=None, force=False
@@ -22062,7 +22539,7 @@ def run_attention_pipeline(samples, workspace, action):
             "status": "MASKS_GENERATED",
             "manifest": str(workspace.manifest_csv),
         }
-    if action == "edit-masks":
+    if action in {"edit-masks", "edit-existing-masks"}:
         return {"status": "EDITOR_READY"}
 
     checkpoint_map = train_attention_unet_crossfit(training_rows, workspace)
@@ -22096,54 +22573,109 @@ def run_attention_pipeline(samples, workspace, action):
     bank = extract_attention_patient_feature_bank(
         samples, workspace, checkpoint_map
     )
+    if action == "build-attention-feature-cache":
+        return {
+            "status": "ATTENTION_FEATURE_CACHE_READY",
+            "fingerprint": bank["fingerprint"],
+            "n_patients": int(len(bank["patient_ids"])),
+            "output": str(workspace.comparison_output),
+        }
     return evaluate_attention_feature_bank(samples, workspace, bank)
 
 
 def attention_v7_entrypoint(argv=None):
-    """V13-compatible entrypoint for classification and iterative review."""
+    """V15 entrypoint with explicit staged CPU/GPU execution."""
 
     args = _parse_attention_arguments(argv)
     action = args.attention_action
+
+    requested_device = args.runtime_device
+    if action in CPU_CACHE_ONLY_ACTIONS and requested_device == "auto":
+        requested_device = "cpu"
+    set_runtime_device(
+        requested=requested_device,
+        context=f"attention action {action}",
+        strict_cuda=(requested_device == "cuda"),
+    )
+    set_feature_cache_device_tag(args.feature_cache_device_tag)
+
+    if action == "release-gpu":
+        release_gpu_resources("explicit release-gpu action")
+        set_runtime_device("cpu", context="after release-gpu")
+        return {"status": "GPU_RESOURCES_RELEASED", "device": DEVICE}
+
+    if action == "build-monai-feature-cache":
+        try:
+            return build_monai_feature_cache_only(args.attention_dataset_path)
+        finally:
+            if not args.keep_gpu_memory:
+                release_gpu_resources(action)
+
+    if action == "monai-cpu-from-cache":
+        global REQUIRE_EXISTING_FEATURE_CACHE
+        previous_cache_requirement = REQUIRE_EXISTING_FEATURE_CACHE
+        REQUIRE_EXISTING_FEATURE_CACHE = True
+        try:
+            run_with_console_logging()
+            return {
+                "status": "MONAI_CPU_EVALUATION_COMPLETED",
+                "device": DEVICE,
+                "feature_cache_device_tag": resolved_feature_cache_device_tag(),
+            }
+        finally:
+            REQUIRE_EXISTING_FEATURE_CACHE = previous_cache_requirement
+            if not args.keep_gpu_memory:
+                release_gpu_resources(action)
+
     if action in {"both", "monai-only"}:
-        run_with_console_logging()
-        if action == "monai-only":
-            return
+        try:
+            run_with_console_logging()
+            if action == "monai-only":
+                return
+        finally:
+            if action == "monai-only" and not args.keep_gpu_memory:
+                release_gpu_resources(action)
 
     workspace = build_attention_workspace(args.attention_work_root)
     samples = load_samples(Path(args.attention_dataset_path))
 
-    if action == "edit-masks":
+    if action in {"edit-masks", "edit-existing-masks"}:
         validate_attention_extension()
         full_rows = build_attention_full_review_manifest(samples, workspace)
+        existing_only = action == "edit-existing-masks"
 
-        # Scopes requiring QC across the whole cohort need complete source masks
-        # before the queue can be ranked accurately.
-        if args.attention_editor_base == "monai" and args.attention_editor_scope == "invalid":
-            full_rows = generate_monai_review_masks(
-                samples,
-                workspace,
-                rows=None,
-                force=args.attention_force_regenerate,
-            )
-        if args.attention_editor_base == "attention" and args.attention_editor_scope == "disagreement":
-            # Disagreement requires both sources on the same complete row set.
-            full_rows = generate_monai_review_masks(
-                samples,
-                workspace,
-                rows=None,
-                force=False,
-            )
-            training_rows = generate_attention_pseudo_masks(samples, workspace)
-            checkpoint_map = train_attention_unet_crossfit(
-                training_rows, workspace
-            )
-            full_rows = generate_attention_review_masks(
-                samples,
-                workspace,
-                checkpoint_map,
-                rows=None,
-                force=args.attention_force_regenerate,
-            )
+        if not existing_only:
+            # Scopes requiring whole-cohort QC generate any missing source masks.
+            if (
+                args.attention_editor_base == "monai"
+                and args.attention_editor_scope == "invalid"
+            ):
+                full_rows = generate_monai_review_masks(
+                    samples,
+                    workspace,
+                    rows=None,
+                    force=args.attention_force_regenerate,
+                )
+            if (
+                args.attention_editor_base == "attention"
+                and args.attention_editor_scope == "disagreement"
+            ):
+                full_rows = generate_monai_review_masks(
+                    samples, workspace, rows=None, force=False
+                )
+                training_rows = generate_attention_pseudo_masks(
+                    samples, workspace
+                )
+                checkpoint_map = train_attention_unet_crossfit(
+                    training_rows, workspace
+                )
+                full_rows = generate_attention_review_masks(
+                    samples,
+                    workspace,
+                    checkpoint_map,
+                    rows=None,
+                    force=args.attention_force_regenerate,
+                )
 
         queue = select_attention_review_rows(
             full_rows,
@@ -22157,7 +22689,27 @@ def attention_v7_entrypoint(argv=None):
         if not queue:
             raise RuntimeError("The requested review queue is empty.")
 
-        if args.attention_editor_base == "monai":
+        if existing_only:
+            original_count = len(queue)
+            queue = [
+                row
+                for row in queue
+                if _review_mask_exists(row, args.attention_editor_base)
+            ]
+            skipped = original_count - len(queue)
+            if skipped:
+                print(
+                    f"[ATTENTION][EDITOR][CPU] Skipped {skipped} rows whose "
+                    f"{args.attention_editor_base} mask is not present on disk.",
+                    flush=True,
+                )
+            if not queue:
+                raise RuntimeError(
+                    "No existing masks are available for this CPU-only queue. "
+                    "Run the corresponding generate-all-* action in a GPU "
+                    "session and persist masks under /kaggle/working first."
+                )
+        elif args.attention_editor_base == "monai":
             queue = generate_monai_review_masks(
                 samples,
                 workspace,
@@ -22181,9 +22733,12 @@ def attention_v7_entrypoint(argv=None):
             f"[ATTENTION][EDITOR] Opening {args.attention_editor_base} "
             f"queue row {args.attention_editor_index} of {len(queue)}; "
             f"scope={args.attention_editor_scope}; "
-            f"round={args.attention_review_round}. Class labels are hidden.",
+            f"round={args.attention_review_round}; "
+            f"existing_only={existing_only}. Class labels are hidden.",
             flush=True,
         )
+        if not args.keep_gpu_memory:
+            release_gpu_resources(action)
         return open_attention_mask_editor(
             workspace,
             start_index=args.attention_editor_index,
@@ -22208,11 +22763,17 @@ def attention_v7_entrypoint(argv=None):
         try:
             print("\n" + "#" * 100, flush=True)
             print(
-                "CAD CARDIAC MRI — V13 FULL-COHORT ITERATIVE MASK REVIEW",
+                "CAD CARDIAC MRI — V15 STAGED CPU/GPU MASK REVIEW",
                 flush=True,
             )
             print("#" * 100, flush=True)
             print(f"[ATTENTION] action={action}", flush=True)
+            print(f"[ATTENTION] runtime_device={DEVICE}", flush=True)
+            print(
+                "[ATTENTION] feature_cache_device_tag="
+                f"{resolved_feature_cache_device_tag()}",
+                flush=True,
+            )
             print(f"[ATTENTION] workspace={workspace.root}", flush=True)
             print(
                 f"[ATTENTION] transient_root={workspace.transient_root}",
@@ -22230,6 +22791,8 @@ def attention_v7_entrypoint(argv=None):
             traceback.print_exc(file=sys.stdout)
             raise
         finally:
+            if not args.keep_gpu_memory:
+                release_gpu_resources(action)
             sys.stdout.flush()
             sys.stderr.flush()
             sys.stdout = original_stdout
@@ -22237,18 +22800,20 @@ def attention_v7_entrypoint(argv=None):
 
 
 print(
-    "[ATTENTION][V13] Full-cohort MONAI/Attention review extension loaded.",
+    "[ATTENTION][V15] Staged CPU/GPU full-cohort review extension loaded.",
     flush=True,
 )
 print(
-    "[ATTENTION][V13] Actions: generate-all-monai-masks, "
-    "generate-all-attention-masks, retrain-regenerate-attention, edit-masks.",
+    "[ATTENTION][V15] GPU actions: build-monai-feature-cache, "
+    "generate-all-monai-masks, retrain-regenerate-attention, "
+    "build-attention-feature-cache. CPU actions: monai-cpu-from-cache, "
+    "evaluate-attention-cpu, edit-existing-masks.",
     flush=True,
 )
 
 
 # ---------------------------------------------------------------------------
-# FINAL V13 STANDALONE ENTRYPOINT
+# FINAL V15 STANDALONE ENTRYPOINT
 # ---------------------------------------------------------------------------
 # At this point the V13 definitions above have replaced the V7.2 review
 # entrypoint while preserving the complete original pipeline source.
