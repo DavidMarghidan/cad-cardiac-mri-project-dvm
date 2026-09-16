@@ -1,3 +1,27 @@
+# Inițializare unică + codul complet al pipeline-ului
+#
+# Această celulă conține direct întregul fișier Python. Nu mai este necesar
+# să atașezi sau să cauți separat fișierul .py în /kaggle/working ori /kaggle/input.
+
+import os
+
+# Setările trebuie definite înainte de importurile și constantele pipeline-ului.
+os.environ.setdefault("CAD_VALIDATION_PROFILE", "fast")
+os.environ["CAD_RUNTIME_DEVICE"] = "cpu"
+os.environ["CAD_SUITE_DEVICE_TAG"] = "cuda"
+os.environ["CAD_FEATURE_CACHE_DEVICE_TAG"] = "cuda"
+os.environ["CAD_ATTENTION_STORE_AUTOMATIC_MASKS_IN_TRANSIENT"] = "0"
+os.environ["CAD_ATTENTION_STORE_PREDICTED_MASKS_IN_TRANSIENT"] = "0"
+os.environ["CAD_ATTENTION_SAVE_ALL_PREDICTED_MASKS"] = "1"
+
+REVIEW_SCOPE = "diverse"   # all | diverse | unreviewed | invalid | disagreement
+REVIEW_LIMIT = 1200         # 0 înseamnă fără limită când scope="all"
+REVIEW_SEED = 42
+
+# ---------------------------------------------------------------------------
+# CODUL COMPLET DIN cad-cardiac-mri-project-dvm.py
+# ---------------------------------------------------------------------------
+
 #%% ============================================================
 """CAD cardiac-MRI patient-level research pipeline.
 
