@@ -1,48 +1,34 @@
 #%% ============================================================
-"""CAD cardiac-MRI patient-level pipeline — lean V17 edition.
+"""CAD cardiac-MRI patient-level research pipeline.
 
 DATA CONTRACT
 -------------
-* ``Directory_*`` is the patient identifier and never crosses train/validation
-  folds. ``series*``/``SR_*`` folders are series proxies, not DICOM UIDs.
-* The top-level Normal/Sick folder supplies one patient label. Slice labels are
-  never treated as independent observations in the recommended model.
+* ``Directory_*`` is the patient unit and never crosses train/validation folds.
+* Immediate child folders are series proxies, not verified DICOM UIDs.
+* ``Normal``/``Sick`` supplies one patient label; slices are not independent
+  labelled observations.
 
-PIPELINE
---------
-1. Discover JPEG slices and preserve patient/series grouping.
-2. Standardize geometry and create aligned MONAI/classifier intensity views.
-3. Use the pinned MONAI ventricular model for cardiac localization; reject
-   implausible masks and use the declared fallback instead of deleting slices.
-4. Extract frozen EfficientNet-B0 embeddings for the candidate and controls.
-5. Pool slice embeddings: slice -> series proxy -> patient.
-6. Fit PCA + linear classifiers only inside training folds. Hyperparameters and
-   decision thresholds are selected from inner patient-level OOF predictions.
-7. Evaluate with patient-level nested CV, bootstrap intervals, repeated-CV and
-   patient-label permutation tests.
-8. Optionally train a cross-fitted Attention U-Net from MONAI pseudo-masks plus
-   every saved manual correction, generate AU1-AU5 representations, and compare
-   them with the locked MONAI A17 candidate.
+CURRENT PIPELINE
+----------------
+1. Discover images while preserving patient and series-proxy grouping.
+2. Apply label-blind geometric/intensity standardization.
+3. Localize ventricular anatomy with the pinned MONAI TorchScript model.
+4. Encode the final candidate and matched controls with frozen EfficientNet-B0.
+5. Pool slice embeddings to series proxies and then to one patient vector.
+6. Fit fold-local scaler, PCA and Logistic Regression inside nested patient CV.
+7. Report patient-level OOF metrics, repeated-CV stability and label permutation.
+8. Optionally train cross-fitted Attention U-Net models from MONAI pseudo-masks
+   plus every saved manual correction and evaluate AU1-AU5.
 
-KAGGLE DEVICE STAGES
---------------------
-GPU is used only for MONAI/EfficientNet inference and Attention U-Net
-training/inference. HTML review and cached statistical evaluation run on CPU.
-The default registry contains 11 candidate/control experiments. Use the staged
-actions exposed by ``attention_v7_entrypoint``; CPU-only actions refuse to
-rebuild missing neural caches.
-
-SCIENTIFIC LIMITS
------------------
-This is an exploratory model on 30 Directory_* patients, not an externally
-validated clinical system. MONAI was trained for short-axis cardiac MRI while
-this JPEG cohort is heterogeneous. High-performing border/outside/provenance
-controls must be reported as evidence of possible acquisition/export shortcuts.
+The active MONAI panel contains one reference, one primary candidate, one
+valid-only ablation and four shortcut/anatomy controls. GPU stages perform
+neural inference/training; HTML review and cached statistical evaluation run on
+CPU. Results are exploratory and not externally validated clinical outputs.
 """
 
 # =============================
+# IMPORTS
 # =============================
-
 import csv
 
 import gc
@@ -55,7 +41,7 @@ import traceback
 
 from collections import OrderedDict, defaultdict
 
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 
 from itertools import combinations
 
@@ -96,9 +82,8 @@ import torchvision.transforms as transforms
 
 from torchvision import models
 
-# IMPORTANT STARTUP OPTIMIZATION:
-# MONAI is intentionally NOT imported at module startup or on the normal model
-# TorchScript artifact cannot be used and reconstruction from model.pt is needed.
+# MONAI is imported lazily only when the verified TorchScript artifact cannot
+# be used and reconstruction from model.pt is required.
 
 import sklearn
 
@@ -120,7 +105,6 @@ from sklearn.pipeline import Pipeline
 
 from sklearn.preprocessing import StandardScaler
 
-from sklearn.svm import LinearSVC
 
 from IPython.display import display, HTML, Javascript
 
@@ -129,7 +113,7 @@ from IPython.display import display, HTML, Javascript
 # CONFIGURATION
 # =============================
 
-ESSENTIAL_PIPELINE_VERSION = "v17-lean"
+PIPELINE_SCHEMA_ID = "cad-cardiac-mri-current"
 
 
 IMG_SIZE = 224
@@ -312,7 +296,7 @@ torch.manual_seed(RANDOM_SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(RANDOM_SEED)
 
-# V6 final-reporting runs favor exact reproducibility over the small throughput
+# final-reporting runs favor exact reproducibility over the small throughput
 # gain from non-deterministic convolution algorithms or half precision. The
 # warn_only flag prevents an unsupported deterministic kernel from aborting an
 # otherwise valid Kaggle run while still recording a visible warning.
@@ -347,7 +331,7 @@ class ExperimentConfig:
     experiment_id: str
     description: str
     feature_mode: str
-    strategy: str
+    strategy: str = "patient_embedding"
     pooling_strategy: str = "hierarchical"
     weighting_mode: str = "equal"
     classifier_type: str = "logistic_regression"
@@ -374,299 +358,151 @@ class ExperimentConfig:
     enabled: bool = True
 
 
-# The registry is intentionally focused on 11 candidate/control models.
-# The complete historical registry remains in the full-source backup.
+# The registry contains the seven models needed for the current analysis.
 EXPERIMENTS_TO_RUN = None
 
-PRIMARY_CANDIDATE_EXPERIMENT_ID = (
+REFERENCE_EXPERIMENT_ID = (
     "A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA"
 )
-# A12 remains the locked V4 reference and A18 remains the prospectively declared
-# V5 candidate that did not outperform the later exploratory A17 result. V6 does
-# not rewrite that history: it prospectively locks A17 before the new exact-
-# support controls are evaluated.
-V5_CANDIDATE_EXPERIMENT_ID = (
-    "A18_HEART_CENTERED_FIXED_FOV_REGION_NORM_VALID_ONLY_HIER_LR_PCA"
-)
-V5_MATCHED_OUTSIDE_CONTROL_EXPERIMENT_ID = (
-    "C30_OUTSIDE_WHOLE_HEART_REGION_NORM_VALID_ONLY_HIER_LR_PCA"
-)
-V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID = (
+PRIMARY_CANDIDATE_EXPERIMENT_ID = (
     "A17_HARD_SUPPORT_REGION_NORM_HIER_LR_PCA"
 )
-V6_VALID_ONLY_ABLATION_EXPERIMENT_ID = (
+VALID_ONLY_ABLATION_EXPERIMENT_ID = (
     "A20_HARD_SUPPORT_REGION_NORM_VALID_ONLY_HIER_LR_PCA"
 )
-V6_EXACT_SUPPORT_MASK_CONTROL_EXPERIMENT_ID = (
+FIXED_PERIPHERY_CONTROL_EXPERIMENT_ID = (
+    "C29_FIXED_PERIPHERY_REGION_NORM_HIER_LR_PCA"
+)
+MASK_ONLY_CONTROL_EXPERIMENT_ID = (
     "C31_A17_EXACT_SUPPORT_MASK_ONLY_HIER_LR_PCA"
 )
-V6_SUPPORT_SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID = (
+SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID = (
     "C32_A17_SUPPORT_INTENSITY_AFFINE_SHUFFLED_HIER_LR_PCA"
 )
-V6_EXACT_SUPPORT_COMPLEMENT_CONTROL_EXPERIMENT_ID = (
+COMPLEMENT_CONTROL_EXPERIMENT_ID = (
     "C33_A17_EXACT_SUPPORT_COMPLEMENT_REGION_NORM_HIER_LR_PCA"
 )
-DEVELOPMENT_BASELINE_EXPERIMENT_ID = None
-BASELINE_EXPERIMENT_ID = PRIMARY_CANDIDATE_EXPERIMENT_ID
-# A12 is the locked reference for all final baseline-relative tables. The
-# separate B1 development branch is retained only in the full V16 backup.
+BASELINE_EXPERIMENT_ID = REFERENCE_EXPERIMENT_ID
 
-# Final compact panel: locked references/candidates plus controls needed to
-# interpret localization, fallback behavior and shortcut risk.
+# Only the final scientific question is active: does the hard-support cardiac
+# representation outperform the strict-ROI reference and matched shortcut
+# controls, and does that conclusion survive valid-slice filtering?
 EXPERIMENT_REGISTRY = (
     ExperimentConfig(
-                experiment_id="A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA",
-                description=(
-                    "Zero-background standardized MONAI ROI for valid masks, with a "
-                    "fixed 60% center crop rather than the full image when the gate fails."
-                ),
-                feature_mode="standardized_roi_zero_bg_center_fallback",
-                strategy="patient_embedding",
-                pooling_strategy="hierarchical",
-                weighting_mode="equal",
-                classifier_type="logistic_regression",
-                use_pca=True,
-                tune_c=True,
-                role="baseline",
-            ),
-    ExperimentConfig(
-                experiment_id="A16_HEART_CENTERED_FIXED_FOV_REGION_NORM_HIER_LR_PCA",
-                description=(
-                    "Fixed-size field of view centred on the valid MONAI hard-mask "
-                    "centroid, with image-centre fallback. Intensities are robustly "
-                    "scaled only inside the retained non-padding crop after cardiac "
-                    "localization; no soft MONAI confidence is multiplied into MRI pixels."
-                ),
-                feature_mode="standardized_heart_centered_fixed_fov_region_norm",
-                strategy="patient_embedding",
-                pooling_strategy="hierarchical",
-                weighting_mode="equal",
-                classifier_type="logistic_regression",
-                use_pca=True,
-                tune_c=True,
-                role="v5_candidate",
-            ),
-    ExperimentConfig(
-                experiment_id="A17_HARD_SUPPORT_REGION_NORM_HIER_LR_PCA",
-                description=(
-                    "Binary dilated cardiac support with region-only robust scaling and "
-                    "fixed-centre fallback. It tests whether MRI intensity remains "
-                    "predictive after removing soft-segmenter confidence modulation."
-                ),
-                feature_mode="standardized_hard_support_region_norm",
-                strategy="patient_embedding",
-                pooling_strategy="hierarchical",
-                weighting_mode="equal",
-                classifier_type="logistic_regression",
-                use_pca=True,
-                tune_c=True,
-                role="v6_prospective_candidate",
-            ),
-    ExperimentConfig(
-                experiment_id="A18_HEART_CENTERED_FIXED_FOV_REGION_NORM_VALID_ONLY_HIER_LR_PCA",
-                description=(
-                    "Prospective V5 candidate: A16 pixels restricted to the standardized "
-                    "MONAI gate-valid slice set. The matched C30 outside control uses "
-                    "exactly the same patient, series and slice rows."
-                ),
-                feature_mode="standardized_heart_centered_fixed_fov_region_norm",
-                strategy="patient_embedding",
-                pooling_strategy="hierarchical",
-                weighting_mode="equal",
-                classifier_type="logistic_regression",
-                use_pca=True,
-                tune_c=True,
-                slice_filter="standardized_monai_valid",
-                role="v5_prospective_candidate",
-            ),
-    ExperimentConfig(
-                experiment_id="A19_HEART_CENTERED_FIXED_FOV_REGION_NORM_VALID_ONLY_HIER_MEAN_STD_LR_PCA",
-                description=(
-                    "A18 representation with mean-plus-standard-deviation summaries "
-                    "inside each folder-defined series proxy before equal patient pooling. "
-                    "It tests whether within-series heterogeneity adds stable information."
-                ),
-                feature_mode="standardized_heart_centered_fixed_fov_region_norm",
-                strategy="patient_embedding",
-                pooling_strategy="hierarchical_mean_std",
-                weighting_mode="equal",
-                classifier_type="logistic_regression",
-                use_pca=True,
-                tune_c=True,
-                slice_filter="standardized_monai_valid",
-                role="v5_ablation",
-            ),
-    ExperimentConfig(
-                experiment_id="C29_FIXED_PERIPHERY_REGION_NORM_HIER_LR_PCA",
-                description=(
-                    "MONAI-independent peripheral control retaining only pixels outside "
-                    "a fixed central square and scaling intensities only in that periphery."
-                ),
-                feature_mode="standardized_fixed_periphery_region_norm",
-                strategy="patient_embedding",
-                pooling_strategy="hierarchical",
-                weighting_mode="equal",
-                classifier_type="logistic_regression",
-                use_pca=True,
-                tune_c=True,
-                role="negative_control",
-            ),
-    ExperimentConfig(
-                experiment_id="C30_OUTSIDE_WHOLE_HEART_REGION_NORM_VALID_ONLY_HIER_LR_PCA",
-                description=(
-                    "Matched outside-heart control for A18. It uses the same standardized "
-                    "MONAI gate-valid rows and independent region-only scaling, so the "
-                    "inside/outside comparison cannot be driven by gate-failure frequency."
-                ),
-                feature_mode="standardized_outside_whole_heart_region_norm",
-                strategy="patient_embedding",
-                pooling_strategy="hierarchical",
-                weighting_mode="equal",
-                classifier_type="logistic_regression",
-                use_pca=True,
-                tune_c=True,
-                slice_filter="standardized_monai_valid",
-                role="negative_control",
-            ),
-    ExperimentConfig(
-                experiment_id="A20_HARD_SUPPORT_REGION_NORM_VALID_ONLY_HIER_LR_PCA",
-                description=(
-                    "A17 pixels restricted to standardized MONAI gate-valid slices. "
-                    "This isolates whether A17's performance depends on its fixed "
-                    "central-square fallback for gate-invalid images."
-                ),
-                feature_mode="standardized_hard_support_region_norm",
-                strategy="patient_embedding",
-                pooling_strategy="hierarchical",
-                weighting_mode="equal",
-                classifier_type="logistic_regression",
-                use_pca=True,
-                tune_c=True,
-                slice_filter="standardized_monai_valid",
-                role="v6_ablation",
-            ),
-    ExperimentConfig(
-                experiment_id="C31_A17_EXACT_SUPPORT_MASK_ONLY_HIER_LR_PCA",
-                description=(
-                    "Exact binary-support control for A17. It uses the identical "
-                    "additional dilation, fixed-centre fallback, content mask, slice "
-                    "rows, pooling and folds, but removes every MRI intensity value."
-                ),
-                feature_mode="standardized_a17_exact_support_mask_only",
-                strategy="patient_embedding",
-                pooling_strategy="hierarchical",
-                weighting_mode="equal",
-                classifier_type="logistic_regression",
-                use_pca=True,
-                tune_c=True,
-                role="segmentation_representation_control",
-            ),
-    ExperimentConfig(
-                experiment_id="C32_A17_SUPPORT_INTENSITY_AFFINE_SHUFFLED_HIER_LR_PCA",
-                description=(
-                    "Anatomy-destruction control for A17. The exact A17 support and "
-                    "within-support intensity histogram are retained, while a "
-                    "deterministic per-image affine permutation destroys the original "
-                    "spatial arrangement without using labels or patient identifiers."
-                ),
-                feature_mode="standardized_a17_support_intensity_affine_shuffled",
-                strategy="patient_embedding",
-                pooling_strategy="hierarchical",
-                weighting_mode="equal",
-                classifier_type="logistic_regression",
-                use_pca=True,
-                tune_c=True,
-                role="anatomy_destruction_control",
-            ),
-    ExperimentConfig(
-                experiment_id="C33_A17_EXACT_SUPPORT_COMPLEMENT_REGION_NORM_HIER_LR_PCA",
-                description=(
-                    "Exact complement control for A17. It retains and independently "
-                    "normalizes only non-padding pixels outside the exact binary support "
-                    "used by A17, including the matched fixed-centre fallback."
-                ),
-                feature_mode="standardized_a17_exact_support_complement_region_norm",
-                strategy="patient_embedding",
-                pooling_strategy="hierarchical",
-                weighting_mode="equal",
-                classifier_type="logistic_regression",
-                use_pca=True,
-                tune_c=True,
-                role="negative_control",
-            ),
-)# These comparisons are declared before evaluation. The first identifier is the
-# reference and the second is the changed configuration, so Delta-AUROC is
-# calculated as ``comparison - reference``. A8 exists specifically to make the
-# legacy strategy comparison clean: A8 and A3 use the same ROI features, equal
-# weights, Logistic Regression, no PCA, and fixed C=1.0.
-PRIMARY_ABLATION_COMPARISONS = (
-    (
-        "A12_VS_V5_FIXED_FOV_REGION_NORMALIZATION",
-        PRIMARY_CANDIDATE_EXPERIMENT_ID,
-        "A16_HEART_CENTERED_FIXED_FOV_REGION_NORM_HIER_LR_PCA",
-        "Post-localization region scaling versus the locked A12 reference.",
+        experiment_id=REFERENCE_EXPERIMENT_ID,
+        description=(
+            "Reference model using a zero-background MONAI ROI with a fixed "
+            "central fallback, hierarchical patient pooling, PCA and Logistic "
+            "Regression."
+        ),
+        feature_mode="standardized_roi_zero_bg_center_fallback",
+        strategy="patient_embedding",
+        role="reference",
     ),
-    (
-        "V5_ALL_SLICES_VS_GATE_VALID_ONLY",
-        "A16_HEART_CENTERED_FIXED_FOV_REGION_NORM_HIER_LR_PCA",
-        V5_CANDIDATE_EXPERIMENT_ID,
-        "Effect of excluding standardized MONAI gate-invalid slices.",
+    ExperimentConfig(
+        experiment_id=PRIMARY_CANDIDATE_EXPERIMENT_ID,
+        description=(
+            "Primary model using a binary dilated cardiac support, robust "
+            "intensity scaling inside the visible region and fixed-centre "
+            "fallback."
+        ),
+        feature_mode="standardized_hard_support_region_norm",
+        strategy="patient_embedding",
+        role="primary_candidate",
     ),
-    (
-        "V5_FIXED_FOV_VS_HARD_SUPPORT",
-        V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID,
-        V5_CANDIDATE_EXPERIMENT_ID,
-        "Fixed heart-centred FOV versus zero-background hard support.",
+    ExperimentConfig(
+        experiment_id=VALID_ONLY_ABLATION_EXPERIMENT_ID,
+        description=(
+            "Primary model restricted to slices whose standardized MONAI mask "
+            "passes the plausibility gate."
+        ),
+        feature_mode="standardized_hard_support_region_norm",
+        strategy="patient_embedding",
+        slice_filter="standardized_monai_valid",
+        role="ablation",
     ),
-    (
-        "V5_HIERARCHICAL_MEAN_VS_MEAN_STD",
-        V5_CANDIDATE_EXPERIMENT_ID,
-        "A19_HEART_CENTERED_FIXED_FOV_REGION_NORM_VALID_ONLY_HIER_MEAN_STD_LR_PCA",
-        "Series mean versus mean-plus-standard-deviation summaries.",
+    ExperimentConfig(
+        experiment_id=FIXED_PERIPHERY_CONTROL_EXPERIMENT_ID,
+        description=(
+            "MONAI-independent peripheral control retaining only pixels outside "
+            "a fixed central square."
+        ),
+        feature_mode="standardized_fixed_periphery_region_norm",
+        strategy="patient_embedding",
+        role="negative_control",
     ),
-    (
-        "V5_MATCHED_INSIDE_VS_OUTSIDE_WHOLE_HEART",
-        V5_MATCHED_OUTSIDE_CONTROL_EXPERIMENT_ID,
-        V5_CANDIDATE_EXPERIMENT_ID,
-        "Matched valid-slice outside-heart control versus the V5 cardiac region.",
+    ExperimentConfig(
+        experiment_id=MASK_ONLY_CONTROL_EXPERIMENT_ID,
+        description=(
+            "Exact binary support used by the primary model with all MRI "
+            "intensities removed."
+        ),
+        feature_mode="standardized_a17_exact_support_mask_only",
+        strategy="patient_embedding",
+        role="segmentation_control",
     ),
-    (
-        "V5_CANDIDATE_VS_MONAI_INDEPENDENT_PERIPHERY",
-        "C29_FIXED_PERIPHERY_REGION_NORM_HIER_LR_PCA",
-        V5_CANDIDATE_EXPERIMENT_ID,
-        "Cardiac candidate versus a fixed MONAI-independent periphery.",
+    ExperimentConfig(
+        experiment_id=SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID,
+        description=(
+            "Exact support and intensity histogram retained while spatial "
+            "anatomy is deterministically shuffled."
+        ),
+        feature_mode="standardized_a17_support_intensity_affine_shuffled",
+        strategy="patient_embedding",
+        role="anatomy_destruction_control",
     ),
-    (
-        "A12_VS_V6_PROSPECTIVE_A17",
-        PRIMARY_CANDIDATE_EXPERIMENT_ID,
-        V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID,
-        "Prospectively locked A17 versus the locked A12 reference.",
-    ),
-    (
-        "A17_ALL_SLICES_VS_A20_VALID_ONLY",
-        V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID,
-        V6_VALID_ONLY_ABLATION_EXPERIMENT_ID,
-        "Effect of removing A17 fixed-centre fallback slices.",
-    ),
-    (
-        "C31_EXACT_SUPPORT_MASK_ONLY_VS_A17",
-        V6_EXACT_SUPPORT_MASK_CONTROL_EXPERIMENT_ID,
-        V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID,
-        "MRI intensities plus support versus exact support geometry alone.",
-    ),
-    (
-        "C32_SHUFFLED_SUPPORT_INTENSITY_VS_A17",
-        V6_SUPPORT_SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID,
-        V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID,
-        "Intact spatial anatomy versus the same support and shuffled histogram.",
-    ),
-    (
-        "C33_EXACT_COMPLEMENT_VS_A17",
-        V6_EXACT_SUPPORT_COMPLEMENT_CONTROL_EXPERIMENT_ID,
-        V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID,
-        "A17 support versus its independently normalized exact complement.",
+    ExperimentConfig(
+        experiment_id=COMPLEMENT_CONTROL_EXPERIMENT_ID,
+        description=(
+            "Independently normalized non-padding complement of the exact "
+            "primary-model support."
+        ),
+        feature_mode="standardized_a17_exact_support_complement_region_norm",
+        strategy="patient_embedding",
+        role="negative_control",
     ),
 )
+# In every pair, delta AUROC is calculated as changed configuration
+# minus reference on the same patient resamples.
+PRIMARY_ABLATION_COMPARISONS = (
+    (
+        "REFERENCE_VS_PRIMARY",
+        REFERENCE_EXPERIMENT_ID,
+        PRIMARY_CANDIDATE_EXPERIMENT_ID,
+        "Hard-support candidate versus strict-ROI reference.",
+    ),
+    (
+        "PRIMARY_ALL_VS_VALID_ONLY",
+        PRIMARY_CANDIDATE_EXPERIMENT_ID,
+        VALID_ONLY_ABLATION_EXPERIMENT_ID,
+        "Effect of removing fallback slices.",
+    ),
+    (
+        "PERIPHERY_VS_PRIMARY",
+        FIXED_PERIPHERY_CONTROL_EXPERIMENT_ID,
+        PRIMARY_CANDIDATE_EXPERIMENT_ID,
+        "Cardiac candidate versus a MONAI-independent periphery.",
+    ),
+    (
+        "MASK_ONLY_VS_PRIMARY",
+        MASK_ONLY_CONTROL_EXPERIMENT_ID,
+        PRIMARY_CANDIDATE_EXPERIMENT_ID,
+        "Support plus MRI intensity versus support geometry alone.",
+    ),
+    (
+        "SHUFFLED_INTENSITY_VS_PRIMARY",
+        SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID,
+        PRIMARY_CANDIDATE_EXPERIMENT_ID,
+        "Intact spatial anatomy versus the same histogram after shuffling.",
+    ),
+    (
+        "COMPLEMENT_VS_PRIMARY",
+        COMPLEMENT_CONTROL_EXPERIMENT_ID,
+        PRIMARY_CANDIDATE_EXPERIMENT_ID,
+        "Primary support versus its exact complement.",
+    ),
+)
+
 N_SPLITS = 5
 CV_RANDOM_STATE = RANDOM_SEED
 INNER_CV_SPLITS = 3
@@ -674,8 +510,8 @@ INNER_CV_RANDOM_STATE = RANDOM_SEED + 1000
 
 CLASSIFIER_C_GRID = (0.01, 0.1, 1.0, 10.0)
 LOGISTIC_MAX_ITER = 4000
-SVM_MAX_ITER = 20000
-SVM_CALIBRATION_C = 1.0
+
+
 # The sigmoid calibrator is fitted on inner OOF patient scores without class
 # balancing, so it targets the prevalence of the outer-training cohort rather
 # than an artificial 50/50 prior. The amount of regularization is predeclared.
@@ -732,67 +568,41 @@ def resolved_feature_cache_device_tag():
     return DEVICE if FEATURE_CACHE_DEVICE_TAG == "auto" else FEATURE_CACHE_DEVICE_TAG
 
 
-FEATURE_CACHE_SCHEMA_VERSION = "2026-09-05-exact-a17-controls-v6-v1"
+FEATURE_CACHE_SCHEMA = "cad-standardized-panel-current"
 EFFICIENTNET_FEATURE_DIM = 1280
 FEATURE_MODES_PER_ENCODER_CALL = 4
-# Several image variants can be concatenated along the batch dimension and
-# encoded by one EfficientNet call. Four modes at a time is a conservative T4
-# default: it reduces Python/kernel-launch overhead without materializing all
-# all thirty-two views simultaneously. Lower this value if GPU memory is insufficient.
+# Encode several requested views per EfficientNet call while bounding VRAM.
 
-SLICE_QUALITY_MIN_WEIGHT = 0.25
-# The quality signal remains a non-clinical heuristic. It is computed once from
-# the confidence-gated ROI/fallback image and activated only by experiment A6.
 
-BORDER_WIDTH_FRACTION = 0.15
-# C1 retains only this outer fraction on each side of the original 224x224
-# image so the first suite result remains directly reproducible.
-
-STANDARDIZED_BORDER_WIDTH_FRACTIONS = (0.05, 0.10)
-STANDARDIZED_CORNER_WIDTH_FRACTION = 0.15
 CENTER_CROP_FALLBACK_FRACTION = 0.60
-FIXED_CENTER_CROP_FRACTIONS = (0.50, 0.60, 0.70)
 STANDARDIZED_CONTENT_LONG_SIDE = 240
-FIXED_CHUNK_SIZE = 20
-FIXED_CHUNK_MIN_REMAINDER_FRACTION = 0.50
-# A final fixed chunk smaller than half the nominal chunk size is merged into
-# the preceding chunk. This prevents one or two residual slices from receiving
-# the same patient-level weight as a complete 20-slice chunk.
 
-MONAI_BBOX_CONTEXT_FRACTION = 0.15
-OUTSIDE_MONAI_BBOX_CONTEXT_FRACTION = 0.30
 
 # ---------------------------------------------------------------------------
-# V5 REGION-NORMALIZED CARDIAC / EXTRACARDIAC REPRESENTATIONS
+# REGION-NORMALIZED CARDIAC / EXTRACARDIAC REPRESENTATIONS
 # ---------------------------------------------------------------------------
-V5_FIXED_HEART_FOV_FRACTION = 0.65
-# Fixed square field of view used by the heart-centred candidate. The square is
-# centred on the MONAI hard-mask centroid when valid and on the image centre
-# otherwise. Its size is independent of mask area, label, fold, and score.
 
-V5_HARD_SUPPORT_EXTRA_DILATION_KERNEL = 15
+
+HARD_SUPPORT_FALLBACK_FRACTION = 0.65
+# Fixed central support used only when localization fails.
+
+HARD_SUPPORT_DILATION_KERNEL = 15
 # Additional odd-kernel dilation applied to the already dilated MONAI hard mask
 # for the binary-support candidate. This retains nearby myocardium/context while
 # avoiding soft-probability modulation of MRI intensity.
 
-V5_WHOLE_HEART_EXCLUSION_CENTER_FRACTION = 0.75
-V5_WHOLE_HEART_EXCLUSION_BBOX_CONTEXT_FRACTION = 0.65
-# C28/C30 remove the union of a large fixed central square and a substantially
-# expanded MONAI ventricular bounding box. This is a conservative whole-heart
-# proxy, not a validated whole-heart segmentation. The constants are fixed
-# before evaluation and must not be tuned to force the outside AUC downward.
 
-V5_FIXED_PERIPHERY_EXCLUSION_FRACTION = 0.75
+FIXED_PERIPHERY_EXCLUSION_FRACTION = 0.75
 # MONAI-independent peripheral control retaining only pixels outside a fixed
 # central square. It tests residual export/protocol signal without using a mask.
 
-V5_REGION_NORM_LOWER_PERCENTILE = 1.0
-V5_REGION_NORM_UPPER_PERCENTILE = 99.0
-V5_REGION_NORM_MIN_PIXELS = 64
-V5_REGION_NORM_HISTOGRAM_BINS = 256
-V5_REGION_NORM_MIN_DYNAMIC_RANGE = 8.0 / 255.0
+REGION_NORM_LOWER_PERCENTILE = 1.0
+REGION_NORM_UPPER_PERCENTILE = 99.0
+REGION_NORM_MIN_PIXELS = 64
+REGION_NORM_HISTOGRAM_BINS = 256
+REGION_NORM_MIN_DYNAMIC_RANGE = 8.0 / 255.0
 # Intensities are robustly rescaled only from pixels inside the region that will
-# remain visible. This removes the V4 coupling in which cardiac intensities could
+# remain visible. This removes the coupling in which cardiac intensities could
 # influence the scaling of an outside-heart control.
 # Percentiles are estimated from a fixed 256-bin masked histogram in a batched
 # GPU-friendly implementation. This avoids one sorting/synchronization operation
@@ -804,14 +614,11 @@ V5_REGION_NORM_MIN_DYNAMIC_RANGE = 8.0 / 255.0
 # 256x256 canvas. This removes the previous dependence of pipeline-added
 # padding on native pixel dimensions and on how much dark border was removed.
 # Aspect ratio is still preserved and therefore remains explicitly audited.
-# Fixed 50%, 60%, and 70% center crops are independent of MONAI geometry.
-# FIXED_CHUNK_SIZE supports a folder-independent pooling ablation. All values
-# are fixed before evaluation and are independent of labels and OOF performance.
 
 # ---------------------------------------------------------------------------
-# V6 EXACT-SUPPORT CONTROL SETTINGS
+# EXACT-SUPPORT CONTROL SETTINGS
 # ---------------------------------------------------------------------------
-V6_SUPPORT_INTENSITY_SHUFFLE_VERSION = "sha256-affine-permutation-v1"
+SUPPORT_INTENSITY_SHUFFLE_SCHEMA = "sha256-affine-permutation-v1"
 # C32 permutes the row-major sequence of pixels inside the exact A17 support by
 # p(i)=(a*i+b) mod n, with a chosen coprime to n from the decoded-pixel hash.
 # This is bijective, deterministic, label-blind, preserves the within-support
@@ -851,61 +658,6 @@ STANDARDIZATION_FEATURE_NAMES = (
 # centered in a 256x256 canvas, so pipeline padding no longer depends on native
 # resolution or on the amount of detected border removal.
 
-MONAI_SOFT_HISTOGRAM_BINS = 64
-# The distribution-only control converts each gate-valid soft MONAI map into a
-# fixed 64-bin cumulative-distribution image. It retains the empirical
-# probability distribution but removes every original pixel coordinate and all
-# connected mask morphology. The value is fixed before evaluation.
-
-MONAI_SOFT_BLOCK_SHUFFLE_GRID = 14
-MONAI_SOFT_BLOCK_SHUFFLE_VERSION = "sha256-per-image-14x14-v1"
-# The 224x224 map is divided into a 14x14 grid of 16x16 blocks. A deterministic
-# per-image permutation is derived from the exact decoded-pixel SHA-256, never
-# from label, patient ID, series ID, fold, or model score. Within-block soft-map
-# texture and the complete probability histogram are preserved, while global
-# shape and location are destroyed. This remains a diagnostic control rather
-# than a natural-image preprocessing recommendation.
-
-MONAI_CANONICAL_MASK_CONTENT_FRACTION = 0.75
-# Canonicalized mask controls crop to the gate-valid hard-mask bounding box,
-# preserve relative morphology, square-pad without anisotropic distortion, and
-# place the result at one fixed centered scale occupying 75% of the 224x224
-# canvas. Absolute mask location and original extent are therefore removed.
-
-SERIES_ANNOTATION_INPUT_PATH = os.environ.get("CAD_SERIES_ANNOTATION_CSV") or None
-RUN_ANNOTATED_SERIES_SUBSET_ANALYSIS = SERIES_ANNOTATION_INPUT_PATH is not None
-ANNOTATED_SERIES_SELECTION_NAME = "heart_nonlocalizer_nonderived"
-ANNOTATED_SERIES_REQUIRE_CONTAINS_HEART = True
-ANNOTATED_SERIES_EXCLUDE_LOCALIZERS = True
-ANNOTATED_SERIES_EXCLUDE_DERIVED_EXPORTS = True
-ANNOTATED_SERIES_ALLOWED_SEQUENCE_TYPES = ()
-ANNOTATED_SERIES_ALLOWED_VIEW_TYPES = ()
-ANNOTATED_SERIES_ALLOWED_CONFIDENCE_VALUES = ("high", "medium")
-ANNOTATED_SERIES_USE_SEQUENCE_VIEW_BALANCED_POOLING = True
-# When annotations are enabled, hierarchical image experiments are rerun with
-# equal weighting across explicitly annotated (sequence_type, view_type) cells:
-# slices -> series proxy -> sequence/view cell -> patient. This prevents a
-# protocol with many exported folders from dominating the patient embedding.
-
-ANNOTATED_SERIES_EXPERIMENT_IDS = (
-    PRIMARY_CANDIDATE_EXPERIMENT_ID,
-    "A16_HEART_CENTERED_FIXED_FOV_REGION_NORM_HIER_LR_PCA",
-    V5_CANDIDATE_EXPERIMENT_ID,
-    "A19_HEART_CENTERED_FIXED_FOV_REGION_NORM_VALID_ONLY_HIER_MEAN_STD_LR_PCA",
-    "C29_FIXED_PERIPHERY_REGION_NORM_HIER_LR_PCA",
-    V5_MATCHED_OUTSIDE_CONTROL_EXPERIMENT_ID,
-    V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID,
-    V6_VALID_ONLY_ABLATION_EXPERIMENT_ID,
-    V6_EXACT_SUPPORT_MASK_CONTROL_EXPERIMENT_ID,
-    V6_SUPPORT_SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID,
-    V6_EXACT_SUPPORT_COMPLEMENT_CONTROL_EXPERIMENT_ID,
-)# The pipeline never infers sequence or view from SR_*/series* folder names.
-# When this optional stage is enabled, the user must point to a completed copy
-# of the blinded series_annotation_template.csv stored outside the current run
-# directory. Only explicitly annotated series proxies are retained, and a fresh
-# patient-level fold manifest is created for the retained cohort. The default is
-# disabled because empty annotation columns cannot support valid filtering.
-
 C_SELECTION_AUC_TOLERANCE = 0.01
 # Select the smallest (most regularized) C whose inner AUC is within this
 # absolute tolerance of the best candidate. This prevents tiny inner-CV
@@ -916,7 +668,7 @@ C_SELECTION_AUC_TOLERANCE = 0.01
 # ---------------------------------------------------------------------------
 # ``fast`` is the default for iterative Kaggle development. It preserves the
 # main stability and permutation checks but reduces their repeated fitting cost.
-# ``full`` restores the original publication-oriented 50/1000/1000 workload.
+# ``full`` restores the original high-precision 50/1000/1000 workload.
 # ``smoke`` is intended only for code/debug checks and is not adequate for final
 # scientific reporting.
 #
@@ -930,7 +682,6 @@ C_SELECTION_AUC_TOLERANCE = 0.01
 #   CAD_STABILITY_REPEATS
 #   CAD_PERMUTATION_REPLICATES
 #   CAD_SELECTION_ADJUSTED_PERMUTATIONS
-#   CAD_STABILITY_PANEL = focused | full
 #
 # The reduced profile changes only repeated patient-level fitting. It does not
 # change image preprocessing, MONAI/Attention masks, EfficientNet embeddings,
@@ -943,19 +694,16 @@ VALIDATION_RUNTIME_PROFILES = {
         "stability_repeats": 3,
         "permutation_replicates": 25,
         "selection_adjusted_permutations": 25,
-        "stability_panel": "focused",
     },
     "fast": {
         "stability_repeats": 10,
         "permutation_replicates": 200,
         "selection_adjusted_permutations": 100,
-        "stability_panel": "focused",
     },
     "full": {
         "stability_repeats": 50,
         "permutation_replicates": 1000,
         "selection_adjusted_permutations": 1000,
-        "stability_panel": "full",
     },
 }
 if VALIDATION_RUNTIME_PROFILE not in VALIDATION_RUNTIME_PROFILES:
@@ -1009,88 +757,29 @@ REPEATED_NESTED_CV_REPEATS = _validation_env_positive_int(
 )
 REPEATED_NESTED_CV_RANDOM_STATE = RANDOM_SEED + 20_000
 
-# The complete panel is retained verbatim for the ``full`` profile.
-FULL_STABILITY_EXPERIMENT_IDS = tuple(
+# Every active experiment is repeated because the registry is already compact.
+STABILITY_EXPERIMENT_IDS = tuple(
     experiment.experiment_id for experiment in EXPERIMENT_REGISTRY
-)
-# The default fast panel concentrates repeated split-sensitivity analysis on the
-# main historical/current candidates and the controls needed to interpret A17.
-# All other enabled experiments still receive their ordinary nested 5-fold OOF
-# evaluation in stage 8; only their additional repeated-CV reruns are omitted.
-FOCUSED_STABILITY_EXPERIMENT_IDS = (
-    PRIMARY_CANDIDATE_EXPERIMENT_ID,
-    V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID,
-    V6_VALID_ONLY_ABLATION_EXPERIMENT_ID,
-    "C29_FIXED_PERIPHERY_REGION_NORM_HIER_LR_PCA",
-    V5_MATCHED_OUTSIDE_CONTROL_EXPERIMENT_ID,
-    V6_EXACT_SUPPORT_MASK_CONTROL_EXPERIMENT_ID,
-    V6_SUPPORT_SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID,
-    V6_EXACT_SUPPORT_COMPLEMENT_CONTROL_EXPERIMENT_ID,
-)
-STABILITY_PANEL = os.environ.get(
-    "CAD_STABILITY_PANEL",
-    _VALIDATION_PROFILE_DEFAULTS["stability_panel"],
-).strip().lower()
-if STABILITY_PANEL not in {"focused", "full"}:
-    raise ValueError(
-        "CAD_STABILITY_PANEL must be 'focused' or 'full', received "
-        f"{STABILITY_PANEL!r}."
-    )
-STABILITY_EXPERIMENT_IDS = (
-    FULL_STABILITY_EXPERIMENT_IDS
-    if STABILITY_PANEL == "full"
-    else FOCUSED_STABILITY_EXPERIMENT_IDS
 )
 
 # All comparisons below use the exact same outer split seeds. The first model
 # is the reference and the second is the changed configuration, so a positive
 # delta means the SECOND named configuration performed better on that repeat.
-# Most rows place A12 second; the deduplication row intentionally places A15
-# second because it asks whether collapsing repeats improves the locked model.
+# Every comparison uses identical repeated split seeds.
 REPEATED_STABILITY_COMPARISONS = (
-    (
-        "A12_VS_A17_PROSPECTIVE_V6",
-        PRIMARY_CANDIDATE_EXPERIMENT_ID,
-        V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID,
-        "Locked A12 versus prospectively locked A17.",
-    ),
-    (
-        "A17_ALL_VS_A20_VALID_ONLY",
-        V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID,
-        V6_VALID_ONLY_ABLATION_EXPERIMENT_ID,
-        "All A17 slices versus gate-valid-only A20.",
-    ),
-    (
-        "C31_EXACT_SUPPORT_MASK_ONLY_VS_A17",
-        V6_EXACT_SUPPORT_MASK_CONTROL_EXPERIMENT_ID,
-        V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID,
-        "MRI intensity plus support versus exact support geometry alone.",
-    ),
-    (
-        "C32_SHUFFLED_INTENSITY_VS_A17",
-        V6_SUPPORT_SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID,
-        V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID,
-        "Intact anatomy versus shuffled within-support intensities.",
-    ),
-    (
-        "C33_EXACT_COMPLEMENT_VS_A17",
-        V6_EXACT_SUPPORT_COMPLEMENT_CONTROL_EXPERIMENT_ID,
-        V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID,
-        "Exact support versus its matched complement.",
-    ),
+    ("REFERENCE_VS_PRIMARY", REFERENCE_EXPERIMENT_ID, PRIMARY_CANDIDATE_EXPERIMENT_ID,
+     "Strict-ROI reference versus primary hard-support model."),
+    ("PRIMARY_ALL_VS_VALID_ONLY", PRIMARY_CANDIDATE_EXPERIMENT_ID,
+     VALID_ONLY_ABLATION_EXPERIMENT_ID, "All slices versus gate-valid-only slices."),
+    ("MASK_ONLY_VS_PRIMARY", MASK_ONLY_CONTROL_EXPERIMENT_ID,
+     PRIMARY_CANDIDATE_EXPERIMENT_ID, "Support geometry alone versus support plus MRI."),
+    ("SHUFFLED_VS_PRIMARY", SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID,
+     PRIMARY_CANDIDATE_EXPERIMENT_ID, "Shuffled intensities versus intact anatomy."),
+    ("COMPLEMENT_VS_PRIMARY", COMPLEMENT_CONTROL_EXPERIMENT_ID,
+     PRIMARY_CANDIDATE_EXPERIMENT_ID, "Exact complement versus cardiac support."),
+    ("PERIPHERY_VS_PRIMARY", FIXED_PERIPHERY_CONTROL_EXPERIMENT_ID,
+     PRIMARY_CANDIDATE_EXPERIMENT_ID, "Fixed periphery versus cardiac support."),
 )
-# Preserve the complete paired-comparison registry for full reporting. Under
-# the focused stability panel, keep only comparisons whose two experiments are
-# actually rerun. The ordinary stage-8 paired comparisons remain unchanged.
-FULL_REPEATED_STABILITY_COMPARISONS = REPEATED_STABILITY_COMPARISONS
-if STABILITY_PANEL == "focused":
-    _focused_stability_ids = set(STABILITY_EXPERIMENT_IDS)
-    REPEATED_STABILITY_COMPARISONS = tuple(
-        row
-        for row in FULL_REPEATED_STABILITY_COMPARISONS
-        if row[1] in _focused_stability_ids
-        and row[2] in _focused_stability_ids
-    )
 
 RUN_PATIENT_LABEL_PERMUTATION_TEST = _validation_env_bool(
     "CAD_RUN_PERMUTATION", True
@@ -1101,24 +790,25 @@ LABEL_PERMUTATION_REPLICATES = _validation_env_positive_int(
 )
 LABEL_PERMUTATION_RANDOM_STATE = RANDOM_SEED + 40_000
 PERMUTATION_EXPERIMENT_IDS = (
-    V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID,
-)
-# A17 is tested prospectively as the V6 candidate. The separate max-statistic
-# family permutation below addresses its exploratory selection after the V5
-# run, rather than pretending the historical choice had been predeclared.
-
-RUN_V6_CANDIDATE_FAMILY_NESTED_SELECTION = True
-V6_CANDIDATE_FAMILY_NESTED_SELECTION_IDS = (
-    V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID,
-    V6_VALID_ONLY_ABLATION_EXPERIMENT_ID,
     PRIMARY_CANDIDATE_EXPERIMENT_ID,
 )
-V6_CANDIDATE_FAMILY_SELECTION_AUC_TOLERANCE = 0.01
+
+# The primary model receives a direct label-permutation test. A separate
+# max-statistic test accounts for choosing among the declared model family.
+
+RUN_MODEL_FAMILY_NESTED_SELECTION = True
+MODEL_FAMILY_NESTED_SELECTION_IDS = (
+    PRIMARY_CANDIDATE_EXPERIMENT_ID,
+    VALID_ONLY_ABLATION_EXPERIMENT_ID,
+    REFERENCE_EXPERIMENT_ID,
+)
+
+MODEL_FAMILY_SELECTION_AUC_TOLERANCE = 0.01
 # Inside each outer-training cohort, each candidate receives its own inner C
 # selection. The first candidate within this tolerance of the best inner AUROC
-# is chosen, fitted on the complete outer-training cohort, and evaluated once on
-# the untouched outer fold. A17 is listed first as the prospectively preferred
-# simple candidate, so near-ties do not silently favor a more complex branch.
+# is chosen, fitted on the complete outer-training cohort, and evaluated
+# once on the untouched outer fold. The primary model is the deterministic
+# near-tie preference.
 
 RUN_SELECTION_ADJUSTED_PERMUTATION_TEST = _validation_env_bool(
     "CAD_RUN_SELECTION_ADJUSTED_PERMUTATION", True
@@ -1133,21 +823,19 @@ SELECTION_ADJUSTED_PERMUTATION_REPLICATES = (
 )
 SELECTION_ADJUSTED_PERMUTATION_RANDOM_STATE = RANDOM_SEED + 60_000
 SELECTION_ADJUSTED_CANDIDATE_EXPERIMENT_IDS = (
+    REFERENCE_EXPERIMENT_ID,
     PRIMARY_CANDIDATE_EXPERIMENT_ID,
-    "A16_HEART_CENTERED_FIXED_FOV_REGION_NORM_HIER_LR_PCA",
-    V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID,
-    V5_CANDIDATE_EXPERIMENT_ID,
-    "A19_HEART_CENTERED_FIXED_FOV_REGION_NORM_VALID_ONLY_HIER_MEAN_STD_LR_PCA",
+    VALID_ONLY_ABLATION_EXPERIMENT_ID,
 )
+
 # For every permuted label vector, the full nested fitting path is rerun for
-# every predeclared V5 candidate and the maximum AUROC is stored. Comparing the
+# every predeclared candidate and the maximum AUROC is stored. Comparing the
 # observed maximum with this maximum-null distribution corrects the permutation
 # result for choosing the best representation from that candidate family.
 
 AUDIT_EXACT_DECODED_PIXEL_DUPLICATES = True
 AUDIT_PERCEPTUAL_NEAR_DUPLICATES = True
 PHASH_HAMMING_THRESHOLD = 3
-PHASH_USE_COMPLETE_BK_TREE_AUDIT = True
 # The reviewed audit searches unique 64-bit hashes with a complete BK-tree
 # radius query. It does not skip large buckets or truncate at an arbitrary
 # image-pair count. pHash matches remain screening candidates, not verdicts.
@@ -1163,13 +851,6 @@ FAIL_SUITE_IF_ANY_EXPERIMENT_FAILS = False
 
 SHORTCUT_WARNING_AUC = 0.65
 MONAI_GATE_RATE_DIFFERENCE_WARNING = 0.20
-
-RUN_EXTERNAL_VALIDATION = False
-EXTERNAL_DATASET_PATH = None
-# External validation is deliberately disabled until an independent dataset with
-# a documented compatible Normal/Sick endpoint and patient mapping is supplied.
-# The suite records an explicit SKIPPED status rather than pretending that
-# internal cross-validation is external validation.
 
 # ---------------------------------------------------------------------------
 # MONAI BUNDLE CONFIGURATION
@@ -1341,28 +1022,17 @@ _selected_experiments_for_identity = [
 ]
 
 _suite_identity = {
+    "pipeline_schema": PIPELINE_SCHEMA_ID,
     "experiments": _selected_experiments_for_identity,
+    "reference_experiment_id": REFERENCE_EXPERIMENT_ID,
     "primary_candidate_experiment_id": PRIMARY_CANDIDATE_EXPERIMENT_ID,
-    "v5_candidate_experiment_id": V5_CANDIDATE_EXPERIMENT_ID,
-    "v5_matched_outside_control_experiment_id": (
-        V5_MATCHED_OUTSIDE_CONTROL_EXPERIMENT_ID
+    "valid_only_ablation_experiment_id": VALID_ONLY_ABLATION_EXPERIMENT_ID,
+    "control_experiment_ids": (
+        FIXED_PERIPHERY_CONTROL_EXPERIMENT_ID,
+        MASK_ONLY_CONTROL_EXPERIMENT_ID,
+        SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID,
+        COMPLEMENT_CONTROL_EXPERIMENT_ID,
     ),
-    "v6_prospective_candidate_experiment_id": (
-        V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID
-    ),
-    "v6_valid_only_ablation_experiment_id": (
-        V6_VALID_ONLY_ABLATION_EXPERIMENT_ID
-    ),
-    "v6_exact_support_mask_control_experiment_id": (
-        V6_EXACT_SUPPORT_MASK_CONTROL_EXPERIMENT_ID
-    ),
-    "v6_support_shuffled_intensity_control_experiment_id": (
-        V6_SUPPORT_SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID
-    ),
-    "v6_exact_support_complement_control_experiment_id": (
-        V6_EXACT_SUPPORT_COMPLEMENT_CONTROL_EXPERIMENT_ID
-    ),
-    "development_baseline_experiment_id": DEVELOPMENT_BASELINE_EXPERIMENT_ID,
     "primary_ablation_comparisons": PRIMARY_ABLATION_COMPARISONS,
     "repeated_stability_comparisons": REPEATED_STABILITY_COMPARISONS,
     "random_seed": RANDOM_SEED,
@@ -1371,184 +1041,33 @@ _suite_identity = {
     "n_splits": N_SPLITS,
     "inner_splits": INNER_CV_SPLITS,
     "c_grid": CLASSIFIER_C_GRID,
-    "c_selection_auc_tolerance": C_SELECTION_AUC_TOLERANCE,
-    "logistic_max_iter": LOGISTIC_MAX_ITER,
-    "svm_max_iter": SVM_MAX_ITER,
-    "svm_calibration_c": SVM_CALIBRATION_C,
     "threshold_method": THRESHOLD_SELECTION_METHOD,
-    "target_sensitivity": TARGET_SENSITIVITY,
     "bootstrap_replicates": BOOTSTRAP_REPLICATES,
     "paired_bootstrap_replicates": PAIRED_BOOTSTRAP_REPLICATES,
-    "bootstrap_confidence": BOOTSTRAP_CONFIDENCE,
     "pca_variance": PATIENT_PCA_EXPLAINED_VARIANCE,
-    "slice_quality_min_weight": SLICE_QUALITY_MIN_WEIGHT,
-    "feature_cache_schema": FEATURE_CACHE_SCHEMA_VERSION,
-    "batch_size": BATCH_SIZE,
-    "use_cuda_amp": USE_CUDA_AMP,
-    "deterministic_algorithms_requested": True,
-    "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
-    "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
-    "cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
-    "cudnn_allow_tf32": bool(
-        getattr(torch.backends.cudnn, "allow_tf32", False)
-    ),
-    "cuda_matmul_allow_tf32": bool(
-        getattr(
-            getattr(torch.backends.cuda, "matmul", object()),
-            "allow_tf32",
-            False,
-        )
-    ),
-    # The suite tag remains stable across staged GPU/CPU sessions. The live
-    # execution device is still written separately to run metadata/logs.
-    "device_type": resolved_suite_device_tag(),
+    "feature_cache_schema": FEATURE_CACHE_SCHEMA,
+    "device_tag": resolved_suite_device_tag(),
     "img_size": IMG_SIZE,
     "monai_input_size": MONAI_INPUT_SIZE,
     "monai_bundle": MONAI_BUNDLE_NAME,
     "monai_bundle_version": MONAI_BUNDLE_VERSION,
     "monai_hf_revision": MONAI_HF_REVISION,
-    "roi_dilation": MONAI_ROI_DILATION_KERNEL,
-    "roi_background": MONAI_BACKGROUND_WEIGHT,
-    "roi_min_area": MONAI_MIN_HEART_AREA_RATIO,
-    "roi_max_area": MONAI_MAX_HEART_AREA_RATIO,
-    "roi_min_peak": MONAI_MIN_PEAK_HEART_PROBABILITY,
-    "efficientnet_weights": EFFICIENTNET_WEIGHTS_NAME,
-    "border_width_fraction": BORDER_WIDTH_FRACTION,
-    "standardized_border_width_fractions": STANDARDIZED_BORDER_WIDTH_FRACTIONS,
-    "standardized_corner_width_fraction": STANDARDIZED_CORNER_WIDTH_FRACTION,
-    "center_crop_fallback_fraction": CENTER_CROP_FALLBACK_FRACTION,
-    "fixed_center_crop_fractions": FIXED_CENTER_CROP_FRACTIONS,
-    "standardized_content_long_side": STANDARDIZED_CONTENT_LONG_SIDE,
-    "fixed_chunk_size": FIXED_CHUNK_SIZE,
-    "fixed_chunk_min_remainder_fraction": (
-        FIXED_CHUNK_MIN_REMAINDER_FRACTION
-    ),
-    "v5_fixed_heart_fov_fraction": V5_FIXED_HEART_FOV_FRACTION,
-    "v5_hard_support_extra_dilation_kernel": (
-        V5_HARD_SUPPORT_EXTRA_DILATION_KERNEL
-    ),
-    "v5_whole_heart_exclusion_center_fraction": (
-        V5_WHOLE_HEART_EXCLUSION_CENTER_FRACTION
-    ),
-    "v5_whole_heart_exclusion_bbox_context_fraction": (
-        V5_WHOLE_HEART_EXCLUSION_BBOX_CONTEXT_FRACTION
-    ),
-    "v5_fixed_periphery_exclusion_fraction": (
-        V5_FIXED_PERIPHERY_EXCLUSION_FRACTION
-    ),
-    "v5_region_norm_lower_percentile": V5_REGION_NORM_LOWER_PERCENTILE,
-    "v5_region_norm_upper_percentile": V5_REGION_NORM_UPPER_PERCENTILE,
-    "v5_region_norm_min_pixels": V5_REGION_NORM_MIN_PIXELS,
-    "v5_region_norm_histogram_bins": V5_REGION_NORM_HISTOGRAM_BINS,
-    "v5_region_norm_min_dynamic_range": (
-        V5_REGION_NORM_MIN_DYNAMIC_RANGE
-    ),
-    "monai_soft_histogram_bins": MONAI_SOFT_HISTOGRAM_BINS,
-    "monai_soft_block_shuffle_grid": MONAI_SOFT_BLOCK_SHUFFLE_GRID,
-    "monai_soft_block_shuffle_version": MONAI_SOFT_BLOCK_SHUFFLE_VERSION,
-    "monai_canonical_mask_content_fraction": (
-        MONAI_CANONICAL_MASK_CONTENT_FRACTION
-    ),
-    "monai_bbox_context_fraction": MONAI_BBOX_CONTEXT_FRACTION,
-    "outside_monai_bbox_context_fraction": (
-        OUTSIDE_MONAI_BBOX_CONTEXT_FRACTION
-    ),
-    "standardization_lower_percentile": STANDARDIZATION_LOWER_PERCENTILE,
-    "standardization_upper_percentile": STANDARDIZATION_UPPER_PERCENTILE,
-    "standardization_dark_line_max_mean": (
-        STANDARDIZATION_DARK_LINE_MAX_MEAN
-    ),
-    "standardization_dark_line_max_std": STANDARDIZATION_DARK_LINE_MAX_STD,
-    "standardization_dark_pixel_max_value": (
-        STANDARDIZATION_DARK_PIXEL_MAX_VALUE
-    ),
-    "standardization_dark_pixel_min_fraction": (
-        STANDARDIZATION_DARK_PIXEL_MIN_FRACTION
-    ),
-    "standardization_max_crop_fraction_per_side": (
-        STANDARDIZATION_MAX_CROP_FRACTION_PER_SIDE
-    ),
-    "standardization_min_retained_fraction": (
-        STANDARDIZATION_MIN_RETAINED_FRACTION
-    ),
-    "standardization_min_padding_run": STANDARDIZATION_MIN_PADDING_RUN,
+    "hard_support_dilation_kernel": HARD_SUPPORT_DILATION_KERNEL,
+    "fixed_periphery_exclusion_fraction": FIXED_PERIPHERY_EXCLUSION_FRACTION,
+    "region_norm_lower_percentile": REGION_NORM_LOWER_PERCENTILE,
+    "region_norm_upper_percentile": REGION_NORM_UPPER_PERCENTILE,
+    "region_norm_min_pixels": REGION_NORM_MIN_PIXELS,
+    "region_norm_histogram_bins": REGION_NORM_HISTOGRAM_BINS,
+    "region_norm_min_dynamic_range": REGION_NORM_MIN_DYNAMIC_RANGE,
+    "support_intensity_shuffle_schema": SUPPORT_INTENSITY_SHUFFLE_SCHEMA,
     "standardization_feature_names": STANDARDIZATION_FEATURE_NAMES,
-    "provenance_classifier_schema": "geometry_file_padding_border_v1",
-    "audit_exact_duplicates": AUDIT_EXACT_DECODED_PIXEL_DUPLICATES,
-    "audit_perceptual_duplicates": AUDIT_PERCEPTUAL_NEAR_DUPLICATES,
-    "phash_hamming_threshold": PHASH_HAMMING_THRESHOLD,
-    "phash_use_complete_bk_tree_audit": PHASH_USE_COMPLETE_BK_TREE_AUDIT,
-    "group_exact_duplicates": GROUP_SPLITS_BY_EXACT_DUPLICATES,
-    "group_phash_candidates": GROUP_SPLITS_BY_PHASH_CANDIDATES,
-    "fail_on_cross_patient_exact_duplicates": (
-        FAIL_ON_CROSS_PATIENT_EXACT_DUPLICATES
-    ),
-    "fail_on_cross_label_exact_duplicates": (
-        FAIL_ON_CROSS_LABEL_EXACT_DUPLICATES
-    ),
-    "shortcut_warning_auc": SHORTCUT_WARNING_AUC,
-    "monai_gate_rate_difference_warning": (
-        MONAI_GATE_RATE_DIFFERENCE_WARNING
-    ),
     "validation_runtime_profile": VALIDATION_RUNTIME_PROFILE,
-    "stability_panel": STABILITY_PANEL,
-    "run_repeated_nested_cv_stability": RUN_REPEATED_NESTED_CV_STABILITY,
-    "repeated_nested_cv_repeats": REPEATED_NESTED_CV_REPEATS,
-    "repeated_nested_cv_random_state": REPEATED_NESTED_CV_RANDOM_STATE,
     "stability_experiment_ids": STABILITY_EXPERIMENT_IDS,
-    "run_patient_label_permutation_test": (
-        RUN_PATIENT_LABEL_PERMUTATION_TEST
-    ),
-    "label_permutation_replicates": LABEL_PERMUTATION_REPLICATES,
-    "label_permutation_random_state": LABEL_PERMUTATION_RANDOM_STATE,
     "permutation_experiment_ids": PERMUTATION_EXPERIMENT_IDS,
-    "run_v6_candidate_family_nested_selection": (
-        RUN_V6_CANDIDATE_FAMILY_NESTED_SELECTION
-    ),
-    "v6_candidate_family_nested_selection_ids": (
-        V6_CANDIDATE_FAMILY_NESTED_SELECTION_IDS
-    ),
-    "v6_candidate_family_selection_auc_tolerance": (
-        V6_CANDIDATE_FAMILY_SELECTION_AUC_TOLERANCE
-    ),
-    "run_selection_adjusted_permutation_test": (
-        RUN_SELECTION_ADJUSTED_PERMUTATION_TEST
-    ),
-    "selection_adjusted_permutation_replicates": (
-        SELECTION_ADJUSTED_PERMUTATION_REPLICATES
-    ),
-    "selection_adjusted_permutation_random_state": (
-        SELECTION_ADJUSTED_PERMUTATION_RANDOM_STATE
-    ),
-    "selection_adjusted_candidate_experiment_ids": (
-        SELECTION_ADJUSTED_CANDIDATE_EXPERIMENT_IDS
-    ),
-    "run_annotated_series_subset_analysis": (
-        RUN_ANNOTATED_SERIES_SUBSET_ANALYSIS
-    ),
-    "series_annotation_input_path": SERIES_ANNOTATION_INPUT_PATH,
-    "annotated_series_selection_name": ANNOTATED_SERIES_SELECTION_NAME,
-    "annotated_series_require_contains_heart": (
-        ANNOTATED_SERIES_REQUIRE_CONTAINS_HEART
-    ),
-    "annotated_series_exclude_localizers": (
-        ANNOTATED_SERIES_EXCLUDE_LOCALIZERS
-    ),
-    "annotated_series_exclude_derived_exports": (
-        ANNOTATED_SERIES_EXCLUDE_DERIVED_EXPORTS
-    ),
-    "annotated_series_allowed_sequence_types": (
-        ANNOTATED_SERIES_ALLOWED_SEQUENCE_TYPES
-    ),
-    "annotated_series_allowed_view_types": ANNOTATED_SERIES_ALLOWED_VIEW_TYPES,
-    "annotated_series_allowed_confidence_values": (
-        ANNOTATED_SERIES_ALLOWED_CONFIDENCE_VALUES
-    ),
-    "annotated_series_use_sequence_view_balanced_pooling": (
-        ANNOTATED_SERIES_USE_SEQUENCE_VIEW_BALANCED_POOLING
-    ),
-    "annotated_series_experiment_ids": ANNOTATED_SERIES_EXPERIMENT_IDS,
+    "model_family_selection_ids": MODEL_FAMILY_NESTED_SELECTION_IDS,
+    "selection_adjusted_candidate_ids": SELECTION_ADJUSTED_CANDIDATE_EXPERIMENT_IDS,
 }
+
 
 SUITE_CONFIGURATION_TAG = hashlib.sha256(
     json.dumps(_suite_identity, sort_keys=True).encode("utf-8")
@@ -1559,19 +1078,11 @@ OUTPUT_DIR = OUTPUT_ROOT / SUITE_NAME
 FEATURE_CACHE_ROOT = OUTPUT_ROOT / "feature_bank_cache"
 CONSOLE_LOG_PATH = OUTPUT_DIR / "console_output.log"
 
-if os.path.exists("/kaggle/working"):
-    DEBUG_OUTPUT_DIR = Path("/kaggle/working/debug_output")
-else:
-    try:
-        DEBUG_OUTPUT_DIR = Path(__file__).resolve().parent / "debug_output"
-    except NameError:
-        DEBUG_OUTPUT_DIR = Path.cwd() / "debug_output"
-
 # =============================
 # EXECUTION STATUS + TIMING HELPERS
 # =============================
 
-PIPELINE_STAGE_COUNT = 14
+PIPELINE_STAGE_COUNT = 12
 # The number matches the suite orchestration stages inside ``main``.
 
 
@@ -1712,733 +1223,133 @@ def get_enabled_experiments():
 
 
 def validate_configuration():
-    """Fail before expensive work when the experiment suite is inconsistent."""
+    """Fail before data loading when the final protocol is inconsistent."""
 
     experiments = get_enabled_experiments()
-    if not experiments:
-        raise ValueError("At least one experiment must be enabled.")
-
-    experiment_ids = [experiment.experiment_id for experiment in experiments]
-    if len(experiment_ids) != len(set(experiment_ids)):
-        raise ValueError("Experiment IDs must be unique.")
-
-    # Validate the predeclared scientific comparison registry against the full
-    # experiment catalog. A reduced preliminary run may omit one side of a pair;
-    # that pair will be saved as SKIPPED rather than being silently redefined.
-    known_experiment_ids = {
-        experiment.experiment_id for experiment in EXPERIMENT_REGISTRY
+    ids = [experiment.experiment_id for experiment in experiments]
+    expected_ids = {
+        REFERENCE_EXPERIMENT_ID,
+        PRIMARY_CANDIDATE_EXPERIMENT_ID,
+        VALID_ONLY_ABLATION_EXPERIMENT_ID,
+        FIXED_PERIPHERY_CONTROL_EXPERIMENT_ID,
+        MASK_ONLY_CONTROL_EXPERIMENT_ID,
+        SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID,
+        COMPLEMENT_CONTROL_EXPERIMENT_ID,
     }
-    comparison_names = [row[0] for row in PRIMARY_ABLATION_COMPARISONS]
-    if len(comparison_names) != len(set(comparison_names)):
-        raise ValueError("Primary ablation comparison names must be unique.")
-    for comparison_name, reference_id, comparison_id, _ in (
-        PRIMARY_ABLATION_COMPARISONS
-    ):
-        if reference_id not in known_experiment_ids:
-            raise ValueError(
-                f"{comparison_name}: unknown reference experiment {reference_id!r}."
-            )
-        if comparison_id not in known_experiment_ids:
-            raise ValueError(
-                f"{comparison_name}: unknown comparison experiment {comparison_id!r}."
-            )
-        if reference_id == comparison_id:
-            raise ValueError(
-                f"{comparison_name}: reference and comparison must differ."
-            )
+    if set(ids) != expected_ids or len(ids) != len(expected_ids):
+        raise ValueError(
+            "The active registry must contain exactly the seven final "
+            f"experiments; received {ids}."
+        )
+    if BASELINE_EXPERIMENT_ID != REFERENCE_EXPERIMENT_ID:
+        raise ValueError("BASELINE_EXPERIMENT_ID must equal the reference model.")
 
-    if BASELINE_EXPERIMENT_ID not in experiment_ids:
-        raise ValueError(
-            "The configured baseline must be present in the enabled suite: "
-            f"{BASELINE_EXPERIMENT_ID!r}."
-        )
-
-    repeated_comparison_names = [
-        row[0] for row in REPEATED_STABILITY_COMPARISONS
-    ]
-    if len(repeated_comparison_names) != len(set(repeated_comparison_names)):
-        raise ValueError(
-            "Repeated-stability comparison names must be unique."
-        )
-    for comparison_name, reference_id, comparison_id, _ in (
-        REPEATED_STABILITY_COMPARISONS
-    ):
-        if reference_id not in known_experiment_ids:
-            raise ValueError(
-                f"{comparison_name}: unknown repeated-CV reference "
-                f"{reference_id!r}."
-            )
-        if comparison_id not in known_experiment_ids:
-            raise ValueError(
-                f"{comparison_name}: unknown repeated-CV comparison "
-                f"{comparison_id!r}."
-            )
-        if reference_id == comparison_id:
-            raise ValueError(
-                f"{comparison_name}: repeated-CV models must differ."
-            )
-        if RUN_REPEATED_NESTED_CV_STABILITY and (
-            reference_id not in STABILITY_EXPERIMENT_IDS
-            or comparison_id not in STABILITY_EXPERIMENT_IDS
-        ):
-            raise ValueError(
-                f"{comparison_name}: both models must be present in "
-                "STABILITY_EXPERIMENT_IDS."
-            )
-
-    if not PERMUTATION_EXPERIMENT_IDS:
-        raise ValueError(
-            "PERMUTATION_EXPERIMENT_IDS must contain at least one experiment."
-        )
-    if len(PERMUTATION_EXPERIMENT_IDS) != len(
-        set(PERMUTATION_EXPERIMENT_IDS)
-    ):
-        raise ValueError(
-            "PERMUTATION_EXPERIMENT_IDS must not contain duplicates."
-        )
-    if not SELECTION_ADJUSTED_CANDIDATE_EXPERIMENT_IDS:
-        raise ValueError(
-            "SELECTION_ADJUSTED_CANDIDATE_EXPERIMENT_IDS cannot be empty."
-        )
-    if len(SELECTION_ADJUSTED_CANDIDATE_EXPERIMENT_IDS) != len(
-        set(SELECTION_ADJUSTED_CANDIDATE_EXPERIMENT_IDS)
-    ):
-        raise ValueError(
-            "SELECTION_ADJUSTED_CANDIDATE_EXPERIMENT_IDS must be unique."
-        )
-    if not V6_CANDIDATE_FAMILY_NESTED_SELECTION_IDS:
-        raise ValueError(
-            "V6_CANDIDATE_FAMILY_NESTED_SELECTION_IDS cannot be empty."
-        )
-    if len(V6_CANDIDATE_FAMILY_NESTED_SELECTION_IDS) != len(
-        set(V6_CANDIDATE_FAMILY_NESTED_SELECTION_IDS)
-    ):
-        raise ValueError(
-            "V6_CANDIDATE_FAMILY_NESTED_SELECTION_IDS must be unique."
-        )
-
-    if (
-        RUN_REPEATED_NESTED_CV_STABILITY
-        or RUN_PATIENT_LABEL_PERMUTATION_TEST
-        or RUN_SELECTION_ADJUSTED_PERMUTATION_TEST
-        or RUN_V6_CANDIDATE_FAMILY_NESTED_SELECTION
-    ):
-        enabled_by_id = {
-            experiment.experiment_id: experiment for experiment in experiments
-        }
-        requested_analysis_ids = set()
-        if RUN_REPEATED_NESTED_CV_STABILITY:
-            requested_analysis_ids.update(STABILITY_EXPERIMENT_IDS)
-        if RUN_PATIENT_LABEL_PERMUTATION_TEST:
-            requested_analysis_ids.update(PERMUTATION_EXPERIMENT_IDS)
-        if RUN_SELECTION_ADJUSTED_PERMUTATION_TEST:
-            requested_analysis_ids.update(
-                SELECTION_ADJUSTED_CANDIDATE_EXPERIMENT_IDS
-            )
-        if RUN_V6_CANDIDATE_FAMILY_NESTED_SELECTION:
-            requested_analysis_ids.update(
-                V6_CANDIDATE_FAMILY_NESTED_SELECTION_IDS
-            )
-
-        for analysis_experiment_id in sorted(requested_analysis_ids):
-            if analysis_experiment_id not in enabled_by_id:
-                raise ValueError(
-                    "The configured stability/permutation/model-selection "
-                    "experiment must be enabled: "
-                    f"{analysis_experiment_id!r}."
-                )
-            analysis_experiment = enabled_by_id[analysis_experiment_id]
-            if analysis_experiment.strategy != "patient_embedding":
-                raise ValueError(
-                    "Stability, permutation, and candidate-family selection "
-                    "are reviewed only for patient-embedding experiments."
-                )
-            if analysis_experiment.classifier_type not in {
-                "logistic_regression",
-                "linear_svm",
-            }:
-                raise ValueError(
-                    "Unsupported classifier for stability/permutation/model "
-                    "selection analysis."
-                )
-
-    valid_feature_modes = {
-        'standardized_roi_zero_bg_center_fallback',
-        'standardized_heart_centered_fixed_fov_region_norm',
-        'standardized_hard_support_region_norm',
-        'standardized_outside_whole_heart_region_norm',
-        'standardized_fixed_periphery_region_norm',
-        'standardized_a17_exact_support_mask_only',
-        'standardized_a17_support_intensity_affine_shuffled',
-        'standardized_a17_exact_support_complement_region_norm',
+    allowed_modes = {
+        "standardized_roi_zero_bg_center_fallback",
+        "standardized_hard_support_region_norm",
+        "standardized_fixed_periphery_region_norm",
+        "standardized_a17_exact_support_mask_only",
+        "standardized_a17_support_intensity_affine_shuffled",
+        "standardized_a17_exact_support_complement_region_norm",
     }
-    valid_strategies = {"patient_embedding"}
-    valid_pooling = {"hierarchical", "hierarchical_mean_std"}
-    valid_weighting = {"equal"}
-    valid_classifiers = {"logistic_regression"}
-    valid_fusion = {None}
-
     for experiment in experiments:
-        if experiment.feature_mode not in valid_feature_modes:
+        if experiment.feature_mode not in allowed_modes:
             raise ValueError(
-                f"{experiment.experiment_id}: invalid feature mode "
+                f"{experiment.experiment_id}: unsupported feature mode "
                 f"{experiment.feature_mode!r}."
             )
-        if experiment.strategy not in valid_strategies:
-            raise ValueError(
-                f"{experiment.experiment_id}: invalid strategy "
-                f"{experiment.strategy!r}."
-            )
-        if experiment.pooling_strategy not in valid_pooling:
-            raise ValueError(
-                f"{experiment.experiment_id}: invalid pooling strategy "
-                f"{experiment.pooling_strategy!r}."
-            )
-        if experiment.weighting_mode not in valid_weighting:
-            raise ValueError(
-                f"{experiment.experiment_id}: invalid weighting mode "
-                f"{experiment.weighting_mode!r}."
-            )
-        if experiment.classifier_type not in valid_classifiers:
-            raise ValueError(
-                f"{experiment.experiment_id}: invalid classifier "
-                f"{experiment.classifier_type!r}."
-            )
-        if experiment.fusion_method not in valid_fusion:
-            raise ValueError(
-                f"{experiment.experiment_id}: invalid fusion method "
-                f"{experiment.fusion_method!r}."
-            )
-        if experiment.slice_filter not in {
-            "all",
-            "standardized_monai_valid",
-        }:
-            raise ValueError(
-                f"{experiment.experiment_id}: invalid slice_filter "
-                f"{experiment.slice_filter!r}."
-            )
-        if experiment.strategy == "patient_tabular" and (
-            experiment.slice_filter != "all"
-        ):
-            raise ValueError(
-                f"{experiment.experiment_id}: patient-tabular experiments "
-                "cannot use an image-row slice filter."
-            )
-        if experiment.fixed_c <= 0:
-            raise ValueError(
-                f"{experiment.experiment_id}: fixed_c must be positive."
-            )
-        if not 0.0 <= experiment.slice_dropout_rate < 1.0:
-            raise ValueError(
-                f"{experiment.experiment_id}: slice_dropout_rate must lie "
-                "in [0,1)."
-            )
-        if experiment.slice_dropout_rate > 0.0 and (
-            experiment.strategy != "patient_embedding"
-            or experiment.feature_mode not in {
-                "monai_roi",
-                "full_image",
-                "border_only",
-                "outside_heart",
-                "standardized_monai_roi",
-                "standardized_full_image",
-                "standardized_roi_zero_background",
-                "standardized_roi_zero_bg_center_fallback",
-                "standardized_roi_bbox",
-                "standardized_heart_centered_fixed_fov_region_norm",
-                "standardized_hard_support_region_norm",
-                "standardized_a17_exact_support_mask_only",
-                "standardized_a17_support_intensity_affine_shuffled",
-                "standardized_a17_exact_support_complement_region_norm",
-                "standardized_outside_whole_heart_region_norm",
-                "standardized_fixed_periphery_region_norm",
-            }
-        ):
-            raise ValueError(
-                f"{experiment.experiment_id}: slice dropout is reviewed only "
-                "for image-based patient-embedding experiments."
-            )
-
-        if experiment.deduplicate_exact_within_patient and (
-            experiment.strategy != "patient_embedding"
-        ):
-            raise ValueError(
-                f"{experiment.experiment_id}: exact within-patient "
-                "deduplication is reviewed only for patient-embedding "
-                "experiments."
-            )
-
-        if experiment.strategy == "slice_probability_fusion":
-            if experiment.classifier_type != "logistic_regression":
-                raise ValueError(
-                    f"{experiment.experiment_id}: the reviewed legacy branch "
-                    "supports Logistic Regression only."
-                )
-            if experiment.fusion_method is None:
-                raise ValueError(
-                    f"{experiment.experiment_id}: legacy probability fusion "
-                    "requires an explicit fusion method."
-                )
-            if experiment.use_pca:
-                raise ValueError(
-                    f"{experiment.experiment_id}: PCA is intentionally disabled "
-                    "for the legacy slice-level branch."
-                )
-
-        if experiment.strategy == "patient_tabular":
-            if experiment.feature_mode not in {
-                "provenance_only",
-                "monai_qc_only",
-                "standardization_qc_only",
-                "standardized_monai_qc_only",
-                "n_slices_only",
-                "n_series_only",
-                "series_length_only",
-                "native_geometry_only",
-                "file_size_only",
-            }:
-                raise ValueError(
-                    f"{experiment.experiment_id}: patient_tabular requires a "
-                    "tabular feature mode."
-                )
-
-        if experiment.classifier_type == "linear_svm" and (
-            experiment.strategy != "patient_embedding"
-        ):
-            raise ValueError(
-                f"{experiment.experiment_id}: Linear SVM is currently reviewed "
-                "only for one-row-per-patient inputs."
-            )
-
-    # V6 claims exact matching between A17 and C31-C33. Enforce that
-    # contract before any image is decoded so a future registry edit cannot
-    # silently turn the controls into unmatched experiments.
-    catalog_by_id = {
-        experiment.experiment_id: experiment
-        for experiment in EXPERIMENT_REGISTRY
-    }
-    v6_contract_ids = (
-        V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID,
-        V6_VALID_ONLY_ABLATION_EXPERIMENT_ID,
-        V6_EXACT_SUPPORT_MASK_CONTROL_EXPERIMENT_ID,
-        V6_SUPPORT_SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID,
-        V6_EXACT_SUPPORT_COMPLEMENT_CONTROL_EXPERIMENT_ID,
-    )
-    missing_v6_contract_ids = [
-        experiment_id
-        for experiment_id in v6_contract_ids
-        if experiment_id not in catalog_by_id
-    ]
-    if missing_v6_contract_ids:
-        raise ValueError(
-            "V6 exact-support registry entries are missing: "
-            f"{missing_v6_contract_ids}."
-        )
-
-    a17 = catalog_by_id[V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID]
-    shared_fields = (
-        "strategy",
-        "pooling_strategy",
-        "weighting_mode",
-        "classifier_type",
-        "use_pca",
-        "tune_c",
-        "fixed_c",
-        "slice_dropout_rate",
-        "deduplicate_exact_within_patient",
-    )
-    for experiment_id in (
-        V6_EXACT_SUPPORT_MASK_CONTROL_EXPERIMENT_ID,
-        V6_SUPPORT_SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID,
-        V6_EXACT_SUPPORT_COMPLEMENT_CONTROL_EXPERIMENT_ID,
-    ):
-        control = catalog_by_id[experiment_id]
-        mismatches = [
-            field_name
-            for field_name in shared_fields
-            if getattr(control, field_name) != getattr(a17, field_name)
-        ]
-        if mismatches:
-            raise ValueError(
-                f"{experiment_id} does not match A17 for fields {mismatches}."
-            )
-        if control.slice_filter != "all":
-            raise ValueError(
-                f"{experiment_id} must use slice_filter='all' to match A17."
-            )
-    if a17.slice_filter != "all":
-        raise ValueError("The prospectively locked A17 must retain all slices.")
-
-    a20 = catalog_by_id[V6_VALID_ONLY_ABLATION_EXPERIMENT_ID]
-    for field_name in shared_fields:
-        if getattr(a20, field_name) != getattr(a17, field_name):
-            raise ValueError(
-                f"A20 must match A17 for {field_name!r}."
-            )
-    if a20.feature_mode != a17.feature_mode:
-        raise ValueError("A20 must use the identical image representation as A17.")
-    if a20.slice_filter != "standardized_monai_valid":
-        raise ValueError(
-            "A20 must differ from A17 only through the gate-valid slice filter."
-        )
-
-    expected_v6_feature_modes = {
-        V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID: (
-            "standardized_hard_support_region_norm"
-        ),
-        V6_EXACT_SUPPORT_MASK_CONTROL_EXPERIMENT_ID: (
-            "standardized_a17_exact_support_mask_only"
-        ),
-        V6_SUPPORT_SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID: (
-            "standardized_a17_support_intensity_affine_shuffled"
-        ),
-        V6_EXACT_SUPPORT_COMPLEMENT_CONTROL_EXPERIMENT_ID: (
-            "standardized_a17_exact_support_complement_region_norm"
-        ),
-    }
-    for experiment_id, expected_mode in expected_v6_feature_modes.items():
-        if catalog_by_id[experiment_id].feature_mode != expected_mode:
-            raise ValueError(
-                f"{experiment_id} must use feature_mode={expected_mode!r}."
-            )
-
-    if (
-        V6_CANDIDATE_FAMILY_NESTED_SELECTION_IDS[0]
-        != V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID
-    ):
-        raise ValueError(
-            "A17 must remain first in the V6 candidate-family tie-break order."
-        )
-    if USE_CUDA_AMP:
-        raise ValueError(
-            "The prospectively locked V6 final run requires USE_CUDA_AMP=False."
-        )
-
-    if IMG_SIZE != 224:
-        raise ValueError(
-            "This reviewed EfficientNet-B0 pipeline requires IMG_SIZE=224."
-        )
-    if MONAI_INPUT_SIZE != 256:
-        raise ValueError(
-            "The pinned ventricular bundle requires MONAI_INPUT_SIZE=256."
-        )
-    if BATCH_SIZE <= 0:
-        raise ValueError("BATCH_SIZE must be positive.")
-    if DATALOADER_NUM_WORKERS < 0:
-        raise ValueError("DATALOADER_NUM_WORKERS cannot be negative.")
-    if PROGRESS_PRINT_EVERY_N_BATCHES <= 0:
-        raise ValueError("PROGRESS_PRINT_EVERY_N_BATCHES must be positive.")
+        if experiment.strategy != "patient_embedding":
+            raise ValueError("Only patient_embedding experiments are supported.")
+        if experiment.pooling_strategy != "hierarchical":
+            raise ValueError("Only hierarchical pooling is supported.")
+        if experiment.weighting_mode != "equal":
+            raise ValueError("Only equal slice weighting is supported.")
+        if experiment.classifier_type != "logistic_regression":
+            raise ValueError("Only Logistic Regression is supported.")
+        if experiment.fusion_method is not None:
+            raise ValueError("Probability fusion is not part of the final pipeline.")
+        if not experiment.use_pca or not experiment.tune_c:
+            raise ValueError("Every final experiment must use fold-local PCA and C selection.")
+        if experiment.slice_filter not in {"all", "standardized_monai_valid"}:
+            raise ValueError(f"Invalid slice filter: {experiment.slice_filter!r}.")
+        if experiment.slice_dropout_rate != 0.0:
+            raise ValueError("Slice-dropout experiments are not part of the final pipeline.")
+        if experiment.deduplicate_exact_within_patient:
+            raise ValueError("Within-patient deduplication is audit-only in the final pipeline.")
 
     if N_SPLITS < 2 or INNER_CV_SPLITS < 2:
-        raise ValueError("Outer and inner CV must each contain at least 2 folds.")
-    if not CLASSIFIER_C_GRID or any(value <= 0 for value in CLASSIFIER_C_GRID):
+        raise ValueError("Outer and inner CV need at least two folds.")
+    if not CLASSIFIER_C_GRID or any(float(value) <= 0 for value in CLASSIFIER_C_GRID):
         raise ValueError("CLASSIFIER_C_GRID must contain positive values.")
-    if LOGISTIC_MAX_ITER <= 0 or SVM_MAX_ITER <= 0:
-        raise ValueError("Classifier iteration limits must be positive.")
-    if SVM_CALIBRATION_C <= 0:
-        raise ValueError("SVM_CALIBRATION_C must be positive.")
-    if not 0.0 < PATIENT_PCA_EXPLAINED_VARIANCE < 1.0:
-        raise ValueError(
-            "PATIENT_PCA_EXPLAINED_VARIANCE must lie strictly in (0,1)."
-        )
-
-    if THRESHOLD_SELECTION_METHOD not in {"youden", "target_sensitivity"}:
-        raise ValueError(
-            "THRESHOLD_SELECTION_METHOD must be 'youden' or "
-            "'target_sensitivity'."
-        )
-    if not 0.0 < TARGET_SENSITIVITY <= 1.0:
-        raise ValueError("TARGET_SENSITIVITY must lie in (0,1].")
-    if BOOTSTRAP_REPLICATES <= 0 or PAIRED_BOOTSTRAP_REPLICATES <= 0:
+    if not 0.0 < PATIENT_PCA_EXPLAINED_VARIANCE <= 1.0:
+        raise ValueError("PATIENT_PCA_EXPLAINED_VARIANCE must lie in (0,1].")
+    if BOOTSTRAP_REPLICATES < 1 or PAIRED_BOOTSTRAP_REPLICATES < 1:
         raise ValueError("Bootstrap replicate counts must be positive.")
-    if not 0.0 < BOOTSTRAP_CONFIDENCE < 1.0:
-        raise ValueError("BOOTSTRAP_CONFIDENCE must lie strictly in (0,1).")
+    if REPEATED_NESTED_CV_REPEATS < 1:
+        raise ValueError("Repeated-CV count must be positive.")
+    if LABEL_PERMUTATION_REPLICATES < 1:
+        raise ValueError("Permutation replicate count must be positive.")
+    if SELECTION_ADJUSTED_PERMUTATION_REPLICATES < 1:
+        raise ValueError("Selection-adjusted permutation count must be positive.")
 
-    if not 0.0 < SLICE_QUALITY_MIN_WEIGHT <= 1.0:
-        raise ValueError("SLICE_QUALITY_MIN_WEIGHT must lie in (0,1].")
-    if not 0.0 < BORDER_WIDTH_FRACTION < 0.5:
-        raise ValueError("BORDER_WIDTH_FRACTION must lie in (0,0.5).")
-    if any(
-        not 0.0 < float(value) < 0.5
-        for value in STANDARDIZED_BORDER_WIDTH_FRACTIONS
-    ):
-        raise ValueError(
-            "STANDARDIZED_BORDER_WIDTH_FRACTIONS must lie in (0,0.5)."
-        )
-    if not 0.0 < STANDARDIZED_CORNER_WIDTH_FRACTION < 0.5:
-        raise ValueError(
-            "STANDARDIZED_CORNER_WIDTH_FRACTION must lie in (0,0.5)."
-        )
-    if not 0.0 < CENTER_CROP_FALLBACK_FRACTION <= 1.0:
-        raise ValueError(
-            "CENTER_CROP_FALLBACK_FRACTION must lie in (0,1]."
-        )
-    if MONAI_BBOX_CONTEXT_FRACTION < 0.0 or (
-        OUTSIDE_MONAI_BBOX_CONTEXT_FRACTION < 0.0
-    ):
-        raise ValueError("MONAI bounding-box context fractions cannot be negative.")
-    if not (
-        0.0 <= STANDARDIZATION_LOWER_PERCENTILE
-        < STANDARDIZATION_UPPER_PERCENTILE <= 100.0
-    ):
-        raise ValueError("Invalid robust standardization percentile interval.")
-    if not 0.0 < STANDARDIZATION_MIN_RETAINED_FRACTION <= 1.0:
-        raise ValueError(
-            "STANDARDIZATION_MIN_RETAINED_FRACTION must lie in (0,1]."
-        )
-    if not 0.0 <= STANDARDIZATION_MAX_CROP_FRACTION_PER_SIDE < 0.5:
-        raise ValueError(
-            "STANDARDIZATION_MAX_CROP_FRACTION_PER_SIDE must lie in [0,0.5)."
-        )
-    if STANDARDIZATION_MIN_PADDING_RUN < 1:
-        raise ValueError("STANDARDIZATION_MIN_PADDING_RUN must be positive.")
-    if not 1 <= STANDARDIZED_CONTENT_LONG_SIDE <= MONAI_INPUT_SIZE:
-        raise ValueError(
-            "STANDARDIZED_CONTENT_LONG_SIDE must lie in [1, MONAI_INPUT_SIZE]."
-        )
-    if FIXED_CHUNK_SIZE <= 0:
-        raise ValueError("FIXED_CHUNK_SIZE must be strictly positive.")
-    if not 0.0 < FIXED_CHUNK_MIN_REMAINDER_FRACTION <= 1.0:
-        raise ValueError(
-            "FIXED_CHUNK_MIN_REMAINDER_FRACTION must lie in (0,1]."
-        )
-    for setting_name, setting_value in (
-        ("V5_FIXED_HEART_FOV_FRACTION", V5_FIXED_HEART_FOV_FRACTION),
-        (
-            "V5_WHOLE_HEART_EXCLUSION_CENTER_FRACTION",
-            V5_WHOLE_HEART_EXCLUSION_CENTER_FRACTION,
-        ),
-        (
-            "V5_FIXED_PERIPHERY_EXCLUSION_FRACTION",
-            V5_FIXED_PERIPHERY_EXCLUSION_FRACTION,
-        ),
-    ):
-        if not 0.0 < float(setting_value) <= 1.0:
-            raise ValueError(f"{setting_name} must lie in (0,1].")
-    if V5_WHOLE_HEART_EXCLUSION_BBOX_CONTEXT_FRACTION < 0.0:
-        raise ValueError(
-            "V5_WHOLE_HEART_EXCLUSION_BBOX_CONTEXT_FRACTION cannot be negative."
-        )
-    if V5_HARD_SUPPORT_EXTRA_DILATION_KERNEL <= 0 or (
-        V5_HARD_SUPPORT_EXTRA_DILATION_KERNEL % 2 == 0
-    ):
-        raise ValueError(
-            "V5_HARD_SUPPORT_EXTRA_DILATION_KERNEL must be a positive odd integer."
-        )
-    if not (
-        0.0 <= V5_REGION_NORM_LOWER_PERCENTILE
-        < V5_REGION_NORM_UPPER_PERCENTILE <= 100.0
-    ):
-        raise ValueError("Invalid V5 region-normalization percentile interval.")
-    if V5_REGION_NORM_MIN_PIXELS < 1:
-        raise ValueError("V5_REGION_NORM_MIN_PIXELS must be positive.")
-    if V5_REGION_NORM_HISTOGRAM_BINS < 2:
-        raise ValueError(
-            "V5_REGION_NORM_HISTOGRAM_BINS must be at least 2."
-        )
-    if not 0.0 < V5_REGION_NORM_MIN_DYNAMIC_RANGE <= 1.0:
-        raise ValueError(
-            "V5_REGION_NORM_MIN_DYNAMIC_RANGE must lie in (0,1]."
-        )
-    if len(FIXED_CENTER_CROP_FRACTIONS) != 3 or any(
-        not 0.0 < float(value) <= 1.0
-        for value in FIXED_CENTER_CROP_FRACTIONS
-    ):
-        raise ValueError(
-            "FIXED_CENTER_CROP_FRACTIONS must contain three values in (0,1]."
-        )
-    if C_SELECTION_AUC_TOLERANCE < 0.0:
-        raise ValueError("C_SELECTION_AUC_TOLERANCE cannot be negative.")
-    if REPEATED_NESTED_CV_REPEATS <= 0:
-        raise ValueError("REPEATED_NESTED_CV_REPEATS must be positive.")
-    if LABEL_PERMUTATION_REPLICATES <= 0:
-        raise ValueError("LABEL_PERMUTATION_REPLICATES must be positive.")
-    if SELECTION_ADJUSTED_PERMUTATION_REPLICATES <= 0:
-        raise ValueError(
-            "SELECTION_ADJUSTED_PERMUTATION_REPLICATES must be positive."
-        )
-    if V6_CANDIDATE_FAMILY_SELECTION_AUC_TOLERANCE < 0.0:
-        raise ValueError(
-            "V6_CANDIDATE_FAMILY_SELECTION_AUC_TOLERANCE cannot be negative."
-        )
-    if not str(V6_SUPPORT_INTENSITY_SHUFFLE_VERSION).strip():
-        raise ValueError(
-            "V6_SUPPORT_INTENSITY_SHUFFLE_VERSION must be non-empty."
-        )
-    if FEATURE_MODES_PER_ENCODER_CALL <= 0:
-        raise ValueError("FEATURE_MODES_PER_ENCODER_CALL must be positive.")
+    enabled = set(ids)
+    requested = (
+        set(STABILITY_EXPERIMENT_IDS)
+        | set(PERMUTATION_EXPERIMENT_IDS)
+        | set(MODEL_FAMILY_NESTED_SELECTION_IDS)
+        | set(SELECTION_ADJUSTED_CANDIDATE_EXPERIMENT_IDS)
+    )
+    missing = sorted(requested - enabled)
+    if missing:
+        raise ValueError(f"Validation analysis references disabled experiments: {missing}")
 
-    # The four V4 segmentation-representation controls use fixed synthetic
-    # encodings. Validate their spatial/distribution settings before the very
-    # expensive feature-bank extraction begins.
-    if MONAI_SOFT_HISTOGRAM_BINS < 2:
-        raise ValueError("MONAI_SOFT_HISTOGRAM_BINS must be at least 2.")
-    if MONAI_SOFT_BLOCK_SHUFFLE_GRID <= 1:
-        raise ValueError(
-            "MONAI_SOFT_BLOCK_SHUFFLE_GRID must be greater than 1."
-        )
-    if IMG_SIZE % MONAI_SOFT_BLOCK_SHUFFLE_GRID != 0:
-        raise ValueError(
-            "IMG_SIZE must be divisible by MONAI_SOFT_BLOCK_SHUFFLE_GRID so "
-            "block shuffling preserves every pixel exactly."
-        )
-    if not 0.0 < MONAI_CANONICAL_MASK_CONTENT_FRACTION <= 1.0:
-        raise ValueError(
-            "MONAI_CANONICAL_MASK_CONTENT_FRACTION must lie in (0,1]."
-        )
-    if not str(MONAI_SOFT_BLOCK_SHUFFLE_VERSION).strip():
-        raise ValueError(
-            "MONAI_SOFT_BLOCK_SHUFFLE_VERSION must be a non-empty string."
-        )
+    if MODEL_FAMILY_NESTED_SELECTION_IDS[0] != PRIMARY_CANDIDATE_EXPERIMENT_ID:
+        raise ValueError("The primary candidate must be first in model-family ties.")
+    if tuple(PERMUTATION_EXPERIMENT_IDS) != (PRIMARY_CANDIDATE_EXPERIMENT_ID,):
+        raise ValueError("The ordinary label-permutation test must target the primary candidate.")
 
-    # Sequence/view analysis is optional because the released JPEG folders do
-    # not expose validated DICOM sequence metadata. When enabled, it must be
-    # driven by a completed external copy of the blinded annotation template.
-    if RUN_ANNOTATED_SERIES_SUBSET_ANALYSIS:
-        if not SERIES_ANNOTATION_INPUT_PATH:
-            raise ValueError(
-                "RUN_ANNOTATED_SERIES_SUBSET_ANALYSIS=True requires "
-                "SERIES_ANNOTATION_INPUT_PATH."
-            )
-        annotation_path = Path(SERIES_ANNOTATION_INPUT_PATH).expanduser()
-        if not annotation_path.is_file():
-            raise FileNotFoundError(
-                "Completed series annotation CSV was not found: "
-                f"{annotation_path}"
-            )
-        try:
-            annotation_path.resolve().relative_to(OUTPUT_DIR.resolve())
-        except ValueError:
-            pass
-        else:
-            raise ValueError(
-                "SERIES_ANNOTATION_INPUT_PATH must point to a completed copy "
-                "stored outside the current run directory. Stage 2 cleans the "
-                "run-specific output package before execution."
-            )
-        if not str(ANNOTATED_SERIES_SELECTION_NAME).strip():
-            raise ValueError(
-                "ANNOTATED_SERIES_SELECTION_NAME must be non-empty."
-            )
-        if any(
-            character in str(ANNOTATED_SERIES_SELECTION_NAME)
-            for character in ("/", "\\")
-        ):
-            raise ValueError(
-                "ANNOTATED_SERIES_SELECTION_NAME must be a safe directory "
-                "name without path separators."
-            )
-        if not ANNOTATED_SERIES_EXPERIMENT_IDS:
-            raise ValueError(
-                "ANNOTATED_SERIES_EXPERIMENT_IDS must not be empty when the "
-                "optional annotated-series analysis is enabled."
-            )
-        if len(ANNOTATED_SERIES_EXPERIMENT_IDS) != len(
-            set(ANNOTATED_SERIES_EXPERIMENT_IDS)
-        ):
-            raise ValueError(
-                "ANNOTATED_SERIES_EXPERIMENT_IDS must not contain duplicates."
-            )
-        enabled_by_id = {
-            experiment.experiment_id: experiment for experiment in experiments
-        }
-        for experiment_id in ANNOTATED_SERIES_EXPERIMENT_IDS:
-            if experiment_id not in enabled_by_id:
+    catalog = {experiment.experiment_id: experiment for experiment in experiments}
+    primary = catalog[PRIMARY_CANDIDATE_EXPERIMENT_ID]
+    valid_only = catalog[VALID_ONLY_ABLATION_EXPERIMENT_ID]
+    exact_controls = (
+        catalog[MASK_ONLY_CONTROL_EXPERIMENT_ID],
+        catalog[SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID],
+        catalog[COMPLEMENT_CONTROL_EXPERIMENT_ID],
+    )
+    common_fields = (
+        "strategy", "pooling_strategy", "weighting_mode", "classifier_type",
+        "use_pca", "tune_c", "fixed_c", "slice_dropout_rate",
+        "deduplicate_exact_within_patient",
+    )
+    for control in exact_controls:
+        for field in common_fields:
+            if getattr(control, field) != getattr(primary, field):
                 raise ValueError(
-                    "Annotated-series experiment must be enabled in the main "
-                    f"suite: {experiment_id!r}."
+                    f"{control.experiment_id}: {field} must match the primary model."
                 )
-            if enabled_by_id[experiment_id].strategy != "patient_embedding":
-                raise ValueError(
-                    "Annotated-series subset analysis supports image-based "
-                    "patient-embedding experiments only."
-                )
-        if not ANNOTATED_SERIES_ALLOWED_CONFIDENCE_VALUES:
-            raise ValueError(
-                "ANNOTATED_SERIES_ALLOWED_CONFIDENCE_VALUES must contain at "
-                "least one accepted confidence label."
-            )
+        if control.slice_filter != "all":
+            raise ValueError("Exact-support controls must use the same all-slice rows.")
+    if valid_only.feature_mode != primary.feature_mode:
+        raise ValueError("The valid-only ablation must reuse the primary feature mode.")
+    if valid_only.slice_filter != "standardized_monai_valid":
+        raise ValueError("The valid-only ablation must use the MONAI-valid filter.")
 
-    if PHASH_HAMMING_THRESHOLD < 0 or PHASH_HAMMING_THRESHOLD > 64:
-        raise ValueError("PHASH_HAMMING_THRESHOLD must lie in [0,64].")
-    if not PHASH_USE_COMPLETE_BK_TREE_AUDIT:
-        raise ValueError(
-            "This reviewed version requires the complete BK-tree pHash audit. "
-            "Keep PHASH_USE_COMPLETE_BK_TREE_AUDIT=True."
-        )
+    if HARD_SUPPORT_DILATION_KERNEL <= 0 or HARD_SUPPORT_DILATION_KERNEL % 2 == 0:
+        raise ValueError("HARD_SUPPORT_DILATION_KERNEL must be a positive odd integer.")
+    if not 0.0 < FIXED_PERIPHERY_EXCLUSION_FRACTION < 1.0:
+        raise ValueError("FIXED_PERIPHERY_EXCLUSION_FRACTION must lie in (0,1).")
+    if not 0.0 <= REGION_NORM_LOWER_PERCENTILE < REGION_NORM_UPPER_PERCENTILE <= 100.0:
+        raise ValueError("Invalid region-normalization percentile interval.")
+    if REGION_NORM_MIN_PIXELS < 1 or REGION_NORM_HISTOGRAM_BINS < 2:
+        raise ValueError("Region-normalization minimums are invalid.")
+    if not 0.0 < REGION_NORM_MIN_DYNAMIC_RANGE <= 1.0:
+        raise ValueError("REGION_NORM_MIN_DYNAMIC_RANGE must lie in (0,1].")
+    if not str(SUPPORT_INTENSITY_SHUFFLE_SCHEMA).strip():
+        raise ValueError("SUPPORT_INTENSITY_SHUFFLE_SCHEMA cannot be empty.")
+    if USE_CUDA_AMP:
+        raise ValueError("Deterministic final runs require USE_CUDA_AMP=False.")
 
-    if FAIL_ON_CROSS_PATIENT_EXACT_DUPLICATES and (
-        not AUDIT_EXACT_DECODED_PIXEL_DUPLICATES
-    ):
-        raise ValueError(
-            "The strict exact-duplicate policy requires the exact audit."
-        )
-    if GROUP_SPLITS_BY_EXACT_DUPLICATES and (
-        not AUDIT_EXACT_DECODED_PIXEL_DUPLICATES
-    ):
-        raise ValueError(
-            "Exact-duplicate-aware folds require exact duplicate auditing."
-        )
-    if GROUP_SPLITS_BY_PHASH_CANDIDATES and (
-        not AUDIT_PERCEPTUAL_NEAR_DUPLICATES
-    ):
-        raise ValueError(
-            "Perceptual-candidate grouping requires the perceptual audit."
-        )
-
-    if MONAI_ROI_DILATION_KERNEL <= 0 or (
-        MONAI_ROI_DILATION_KERNEL % 2 == 0
-    ):
-        raise ValueError(
-            "MONAI_ROI_DILATION_KERNEL must be a positive odd integer."
-        )
-    if not 0.0 <= MONAI_BACKGROUND_WEIGHT <= 1.0:
-        raise ValueError("MONAI_BACKGROUND_WEIGHT must lie in [0,1].")
-    if not (
-        0.0 <= MONAI_MIN_HEART_AREA_RATIO
-        < MONAI_MAX_HEART_AREA_RATIO
-        <= 1.0
-    ):
-        raise ValueError("Invalid MONAI heart-area plausibility interval.")
-    if not 0.0 <= MONAI_MIN_PEAK_HEART_PROBABILITY <= 1.0:
-        raise ValueError(
-            "MONAI_MIN_PEAK_HEART_PROBABILITY must lie in [0,1]."
-        )
-
-    if VERIFY_MONAI_ARTIFACT_SHA256:
-        for digest_name, digest_value in (
-            (
-                "MONAI_OFFICIAL_TORCHSCRIPT_SHA256",
-                MONAI_OFFICIAL_TORCHSCRIPT_SHA256,
-            ),
-            ("MONAI_MODEL_SHA256", MONAI_MODEL_SHA256),
-        ):
-            if len(digest_value) != 64 or any(
-                character not in "0123456789abcdefABCDEF"
-                for character in digest_value
-            ):
-                raise ValueError(
-                    f"{digest_name} must be a 64-character hexadecimal digest."
-                )
-
-    if EFFICIENTNET_WEIGHTS_NAME not in (
-        models.EfficientNet_B0_Weights.__members__
-    ):
-        raise ValueError(
-            f"Unknown EfficientNet-B0 weight enum: "
-            f"{EFFICIENTNET_WEIGHTS_NAME!r}."
-        )
-
-    if RUN_EXTERNAL_VALIDATION and not EXTERNAL_DATASET_PATH:
-        raise ValueError(
-            "RUN_EXTERNAL_VALIDATION=True requires EXTERNAL_DATASET_PATH."
-        )
-
-    # The V6 scientific interpretation depends on exact construction contracts,
-    # not merely on matching experiment names. Run a tiny deterministic tensor
-    # self-test before dataset scanning or model loading so a future edit cannot
-    # silently make C31-C33 non-matched to A17.
-    run_v6_transform_contract_self_test()
+    run_exact_support_transform_contract_self_test()
 
 
 # =============================
@@ -2639,7 +1550,7 @@ def _fixed_content_canvas_geometry(height, width):
     """Return deterministic fixed-content geometry for a 256x256 canvas.
 
     The longest retained image side is resized to exactly
-    ``STANDARDIZED_CONTENT_LONG_SIDE`` pixels. Unlike the historical MONAI
+    ``STANDARDIZED_CONTENT_LONG_SIDE`` pixels. Unlike the MONAI
     helper, this transformation deliberately allows both downsampling and
     upsampling. Consequently, native image resolution and the number of removed
     dark-border pixels cannot change the final content scale. Aspect ratio is
@@ -2755,8 +1666,8 @@ def build_label_blind_standardized_image(image):
             -> conservative dark-uniform edge detection
             -> crop only the detected edge runs
             -> min-max scaling for the pretrained MONAI segmenter
-            -> robust fixed-percentile scaling for historical EfficientNet views
-            -> unscaled [0,1] uint8-intensity view for V5 region normalization
+            -> robust fixed-percentile scaling for EfficientNet views
+            -> unscaled [0,1] uint8-intensity view for region normalization
             -> identical fixed-content 240-in-256 geometry for all views
             -> binary fixed-canvas padding control
 
@@ -2772,7 +1683,7 @@ def build_label_blind_standardized_image(image):
             256x256 min-max image used only by the MONAI segmenter.
         raw_classifier_canvas:
             256x256 retained uint8 intensity divided by 255, with no per-image
-            min-max or global percentile scaling. V5 computes percentiles only
+            min-max or global percentile scaling. computes percentiles only
             inside the final visible region after MONAI localization.
         fixed_padding_canvas:
             Binary geometry-only control after content-size normalization.
@@ -2879,81 +1790,6 @@ def build_label_blind_standardized_image(image):
     return robust_canvas, monai_canvas, raw_canvas, padding_canvas, features
 
 
-def zero_pad_to_monai_canvas(image):
-    """
-    Place a 2D image inside a centered 256×256 MONAI input canvas.
-
-    Design rules:
-
-        1. Preserve aspect ratio.
-        2. Do not enlarge images already smaller than 256×256.
-        3. Fill unused pixels with zero.
-        4. If an image is larger than 256×256, downscale it only enough to fit.
-
-    The official bundle documentation states that training volumes had spatial
-    size 256×256 and that smaller images were zero-padded; differing dimensions
-    should otherwise be cropped or padded to that size. For this JPEG pipeline,
-    isotropic downscaling of an oversized image is a deliberate adaptation that
-    preserves the complete field of view. It is NOT identical to the official
-    bundle preprocessing and should be reported if oversized inputs occur.
-    """
-
-    # Step 1: enforce the grayscale two-dimensional input contract. This
-    # catches accidental H×W×C input before any geometry calculation.
-    if image.ndim != 2:
-        raise ValueError(
-            f"Expected a 2D grayscale image, received shape {image.shape}."
-        )
-
-    # Step 2: read native geometry. These dimensions determine whether
-    # downscaling is necessary; smaller images are never enlarged here.
-    height, width = image.shape
-
-    if height <= 0 or width <= 0:
-        raise ValueError(f"Invalid image dimensions: {image.shape}.")
-
-    # Step 3: choose one isotropic scale factor for both axes. The leading
-    # 1.0 caps the factor, so the function can downscale but cannot upsample.
-    scale = min(
-        1.0,
-        MONAI_INPUT_SIZE / height,
-        MONAI_INPUT_SIZE / width,
-    )
-
-    resized_height = max(1, int(round(height * scale)))
-    resized_width = max(1, int(round(width * scale)))
-
-    # Step 4: resize only when at least one dimension exceeds the canvas.
-    # INTER_AREA is appropriate for downsampling and reduces aliasing.
-    if resized_height != height or resized_width != width:
-        resized = cv2.resize(
-            image,
-            (resized_width, resized_height),
-            interpolation=cv2.INTER_AREA,
-        )
-    else:
-        resized = image
-
-    # Step 5: allocate the fixed MONAI canvas. Zero corresponds to the
-    # minimum of the already normalized intensity range and acts as padding.
-    canvas = np.zeros(
-        (MONAI_INPUT_SIZE, MONAI_INPUT_SIZE),
-        dtype=np.float32,
-    )
-
-    # Step 6: compute centered integer offsets. An odd unused margin leaves
-    # one extra padding pixel on the bottom or right, which is deterministic.
-    top = (MONAI_INPUT_SIZE - resized_height) // 2
-    left = (MONAI_INPUT_SIZE - resized_width) // 2
-
-    # Step 7: copy the complete resized field of view into the centered
-    # region. No cropping is performed by this helper.
-    canvas[
-        top:top + resized_height,
-        left:left + resized_width,
-    ] = resized
-
-    return canvas
 
 
 # =============================
@@ -3096,311 +1932,76 @@ def compute_image_provenance_features(image, image_path):
 
 
 class MRIDataset(Dataset):
-    """
-    PIPELINE STEP 1:
-    Load one JPEG MRI slice and construct the spatially aligned MONAI,
-    historical-classifier, V5-raw-classifier, and padding-control inputs plus
-    the label-free audit metadata needed by the multi-experiment suite.
+    """Decode one JPEG and build only the standardized tensors now required.
 
-    Returns:
-        classification_image:
-            Tensor [3, 224, 224], values in [0,1].
-            Used by EfficientNet only after the selected image representation
-            has been created and ImageNet normalization has been applied.
+    The raw uint8 image is decoded once. Hashes and provenance features are
+    calculated before resizing. Three aligned image views are then returned:
 
-        monai_image:
-            Tensor [1, 256, 256], values in [0,1].
-            Original min-max baseline input for the MONAI segmenter.
+    * ``standardized_image``: robust-scaled 3x224x224 classifier input;
+    * ``standardized_monai``: min-max 1x256x256 segmentation input;
+    * ``standardized_raw``: uint8/255 3x224x224 canvas used for region-specific
+      intensity normalization after the final support is selected.
 
-        standardized_classification_image:
-            Tensor [3, 224, 224], values in [0,1]. Label-blind native padding
-            removal, robust percentile scaling, and fixed 240-in-256 content
-            geometry are applied before the EfficientNet resize.
-
-        standardized_monai_image:
-            Tensor [1, 256, 256], values in [0,1]. It uses min-max scaling on
-            the same retained crop and exactly the same fixed geometry, keeping
-            MONAI closer to its documented intensity contract.
-
-        standardized_raw_classification_image:
-            Tensor [3, 224, 224], values in [0,1], created from retained uint8
-            intensities divided by 255 without global percentile scaling. V5
-            uses it only to compute region-specific normalization after the
-            final cardiac or extracardiac support has been defined.
-
-        detected_padding_image:
-            Tensor [3, 224, 224], binary. It contains only the standardized
-            fixed-canvas padding geometry; removed native padding is represented
-            separately by tabular crop-fraction audit features.
-
-        label:
-            0 for Normal, 1 for Sick. The label travels as metadata only and is
-            never supplied to MONAI, EfficientNet, image hashes, or provenance
-            feature extraction.
-
-        patient_id:
-            The validated patient identifier itself, for example Directory_24.
-
-        series_id:
-            Patient-scoped folder-defined series proxy, for example
-            Directory_24/SR_3. This is not a recovered DICOM UID.
-
-        sample_index:
-            Stable integer position in ``samples``. It preserves one-to-one row
-            alignment across feature-bank arrays and deterministic debug images.
-
-        decoded_pixel_hash:
-            SHA-256 of the decoded uint8 grayscale pixel matrix plus its native
-            shape. It supports an exact-pixel duplicate audit; it is not a
-            perceptual or near-duplicate hash.
-
-        perceptual_hash:
-            A deterministic 64-bit DCT pHash used only to generate candidate
-            cross-patient near-duplicate pairs. A small Hamming distance is a
-            screening signal and is not proof that two images are duplicates.
-
-        provenance_features:
-            Label-free native image/export features such as dimensions, file
-            size, intensity distribution, border statistics, edge fraction and
-            sharpness. These features support the provenance-only negative
-            control; they are not fed to the image encoder.
-
-        standardization_features:
-            Label-free crop fractions and robust intensity limits generated by
-            the standardized branch. They support a separate QC-only control.
-
-    =========================================================================
-    WHY SEPARATE ALIGNED INPUT TENSORS?
-    =========================================================================
-
-    The two pretrained networks were built around different input conventions:
-
-        MONAI cardiac segmenter:
-            - one grayscale channel
-            - 256×256
-            - intensity range [0,1]
-
-        EfficientNet-B0:
-            - three channels
-            - 224×224
-            - ImageNet mean/std normalization
-
-    Reusing one already-normalized tensor for both networks would violate at
-    least one model's expected input distribution. V5 additionally needs the
-    retained raw uint8/255 intensity so its inside and outside branches can be
-    normalized only after their final visible regions are defined. Therefore
-    segmentation, historical classification, and V5 preprocessing remain
-    explicitly separate while sharing one geometry.
-
-    =========================================================================
-    SPATIAL ALIGNMENT
-    =========================================================================
-
-    The original MRI is first placed in a 256×256 square canvas. The 224×224
-    classifier image is created by uniformly resizing that complete square.
-    Consequently, a MONAI probability map resized from 256×256 to 224×224 aligns
-    with the EfficientNet image without requiring DICOM geometry metadata.
-
-    =========================================================================
-    WHY AUDIT METADATA IS CREATED DURING THE SAME DECODE?
-    =========================================================================
-
-    Native image dimensions, exact hashes, pHash and export-style features must
-    be calculated before normalization/resizing destroys that information.
-    Computing them here avoids a second complete JPEG-decoding pass and keeps
-    every audit row aligned with the frozen feature-bank row for the same file.
+    A one-channel padding mask preserves the non-padding content support. Labels
+    travel only as metadata and never influence preprocessing or neural inference.
     """
 
     def __init__(self, samples, transform=None):
-
-        # Store only lightweight paths and immutable metadata. JPEG decoding is
-        # deferred to ``__getitem__`` so DataLoader controls when each image is
-        # read and can use worker processes if that option is enabled later.
         self.samples = samples
-        # List containing:
-        #   (image_path, binary_label, patient_id, series_id)
-
         self.transform = transform
-        # Classifier-side HWC NumPy -> CHW PyTorch conversion. ImageNet
-        # normalization is deliberately deferred until after full/ROI/control
-        # image construction.
 
     def __len__(self):
-
-        # DataLoader uses this exact count to determine complete batch coverage.
-        # Because extraction uses ``shuffle=False``, indices remain aligned with
-        # ``samples`` and all feature-bank arrays.
         return len(self.samples)
 
-    def __getitem__(self, idx):
-
-        # Resolve the immutable metadata row first. Neither the binary label nor
-        # the grouping identifiers influence pixels, masks, hashes, or audit
-        # features.
-        img_path, label, patient_id, series_id = self.samples[idx]
-
-        # =========================================================
-        # LOAD RAW GRAYSCALE MRI JPEG
-        # =========================================================
-
-        image = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-
+    def __getitem__(self, index):
+        image_path, label, patient_id, series_id = self.samples[index]
+        image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
         if image is None:
-            # An unreadable file is a dataset error. Silently skipping it would
-            # change patient/series composition and could make cache rows drift.
-            raise FileNotFoundError(
-                f"OpenCV could not read the MRI image: {img_path}"
-            )
+            raise FileNotFoundError(f"OpenCV could not read MRI image: {image_path}")
 
-        # =========================================================
-        # EXACT AND PERCEPTUAL DUPLICATE KEYS
-        # =========================================================
-
-        # Hash the decoded uint8 matrix BEFORE any normalization or resizing.
-        # Shape is included so two flattened byte streams with different native
-        # geometry cannot be treated as equal merely because their bytes match.
-        # Hashing decoded pixels, rather than JPEG container bytes, detects files
-        # with different container metadata but exactly equal decoded matrices.
-        pixel_digest = hashlib.sha256()
-        pixel_digest.update(
-            np.asarray(image.shape, dtype=np.int32).tobytes()
-        )
-        pixel_digest.update(image.tobytes(order="C"))
-        decoded_pixel_hash = pixel_digest.hexdigest()
-
-        # pHash deliberately tolerates small low-frequency changes and is used
-        # only to generate review candidates. It must not be interpreted as a
-        # validated duplicate decision without inspecting the saved examples.
+        digest = hashlib.sha256()
+        digest.update(np.asarray(image.shape, dtype=np.int32).tobytes())
+        digest.update(image.tobytes(order="C"))
+        decoded_pixel_hash = digest.hexdigest()
         perceptual_hash = compute_dct_perceptual_hash(image)
+        provenance_features = compute_image_provenance_features(image, image_path)
 
-        # =========================================================
-        # NATIVE EXPORT / PROVENANCE FEATURES
-        # =========================================================
-
-        # These values are calculated on the unmodified uint8 image and file.
-        # They make it possible to ask whether image dimensions, borders,
-        # compression proxies or acquisition/export style alone predict class.
-        provenance_features = compute_image_provenance_features(
-            image,
-            img_path,
-        )
-
-        # =========================================================
-        # ORIGINAL AND LABEL-BLIND STANDARDIZED PREPROCESSING
-        # =========================================================
-
-        # Preserve the original baseline transformation exactly so the first
-        # 16-experiment suite remains reproducible and can be compared directly
-        # with the new deconfounded branch.
-        original_scaled_image = scale_intensity_0_1(image)
-        monai_canvas = zero_pad_to_monai_canvas(original_scaled_image)
-        monai_image = torch.from_numpy(monai_canvas).unsqueeze(0)
-
-        # Build a label-blind branch on one shared crop with three aligned
-        # intensity views. MONAI receives min-max scaling, historical V4
-        # EfficientNet views receive global robust scaling, and V5 receives raw
-        # uint8/255 intensity for later region-only scaling. Every view uses the
-        # same fixed 240-in-256 geometry, removing the former dependence of
-        # pipeline-added padding on native resolution and crop size.
         (
-            standardized_classifier_canvas,
-            standardized_monai_canvas,
-            standardized_raw_canvas,
-            detected_padding_canvas,
+            classifier_canvas,
+            monai_canvas,
+            raw_canvas,
+            padding_canvas,
             standardization_features,
         ) = build_label_blind_standardized_image(image)
-        standardized_monai_image = torch.from_numpy(
-            standardized_monai_canvas
-        ).unsqueeze(0)
 
-        # =========================================================
-        # EFFICIENTNET SPATIAL PREPROCESSING
-        # =========================================================
-
-        # Resize both complete square canvases to EfficientNet resolution. Each
-        # 224x224 image remains aligned with the MONAI output generated from its
-        # corresponding 256x256 canvas.
-        classification_gray = cv2.resize(
-            monai_canvas,
-            (IMG_SIZE, IMG_SIZE),
-            interpolation=cv2.INTER_AREA,
+        classifier_gray = cv2.resize(
+            classifier_canvas, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA
         )
-        standardized_classification_gray = cv2.resize(
-            standardized_classifier_canvas,
-            (IMG_SIZE, IMG_SIZE),
-            interpolation=cv2.INTER_AREA,
+        raw_gray = cv2.resize(
+            raw_canvas, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA
         )
-        standardized_raw_classification_gray = cv2.resize(
-            standardized_raw_canvas,
-            (IMG_SIZE, IMG_SIZE),
-            interpolation=cv2.INTER_AREA,
-        )
-        detected_padding_gray = cv2.resize(
-            detected_padding_canvas,
-            (IMG_SIZE, IMG_SIZE),
-            interpolation=cv2.INTER_NEAREST,
+        padding_gray = cv2.resize(
+            padding_canvas, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_NEAREST
         )
 
-        # ImageNet-pretrained models expect three channels. Replicating a
-        # grayscale channel adds no information but satisfies the pretrained
-        # first convolution's input contract. The padding control is a binary
-        # geometry image, not an anatomical MRI representation.
-        classification_image = np.stack(
-            [classification_gray] * 3,
-            axis=-1,
-        )
-        standardized_classification_image = np.stack(
-            [standardized_classification_gray] * 3,
-            axis=-1,
-        )
-        standardized_raw_classification_image = np.stack(
-            [standardized_raw_classification_gray] * 3,
-            axis=-1,
-        )
-        detected_padding_image = np.stack(
-            [detected_padding_gray] * 3,
-            axis=-1,
-        )
-
-        # Convert HWC NumPy arrays to CHW tensors. ImageNet normalization is
-        # still deferred until after the requested ROI/control view is created.
-        if self.transform:
-            classification_image = self.transform(classification_image)
-            standardized_classification_image = self.transform(
-                standardized_classification_image
-            )
-            standardized_raw_classification_image = self.transform(
-                standardized_raw_classification_image
-            )
-            detected_padding_image = self.transform(detected_padding_image)
+        classifier_hwc = np.stack([classifier_gray] * 3, axis=-1)
+        raw_hwc = np.stack([raw_gray] * 3, axis=-1)
+        if self.transform is not None:
+            standardized_image = self.transform(classifier_hwc)
+            standardized_raw = self.transform(raw_hwc)
         else:
-            classification_image = torch.from_numpy(
-                classification_image
-            ).permute(2, 0, 1)
-            standardized_classification_image = torch.from_numpy(
-                standardized_classification_image
-            ).permute(2, 0, 1)
-            standardized_raw_classification_image = torch.from_numpy(
-                standardized_raw_classification_image
-            ).permute(2, 0, 1)
-            detected_padding_image = torch.from_numpy(
-                detected_padding_image
-            ).permute(2, 0, 1)
+            standardized_image = torch.from_numpy(classifier_hwc).permute(2, 0, 1)
+            standardized_raw = torch.from_numpy(raw_hwc).permute(2, 0, 1)
 
-        # The default PyTorch collate function stacks tensors and keeps strings
-        # as ordered lists. ``sample_index`` later places every result into its
-        # deterministic feature-bank row even if DataLoader workers are used.
         return (
-            classification_image,
-            monai_image,
-            standardized_classification_image,
-            standardized_monai_image,
-            standardized_raw_classification_image,
-            detected_padding_image,
-            label,
-            patient_id,
-            series_id,
-            idx,
+            standardized_image,
+            torch.from_numpy(monai_canvas).unsqueeze(0),
+            standardized_raw,
+            torch.from_numpy(padding_gray).unsqueeze(0),
+            int(label),
+            str(patient_id),
+            str(series_id),
+            int(index),
             decoded_pixel_hash,
             perceptual_hash,
             torch.from_numpy(provenance_features),
@@ -3731,7 +2332,7 @@ def locate_monai_bundle_root():
     ):
         return direct_root
 
-    # If the canonical location is absent, search deterministic legacy
+    # If the canonical location is absent, search deterministic alternate
     # layouts. Candidate paths still must contain the requested bundle slug.
     if MONAI_BUNDLE_DIR.exists():
         candidate_artifacts = []
@@ -4806,228 +3407,87 @@ class FeatureExtractor(nn.Module):
 # =============================
 
 
-def _normalize_quality_weights(scores, minimum_weight=SLICE_QUALITY_MIN_WEIGHT):
-    """
-    Convert a heuristic per-slice score into bounded weights within ONE series
-    proxy.
-
-    WHY WEIGHTS INSTEAD OF DELETING SLICES?
-    -----------------------------------------
-    A hard top-percentage or median cutoff can remove diagnostically useful
-    slices and makes the result depend on an arbitrary exclusion rule. When the
-    optional quality ablation is enabled, every slice remains present and only
-    its relative influence inside its own series proxy changes.
-
-    IMPORTANT LIMITATION
-    --------------------
-    The score is the image-intensity standard deviation after confidence-gated
-    ROI weighting/full-image fallback. It can respond to anatomy, contrast,
-    noise, mask size and export style; it is NOT a validated clinical MRI image-
-    quality score. Equal weights therefore remain the publication-safe baseline.
-
-    The 25th and 75th percentiles provide a robust local scale, weights are
-    clipped to a positive interval, and the final mean-one normalization is only
-    a convenient within-series convention. Downstream pooling renormalizes the
-    values again, so their common scale does not define model regularization.
-    """
-
-    scores = np.asarray(scores, dtype=np.float64)
-    if scores.size == 0:
-        raise ValueError("Cannot normalize an empty quality-score collection.")
-    if scores.size == 1:
-        return np.ones(1, dtype=np.float64)
-    if not np.all(np.isfinite(scores)):
-        raise ValueError("Quality scores must be finite.")
-
-    q25, q75 = np.percentile(scores, [25, 75])
-    scale = max(float(q75 - q25), 1e-8)
-    normalized = np.clip((scores - q25) / scale, 0.0, 1.0)
-    weights = minimum_weight + (1.0 - minimum_weight) * normalized
-    weights /= max(float(weights.mean()), 1e-8)
-    return weights
-
-
 def required_efficientnet_feature_modes(experiments):
-    """Return the ordered EfficientNet views used by the final registry."""
+    """Return the deterministic EfficientNet views required by the final panel."""
 
     canonical_order = (
-        'standardized_roi_zero_bg_center_fallback',
-        'standardized_heart_centered_fixed_fov_region_norm',
-        'standardized_hard_support_region_norm',
-        'standardized_outside_whole_heart_region_norm',
-        'standardized_fixed_periphery_region_norm',
-        'standardized_a17_exact_support_mask_only',
-        'standardized_a17_support_intensity_affine_shuffled',
-        'standardized_a17_exact_support_complement_region_norm',
+        "standardized_roi_zero_bg_center_fallback",
+        "standardized_hard_support_region_norm",
+        "standardized_fixed_periphery_region_norm",
+        "standardized_a17_exact_support_mask_only",
+        "standardized_a17_support_intensity_affine_shuffled",
+        "standardized_a17_exact_support_complement_region_norm",
     )
-    requested = {experiment.feature_mode for experiment in experiments}
-    unknown = sorted(requested - set(canonical_order))
+    requested = {
+        experiment.feature_mode
+        for experiment in experiments
+        if experiment.strategy == "patient_embedding"
+    }
+    unknown = requested.difference(canonical_order)
     if unknown:
-        raise ValueError(f"Unsupported final feature modes: {unknown}")
+        raise ValueError(f"Unsupported EfficientNet feature modes: {sorted(unknown)}")
     return tuple(mode for mode in canonical_order if mode in requested)
 
 
-def feature_bank_fingerprint(samples, dataset_root):
-    """Hash the dataset inventory and every setting that changes cached features."""
+def feature_bank_fingerprint(samples, dataset_path):
+    """Hash dataset file metadata and every setting that changes frozen views."""
 
-    started_at = time.perf_counter()
-    root = Path(dataset_root).resolve()
-    digest = hashlib.sha256()
-
-    settings = {
-        "schema": FEATURE_CACHE_SCHEMA_VERSION,
-        "batch_size": BATCH_SIZE,
-        "use_cuda_amp": USE_CUDA_AMP,
-        "deterministic_algorithms_requested": True,
-        "cublas_workspace_config": os.environ.get(
-            "CUBLAS_WORKSPACE_CONFIG"
-        ),
-        "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
-        "cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
-        "cudnn_allow_tf32": bool(
-            getattr(torch.backends.cudnn, "allow_tf32", False)
-        ),
-        "cuda_matmul_allow_tf32": bool(
-            getattr(
-                getattr(torch.backends.cuda, "matmul", object()),
-                "allow_tf32",
-                False,
-            )
-        ),
-        # The tag records the device used to create the frozen bank. A CPU
-        # evaluation session may deliberately set this to ``cuda`` in order to
-        # address a matching bank generated during an earlier GPU session.
-        "device_type": resolved_feature_cache_device_tag(),
+    started = time.perf_counter()
+    hasher = hashlib.sha256()
+    configuration = {
+        "schema": FEATURE_CACHE_SCHEMA,
+        "dataset_path": str(Path(dataset_path).resolve()),
+        "required_modes": list(required_efficientnet_feature_modes(get_enabled_experiments())),
         "img_size": IMG_SIZE,
         "monai_input_size": MONAI_INPUT_SIZE,
-        "monai_bundle": MONAI_BUNDLE_NAME,
-        "monai_bundle_version": MONAI_BUNDLE_VERSION,
-        "monai_hf_revision": MONAI_HF_REVISION,
-        "monai_model_ts_sha256": MONAI_OFFICIAL_TORCHSCRIPT_SHA256,
-        "monai_model_pt_sha256": MONAI_MODEL_SHA256,
-        "roi_dilation": MONAI_ROI_DILATION_KERNEL,
-        "roi_background": MONAI_BACKGROUND_WEIGHT,
-        "roi_min_area": MONAI_MIN_HEART_AREA_RATIO,
-        "roi_max_area": MONAI_MAX_HEART_AREA_RATIO,
-        "roi_min_peak": MONAI_MIN_PEAK_HEART_PROBABILITY,
-        "efficientnet_weights": EFFICIENTNET_WEIGHTS_NAME,
-        "efficientnet_mean": EFFICIENTNET_MEAN,
-        "efficientnet_std": EFFICIENTNET_STD,
-        "border_width_fraction": BORDER_WIDTH_FRACTION,
-        "standardized_border_width_fractions": STANDARDIZED_BORDER_WIDTH_FRACTIONS,
-        "standardized_corner_width_fraction": STANDARDIZED_CORNER_WIDTH_FRACTION,
-        "center_crop_fallback_fraction": CENTER_CROP_FALLBACK_FRACTION,
-        "fixed_center_crop_fractions": FIXED_CENTER_CROP_FRACTIONS,
         "standardized_content_long_side": STANDARDIZED_CONTENT_LONG_SIDE,
-        "fixed_chunk_size": FIXED_CHUNK_SIZE,
-        "fixed_chunk_min_remainder_fraction": (
-            FIXED_CHUNK_MIN_REMAINDER_FRACTION
-        ),
-        "v5_fixed_heart_fov_fraction": V5_FIXED_HEART_FOV_FRACTION,
-        "v5_hard_support_extra_dilation_kernel": (
-            V5_HARD_SUPPORT_EXTRA_DILATION_KERNEL
-        ),
-        "v5_whole_heart_exclusion_center_fraction": (
-            V5_WHOLE_HEART_EXCLUSION_CENTER_FRACTION
-        ),
-        "v5_whole_heart_exclusion_bbox_context_fraction": (
-            V5_WHOLE_HEART_EXCLUSION_BBOX_CONTEXT_FRACTION
-        ),
-        "v5_fixed_periphery_exclusion_fraction": (
-            V5_FIXED_PERIPHERY_EXCLUSION_FRACTION
-        ),
-        "v5_region_norm_lower_percentile": V5_REGION_NORM_LOWER_PERCENTILE,
-        "v5_region_norm_upper_percentile": V5_REGION_NORM_UPPER_PERCENTILE,
-        "v5_region_norm_min_pixels": V5_REGION_NORM_MIN_PIXELS,
-        "v5_region_norm_histogram_bins": V5_REGION_NORM_HISTOGRAM_BINS,
-        "v5_region_norm_min_dynamic_range": (
-            V5_REGION_NORM_MIN_DYNAMIC_RANGE
-        ),
-        "v6_support_intensity_shuffle_version": (
-            V6_SUPPORT_INTENSITY_SHUFFLE_VERSION
-        ),
-        "monai_soft_histogram_bins": MONAI_SOFT_HISTOGRAM_BINS,
-        "monai_soft_block_shuffle_grid": MONAI_SOFT_BLOCK_SHUFFLE_GRID,
-        "monai_soft_block_shuffle_version": MONAI_SOFT_BLOCK_SHUFFLE_VERSION,
-        "monai_canonical_mask_content_fraction": (
-            MONAI_CANONICAL_MASK_CONTENT_FRACTION
-        ),
-        "monai_bbox_context_fraction": MONAI_BBOX_CONTEXT_FRACTION,
-        "outside_monai_bbox_context_fraction": (
-            OUTSIDE_MONAI_BBOX_CONTEXT_FRACTION
-        ),
-        "standardization_lower_percentile": STANDARDIZATION_LOWER_PERCENTILE,
-        "standardization_upper_percentile": STANDARDIZATION_UPPER_PERCENTILE,
-        "standardization_dark_line_max_mean": (
-            STANDARDIZATION_DARK_LINE_MAX_MEAN
-        ),
-        "standardization_dark_line_max_std": (
-            STANDARDIZATION_DARK_LINE_MAX_STD
-        ),
-        "standardization_dark_pixel_max_value": (
-            STANDARDIZATION_DARK_PIXEL_MAX_VALUE
-        ),
-        "standardization_dark_pixel_min_fraction": (
-            STANDARDIZATION_DARK_PIXEL_MIN_FRACTION
-        ),
-        "standardization_max_crop_fraction_per_side": (
-            STANDARDIZATION_MAX_CROP_FRACTION_PER_SIDE
-        ),
-        "standardization_min_retained_fraction": (
-            STANDARDIZATION_MIN_RETAINED_FRACTION
-        ),
-        "standardization_min_padding_run": STANDARDIZATION_MIN_PADDING_RUN,
-        "standardization_features": STANDARDIZATION_FEATURE_NAMES,
-        "provenance_features": PROVENANCE_FEATURE_NAMES,
-        "provenance_classifier_features": (
-            PROVENANCE_CLASSIFIER_FEATURE_NAMES
-        ),
-        "perceptual_hash": "32x32_DCT_8x8_64bit_v1",
-        "numpy": np.__version__,
-        "torch": torch.__version__,
-        "torchvision": torchvision.__version__,
-        "opencv": cv2.__version__,
+        "center_crop_fallback_fraction": CENTER_CROP_FALLBACK_FRACTION,
+        "hard_support_dilation_kernel": HARD_SUPPORT_DILATION_KERNEL,
+        "fixed_periphery_exclusion_fraction": FIXED_PERIPHERY_EXCLUSION_FRACTION,
+        "region_norm": [
+            REGION_NORM_LOWER_PERCENTILE,
+            REGION_NORM_UPPER_PERCENTILE,
+            REGION_NORM_MIN_PIXELS,
+            REGION_NORM_HISTOGRAM_BINS,
+            REGION_NORM_MIN_DYNAMIC_RANGE,
+        ],
+        "shuffle_schema": SUPPORT_INTENSITY_SHUFFLE_SCHEMA,
+        "monai_bundle": [MONAI_BUNDLE_NAME, MONAI_BUNDLE_VERSION, MONAI_HF_REVISION],
+        "efficientnet_weights": EFFICIENTNET_WEIGHTS_NAME,
+        "device_tag": resolved_feature_cache_device_tag(),
+        "use_cuda_amp": USE_CUDA_AMP,
     }
-    digest.update(json.dumps(settings, sort_keys=True).encode("utf-8"))
+    hasher.update(json.dumps(configuration, sort_keys=True).encode("utf-8"))
 
-    progress_step = max(1, len(samples) // 10)
-    for index, (image_path, label, patient_id, series_id) in enumerate(
-        samples,
-        start=1,
-    ):
+    dataset_root = Path(dataset_path).resolve()
+    total = len(samples)
+    checkpoints = set(np.linspace(0, max(total - 1, 0), min(11, max(total, 1)), dtype=int))
+    for index, sample in enumerate(samples):
+        image_path, label, patient_id, series_id = sample
         path = Path(image_path)
         stat = path.stat()
         try:
-            relative = path.resolve().relative_to(root)
+            relative = str(path.resolve().relative_to(dataset_root))
         except ValueError:
-            relative = path.resolve()
+            relative = str(path.resolve())
+        row = (relative, int(label), str(patient_id), str(series_id), int(stat.st_size), int(stat.st_mtime_ns))
+        hasher.update(repr(row).encode("utf-8"))
+        if index in checkpoints:
+            percent = 100.0 * (index + 1) / max(total, 1)
+            print(f"[FEATURE BANK FINGERPRINT] {index + 1}/{total} files ({percent:.0f}%)", flush=True)
 
-        record = (
-            f"{relative.as_posix()}|{stat.st_size}|{stat.st_mtime_ns}|"
-            f"{int(label)}|{patient_id}|{series_id}\n"
-        )
-        digest.update(record.encode("utf-8"))
-
-        if ENABLE_DETAILED_PROGRESS_PRINTS and (
-            index == 1 or index % progress_step == 0 or index == len(samples)
-        ):
-            print(
-                f"[FEATURE BANK FINGERPRINT] {index}/{len(samples)} files "
-                f"({100.0 * index / len(samples):.0f}%)",
-                flush=True,
-            )
-
-    fingerprint = digest.hexdigest()
+    digest = hasher.hexdigest()
     print(
-        "[FEATURE BANK] Fingerprint completed in "
-        f"{_format_elapsed_time(time.perf_counter() - started_at)}: "
-        f"{fingerprint[:16]}...",
+        f"[FEATURE BANK] Fingerprint completed in "
+        f"{_format_elapsed_time(time.perf_counter() - started)}: {digest[:16]}...",
         flush=True,
     )
-    return fingerprint
+    return digest
 
 
 def _feature_bank_shared_paths(cache_dir):
+    """Return the aligned non-embedding arrays stored beside every feature view."""
+
     names = (
         "labels",
         "patient_ids",
@@ -5037,16 +3497,10 @@ def _feature_bank_shared_paths(cache_dir):
         "perceptual_hashes",
         "provenance_features",
         "standardization_features",
-        "monai_valid",
-        "area_ratios",
-        "peak_probabilities",
-        "mean_foreground_probabilities",
-        "roi_slice_scores",
         "standardized_monai_valid",
         "standardized_area_ratios",
         "standardized_peak_probabilities",
         "standardized_mean_foreground_probabilities",
-        "standardized_roi_slice_scores",
     )
     return {name: cache_dir / f"{name}.npy" for name in names}
 
@@ -5126,91 +3580,25 @@ def load_feature_bank(cache_dir, expected_fingerprint, required_modes):
     return bank
 
 
-def _hard_mask_bounding_box(mask_2d):
-    """Return inclusive-exclusive bounding-box coordinates or None."""
-
-    positions = torch.nonzero(mask_2d > 0.5, as_tuple=False)
-    if positions.numel() == 0:
-        return None
-    top = int(positions[:, 0].min().item())
-    bottom = int(positions[:, 0].max().item()) + 1
-    left = int(positions[:, 1].min().item())
-    right = int(positions[:, 1].max().item()) + 1
-    return top, bottom, left, right
-
-
-def _resize_single_crop(image, top, bottom, left, right, output_size):
-    """Crop one CHW tensor, square-pad it, and resize without aspect distortion.
-
-    Directly stretching a rectangular cardiac crop to 224x224 would introduce a
-    new geometry artefact and make the center-crop/bounding-box controls harder
-    to interpret. The cropped field is therefore centered in a zero-valued
-    square first, then resized uniformly to the requested output dimensions.
-    """
-
-    height, width = image.shape[-2:]
-    top = int(np.clip(top, 0, height - 1))
-    bottom = int(np.clip(bottom, top + 1, height))
-    left = int(np.clip(left, 0, width - 1))
-    right = int(np.clip(right, left + 1, width))
-    crop = image.unsqueeze(0)[:, :, top:bottom, left:right]
-
-    crop_height, crop_width = crop.shape[-2:]
-    square_side = max(crop_height, crop_width)
-    pad_height = square_side - crop_height
-    pad_width = square_side - crop_width
-    pad_top = pad_height // 2
-    pad_bottom = pad_height - pad_top
-    pad_left = pad_width // 2
-    pad_right = pad_width - pad_left
-    square_crop = F.pad(
-        crop,
-        (pad_left, pad_right, pad_top, pad_bottom),
-        mode="constant",
-        value=0.0,
-    )
-    return F.interpolate(
-        square_crop,
-        size=output_size,
-        mode="bilinear",
-        align_corners=False,
-    )[0]
-
-
 def create_fixed_fraction_center_crop_images(images, crop_fraction):
-    """Create a MONAI-independent square center crop at a fixed fraction.
-
-    ``crop_fraction`` is applied to the standardized 224x224 image dimensions
-    and is fixed before evaluation. No MONAI mask, gate value, label, patient ID,
-    fold assignment, or classifier score influences the crop. The selected
-    square is resized back to the full EfficientNet input size.
-    """
+    """Return one fixed, MONAI-independent center crop resized to input size."""
 
     crop_fraction = float(crop_fraction)
     if not 0.0 < crop_fraction <= 1.0:
         raise ValueError("crop_fraction must lie in (0,1].")
-
     height, width = images.shape[-2:]
-    crop_side = max(2, int(round(min(height, width) * crop_fraction)))
-    center_y = height // 2
-    center_x = width // 2
-    top = center_y - crop_side // 2
-    left = center_x - crop_side // 2
-    bottom = top + crop_side
-    right = left + crop_side
+    side = max(2, int(round(min(height, width) * crop_fraction)))
+    top = (height - side) // 2
+    left = (width - side) // 2
+    crop = images[:, :, top:top + side, left:left + side]
+    return F.interpolate(
+        crop,
+        size=(height, width),
+        mode="bilinear",
+        align_corners=False,
+    )
 
-    output = [
-        _resize_single_crop(
-            images[index],
-            top,
-            bottom,
-            left,
-            right,
-            (height, width),
-        )
-        for index in range(images.shape[0])
-    ]
-    return torch.stack(output, dim=0)
+
 
 
 def apply_zero_background_roi_with_fixed_center_fallback(
@@ -5221,10 +3609,9 @@ def apply_zero_background_roi_with_fixed_center_fallback(
 ):
     """Use strict zero-background ROI or a fixed center crop when invalid.
 
-    The existing A10 ablation falls back to the complete standardized image when
-    MONAI gating fails. That is safe operationally but allows full export and
-    border information into an otherwise strict ROI experiment. This helper
-    instead uses a fixed, MONAI-independent center crop for invalid masks. It
+    A full-image fallback would reintroduce export and border information into
+    an otherwise strict ROI representation. This helper instead uses a fixed,
+    MONAI-independent center crop for invalid masks. It
     retains every slice and makes fallback content deterministic and label-blind.
     """
 
@@ -5262,21 +3649,8 @@ def _fixed_square_bounds(height, width, center_y, center_x, fraction):
     return top, top + side, left, left + side
 
 
-def _mask_centroid_or_image_center(mask_2d, use_mask):
-    """Return a hard-mask centroid or the deterministic geometric centre."""
-
-    height, width = mask_2d.shape[-2:]
-    if use_mask:
-        positions = torch.nonzero(mask_2d > 0.5, as_tuple=False)
-        if positions.numel() > 0:
-            center_y = float(positions[:, 0].float().mean().item())
-            center_x = float(positions[:, 1].float().mean().item())
-            return center_y, center_x
-    return (height - 1) / 2.0, (width - 1) / 2.0
-
-
 def _robust_scale_visible_regions(images, visible_masks):
-    """Batched masked robust scaling for V5 inside/outside representations.
+    """Batched masked robust scaling for inside/outside representations.
 
     ``images`` contains the raw standardized view: retained native JPEG
     intensity divided by 255 and placed in the fixed-content canvas, without a
@@ -5286,7 +3660,7 @@ def _robust_scale_visible_regions(images, visible_masks):
     The lower and upper percentiles are estimated independently for every image
     from a fixed-bin masked histogram. This is intentionally batched: an exact
     ``torch.quantile`` call inside a Python loop would sort tens of thousands of
-    pixels and synchronize the GPU once per image, making a 63,425-slice V5
+    pixels and synchronize the GPU once per image, making a 63,425-slice
     feature bank unnecessarily slow. With 256 bins, the estimate matches the
     natural precision of the original 8-bit JPEG source while remaining robust
     to the interpolation used for fixed-canvas resizing.
@@ -5311,7 +3685,7 @@ def _robust_scale_visible_regions(images, visible_masks):
             "Visible-region masks must align with the image batch and spatial shape."
         )
 
-    bins = int(V5_REGION_NORM_HISTOGRAM_BINS)
+    bins = int(REGION_NORM_HISTOGRAM_BINS)
     mask = visible_masks > 0.5
     mask_flat = mask[:, 0].reshape(images.shape[0], -1)
     counts = mask_flat.sum(dim=1).to(torch.long)
@@ -5338,14 +3712,14 @@ def _robust_scale_visible_regions(images, visible_masks):
     safe_counts = counts.clamp_min(1)
     lower_rank = (
         torch.floor(
-            (V5_REGION_NORM_LOWER_PERCENTILE / 100.0)
+            (REGION_NORM_LOWER_PERCENTILE / 100.0)
             * (safe_counts - 1).to(torch.float32)
         ).to(torch.long)
         + 1
     )
     upper_rank = (
         torch.floor(
-            (V5_REGION_NORM_UPPER_PERCENTILE / 100.0)
+            (REGION_NORM_UPPER_PERCENTILE / 100.0)
             * (safe_counts - 1).to(torch.float32)
         ).to(torch.long)
         + 1
@@ -5361,7 +3735,7 @@ def _robust_scale_visible_regions(images, visible_masks):
     lower = lower_bins.to(torch.float32) / float(bins - 1)
     upper = upper_bins.to(torch.float32) / float(bins - 1)
     valid_rows = (
-        (counts >= int(V5_REGION_NORM_MIN_PIXELS))
+        (counts >= int(REGION_NORM_MIN_PIXELS))
         & torch.isfinite(lower)
         & torch.isfinite(upper)
         & (upper > lower)
@@ -5372,78 +3746,12 @@ def _robust_scale_visible_regions(images, visible_masks):
     scaled = (
         (images.float() - lower)
         / (upper - lower).clamp_min(
-            float(V5_REGION_NORM_MIN_DYNAMIC_RANGE)
+            float(REGION_NORM_MIN_DYNAMIC_RANGE)
         )
     ).clamp(0.0, 1.0)
     scaled = scaled * mask.to(scaled.dtype)
     scaled = scaled * valid_rows.view(-1, 1, 1, 1).to(scaled.dtype)
     return scaled.to(images.dtype)
-
-
-def create_heart_centered_fixed_fov_region_normalized_images(
-    raw_images,
-    hard_mask,
-    valid_mask,
-    content_mask,
-    crop_fraction=V5_FIXED_HEART_FOV_FRACTION,
-):
-    """Create the V5 fixed-FOV, heart-centred, region-normalized candidate.
-
-    A fixed square is centred on the valid MONAI hard-mask centroid. Gate-invalid
-    slices use the image centre, so no full-image fallback can reintroduce border
-    or export information. The square size is fixed independently of predicted
-    mask area. Intensities are scaled only from retained, non-padding pixels
-    inside that square, and the crop is uniformly resized to 224x224 without a
-    surrounding square-canvas padding signature.
-    """
-
-    if raw_images.ndim != 4 or raw_images.shape[1] != 3:
-        raise ValueError("raw_images must have shape [B,3,H,W].")
-    if hard_mask.ndim != 4 or hard_mask.shape[1] != 1:
-        raise ValueError("hard_mask must have shape [B,1,H,W].")
-    if content_mask.ndim != 4 or content_mask.shape[1] != 1:
-        raise ValueError("content_mask must have shape [B,1,H,W].")
-
-    height, width = raw_images.shape[-2:]
-    crop_bounds = []
-    visible = torch.zeros(
-        raw_images.shape[0],
-        1,
-        height,
-        width,
-        device=raw_images.device,
-        dtype=raw_images.dtype,
-    )
-    for index in range(raw_images.shape[0]):
-        use_mask = bool(valid_mask[index].item())
-        center_y, center_x = _mask_centroid_or_image_center(
-            hard_mask[index, 0],
-            use_mask,
-        )
-        top, bottom, left, right = _fixed_square_bounds(
-            height,
-            width,
-            center_y,
-            center_x,
-            crop_fraction,
-        )
-        crop_bounds.append((top, bottom, left, right))
-        visible[index, 0, top:bottom, left:right] = 1.0
-
-    visible = visible * content_mask
-    scaled_full = _robust_scale_visible_regions(raw_images, visible)
-    output = []
-    for index, (top, bottom, left, right) in enumerate(crop_bounds):
-        scaled_crop = scaled_full[index, :, top:bottom, left:right]
-        output.append(
-            F.interpolate(
-                scaled_crop.unsqueeze(0),
-                size=(height, width),
-                mode="bilinear",
-                align_corners=False,
-            )[0]
-        )
-    return torch.stack(output, dim=0)
 
 
 def create_a17_exact_support_mask(
@@ -5455,7 +3763,7 @@ def create_a17_exact_support_mask(
 
     This helper is the single source of truth for A17, A20, C31, C32 and C33.
     A gate-valid slice receives the already dilated MONAI hard mask followed by
-    the fixed additional V5 dilation. A gate-invalid slice receives the fixed
+    the fixed additional dilation. A gate-invalid slice receives the fixed
     central square used by A17. In both cases pipeline padding is removed by the
     aligned content mask. No label, patient identifier, series identifier, fold,
     or model score is used.
@@ -5472,7 +3780,7 @@ def create_a17_exact_support_mask(
     if len(valid_mask) != hard_mask.shape[0]:
         raise ValueError("valid_mask length must match the image batch size.")
 
-    kernel = int(V5_HARD_SUPPORT_EXTRA_DILATION_KERNEL)
+    kernel = int(HARD_SUPPORT_DILATION_KERNEL)
     binary_support = (hard_mask > 0.5).to(content_mask.dtype)
     binary_support = F.max_pool2d(
         binary_support,
@@ -5486,7 +3794,7 @@ def create_a17_exact_support_mask(
         batch_size,
         height,
         width,
-        V5_FIXED_HEART_FOV_FRACTION,
+        HARD_SUPPORT_FALLBACK_FRACTION,
         hard_mask.device,
         content_mask.dtype,
     )
@@ -5542,7 +3850,7 @@ def _affine_permutation_parameters(decoded_pixel_hash, n_values):
 
     digest = hashlib.sha256(
         (
-            str(V6_SUPPORT_INTENSITY_SHUFFLE_VERSION)
+            str(SUPPORT_INTENSITY_SHUFFLE_SCHEMA)
             + ":"
             + str(decoded_pixel_hash)
         ).encode("utf-8")
@@ -5649,7 +3957,7 @@ def create_a17_exact_support_complement_region_normalized_images(
     return _robust_scale_visible_regions(raw_images, visible)
 
 
-def run_v6_transform_contract_self_test():
+def run_exact_support_transform_contract_self_test():
     """Fail fast if the exact A17/C31/C32/C33 pixel contract is violated.
 
     The test uses small CPU tensors and no labels, files, neural networks or
@@ -5700,13 +4008,13 @@ def run_v6_transform_contract_self_test():
     )
 
     if not torch.equal(c31[:, 0:1], support):
-        raise RuntimeError("V6 self-test failed: C31 support differs from A17.")
+        raise RuntimeError("self-test failed: C31 support differs from A17.")
     if torch.any(a17 * (1.0 - support) != 0.0):
-        raise RuntimeError("V6 self-test failed: A17 is non-zero outside support.")
+        raise RuntimeError("self-test failed: A17 is non-zero outside support.")
     if torch.any(c32 * (1.0 - support) != 0.0):
-        raise RuntimeError("V6 self-test failed: C32 is non-zero outside support.")
+        raise RuntimeError("self-test failed: C32 is non-zero outside support.")
     if torch.any(c33 * support != 0.0):
-        raise RuntimeError("V6 self-test failed: C33 overlaps A17 support.")
+        raise RuntimeError("self-test failed: C33 overlaps A17 support.")
 
     for index in range(raw.shape[0]):
         mask = support[index, 0] > 0.5
@@ -5714,7 +4022,7 @@ def run_v6_transform_contract_self_test():
         c32_values = torch.sort(c32[index, 0][mask]).values
         if not torch.equal(a17_values, c32_values):
             raise RuntimeError(
-                "V6 self-test failed: C32 does not preserve the exact A17 "
+                "self-test failed: C32 does not preserve the exact A17 "
                 "within-support intensity multiset."
             )
         if int(mask.sum().item()) > 1 and torch.equal(
@@ -5722,7 +4030,7 @@ def run_v6_transform_contract_self_test():
             c32[index, 0][mask],
         ):
             raise RuntimeError(
-                "V6 self-test failed: C32 spatial assignment was unchanged."
+                "self-test failed: C32 spatial assignment was unchanged."
             )
 
     c32_repeat = create_a17_support_intensity_affine_shuffled_images(
@@ -5733,7 +4041,7 @@ def run_v6_transform_contract_self_test():
         decoded_hashes,
     )
     if not torch.equal(c32, c32_repeat):
-        raise RuntimeError("V6 self-test failed: C32 is not deterministic.")
+        raise RuntimeError("self-test failed: C32 is not deterministic.")
 
     changed_outside = raw.clone()
     changed_outside[(1.0 - support).repeat(1, 3, 1, 1) > 0.5] = 0.987
@@ -5747,7 +4055,7 @@ def run_v6_transform_contract_self_test():
         ),
     ):
         raise RuntimeError(
-            "V6 self-test failed: excluded complement pixels affect A17."
+            "self-test failed: excluded complement pixels affect A17."
         )
 
     changed_inside = raw.clone()
@@ -5762,7 +4070,7 @@ def run_v6_transform_contract_self_test():
         ),
     ):
         raise RuntimeError(
-            "V6 self-test failed: excluded A17 pixels affect C33."
+            "self-test failed: excluded A17 pixels affect C33."
         )
 
     complement = (
@@ -5773,7 +4081,7 @@ def run_v6_transform_contract_self_test():
         content > 0.5,
     ):
         raise RuntimeError(
-            "V6 self-test failed: support and complement do not partition content."
+            "self-test failed: support and complement do not partition content."
         )
 
     # Check that the affine mapping is a genuine bijection for representative
@@ -5788,12 +4096,12 @@ def run_v6_transform_contract_self_test():
             for index in range(n_values)
         }
         if len(mapped) != n_values:
-            raise RuntimeError("V6 self-test failed: C32 map is not bijective.")
+            raise RuntimeError("self-test failed: C32 map is not bijective.")
         if all(
             (multiplier * index + offset) % n_values == index
             for index in range(n_values)
         ):
-            raise RuntimeError("V6 self-test failed: C32 map is the identity.")
+            raise RuntimeError("self-test failed: C32 map is the identity.")
 
 
 def _fixed_central_square_mask(batch_size, height, width, fraction, device, dtype):
@@ -5811,82 +4119,6 @@ def _fixed_central_square_mask(batch_size, height, width, fraction, device, dtyp
     return mask
 
 
-def create_conservative_whole_heart_exclusion_mask(hard_mask, valid_mask):
-    """Build a conservative whole-heart exclusion proxy for C28/C30.
-
-    The mask is the union of: (1) a large fixed central square for every slice,
-    (2) a same-size square centred on the MONAI hard-mask centroid for valid
-    slices, and (3) a substantially expanded ventricular bounding box. This is
-    intentionally conservative because the ventricular model does not segment
-    atria, great vessels, or the complete heart on every view. It remains a
-    proxy and must not be described as ground-truth whole-heart segmentation.
-    """
-
-    if hard_mask.ndim != 4 or hard_mask.shape[1] != 1:
-        raise ValueError("hard_mask must have shape [B,1,H,W].")
-    batch_size, _, height, width = hard_mask.shape
-    exclusion = _fixed_central_square_mask(
-        batch_size,
-        height,
-        width,
-        V5_WHOLE_HEART_EXCLUSION_CENTER_FRACTION,
-        hard_mask.device,
-        hard_mask.dtype,
-    )
-
-    for index in range(batch_size):
-        if not bool(valid_mask[index].item()):
-            continue
-        box = _hard_mask_bounding_box(hard_mask[index, 0])
-        if box is None:
-            continue
-        center_y, center_x = _mask_centroid_or_image_center(
-            hard_mask[index, 0],
-            True,
-        )
-        top, bottom, left, right = _fixed_square_bounds(
-            height,
-            width,
-            center_y,
-            center_x,
-            V5_WHOLE_HEART_EXCLUSION_CENTER_FRACTION,
-        )
-        exclusion[index, 0, top:bottom, left:right] = 1.0
-
-        box_top, box_bottom, box_left, box_right = box
-        box_height = box_bottom - box_top
-        box_width = box_right - box_left
-        margin = int(
-            round(
-                max(box_height, box_width)
-                * V5_WHOLE_HEART_EXCLUSION_BBOX_CONTEXT_FRACTION
-            )
-        )
-        box_top = max(0, box_top - margin)
-        box_bottom = min(height, box_bottom + margin)
-        box_left = max(0, box_left - margin)
-        box_right = min(width, box_right + margin)
-        exclusion[index, 0, box_top:box_bottom, box_left:box_right] = 1.0
-
-    return exclusion.clamp(0.0, 1.0)
-
-
-def create_outside_whole_heart_region_normalized_images(
-    raw_images,
-    hard_mask,
-    valid_mask,
-    content_mask,
-):
-    """Retain and independently scale only a conservative extracardiac proxy."""
-
-    exclusion = create_conservative_whole_heart_exclusion_mask(
-        hard_mask,
-        valid_mask,
-    )
-    visible = (1.0 - exclusion) * content_mask
-    return _robust_scale_visible_regions(raw_images, visible)
-
-
 def create_fixed_periphery_region_normalized_images(raw_images, content_mask):
     """Retain only a fixed MONAI-independent periphery with local scaling."""
 
@@ -5895,7 +4127,7 @@ def create_fixed_periphery_region_normalized_images(raw_images, content_mask):
         batch_size,
         height,
         width,
-        V5_FIXED_PERIPHERY_EXCLUSION_FRACTION,
+        FIXED_PERIPHERY_EXCLUSION_FRACTION,
         raw_images.device,
         raw_images.dtype,
     )
@@ -5911,91 +4143,23 @@ def extract_feature_bank(
     cache_dir,
     fingerprint,
 ):
-    """
-    Run the shared frozen image-processing stage and build one aligned feature
-    bank for every image representation required by the experiment registry.
+    """Build the aligned standardized MONAI/EfficientNet feature bank.
 
-    PIPELINE FOR EACH DISCOVERED JPEG
-    ---------------------------------
-
-        native JPEG decode
-            -> exact decoded-pixel hash + DCT pHash + provenance features
-            -> per-image intensity scaling to [0,1]
-            -> centered 256x256 MONAI canvas
-            -> optional MONAI inference on original and standardized canvases
-            -> original and standardized ROI / image / shortcut-control views
-            -> ImageNet normalization performed separately for each view
-            -> frozen EfficientNet-B0 1280-D embedding per requested view
-            -> one deterministic row in every feature-bank array
-
-    WHY ONE DATASET PASS?
-    ---------------------
-    Full-image, ROI and negative-control ablations must use exactly the same JPEG
-    files and metadata rows. Decoding the JPEG and running MONAI once per batch
-    avoids repeated I/O and repeated segmentation while preserving a controlled
-    comparison. EfficientNet is still executed separately for each requested
-    image representation because each view has different pixels.
-
-    WHY MEMORY-MAPPED FEATURE MATRICES?
-    -----------------------------------
-    A 63,648 x 1,280 float32 matrix is roughly 311 MiB. This deconfounding
-    suite can create thirty-two such representations, so keeping them plus
-    intermediate tensors in ordinary RAM is unnecessary. Each matrix is
-    written incrementally to a NumPy .npy memory map, flushed, and reopened read-
-    only after the metadata completion marker is written.
-
-    LABEL-LEAKAGE CONTRACT
-    ----------------------
-    Labels are carried only as aligned metadata. They are not inputs to MONAI,
-    EfficientNet, mask gating, quality scoring, hashes, or provenance features.
-    All supervised fitting occurs later inside patient-level CV folds.
+    Every JPEG is decoded once. MONAI runs once on the standardized 256x256
+    canvas, and the six active candidate/control views are encoded by frozen
+    EfficientNet-B0. Large embedding arrays are written incrementally as NumPy
+    memory maps; metadata.json is the final cache-completion marker.
     """
 
-    # ------------------------------------------------------------------
-    # Feature-bank stage 1: validate the requested view contract.
-    # ------------------------------------------------------------------
-    # Tabular controls do not create EfficientNet matrices and therefore are
-    # absent from ``required_modes``. At least one image experiment must remain.
-    if not required_modes:
-        raise ValueError("At least one EfficientNet feature mode is required.")
+    allowed_modes = set(required_efficientnet_feature_modes(EXPERIMENT_REGISTRY))
+    unknown = set(required_modes) - allowed_modes
+    if not required_modes or unknown:
+        raise ValueError(f"Invalid feature modes: {sorted(unknown)}")
+    if monai_segmenter is None:
+        raise RuntimeError("The active feature panel requires the MONAI segmenter.")
 
-    # MONAI is loaded only when an enabled image view actually needs its mask.
-    # The full-image and border-only controls can otherwise run without MONAI.
-    # The final panel uses only standardized MONAI-derived views.
-    original_monai_modes = set()
-    standardized_monai_modes = {
-        'standardized_roi_zero_bg_center_fallback',
-        'standardized_heart_centered_fixed_fov_region_norm',
-        'standardized_hard_support_region_norm',
-        'standardized_outside_whole_heart_region_norm',
-        'standardized_fixed_periphery_region_norm',
-        'standardized_a17_exact_support_mask_only',
-        'standardized_a17_support_intensity_affine_shuffled',
-        'standardized_a17_exact_support_complement_region_norm',
-    }
-    need_original_monai = any(
-        mode in original_monai_modes for mode in required_modes
-    )
-    need_standardized_monai = any(
-        mode in standardized_monai_modes for mode in required_modes
-    )
-    need_monai = need_original_monai or need_standardized_monai
-    if need_monai and monai_segmenter is None:
-        raise RuntimeError(
-            "MONAI-dependent feature modes were requested without a segmenter."
-        )
-
-    # ------------------------------------------------------------------
-    # Feature-bank stage 2: create a clean cache transaction directory.
-    # ------------------------------------------------------------------
-    # metadata.json is written only after every array succeeds. Therefore an
-    # existing incomplete directory is safe to remove before a rebuild.
     if cache_dir.exists():
-        print(
-            f"[FEATURE BANK] Removing incomplete or deliberately rebuilt cache: "
-            f"{cache_dir}",
-            flush=True,
-        )
+        print(f"[FEATURE BANK] Removing incomplete/rebuilt cache: {cache_dir}", flush=True)
         shutil.rmtree(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -6003,11 +4167,6 @@ def extract_feature_bank(
     if n_slices <= 0:
         raise RuntimeError("Cannot extract a feature bank from an empty dataset.")
 
-    # ------------------------------------------------------------------
-    # Feature-bank stage 3: preallocate disk-backed embedding matrices.
-    # ------------------------------------------------------------------
-    # Each row index is the immutable sample_index. Direct indexed writes avoid
-    # accumulating hundreds of megabytes of Python lists before np.vstack.
     feature_maps = {
         mode: np.lib.format.open_memmap(
             _feature_mode_path(cache_dir, mode),
@@ -6017,55 +4176,23 @@ def extract_feature_bank(
         )
         for mode in required_modes
     }
-
-    # Shared arrays below contain one value/vector per slice and remain aligned
-    # with every feature matrix. Small numeric arrays stay in RAM during the
-    # pass; large embedding matrices are already memory mapped.
     labels_array = np.empty(n_slices, dtype=np.int64)
     sample_indices_array = np.empty(n_slices, dtype=np.int64)
     provenance_array = np.empty(
-        (n_slices, len(PROVENANCE_FEATURE_NAMES)),
-        dtype=np.float32,
+        (n_slices, len(PROVENANCE_FEATURE_NAMES)), dtype=np.float32
     )
     standardization_array = np.empty(
-        (n_slices, len(STANDARDIZATION_FEATURE_NAMES)),
-        dtype=np.float32,
+        (n_slices, len(STANDARDIZATION_FEATURE_NAMES)), dtype=np.float32
     )
-
-    # Original-baseline MONAI QC arrays remain available for historical C4.
     monai_valid_array = np.zeros(n_slices, dtype=bool)
     area_ratio_array = np.full(n_slices, np.nan, dtype=np.float32)
     peak_probability_array = np.full(n_slices, np.nan, dtype=np.float32)
-    mean_foreground_array = np.full(n_slices, np.nan, dtype=np.float32)
-    roi_slice_score_array = np.full(n_slices, np.nan, dtype=np.float32)
-
-    # The deconfounded branch receives its own MONAI inference/QC arrays because
-    # label-blind cropping and fixed content geometry can legitimately change
-    # masks. MONAI itself receives min-max scaling, not the robust classifier view.
-    standardized_monai_valid_array = np.zeros(n_slices, dtype=bool)
-    standardized_area_ratio_array = np.full(
-        n_slices, np.nan, dtype=np.float32
-    )
-    standardized_peak_probability_array = np.full(
-        n_slices, np.nan, dtype=np.float32
-    )
-    standardized_mean_foreground_array = np.full(
-        n_slices, np.nan, dtype=np.float32
-    )
-    standardized_roi_slice_score_array = np.full(
-        n_slices, np.nan, dtype=np.float32
-    )
-
+    foreground_probability_array = np.full(n_slices, np.nan, dtype=np.float32)
     patient_ids_values = [None] * n_slices
     series_ids_values = [None] * n_slices
     decoded_hash_values = [None] * n_slices
     perceptual_hash_values = [None] * n_slices
 
-    # ------------------------------------------------------------------
-    # Feature-bank stage 4: build a deterministic non-shuffled DataLoader.
-    # ------------------------------------------------------------------
-    # ``sample_index`` is still used for indexed writes, so increasing worker
-    # count later cannot silently reorder the cache rows.
     loader = DataLoader(
         dataset,
         batch_size=BATCH_SIZE,
@@ -6074,53 +4201,29 @@ def extract_feature_bank(
         pin_memory=(DEVICE == "cuda"),
         persistent_workers=(DATALOADER_NUM_WORKERS > 0),
     )
-
     total_batches = len(loader)
-    progress_interval = max(
-        1,
-        PROGRESS_PRINT_EVERY_N_BATCHES,
-        total_batches // 20,
-    )
+    progress_interval = max(1, PROGRESS_PRINT_EVERY_N_BATCHES, total_batches // 20)
     autocast_enabled = USE_CUDA_AMP and DEVICE == "cuda"
-    extraction_started_at = time.perf_counter()
-    processed_slices = 0
+    started = time.perf_counter()
+    processed = 0
 
-    print(
-        "[FEATURE BANK] Starting multi-view frozen extraction.",
-        flush=True,
-    )
     print(
         f"[FEATURE BANK] slices={n_slices}, batches={total_batches}, "
-        f"batch_size={BATCH_SIZE}, modes={list(required_modes)}, "
-        f"MONAI_required={need_monai}, device={DEVICE}",
+        f"modes={list(required_modes)}, device={DEVICE}",
         flush=True,
     )
 
-    # ------------------------------------------------------------------
-    # Feature-bank stage 5: process every discovered image exactly once.
-    # ------------------------------------------------------------------
-    # Inference mode disables gradients for both frozen networks. CUDA autocast
-    # affects only network inference; probabilities and stored embeddings are
-    # converted back to float32 before QC/downstream analysis.
     with torch.inference_mode():
         for batch_index, batch in enumerate(
-            tqdm(
-                loader,
-                desc="Feature bank",
-                unit="batch",
-                dynamic_ncols=True,
-                file=sys.stdout,
-            ),
+            tqdm(loader, desc="Feature bank", unit="batch", dynamic_ncols=True, file=sys.stdout),
             start=1,
         ):
-            batch_started_at = time.perf_counter()
+            batch_started = time.perf_counter()
             (
-                images,
-                monai_images,
                 standardized_images,
                 standardized_monai_images,
                 standardized_raw_images,
-                detected_padding_images,
+                padding_images,
                 labels,
                 patient_ids,
                 series_ids,
@@ -6131,373 +4234,133 @@ def extract_feature_bank(
                 standardization_features,
             ) = batch
 
-            # Stable global indices identify the target rows in every output
-            # array. Only network tensors are moved to the runtime device; IDs,
-            # hashes and provenance values remain host-side metadata.
-            index_values = sample_indices.detach().cpu().numpy().astype(np.int64)
-            images = images.to(DEVICE, non_blocking=True)
-            monai_images = monai_images.to(DEVICE, non_blocking=True)
-            standardized_images = standardized_images.to(
-                DEVICE, non_blocking=True
-            )
-            standardized_monai_images = standardized_monai_images.to(
-                DEVICE, non_blocking=True
-            )
-            standardized_raw_images = standardized_raw_images.to(
-                DEVICE, non_blocking=True
-            )
-            detected_padding_images = detected_padding_images.to(
-                DEVICE, non_blocking=True
-            )
+            indices = sample_indices.detach().cpu().numpy().astype(np.int64)
+            standardized_images = standardized_images.to(DEVICE, non_blocking=True)
+            standardized_monai_images = standardized_monai_images.to(DEVICE, non_blocking=True)
+            standardized_raw_images = standardized_raw_images.to(DEVICE, non_blocking=True)
+            padding_images = padding_images.to(DEVICE, non_blocking=True)
 
-            # -------------------------------------------------------------
-            # Feature-bank stage 6: run MONAI separately on the original and
-            # standardized canvases only when enabled views require them.
-            # -------------------------------------------------------------
-            # The two branches must not share masks because dark-padding removal
-            # and robust scaling can legitimately alter the segmenter's output.
-            # Both use the same pinned network, gate thresholds and dilation.
-            batch_size = images.shape[0]
-
-            if need_original_monai:
-                with torch.autocast(
-                    device_type="cuda",
-                    dtype=torch.float16,
-                    enabled=autocast_enabled,
-                ):
-                    (
-                        roi_probability,
-                        hard_mask,
-                        valid_mask,
-                        area_ratio,
-                        peak_probability,
-                        mean_foreground_probability,
-                    ) = predict_monai_heart_masks(
-                        monai_images,
-                        classifier_size=images.shape[-2:],
-                        monai_segmenter=monai_segmenter,
-                    )
-                    roi_images = apply_confidence_gated_soft_roi(
-                        images,
-                        roi_probability,
-                        valid_mask,
-                    )
-            else:
-                roi_probability = torch.zeros(
-                    batch_size,
-                    1,
-                    *images.shape[-2:],
-                    device=images.device,
-                    dtype=images.dtype,
-                )
-                hard_mask = roi_probability.clone()
-                valid_mask = torch.zeros(
-                    batch_size,
-                    device=images.device,
-                    dtype=torch.bool,
-                )
-                area_ratio = torch.full(
-                    (batch_size,),
-                    float("nan"),
-                    device=images.device,
-                )
-                peak_probability = torch.full_like(area_ratio, float("nan"))
-                mean_foreground_probability = torch.full_like(
+            with torch.autocast(
+                device_type="cuda", dtype=torch.float16, enabled=autocast_enabled
+            ):
+                (
+                    roi_probability,
+                    hard_mask,
+                    valid_mask,
                     area_ratio,
-                    float("nan"),
+                    peak_probability,
+                    mean_foreground_probability,
+                ) = predict_monai_heart_masks(
+                    standardized_monai_images,
+                    classifier_size=standardized_images.shape[-2:],
+                    monai_segmenter=monai_segmenter,
                 )
-                roi_images = images
 
-            if need_standardized_monai:
-                with torch.autocast(
-                    device_type="cuda",
-                    dtype=torch.float16,
-                    enabled=autocast_enabled,
-                ):
-                    (
-                        standardized_roi_probability,
-                        standardized_hard_mask,
-                        standardized_valid_mask,
-                        standardized_area_ratio,
-                        standardized_peak_probability,
-                        standardized_mean_foreground_probability,
-                    ) = predict_monai_heart_masks(
-                        standardized_monai_images,
-                        classifier_size=standardized_images.shape[-2:],
-                        monai_segmenter=monai_segmenter,
-                    )
-                    standardized_roi_images = apply_confidence_gated_soft_roi(
-                        standardized_images,
-                        standardized_roi_probability,
-                        standardized_valid_mask,
-                    )
-            else:
-                standardized_roi_probability = torch.zeros(
-                    batch_size,
-                    1,
-                    *standardized_images.shape[-2:],
-                    device=standardized_images.device,
-                    dtype=standardized_images.dtype,
-                )
-                standardized_hard_mask = standardized_roi_probability.clone()
-                standardized_valid_mask = torch.zeros(
-                    batch_size,
-                    device=standardized_images.device,
-                    dtype=torch.bool,
-                )
-                standardized_area_ratio = torch.full(
-                    (batch_size,),
-                    float("nan"),
-                    device=standardized_images.device,
-                )
-                standardized_peak_probability = torch.full_like(
-                    standardized_area_ratio,
-                    float("nan"),
-                )
-                standardized_mean_foreground_probability = torch.full_like(
-                    standardized_area_ratio,
-                    float("nan"),
-                )
-                standardized_roi_images = standardized_images
-
-            # -------------------------------------------------------------
-            # Feature-bank stage 7: construct only the enabled image views.
-            # -------------------------------------------------------------
-            # Original controls remain available for exact reproduction. New
-            # standardized controls isolate narrow borders, corners, padding
-            # geometry, center cropping, stricter ROI removal, and exterior
-            # signal after label-blind export normalization.
+            content_mask = (1.0 - padding_images).clamp(0.0, 1.0)
             variants = {}
-            standardized_content_mask = (
-                1.0 - detected_padding_images[:, 0:1]
-            ).clamp(0.0, 1.0)
-
             if "standardized_roi_zero_bg_center_fallback" in required_modes:
                 variants["standardized_roi_zero_bg_center_fallback"] = (
                     apply_zero_background_roi_with_fixed_center_fallback(
                         standardized_images,
-                        standardized_roi_probability,
-                        standardized_valid_mask,
+                        roi_probability,
+                        valid_mask,
                         fallback_fraction=CENTER_CROP_FALLBACK_FRACTION,
-                    )
-                )
-            if "standardized_heart_centered_fixed_fov_region_norm" in required_modes:
-                variants["standardized_heart_centered_fixed_fov_region_norm"] = (
-                    create_heart_centered_fixed_fov_region_normalized_images(
-                        standardized_raw_images,
-                        standardized_hard_mask,
-                        standardized_valid_mask,
-                        standardized_content_mask,
                     )
                 )
             if "standardized_hard_support_region_norm" in required_modes:
                 variants["standardized_hard_support_region_norm"] = (
                     create_hard_support_region_normalized_images(
-                        standardized_raw_images,
-                        standardized_hard_mask,
-                        standardized_valid_mask,
-                        standardized_content_mask,
-                    )
-                )
-            if "standardized_outside_whole_heart_region_norm" in required_modes:
-                variants["standardized_outside_whole_heart_region_norm"] = (
-                    create_outside_whole_heart_region_normalized_images(
-                        standardized_raw_images,
-                        standardized_hard_mask,
-                        standardized_valid_mask,
-                        standardized_content_mask,
+                        standardized_raw_images, hard_mask, valid_mask, content_mask
                     )
                 )
             if "standardized_fixed_periphery_region_norm" in required_modes:
                 variants["standardized_fixed_periphery_region_norm"] = (
                     create_fixed_periphery_region_normalized_images(
-                        standardized_raw_images,
-                        standardized_content_mask,
+                        standardized_raw_images, content_mask
                     )
                 )
             if "standardized_a17_exact_support_mask_only" in required_modes:
                 variants["standardized_a17_exact_support_mask_only"] = (
                     create_a17_exact_support_mask_only_images(
-                        standardized_hard_mask,
-                        standardized_valid_mask,
-                        standardized_content_mask,
+                        hard_mask, valid_mask, content_mask
                     )
                 )
             if "standardized_a17_support_intensity_affine_shuffled" in required_modes:
                 variants["standardized_a17_support_intensity_affine_shuffled"] = (
                     create_a17_support_intensity_affine_shuffled_images(
                         standardized_raw_images,
-                        standardized_hard_mask,
-                        standardized_valid_mask,
-                        standardized_content_mask,
+                        hard_mask,
+                        valid_mask,
+                        content_mask,
                         decoded_pixel_hashes,
                     )
                 )
             if "standardized_a17_exact_support_complement_region_norm" in required_modes:
                 variants["standardized_a17_exact_support_complement_region_norm"] = (
                     create_a17_exact_support_complement_region_normalized_images(
-                        standardized_raw_images,
-                        standardized_hard_mask,
-                        standardized_valid_mask,
-                        standardized_content_mask,
+                        standardized_raw_images, hard_mask, valid_mask, content_mask
                     )
                 )
 
-            # -------------------------------------------------------------
-            # Feature-bank stage 8: encode requested views in small mode chunks.
-            # -------------------------------------------------------------
-            # Each view still receives an independent 1280-D embedding, but up
-            # to FEATURE_MODES_PER_ENCODER_CALL views are concatenated along the
-            # batch dimension before one frozen EfficientNet forward pass. In
-            # evaluation mode, EfficientNet batch-normalization uses fixed
-            # running statistics, so one view cannot change another view's
-            # representation. Chunking reduces Python and CUDA launch overhead
-            # while bounding peak memory on a Tesla T4-class GPU.
             mode_names = list(required_modes)
-            for chunk_start in range(
-                0,
-                len(mode_names),
-                FEATURE_MODES_PER_ENCODER_CALL,
-            ):
-                chunk_modes = mode_names[
-                    chunk_start:chunk_start + FEATURE_MODES_PER_ENCODER_CALL
-                ]
-                concatenated_images = torch.cat(
-                    [variants[mode] for mode in chunk_modes],
-                    dim=0,
-                )
+            for offset in range(0, len(mode_names), FEATURE_MODES_PER_ENCODER_CALL):
+                chunk_modes = mode_names[offset:offset + FEATURE_MODES_PER_ENCODER_CALL]
+                concatenated = torch.cat([variants[mode] for mode in chunk_modes], dim=0)
                 with torch.autocast(
-                    device_type="cuda",
-                    dtype=torch.float16,
-                    enabled=autocast_enabled,
+                    device_type="cuda", dtype=torch.float16, enabled=autocast_enabled
                 ):
-                    network_input = normalize_for_efficientnet(
-                        concatenated_images
-                    )
-                    concatenated_features = feature_extractor(
-                        network_input
+                    encoded = feature_extractor(
+                        normalize_for_efficientnet(concatenated)
                     ).float()
-
-                expected_rows = len(index_values) * len(chunk_modes)
-                if concatenated_features.shape != (
-                    expected_rows,
-                    EFFICIENTNET_FEATURE_DIM,
-                ):
+                expected_rows = len(indices) * len(chunk_modes)
+                if encoded.shape != (expected_rows, EFFICIENTNET_FEATURE_DIM):
                     raise RuntimeError(
-                        "Unexpected concatenated EfficientNet feature shape for "
-                        f"modes {chunk_modes}: "
-                        f"{tuple(concatenated_features.shape)}."
+                        f"Unexpected EfficientNet shape for {chunk_modes}: {tuple(encoded.shape)}"
                     )
+                for mode, values in zip(chunk_modes, torch.split(encoded, len(indices), dim=0)):
+                    feature_maps[mode][indices, :] = values.detach().cpu().numpy()
+                del concatenated, encoded
 
-                split_features = torch.split(
-                    concatenated_features,
-                    len(index_values),
-                    dim=0,
-                )
-                for mode, batch_features in zip(chunk_modes, split_features):
-                    feature_maps[mode][index_values, :] = (
-                        batch_features.detach().cpu().numpy()
-                    )
-
-                # Release the largest temporary tensors before MONAI-QC and
-                # metadata arrays are copied back to the host.
-                del concatenated_images, network_input, concatenated_features
-
-            # -------------------------------------------------------------
-            # Feature-bank stage 9: record the optional heuristic and QC data.
-            # -------------------------------------------------------------
-            # ROI/fallback standard deviation is saved for A6 but does not alter
-            # the default baseline. Every shared value uses the same row indices.
-            roi_scores = torch.std(roi_images, dim=(1, 2, 3))
-            standardized_roi_scores = torch.std(
-                standardized_roi_images, dim=(1, 2, 3)
-            )
-
-            labels_array[index_values] = labels.detach().cpu().numpy()
-            sample_indices_array[index_values] = index_values
-            provenance_array[index_values, :] = (
-                provenance_features.detach().cpu().numpy()
-            )
-            standardization_array[index_values, :] = (
-                standardization_features.detach().cpu().numpy()
-            )
-
-            monai_valid_array[index_values] = valid_mask.detach().cpu().numpy()
-            area_ratio_array[index_values] = area_ratio.detach().cpu().numpy()
-            peak_probability_array[index_values] = (
-                peak_probability.detach().cpu().numpy()
-            )
-            mean_foreground_array[index_values] = (
+            labels_array[indices] = labels.detach().cpu().numpy()
+            sample_indices_array[indices] = indices
+            provenance_array[indices, :] = provenance_features.detach().cpu().numpy()
+            standardization_array[indices, :] = standardization_features.detach().cpu().numpy()
+            monai_valid_array[indices] = valid_mask.detach().cpu().numpy()
+            area_ratio_array[indices] = area_ratio.detach().cpu().numpy()
+            peak_probability_array[indices] = peak_probability.detach().cpu().numpy()
+            foreground_probability_array[indices] = (
                 mean_foreground_probability.detach().cpu().numpy()
             )
-            roi_slice_score_array[index_values] = roi_scores.detach().cpu().numpy()
 
-            standardized_monai_valid_array[index_values] = (
-                standardized_valid_mask.detach().cpu().numpy()
-            )
-            standardized_area_ratio_array[index_values] = (
-                standardized_area_ratio.detach().cpu().numpy()
-            )
-            standardized_peak_probability_array[index_values] = (
-                standardized_peak_probability.detach().cpu().numpy()
-            )
-            standardized_mean_foreground_array[index_values] = (
-                standardized_mean_foreground_probability.detach().cpu().numpy()
-            )
-            standardized_roi_slice_score_array[index_values] = (
-                standardized_roi_scores.detach().cpu().numpy()
-            )
+            for local, global_index in enumerate(indices.tolist()):
+                patient_ids_values[global_index] = str(patient_ids[local])
+                series_ids_values[global_index] = str(series_ids[local])
+                decoded_hash_values[global_index] = str(decoded_pixel_hashes[local])
+                perceptual_hash_values[global_index] = str(perceptual_hashes[local])
 
-            for local_position, global_index in enumerate(index_values.tolist()):
-                patient_ids_values[global_index] = str(patient_ids[local_position])
-                series_ids_values[global_index] = str(series_ids[local_position])
-                decoded_hash_values[global_index] = str(
-                    decoded_pixel_hashes[local_position]
-                )
-                perceptual_hash_values[global_index] = str(
-                    perceptual_hashes[local_position]
-                )
-
-
-            processed_slices += len(index_values)
-            if (
-                batch_index == 1
-                or batch_index % progress_interval == 0
-                or batch_index == total_batches
-            ):
+            processed += len(indices)
+            if batch_index == 1 or batch_index % progress_interval == 0 or batch_index == total_batches:
                 _synchronize_timing_device()
-                elapsed = time.perf_counter() - extraction_started_at
-                rate = processed_slices / max(elapsed, 1e-8)
-                remaining = n_slices - processed_slices
-                eta = remaining / max(rate, 1e-8)
+                elapsed = time.perf_counter() - started
+                rate = processed / max(elapsed, 1e-8)
+                eta = (n_slices - processed) / max(rate, 1e-8)
                 print(
-                    f"[FEATURE BANK] {processed_slices}/{n_slices} slices "
-                    f"({100.0 * processed_slices / n_slices:.1f}%) | "
-                    f"batch={batch_index}/{total_batches} | "
+                    f"[FEATURE BANK] {processed}/{n_slices} "
+                    f"({100.0 * processed / n_slices:.1f}%) | "
                     f"rate={rate:.2f} slices/s | ETA={_format_elapsed_time(eta)} | "
-                    f"latest_batch={_format_elapsed_time(time.perf_counter() - batch_started_at)}",
+                    f"batch={_format_elapsed_time(time.perf_counter() - batch_started)}",
                     flush=True,
                 )
 
-    # ------------------------------------------------------------------
-    # Feature-bank stage 10: prove complete one-to-one row coverage.
-    # ------------------------------------------------------------------
-    # A partially written matrix must never receive a completion marker or be
-    # accepted as a valid cache on a later run.
-    if any(value is None for value in patient_ids_values):
-        raise RuntimeError("At least one patient ID was not written to the bank.")
-    if any(value is None for value in decoded_hash_values):
-        raise RuntimeError("At least one decoded hash was not written to the bank.")
+    if any(value is None for value in patient_ids_values + decoded_hash_values):
+        raise RuntimeError("Feature-bank metadata rows are incomplete.")
     if not np.array_equal(sample_indices_array, np.arange(n_slices)):
         raise RuntimeError("Feature-bank sample indices are incomplete or reordered.")
 
-    # Flush large disk-backed matrices before writing the smaller shared arrays
-    # and metadata. metadata.json remains the final completion marker.
-    for feature_map in feature_maps.values():
-        feature_map.flush()
+    for values in feature_maps.values():
+        values.flush()
     del feature_maps
 
-    shared_paths = _feature_bank_shared_paths(cache_dir)
     shared_arrays = {
         "labels": labels_array,
         "patient_ids": np.asarray(patient_ids_values),
@@ -6507,54 +4370,34 @@ def extract_feature_bank(
         "perceptual_hashes": np.asarray(perceptual_hash_values),
         "provenance_features": provenance_array,
         "standardization_features": standardization_array,
-        "monai_valid": monai_valid_array,
-        "area_ratios": area_ratio_array,
-        "peak_probabilities": peak_probability_array,
-        "mean_foreground_probabilities": mean_foreground_array,
-        "roi_slice_scores": roi_slice_score_array,
-        "standardized_monai_valid": standardized_monai_valid_array,
-        "standardized_area_ratios": standardized_area_ratio_array,
-        "standardized_peak_probabilities": (
-            standardized_peak_probability_array
-        ),
-        "standardized_mean_foreground_probabilities": (
-            standardized_mean_foreground_array
-        ),
-        "standardized_roi_slice_scores": (
-            standardized_roi_slice_score_array
-        ),
+        "standardized_monai_valid": monai_valid_array,
+        "standardized_area_ratios": area_ratio_array,
+        "standardized_peak_probabilities": peak_probability_array,
+        "standardized_mean_foreground_probabilities": foreground_probability_array,
     }
     for name, array in shared_arrays.items():
-        np.save(shared_paths[name], np.asarray(array), allow_pickle=False)
+        np.save(_feature_bank_shared_paths(cache_dir)[name], np.asarray(array), allow_pickle=False)
 
-    # ------------------------------------------------------------------
-    # Feature-bank stage 11: write provenance metadata last and re-open cache.
-    # ------------------------------------------------------------------
     metadata = {
         "fingerprint": fingerprint,
-        "schema": FEATURE_CACHE_SCHEMA_VERSION,
+        "schema": FEATURE_CACHE_SCHEMA,
         "completed_modes": list(required_modes),
         "n_slices": int(n_slices),
         "feature_dimension": EFFICIENTNET_FEATURE_DIM,
         "provenance_feature_names": list(PROVENANCE_FEATURE_NAMES),
-        "standardization_feature_names": list(
-            STANDARDIZATION_FEATURE_NAMES
-        ),
+        "standardization_feature_names": list(STANDARDIZATION_FEATURE_NAMES),
         "monai_runtime_source": MONAI_RUNTIME_SOURCE,
         "monai_runtime_artifact_path": MONAI_RUNTIME_ARTIFACT_PATH,
     }
     (cache_dir / "metadata.json").write_text(
-        json.dumps(metadata, indent=2, sort_keys=True),
-        encoding="utf-8",
+        json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8"
     )
-
     _synchronize_timing_device()
     print(
         "[FEATURE BANK] Extraction and cache write completed in "
-        f"{_format_elapsed_time(time.perf_counter() - extraction_started_at)}.",
+        f"{_format_elapsed_time(time.perf_counter() - started)}.",
         flush=True,
     )
-
     loaded = load_feature_bank(cache_dir, fingerprint, required_modes)
     if loaded is None:
         raise RuntimeError("Freshly written feature bank could not be reloaded.")
@@ -6585,14 +4428,10 @@ def load_or_extract_feature_bank(samples, required_modes, fingerprint, cache_dir
 
     # Keep this set synchronized with every representation that consumes a
     # MONAI probability map, hard mask, gate decision, or bounding box. This is
-    # especially important for preliminary runs that enable only A12 or one of
-    # the mask-only controls; such a run must still load the segmenter even when
-    # B1 is not selected as an incidental MONAI-dependent companion.
+    # Every active image representation depends on standardized MONAI output.
     monai_dependent_modes = {
         'standardized_roi_zero_bg_center_fallback',
-        'standardized_heart_centered_fixed_fov_region_norm',
         'standardized_hard_support_region_norm',
-        'standardized_outside_whole_heart_region_norm',
         'standardized_fixed_periphery_region_norm',
         'standardized_a17_exact_support_mask_only',
         'standardized_a17_support_intensity_affine_shuffled',
@@ -7421,45 +5260,23 @@ def write_patient_fold_manifest(output_path, rows):
 
 
 def write_cohort_manifest(output_path, samples, bank, fold_manifest_rows):
-    """Write one auditable row per image including folds and provenance fields."""
+    """Write one auditable row per image with patient folds and QC metadata."""
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fold_by_patient = {
-        row["patient_id"]: row["outer_fold"] for row in fold_manifest_rows
-    }
+    fold_by_patient = {row["patient_id"]: row["outer_fold"] for row in fold_manifest_rows}
     component_by_patient = {
-        row["patient_id"]: row["duplicate_component_id"]
-        for row in fold_manifest_rows
+        row["patient_id"]: row["duplicate_component_id"] for row in fold_manifest_rows
     }
-
     fieldnames = [
-        "sample_index",
-        "image_path",
-        "true_label",
-        "patient_id",
-        "series_id",
-        "outer_fold",
-        "duplicate_component_id",
-        "decoded_pixel_sha256",
-        "perceptual_hash",
-        "monai_gate_valid",
-        "monai_area_ratio",
-        "monai_peak_probability",
-        "monai_mean_foreground_probability",
-        "roi_slice_std_score",
-        "standardized_monai_gate_valid",
-        "standardized_monai_area_ratio",
-        "standardized_monai_peak_probability",
-        "standardized_monai_mean_foreground_probability",
-        "standardized_roi_slice_std_score",
-        *PROVENANCE_FEATURE_NAMES,
-        *STANDARDIZATION_FEATURE_NAMES,
+        "sample_index", "image_path", "true_label", "patient_id", "series_id",
+        "outer_fold", "duplicate_component_id", "decoded_pixel_sha256",
+        "perceptual_hash", "monai_gate_valid", "monai_area_ratio",
+        "monai_peak_probability", "monai_mean_foreground_probability",
+        *PROVENANCE_FEATURE_NAMES, *STANDARDIZATION_FEATURE_NAMES,
     ]
-
     with open(output_path, "w", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(file, fieldnames=fieldnames)
         writer.writeheader()
-
         for index, sample in enumerate(samples):
             image_path, label, patient_id, series_id = sample
             row = {
@@ -7472,642 +5289,22 @@ def write_cohort_manifest(output_path, samples, bank, fold_manifest_rows):
                 "duplicate_component_id": component_by_patient[str(patient_id)],
                 "decoded_pixel_sha256": str(bank["decoded_pixel_hashes"][index]),
                 "perceptual_hash": str(bank["perceptual_hashes"][index]),
-                "monai_gate_valid": int(bool(bank["monai_valid"][index])),
-                "monai_area_ratio": float(bank["area_ratios"][index]),
-                "monai_peak_probability": float(
-                    bank["peak_probabilities"][index]
-                ),
+                "monai_gate_valid": int(bool(bank["standardized_monai_valid"][index])),
+                "monai_area_ratio": float(bank["standardized_area_ratios"][index]),
+                "monai_peak_probability": float(bank["standardized_peak_probabilities"][index]),
                 "monai_mean_foreground_probability": float(
-                    bank["mean_foreground_probabilities"][index]
-                ),
-                "roi_slice_std_score": float(bank["roi_slice_scores"][index]),
-                "standardized_monai_gate_valid": int(
-                    bool(bank["standardized_monai_valid"][index])
-                ),
-                "standardized_monai_area_ratio": float(
-                    bank["standardized_area_ratios"][index]
-                ),
-                "standardized_monai_peak_probability": float(
-                    bank["standardized_peak_probabilities"][index]
-                ),
-                "standardized_monai_mean_foreground_probability": float(
                     bank["standardized_mean_foreground_probabilities"][index]
                 ),
-                "standardized_roi_slice_std_score": float(
-                    bank["standardized_roi_slice_scores"][index]
-                ),
             }
-            for feature_name, value in zip(
-                PROVENANCE_FEATURE_NAMES,
-                bank["provenance_features"][index],
-            ):
-                row[feature_name] = float(value)
-            for feature_name, value in zip(
-                STANDARDIZATION_FEATURE_NAMES,
-                bank["standardization_features"][index],
-            ):
-                row[feature_name] = float(value)
+            row.update({
+                name: float(value)
+                for name, value in zip(PROVENANCE_FEATURE_NAMES, bank["provenance_features"][index])
+            })
+            row.update({
+                name: float(value)
+                for name, value in zip(STANDARDIZATION_FEATURE_NAMES, bank["standardization_features"][index])
+            })
             writer.writerow(row)
-
-
-def write_series_annotation_template(output_path, samples):
-    """Write a blinded-ready manual sequence/view annotation template.
-
-    JPEG folder names are not treated as validated DICOM series identities and
-    this function does not infer sequence or view labels from SR_*/series* names.
-    It records deterministic first, middle, and last image paths for every
-    folder-defined proxy so a radiologist or trained reviewer can annotate the
-    released structure without inspecting model predictions.
-    """
-
-    grouped = defaultdict(list)
-    patient_label = {}
-    for image_path, label, patient_id, series_id in samples:
-        patient_id = str(patient_id)
-        series_id = str(series_id)
-        previous = patient_label.get(patient_id)
-        if previous is not None and int(previous) != int(label):
-            raise RuntimeError(
-                f"Patient {patient_id} has inconsistent series-template labels."
-            )
-        patient_label[patient_id] = int(label)
-        grouped[(patient_id, series_id)].append(str(image_path))
-
-    rows = []
-    for patient_id, series_id in sorted(grouped):
-        paths = sorted(grouped[(patient_id, series_id)])
-        middle_index = len(paths) // 2
-        rows.append(
-            {
-                "patient_id": patient_id,
-                "series_proxy_id": series_id,
-                "n_images": int(len(paths)),
-                "first_image_path": paths[0],
-                "middle_image_path": paths[middle_index],
-                "last_image_path": paths[-1],
-                "sequence_type": "",
-                "view_type": "",
-                "contains_heart": "",
-                "is_localizer": "",
-                "is_derived_export": "",
-                "monai_mask_anatomically_plausible": "",
-                "annotation_confidence": "",
-                "reviewer": "",
-                "notes": "",
-            }
-        )
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=list(rows[0]))
-        writer.writeheader()
-        writer.writerows(rows)
-
-    # Keep labels in a separate key so the annotation table can be given to a
-    # reviewer without exposing Normal/Sick outcome. The key is merged only
-    # after sequence/view annotation is complete.
-    label_key_path = output_path.with_name(
-        "series_annotation_label_key.csv"
-    )
-    key_rows = [
-        {
-            "patient_id": patient_id,
-            "true_label": int(patient_label[patient_id]),
-        }
-        for patient_id in sorted(patient_label)
-    ]
-    with open(label_key_path, "w", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=list(key_rows[0]))
-        writer.writeheader()
-        writer.writerows(key_rows)
-
-    print(
-        f"[SERIES REVIEW] Wrote {len(rows)} blinded folder-proxy rows: "
-        f"{output_path}",
-        flush=True,
-    )
-    print(
-        f"[SERIES REVIEW] Label key kept separately: {label_key_path}",
-        flush=True,
-    )
-    return rows
-
-
-def _normalize_annotation_token(value):
-    """Normalize one manually entered annotation token for exact matching."""
-
-    return str(value or "").strip().casefold()
-
-
-def _parse_required_annotation_boolean(value, field_name, row_number):
-    """Parse a required blinded annotation Boolean without guessing.
-
-    Manual CSV editors can serialize Boolean choices in several equivalent
-    forms. Accepted positive values are ``1/true/yes/y`` and accepted negative
-    values are ``0/false/no/n``. Blank or unfamiliar values return ``None`` so
-    the row is counted as incomplete rather than silently coerced.
-    """
-
-    normalized = _normalize_annotation_token(value)
-    if normalized in {"1", "true", "yes", "y"}:
-        return True
-    if normalized in {"0", "false", "no", "n"}:
-        return False
-    if normalized == "":
-        return None
-
-    print(
-        f"[SERIES SUBSET] Row {row_number}: unrecognized {field_name}="
-        f"{value!r}; treating the row as incomplete.",
-        flush=True,
-    )
-    return None
-
-
-def build_annotated_series_selection(annotation_path, bank):
-    """Create one feature-bank row mask from completed blinded annotations.
-
-    The function never infers sequence/view from ``SR_*`` or ``series*`` names.
-    It reads only explicit reviewer entries from the completed CSV, applies the
-    predeclared label-blind inclusion rules, verifies that the series identifiers
-    belong to the current feature bank, and then expands selected series proxies
-    to their aligned image rows.
-
-    Rows with incomplete required annotations are reported and excluded. A
-    stale annotation file containing unknown series identifiers fails loudly,
-    because silently ignoring them could mix annotations from another dataset
-    version. Sequence and view filters are optional; an empty configured tuple
-    means that all explicitly annotated values are eligible.
-    """
-
-    annotation_path = Path(annotation_path).expanduser().resolve()
-    required_columns = {
-        "patient_id",
-        "series_proxy_id",
-        "contains_heart",
-        "is_localizer",
-        "is_derived_export",
-        "annotation_confidence",
-        "sequence_type",
-        "view_type",
-    }
-
-    with open(annotation_path, "r", newline="", encoding="utf-8-sig") as file:
-        reader = csv.DictReader(file)
-        actual_columns = set(reader.fieldnames or [])
-        missing_columns = sorted(required_columns - actual_columns)
-        if missing_columns:
-            raise ValueError(
-                "Completed series annotation CSV is missing required columns: "
-                f"{missing_columns}."
-            )
-        annotation_rows = list(reader)
-
-    if not annotation_rows:
-        raise ValueError("Completed series annotation CSV contains no data rows.")
-
-    bank_series_ids = np.asarray(bank["series_ids"]).astype(str)
-    bank_patient_ids = np.asarray(bank["patient_ids"]).astype(str)
-    if len(bank_series_ids) != len(bank_patient_ids):
-        raise RuntimeError(
-            "Feature-bank series and patient arrays have different lengths."
-        )
-    series_to_patient = {}
-    for series_id, patient_id in zip(bank_series_ids, bank_patient_ids):
-        previous = series_to_patient.get(str(series_id))
-        if previous is not None and previous != str(patient_id):
-            raise RuntimeError(
-                f"Series proxy {series_id!r} maps to multiple patients in the "
-                "feature bank."
-            )
-        series_to_patient[str(series_id)] = str(patient_id)
-    available_series = set(series_to_patient)
-    allowed_sequences = {
-        _normalize_annotation_token(value)
-        for value in ANNOTATED_SERIES_ALLOWED_SEQUENCE_TYPES
-        if _normalize_annotation_token(value)
-    }
-    allowed_views = {
-        _normalize_annotation_token(value)
-        for value in ANNOTATED_SERIES_ALLOWED_VIEW_TYPES
-        if _normalize_annotation_token(value)
-    }
-    allowed_confidences = {
-        _normalize_annotation_token(value)
-        for value in ANNOTATED_SERIES_ALLOWED_CONFIDENCE_VALUES
-        if _normalize_annotation_token(value)
-    }
-
-    seen_series = set()
-    selected_series = set()
-    selected_annotation_rows = []
-    incomplete_rows = 0
-    excluded_by_confidence = 0
-    excluded_by_clinical_rules = 0
-    excluded_by_sequence_or_view = 0
-    unknown_series = []
-
-    for row_number, row in enumerate(annotation_rows, start=2):
-        series_id = str(row.get("series_proxy_id", "")).strip()
-        if not series_id:
-            incomplete_rows += 1
-            continue
-        if series_id in seen_series:
-            raise ValueError(
-                "Completed annotation CSV contains a duplicate "
-                f"series_proxy_id at row {row_number}: {series_id!r}."
-            )
-        seen_series.add(series_id)
-
-        if series_id not in available_series:
-            unknown_series.append(series_id)
-            continue
-
-        annotated_patient_id = str(row.get("patient_id", "")).strip()
-        expected_patient_id = series_to_patient[series_id]
-        if not annotated_patient_id:
-            incomplete_rows += 1
-            continue
-        if annotated_patient_id != expected_patient_id:
-            raise ValueError(
-                f"Annotation row {row_number} maps series {series_id!r} to "
-                f"patient {annotated_patient_id!r}, but the current feature "
-                f"bank maps it to {expected_patient_id!r}."
-            )
-
-        contains_heart = _parse_required_annotation_boolean(
-            row.get("contains_heart"), "contains_heart", row_number
-        )
-        is_localizer = _parse_required_annotation_boolean(
-            row.get("is_localizer"), "is_localizer", row_number
-        )
-        is_derived = _parse_required_annotation_boolean(
-            row.get("is_derived_export"), "is_derived_export", row_number
-        )
-        confidence = _normalize_annotation_token(
-            row.get("annotation_confidence")
-        )
-        sequence_type = _normalize_annotation_token(row.get("sequence_type"))
-        view_type = _normalize_annotation_token(row.get("view_type"))
-
-        if (
-            contains_heart is None
-            or is_localizer is None
-            or is_derived is None
-            or not confidence
-        ):
-            incomplete_rows += 1
-            continue
-        if ANNOTATED_SERIES_USE_SEQUENCE_VIEW_BALANCED_POOLING and (
-            not sequence_type or not view_type
-        ):
-            # Equal cell weighting is meaningful only when both fields were
-            # explicitly reviewed. Blank cells are excluded rather than guessed.
-            incomplete_rows += 1
-            continue
-
-        if confidence not in allowed_confidences:
-            excluded_by_confidence += 1
-            continue
-
-        if (
-            ANNOTATED_SERIES_REQUIRE_CONTAINS_HEART
-            and not contains_heart
-        ):
-            excluded_by_clinical_rules += 1
-            continue
-        if ANNOTATED_SERIES_EXCLUDE_LOCALIZERS and is_localizer:
-            excluded_by_clinical_rules += 1
-            continue
-        if ANNOTATED_SERIES_EXCLUDE_DERIVED_EXPORTS and is_derived:
-            excluded_by_clinical_rules += 1
-            continue
-
-        if allowed_sequences and sequence_type not in allowed_sequences:
-            excluded_by_sequence_or_view += 1
-            continue
-        if allowed_views and view_type not in allowed_views:
-            excluded_by_sequence_or_view += 1
-            continue
-
-        selected_series.add(series_id)
-        selected_annotation_rows.append(
-            {
-                "patient_id": annotated_patient_id,
-                "series_proxy_id": series_id,
-                "sequence_type": str(row.get("sequence_type", "")).strip(),
-                "view_type": str(row.get("view_type", "")).strip(),
-                "contains_heart": int(contains_heart),
-                "is_localizer": int(is_localizer),
-                "is_derived_export": int(is_derived),
-                "annotation_confidence": str(
-                    row.get("annotation_confidence", "")
-                ).strip(),
-                "reviewer": str(row.get("reviewer", "")).strip(),
-                "notes": str(row.get("notes", "")).strip(),
-            }
-        )
-
-    if unknown_series:
-        examples = unknown_series[:10]
-        raise ValueError(
-            "The completed annotation CSV contains series_proxy_id values that "
-            "are absent from the current feature bank. This usually means the "
-            "annotation belongs to another dataset/run. Examples: "
-            f"{examples}; total_unknown={len(unknown_series)}."
-        )
-    if not selected_series:
-        raise ValueError(
-            "The completed annotations and configured inclusion rules retained "
-            "no series proxies."
-        )
-
-    row_mask = np.isin(bank_series_ids, np.asarray(sorted(selected_series)))
-    labels = np.asarray(bank["labels"], dtype=np.int64)[row_mask]
-    patient_ids = np.asarray(bank["patient_ids"]).astype(str)[row_mask]
-    selected_patient_ids, selected_patient_labels = build_patient_label_table(
-        labels,
-        patient_ids,
-    )
-    class_counts = {
-        0: int(np.sum(selected_patient_labels == 0)),
-        1: int(np.sum(selected_patient_labels == 1)),
-    }
-    if min(class_counts.values()) < N_SPLITS:
-        raise ValueError(
-            "Annotated-series subset must retain at least N_SPLITS patients in "
-            "each class. Retained counts: "
-            f"Normal={class_counts[0]}, Sick={class_counts[1]}, "
-            f"N_SPLITS={N_SPLITS}."
-        )
-
-    series_to_pooling_cell = {
-        str(row["series_proxy_id"]): (
-            f"{_normalize_annotation_token(row['sequence_type'])}::"
-            f"{_normalize_annotation_token(row['view_type'])}"
-        )
-        for row in selected_annotation_rows
-    }
-    selected_cell_counts = defaultdict(int)
-    for cell in series_to_pooling_cell.values():
-        selected_cell_counts[str(cell)] += 1
-
-    summary = {
-        "status": "READY",
-        "annotation_path": str(annotation_path),
-        "selection_name": str(ANNOTATED_SERIES_SELECTION_NAME),
-        "n_annotation_rows": int(len(annotation_rows)),
-        "n_feature_bank_series": int(len(available_series)),
-        "n_selected_series": int(len(selected_series)),
-        "n_selected_image_rows": int(np.sum(row_mask)),
-        "n_selected_patients": int(len(selected_patient_ids)),
-        "n_selected_sequence_view_cells": int(len(selected_cell_counts)),
-        "selected_sequence_view_cell_series_counts": dict(
-            sorted(selected_cell_counts.items())
-        ),
-        "sequence_view_balanced_pooling_enabled": bool(
-            ANNOTATED_SERIES_USE_SEQUENCE_VIEW_BALANCED_POOLING
-        ),
-        "normal_patients": class_counts[0],
-        "sick_patients": class_counts[1],
-        "n_incomplete_rows_excluded": int(incomplete_rows),
-        "n_rows_excluded_by_confidence": int(excluded_by_confidence),
-        "n_rows_excluded_by_clinical_rules": int(
-            excluded_by_clinical_rules
-        ),
-        "n_rows_excluded_by_sequence_or_view": int(
-            excluded_by_sequence_or_view
-        ),
-        "require_contains_heart": bool(
-            ANNOTATED_SERIES_REQUIRE_CONTAINS_HEART
-        ),
-        "exclude_localizers": bool(ANNOTATED_SERIES_EXCLUDE_LOCALIZERS),
-        "exclude_derived_exports": bool(
-            ANNOTATED_SERIES_EXCLUDE_DERIVED_EXPORTS
-        ),
-        "allowed_sequence_types": list(
-            ANNOTATED_SERIES_ALLOWED_SEQUENCE_TYPES
-        ),
-        "allowed_view_types": list(ANNOTATED_SERIES_ALLOWED_VIEW_TYPES),
-        "allowed_confidence_values": list(
-            ANNOTATED_SERIES_ALLOWED_CONFIDENCE_VALUES
-        ),
-    }
-    return (
-        row_mask,
-        selected_annotation_rows,
-        series_to_pooling_cell,
-        summary,
-    )
-
-
-def run_annotated_series_subset_analysis(
-    bank,
-    experiments,
-    tabular_feature_sets,
-    base_fold_manifest_rows,
-):
-    """Optionally rerun selected image experiments on annotated series only.
-
-    This is a secondary sensitivity analysis, not a replacement for the locked
-    full-cohort result. It can run only after a blinded reviewer completes the
-    exported series annotation template. The selected image rows are filtered
-    before pooling; a fresh patient-level fold manifest is then constructed for
-    the retained patient set using the same duplicate-component constraints.
-    No annotation field is derived from class labels or model predictions.
-    """
-
-    status_path = OUTPUT_DIR / "audits" / "series_annotation_analysis_status.json"
-    if not RUN_ANNOTATED_SERIES_SUBSET_ANALYSIS:
-        summary = {
-            "status": "SKIPPED_DISABLED",
-            "annotation_path": SERIES_ANNOTATION_INPUT_PATH,
-            "selection_name": ANNOTATED_SERIES_SELECTION_NAME,
-            "reason": (
-                "Enable RUN_ANNOTATED_SERIES_SUBSET_ANALYSIS only after a "
-                "blinded reviewer completes a copy of "
-                "series_annotation_template.csv."
-            ),
-        }
-        status_path.write_text(
-            json.dumps(summary, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
-        print(
-            "[SERIES SUBSET] SKIPPED: no completed annotation CSV was enabled.",
-            flush=True,
-        )
-        return summary
-
-    (
-        row_mask,
-        selected_rows,
-        series_to_pooling_cell,
-        selection_summary,
-    ) = build_annotated_series_selection(
-        SERIES_ANNOTATION_INPUT_PATH,
-        bank,
-    )
-    selection_root = (
-        OUTPUT_DIR
-        / "sequence_view_analysis"
-        / str(ANNOTATED_SERIES_SELECTION_NAME)
-    )
-    experiment_root = selection_root / "experiments"
-    comparison_root = selection_root / "comparison"
-    selection_root.mkdir(parents=True, exist_ok=True)
-    experiment_root.mkdir(parents=True, exist_ok=True)
-    comparison_root.mkdir(parents=True, exist_ok=True)
-
-    selected_series_path = selection_root / "selected_series_proxies.csv"
-    with open(selected_series_path, "w", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=list(selected_rows[0]))
-        writer.writeheader()
-        writer.writerows(selected_rows)
-
-    selected_labels = np.asarray(bank["labels"], dtype=np.int64)[row_mask]
-    selected_patients = np.asarray(bank["patient_ids"]).astype(str)[row_mask]
-    patient_ids, patient_labels = build_patient_label_table(
-        selected_labels,
-        selected_patients,
-    )
-    base_group_by_patient = {
-        str(row["patient_id"]): str(row["duplicate_component_id"])
-        for row in base_fold_manifest_rows
-    }
-    missing_group_patients = sorted(
-        set(patient_ids.tolist()) - set(base_group_by_patient)
-    )
-    if missing_group_patients:
-        raise RuntimeError(
-            "Annotated-series patients are missing duplicate-component IDs: "
-            f"{missing_group_patients}."
-        )
-    subset_fold_rows = _build_fold_manifest_rows_for_seed(
-        patient_ids,
-        patient_labels,
-        base_group_by_patient,
-        CV_RANDOM_STATE + 70_000,
-    )
-    write_patient_fold_manifest(
-        selection_root / "patient_fold_manifest.csv",
-        subset_fold_rows,
-    )
-
-    experiments_by_id = {
-        experiment.experiment_id: experiment for experiment in experiments
-    }
-    successful_results = []
-    failed_results = []
-    prepared_cache = {}
-
-    for index, experiment_id in enumerate(
-        ANNOTATED_SERIES_EXPERIMENT_IDS,
-        start=1,
-    ):
-        experiment = experiments_by_id[experiment_id]
-        analysis_experiment = experiment
-        if (
-            ANNOTATED_SERIES_USE_SEQUENCE_VIEW_BALANCED_POOLING
-            and experiment.pooling_strategy == "hierarchical"
-        ):
-            analysis_experiment = replace(
-                experiment,
-                pooling_strategy="sequence_view_balanced",
-                description=(
-                    experiment.description
-                    + " In this annotated sensitivity analysis, series proxies "
-                    + "are additionally balanced across explicit sequence/view cells."
-                ),
-            )
-        print(
-            f"[SERIES SUBSET] Experiment {index}/"
-            f"{len(ANNOTATED_SERIES_EXPERIMENT_IDS)}: {experiment_id}; "
-            f"pooling={analysis_experiment.pooling_strategy}",
-            flush=True,
-        )
-        output_dir = experiment_root / experiment_id
-        preparation_key = experiment_preparation_cache_key(analysis_experiment)
-        try:
-            if preparation_key not in prepared_cache:
-                prepared_cache[preparation_key] = prepare_experiment_data(
-                    analysis_experiment,
-                    bank,
-                    tabular_feature_sets,
-                    row_mask=row_mask,
-                    series_to_pooling_cell=series_to_pooling_cell,
-                )
-            result = run_one_experiment(
-                experiment=analysis_experiment,
-                prepared=prepared_cache[preparation_key],
-                fold_manifest_rows=subset_fold_rows,
-                output_dir=output_dir,
-                legacy_prediction_cache=None,
-            )
-            successful_results.append(result)
-        except Exception as error:
-            output_dir.mkdir(parents=True, exist_ok=True)
-            failure = {
-                "experiment_id": experiment_id,
-                "status": "FAILED",
-                "error_type": type(error).__name__,
-                "error_message": str(error),
-                "traceback": traceback.format_exc(),
-            }
-            failed_results.append(failure)
-            (output_dir / "failure.json").write_text(
-                json.dumps(failure, indent=2, sort_keys=True),
-                encoding="utf-8",
-            )
-            print(
-                f"[SERIES SUBSET] FAILED {experiment_id}: "
-                f"{type(error).__name__}: {error}",
-                flush=True,
-            )
-            traceback.print_exc(file=sys.stdout)
-
-    paired_rows = compare_experiments_to_baseline(successful_results)
-    primary_rows = compare_predeclared_ablation_pairs(successful_results)
-    summary_rows = write_master_outputs(
-        successful_results,
-        failed_results,
-        paired_rows,
-        primary_rows,
-        comparison_root,
-    )
-
-    summary = {
-        **selection_summary,
-        "status": (
-            "OK" if not failed_results else "COMPLETED_WITH_FAILURES"
-        ),
-        "selected_series_csv": str(selected_series_path),
-        "fold_manifest": str(selection_root / "patient_fold_manifest.csv"),
-        "comparison_directory": str(comparison_root),
-        "requested_experiment_ids": list(ANNOTATED_SERIES_EXPERIMENT_IDS),
-        "successful_experiment_ids": [
-            result["config"].experiment_id for result in successful_results
-        ],
-        "failed_experiments": failed_results,
-        "experiment_summary_rows": summary_rows,
-        "interpretation": (
-            "This sensitivity analysis uses manually annotated folder proxies "
-            "only. It does not create validated DICOM SeriesInstanceUIDs and "
-            "does not replace independent external validation."
-        ),
-    }
-    status_path.write_text(
-        json.dumps(summary, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
-    print(
-        "[SERIES SUBSET] Completed annotated series/view sensitivity analysis: "
-        f"patients={selection_summary['n_selected_patients']}, "
-        f"series={selection_summary['n_selected_series']}, "
-        f"successful={len(successful_results)}, failed={len(failed_results)}.",
-        flush=True,
-    )
-    return summary
 
 
 def _patient_indices(patient_ids):
@@ -8200,158 +5397,7 @@ def aggregate_patient_provenance_features(bank):
     return X, y, ordered_patients, tuple(output_names)
 
 
-def subset_patient_tabular_feature_set(feature_set, selected_feature_names):
-    """Return one named subset of an already aligned patient feature matrix.
 
-    This helper is used to decompose the broad provenance-only control into
-    single-family experiments. Every subset retains exactly the same patient
-    order and labels; only columns change. This avoids rerunning image decoding
-    and makes it possible to identify whether slice counts, folder counts,
-    native geometry, or file-size proxies are responsible for classification.
-    """
-
-    X, y, patient_ids, feature_names = feature_set
-    feature_names = tuple(feature_names)
-    selected_feature_names = tuple(selected_feature_names)
-    missing = [name for name in selected_feature_names if name not in feature_names]
-    if missing:
-        raise ValueError(
-            f"Requested tabular control features are missing: {missing}."
-        )
-    indices = np.asarray(
-        [feature_names.index(name) for name in selected_feature_names],
-        dtype=np.int64,
-    )
-    subset = np.asarray(X, dtype=np.float32)[:, indices]
-    if subset.ndim != 2 or subset.shape[1] != len(selected_feature_names):
-        raise RuntimeError("Patient tabular feature subsetting produced an invalid shape.")
-    return (
-        subset,
-        np.asarray(y, dtype=np.int64),
-        np.asarray(patient_ids),
-        selected_feature_names,
-    )
-
-
-def build_provenance_component_control_sets(provenance_set):
-    """Create predeclared single-family export/provenance controls.
-
-    The broad C3 matrix can obtain a high AUC without revealing which released
-    dataset property carries the label. These narrower controls separate:
-
-        - total number of exported slices;
-        - number of folder-defined series proxies;
-        - mean and maximum proxy length;
-        - native height/width/aspect-ratio summaries;
-        - file-size and bytes-per-pixel summaries.
-
-    None of these matrices contains EfficientNet embeddings, MONAI outputs, or
-    central image texture.
-    """
-
-    feature_names = tuple(provenance_set[3])
-    geometry_names = tuple(
-        name
-        for name in feature_names
-        if any(
-            token in name
-            for token in (
-                "native_height",
-                "native_width",
-                "aspect_ratio_width_over_height",
-            )
-        )
-    )
-    file_size_names = tuple(
-        name
-        for name in feature_names
-        if any(
-            token in name
-            for token in (
-                "file_size_bytes",
-                "bytes_per_native_pixel",
-            )
-        )
-    )
-
-    return {
-        "n_slices_only": subset_patient_tabular_feature_set(
-            provenance_set,
-            ("n_slices",),
-        ),
-        "n_series_only": subset_patient_tabular_feature_set(
-            provenance_set,
-            ("n_series_proxies",),
-        ),
-        "series_length_only": subset_patient_tabular_feature_set(
-            provenance_set,
-            ("mean_series_length", "max_series_length"),
-        ),
-        "native_geometry_only": subset_patient_tabular_feature_set(
-            provenance_set,
-            geometry_names,
-        ),
-        "file_size_only": subset_patient_tabular_feature_set(
-            provenance_set,
-            file_size_names,
-        ),
-    }
-
-
-def aggregate_patient_monai_qc_features(bank):
-    """Aggregate MONAI gate diagnostics to one label-free patient feature row."""
-
-    labels = np.asarray(bank["labels"], dtype=np.int64)
-    patient_ids = np.asarray(bank["patient_ids"])
-    valid = np.asarray(bank["monai_valid"], dtype=bool)
-    area = np.asarray(bank["area_ratios"], dtype=np.float32)
-    peak = np.asarray(bank["peak_probabilities"], dtype=np.float32)
-    foreground = np.asarray(
-        bank["mean_foreground_probabilities"],
-        dtype=np.float32,
-    )
-
-    mapping = _patient_indices(patient_ids)
-    ordered_patients = np.asarray(sorted(mapping))
-    patient_labels = []
-    rows = []
-    feature_names = (
-        "plausible_mask_rate",
-        "median_area_ratio",
-        "std_area_ratio",
-        "median_peak_probability",
-        "std_peak_probability",
-        "median_mean_foreground_probability",
-        "std_mean_foreground_probability",
-    )
-
-    for patient_id in ordered_patients:
-        indices = np.asarray(mapping[str(patient_id)], dtype=np.int64)
-        label_values = np.unique(labels[indices])
-        if len(label_values) != 1:
-            raise RuntimeError(
-                f"Patient {patient_id} has inconsistent MONAI-QC labels."
-            )
-        patient_labels.append(int(label_values[0]))
-        rows.append(
-            [
-                float(np.mean(valid[indices])),
-                float(np.nanmedian(area[indices])),
-                float(np.nanstd(area[indices])),
-                float(np.nanmedian(peak[indices])),
-                float(np.nanstd(peak[indices])),
-                float(np.nanmedian(foreground[indices])),
-                float(np.nanstd(foreground[indices])),
-            ]
-        )
-
-    X = np.asarray(rows, dtype=np.float32)
-    if not np.all(np.isfinite(X)):
-        raise RuntimeError(
-            "MONAI-QC patient features contain non-finite values."
-        )
-    y = np.asarray(patient_labels, dtype=np.int64)
-    return X, y, ordered_patients, feature_names
 
 
 def aggregate_patient_standardization_features(bank):
@@ -8498,82 +5544,7 @@ def bootstrap_difference_in_means(values, labels, n_bootstrap, random_state):
     )
 
 
-def write_monai_qc_outputs(output_dir, bank):
-    """Write patient-level gate statistics and class-specific comparison."""
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    X_qc, y_qc, patient_ids, feature_names = (
-        aggregate_patient_monai_qc_features(bank)
-    )
-
-    rows = []
-    for patient_id, label, values in zip(patient_ids, y_qc, X_qc):
-        row = {"patient_id": str(patient_id), "true_label": int(label)}
-        for feature_name, value in zip(feature_names, values):
-            row[feature_name] = float(value)
-        rows.append(row)
-
-    patient_csv = output_dir / "monai_qc_by_patient.csv"
-    with open(patient_csv, "w", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=list(rows[0]))
-        writer.writeheader()
-        writer.writerows(rows)
-
-    gate_rates = X_qc[:, feature_names.index("plausible_mask_rate")]
-    normal_mean = float(np.mean(gate_rates[y_qc == 0]))
-    sick_mean = float(np.mean(gate_rates[y_qc == 1]))
-    difference = sick_mean - normal_mean
-    ci_lower, ci_upper = bootstrap_difference_in_means(
-        gate_rates,
-        y_qc,
-        BOOTSTRAP_REPLICATES,
-        RANDOM_SEED + 701,
-    )
-
-    slice_labels = np.asarray(bank["labels"], dtype=np.int64)
-    slice_valid = np.asarray(bank["monai_valid"], dtype=bool)
-    slice_normal_rate = float(np.mean(slice_valid[slice_labels == 0]))
-    slice_sick_rate = float(np.mean(slice_valid[slice_labels == 1]))
-
-    comparison = {
-        "patient_level_normal_mean_gate_rate": normal_mean,
-        "patient_level_sick_mean_gate_rate": sick_mean,
-        "patient_level_sick_minus_normal_difference": difference,
-        "patient_level_difference_ci": [ci_lower, ci_upper],
-        "slice_level_normal_gate_rate_descriptive": slice_normal_rate,
-        "slice_level_sick_gate_rate_descriptive": slice_sick_rate,
-        "warning_threshold_absolute_difference": (
-            MONAI_GATE_RATE_DIFFERENCE_WARNING
-        ),
-        "warning_triggered": bool(
-            abs(difference) >= MONAI_GATE_RATE_DIFFERENCE_WARNING
-        ),
-        "interpretation": (
-            "A large class difference may reflect sequence/protocol/export "
-            "confounding; it is not segmentation-accuracy evidence."
-        ),
-    }
-    (output_dir / "monai_gate_class_comparison.json").write_text(
-        json.dumps(comparison, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
-
-    print(
-        "[MONAI QC] Patient-level mean plausible-mask rate: "
-        f"Normal={normal_mean:.3f}, Sick={sick_mean:.3f}, "
-        f"difference={difference:+.3f}, "
-        f"95% CI=[{ci_lower:+.3f}, {ci_upper:+.3f}]",
-        flush=True,
-    )
-    if comparison["warning_triggered"]:
-        print(
-            "[WARNING] The class-specific MONAI gate-rate difference exceeds "
-            f"{MONAI_GATE_RATE_DIFFERENCE_WARNING:.0%}. Protocol/export "
-            "confounding must be investigated.",
-            flush=True,
-        )
-
-    return comparison, (X_qc, y_qc, patient_ids, feature_names)
 
 
 def write_standardized_monai_qc_outputs(output_dir, bank):
@@ -8677,33 +5648,8 @@ def write_patient_tabular_features(output_path, X, y, patient_ids, feature_names
 
 # =============================
 # PIPELINE STEP 7
-# WEIGHTING, POOLING AND LEGACY FUSION
+# PATIENT-LEVEL HIERARCHICAL POOLING
 # =============================
-
-
-def build_slice_weights(roi_slice_scores, series_ids, weighting_mode):
-    """Create equal or series-local heuristic weights without rerunning images."""
-
-    series_ids = np.asarray(series_ids)
-    if weighting_mode == "equal":
-        return np.ones(len(series_ids), dtype=np.float64)
-    if weighting_mode != "quality":
-        raise ValueError(f"Unsupported slice weighting mode: {weighting_mode!r}.")
-
-    scores = np.asarray(roi_slice_scores, dtype=np.float64)
-    if len(scores) != len(series_ids):
-        raise ValueError("Quality scores and series IDs must align.")
-    if not np.all(np.isfinite(scores)):
-        raise ValueError("Quality weighting requires finite ROI slice scores.")
-
-    weights = np.zeros(len(scores), dtype=np.float64)
-    for series_id in np.unique(series_ids):
-        indices = np.flatnonzero(series_ids == series_id)
-        weights[indices] = _normalize_quality_weights(scores[indices])
-
-    if np.any(weights <= 0) or not np.all(np.isfinite(weights)):
-        raise RuntimeError("Quality weighting produced invalid slice weights.")
-    return weights
 
 
 def aggregate_patient_embeddings(
@@ -8711,204 +5657,53 @@ def aggregate_patient_embeddings(
     labels,
     patient_ids,
     series_ids,
-    slice_weights,
-    pooling_strategy,
+    slice_weights=None,
+    pooling_strategy="hierarchical",
     sample_order_keys=None,
     series_to_pooling_cell=None,
 ):
-    """Pool frozen slice embeddings to one vector per Directory_* patient.
+    """Pool slice embeddings to series means and then one mean per patient."""
 
-    Supported label-blind pooling strategies:
+    if pooling_strategy != "hierarchical":
+        raise ValueError("The final pipeline supports hierarchical pooling only.")
+    if series_to_pooling_cell is not None:
+        raise ValueError("Sequence/view-balanced pooling is not part of this pipeline.")
 
-    ``hierarchical``
-        weighted slice mean inside each folder-defined series proxy, followed by
-        an equal mean across the patient's series proxies.
-
-    ``hierarchical_mean_std``
-        concatenate the weighted mean and weighted standard deviation inside
-        every series proxy, then average those summaries equally across series.
-        This preserves within-series heterogeneity without adding a trainable
-        attention mechanism to a 30-patient cohort.
-
-    ``sequence_view_balanced``
-        weighted slice mean -> equal series mean inside each explicitly annotated
-        (sequence_type, view_type) cell -> equal mean across cells. This strategy
-        is available only in the optional blinded annotation analysis and never
-        infers sequence or view from SR_*/series* names.
-
-    ``flat``
-        one weighted mean over all slices from the patient.
-
-    ``fixed_chunk``
-        deterministic series-independent ordering -> fixed-size chunks -> equal
-        chunk mean. A very small final remainder is merged into the preceding
-        chunk, preventing one residual slice from receiving a full chunk's weight.
-
-    Every strategy remains label-free. Labels are used only to verify that one
-    Directory_* patient has a single consistent outcome.
-    """
-
-    features = np.asarray(features)
+    features = np.asarray(features, dtype=np.float32)
     labels = np.asarray(labels, dtype=np.int64)
     patient_ids = np.asarray(patient_ids).astype(str)
     series_ids = np.asarray(series_ids).astype(str)
+    if slice_weights is None:
+        slice_weights = np.ones(len(labels), dtype=np.float64)
     slice_weights = np.asarray(slice_weights, dtype=np.float64)
-
-    if sample_order_keys is None:
-        sample_order_keys = np.arange(len(labels), dtype=np.int64)
-    sample_order_keys = np.asarray(sample_order_keys)
-
-    if not (
-        len(features)
-        == len(labels)
-        == len(patient_ids)
-        == len(series_ids)
-        == len(slice_weights)
-        == len(sample_order_keys)
-    ):
-        raise ValueError("Embedding-pooling arrays must have equal lengths.")
-    if pooling_strategy not in {
-        "hierarchical",
-        "hierarchical_mean_std",
-        "sequence_view_balanced",
-        "flat",
-        "fixed_chunk",
-    }:
-        raise ValueError(
-            f"Unsupported patient embedding pooling: {pooling_strategy!r}."
-        )
-    if np.any(slice_weights < 0) or not np.all(np.isfinite(slice_weights)):
-        raise ValueError("Slice weights must be finite and non-negative.")
-    if pooling_strategy == "sequence_view_balanced" and not series_to_pooling_cell:
-        raise ValueError(
-            "sequence_view_balanced pooling requires explicit blinded "
-            "series-to-(sequence,view) annotations."
-        )
+    if not (len(features) == len(labels) == len(patient_ids) == len(series_ids) == len(slice_weights)):
+        raise ValueError("Pooling arrays must have equal lengths.")
 
     patient_to_label = {}
-    patient_to_indices = defaultdict(list)
-    patient_to_series_indices = defaultdict(lambda: defaultdict(list))
-
-    for index, (label, patient_id, series_id) in enumerate(
-        zip(labels, patient_ids, series_ids)
-    ):
-        label = int(label)
+    grouped = defaultdict(lambda: defaultdict(list))
+    for index, (label, patient_id, series_id) in enumerate(zip(labels, patient_ids, series_ids)):
         previous = patient_to_label.get(patient_id)
-        if previous is not None and previous != label:
-            raise RuntimeError(
-                f"Patient {patient_id} has inconsistent labels during pooling."
-            )
-        patient_to_label[patient_id] = label
-        patient_to_indices[patient_id].append(index)
-        patient_to_series_indices[patient_id][series_id].append(index)
+        if previous is not None and previous != int(label):
+            raise RuntimeError(f"Patient {patient_id} has inconsistent labels.")
+        patient_to_label[patient_id] = int(label)
+        grouped[patient_id][series_id].append(index)
 
-    def weighted_mean(indices):
-        indices = np.asarray(indices, dtype=np.int64)
-        weights = slice_weights[indices]
-        if not np.any(weights > 0):
-            raise RuntimeError("A pooling unit has no positive slice weight.")
-        return np.average(features[indices], axis=0, weights=weights)
-
-    def weighted_mean_and_std(indices):
-        indices = np.asarray(indices, dtype=np.int64)
-        weights = slice_weights[indices]
-        if not np.any(weights > 0):
-            raise RuntimeError("A pooling unit has no positive slice weight.")
-        mean = np.average(features[indices], axis=0, weights=weights)
-        variance = np.average(
-            np.square(features[indices] - mean),
-            axis=0,
-            weights=weights,
-        )
-        std = np.sqrt(np.maximum(variance, 0.0))
-        return np.concatenate([mean, std], axis=0)
-
-    ordered_patients = np.asarray(sorted(patient_to_label))
-    pooled_features = []
-    pooled_labels = []
-
+    pooled, pooled_labels, ordered_patients = [], [], sorted(grouped)
     for patient_id in ordered_patients:
-        if pooling_strategy == "flat":
-            patient_embedding = weighted_mean(patient_to_indices[patient_id])
-
-        elif pooling_strategy == "fixed_chunk":
-            indices = np.asarray(patient_to_indices[patient_id], dtype=np.int64)
-            ordering_keys = [
-                hashlib.sha256(
-                    (
-                        f"{RANDOM_SEED}|fixed_chunk|{patient_id}|"
-                        f"{sample_order_keys[index]}"
-                    ).encode("utf-8")
-                ).hexdigest()
-                for index in indices
-            ]
-            indices = indices[np.argsort(np.asarray(ordering_keys))]
-            chunks = [
-                indices[start:start + FIXED_CHUNK_SIZE]
-                for start in range(0, len(indices), FIXED_CHUNK_SIZE)
-            ]
-            minimum_remainder = max(
-                1,
-                int(
-                    np.ceil(
-                        FIXED_CHUNK_SIZE
-                        * FIXED_CHUNK_MIN_REMAINDER_FRACTION
-                    )
-                ),
-            )
-            if len(chunks) > 1 and len(chunks[-1]) < minimum_remainder:
-                chunks[-2] = np.concatenate([chunks[-2], chunks[-1]])
-                chunks.pop()
-            chunk_embeddings = [weighted_mean(chunk) for chunk in chunks]
-            patient_embedding = np.mean(
-                np.stack(chunk_embeddings, axis=0),
-                axis=0,
-            )
-
-        else:
-            series_embeddings = {}
-            for series_id in sorted(patient_to_series_indices[patient_id]):
-                indices = patient_to_series_indices[patient_id][series_id]
-                if pooling_strategy == "hierarchical_mean_std":
-                    series_embeddings[series_id] = weighted_mean_and_std(indices)
-                else:
-                    series_embeddings[series_id] = weighted_mean(indices)
-
-            if pooling_strategy == "sequence_view_balanced":
-                cell_to_series_embeddings = defaultdict(list)
-                for series_id, series_embedding in series_embeddings.items():
-                    cell = series_to_pooling_cell.get(series_id)
-                    if not cell:
-                        raise RuntimeError(
-                            "Missing sequence/view pooling cell for selected "
-                            f"series proxy {series_id!r}."
-                        )
-                    cell_to_series_embeddings[str(cell)].append(series_embedding)
-                cell_embeddings = [
-                    np.mean(np.stack(cell_to_series_embeddings[cell], axis=0), axis=0)
-                    for cell in sorted(cell_to_series_embeddings)
-                ]
-                patient_embedding = np.mean(
-                    np.stack(cell_embeddings, axis=0),
-                    axis=0,
-                )
-            else:
-                patient_embedding = np.mean(
-                    np.stack(
-                        [series_embeddings[key] for key in sorted(series_embeddings)],
-                        axis=0,
-                    ),
-                    axis=0,
-                )
-
-        pooled_features.append(np.asarray(patient_embedding, dtype=np.float32))
+        series_vectors = []
+        for series_id in sorted(grouped[patient_id]):
+            indices = np.asarray(grouped[patient_id][series_id], dtype=np.int64)
+            weights = slice_weights[indices]
+            if not np.any(weights > 0):
+                raise RuntimeError("A series proxy has no positive slice weight.")
+            series_vectors.append(np.average(features[indices], axis=0, weights=weights))
+        pooled.append(np.mean(np.stack(series_vectors, axis=0), axis=0).astype(np.float32))
         pooled_labels.append(patient_to_label[patient_id])
 
-    X_patient = np.stack(pooled_features, axis=0)
-    y_patient = np.asarray(pooled_labels, dtype=np.int64)
-    if not np.all(np.isfinite(X_patient)):
+    X = np.stack(pooled, axis=0)
+    if not np.all(np.isfinite(X)):
         raise RuntimeError("Pooled patient embeddings contain non-finite values.")
-    return X_patient, y_patient, ordered_patients
+    return X, np.asarray(pooled_labels, dtype=np.int64), np.asarray(ordered_patients)
 
 
 def compute_balanced_patient_weights(labels):
@@ -8925,408 +5720,10 @@ def compute_balanced_patient_weights(labels):
     )
 
 
-def compute_hierarchical_training_weights(
-    labels,
-    patient_ids,
-    series_ids,
-    quality_weights,
-):
-    """
-    Build legacy slice-classifier training weights aligned with the evaluation
-    hierarchy.
-
-    Desired nominal influence structure:
-
-        class -> patient -> series proxy -> slice
-
-    For slice i belonging to series proxy s of patient p and class c:
-
-        w_i = (1 / N_patients_in_class_c)
-              * (1 / N_series_for_patient_p)
-              * (q_i / sum(q_j for j in series_s))
-
-    where q_i is either 1 or the optional series-local heuristic weight. This
-    gives two useful invariances:
-
-        1. A patient with more exported JPEG files does not automatically
-           dominate fitting.
-        2. One unusually long folder proxy does not dominate the patient's
-           shorter proxies.
-
-    The class term gives Normal and Sick equal total nominal supervised mass.
-
-    IMPORTANT: WEIGHTS DO NOT REMOVE PSEUDO-REPLICATION
-    ----------------------------------------------------
-    Every slice still carries its patient's repeated Normal/Sick label, and
-    slices from one patient remain strongly correlated. The weights control
-    nominal influence but do not turn slices into independent observations. The
-    legacy branch must therefore be reported only as an ablation.
-
-    GLOBAL WEIGHT SCALE AND REGULARIZATION
-    --------------------------------------
-    Multiplying all sample weights by a constant changes the data-loss versus
-    regularization balance of Logistic Regression at fixed C. The final vector
-    is therefore rescaled so its total mass equals the number of unique training
-    patients, making effective regularization independent of JPEG count.
-    """
-
-    labels = np.asarray(labels, dtype=np.int64)
-    patient_ids = np.asarray(patient_ids)
-    series_ids = np.asarray(series_ids)
-    quality_weights = np.asarray(quality_weights, dtype=np.float64)
-
-    if not (
-        len(labels)
-        == len(patient_ids)
-        == len(series_ids)
-        == len(quality_weights)
-    ):
-        raise ValueError("Legacy training arrays must have equal lengths.")
-    if np.any(quality_weights < 0) or not np.all(np.isfinite(quality_weights)):
-        raise ValueError("Legacy quality weights are invalid.")
-
-    patient_to_label = {}
-    patient_to_series = defaultdict(set)
-    series_quality_sum = defaultdict(float)
-
-    for label, patient_id, series_id, quality_weight in zip(
-        labels,
-        patient_ids,
-        series_ids,
-        quality_weights,
-    ):
-        patient_id = str(patient_id)
-        series_id = str(series_id)
-        label = int(label)
-        previous = patient_to_label.get(patient_id)
-        if previous is not None and previous != label:
-            raise RuntimeError(
-                f"Patient {patient_id} has inconsistent legacy labels."
-            )
-        patient_to_label[patient_id] = label
-        patient_to_series[patient_id].add(series_id)
-        series_quality_sum[series_id] += float(quality_weight)
-
-    class_patient_counts = np.bincount(
-        np.asarray(list(patient_to_label.values()), dtype=np.int64),
-        minlength=2,
-    )
-    if int(class_patient_counts.min()) <= 0:
-        raise RuntimeError("Legacy training fold must contain both classes.")
-
-    weights = np.empty(len(labels), dtype=np.float64)
-    for index, (label, patient_id, series_id, quality_weight) in enumerate(
-        zip(labels, patient_ids, series_ids, quality_weights)
-    ):
-        patient_id = str(patient_id)
-        series_id = str(series_id)
-        label = int(label)
-        weights[index] = (
-            float(quality_weight)
-            / max(series_quality_sum[series_id], 1e-12)
-            / len(patient_to_series[patient_id])
-            / class_patient_counts[label]
-        )
-
-    n_patients = len(patient_to_label)
-    weights *= n_patients / max(float(weights.sum()), 1e-12)
-    return weights
-
-
-def weighted_log_odds_fusion(probabilities, weights=None):
-    """
-    Fuse finite probability-like model outputs in log-odds space.
-
-    Mathematical form:
-
-        logit(p_fused) = sum_i w_i * logit(p_i) / sum_i w_i
-
-    Averaging logits avoids directly multiplying many probabilities, which
-    would make the number of slices or series proxies force the output toward 0
-    or 1. Inputs are clipped before the logarithm for numerical stability.
-
-    LIMITATION
-    ----------
-    Logistic Regression slice outputs are not guaranteed to be calibrated on a
-    new clinical population. The fused result is therefore an aggregation score
-    on a 0-to-1 scale, not a validated posterior probability of CAD. Mean-
-    probability fusion is retained as a controlled legacy ablation.
-    """
-
-    probabilities = np.asarray(probabilities, dtype=np.float64)
-    if probabilities.size == 0:
-        raise ValueError("Cannot fuse an empty probability collection.")
-    if weights is None:
-        weights = np.ones_like(probabilities, dtype=np.float64)
-    else:
-        weights = np.asarray(weights, dtype=np.float64)
-
-    if probabilities.shape != weights.shape:
-        raise ValueError("Probabilities and fusion weights must share a shape.")
-    if not np.all(np.isfinite(probabilities)):
-        raise ValueError("Fusion probabilities must be finite.")
-    if np.any(weights < 0) or not np.any(weights > 0):
-        raise ValueError("Fusion weights must be non-negative and not all zero.")
-
-    probabilities = np.clip(probabilities, 1e-6, 1.0 - 1e-6)
-    logits = np.log(probabilities / (1.0 - probabilities))
-    fused_logit = float(np.average(logits, weights=weights))
-    return float(1.0 / (1.0 + np.exp(-fused_logit)))
-
-
-def fuse_probabilities(probabilities, weights, method):
-    """Apply the declared mean-probability or log-odds fusion rule."""
-
-    probabilities = np.asarray(probabilities, dtype=np.float64)
-    weights = np.asarray(weights, dtype=np.float64)
-    if method == "log_odds":
-        return weighted_log_odds_fusion(probabilities, weights)
-    if method == "mean_probability":
-        if probabilities.size == 0:
-            raise ValueError("Cannot fuse an empty probability collection.")
-        if probabilities.shape != weights.shape:
-            raise ValueError("Mean-fusion arrays must share a shape.")
-        if np.any(weights < 0) or not np.any(weights > 0):
-            raise ValueError("Mean-fusion weights are invalid.")
-        return float(np.average(probabilities, weights=weights))
-    raise ValueError(f"Unknown probability fusion method: {method!r}.")
-
-
-def aggregate_legacy_slice_probabilities(
-    slice_probabilities,
-    labels,
-    patient_ids,
-    series_ids,
-    quality_weights,
-    fusion_method,
-):
-    """Fuse validation slice scores to series proxies and then patients."""
-
-    if not (
-        len(slice_probabilities)
-        == len(labels)
-        == len(patient_ids)
-        == len(series_ids)
-        == len(quality_weights)
-    ):
-        raise ValueError("Legacy aggregation arrays must have equal lengths.")
-
-    nested = defaultdict(lambda: defaultdict(lambda: {"p": [], "w": []}))
-    patient_to_label = {}
-    for probability, label, patient_id, series_id, weight in zip(
-        slice_probabilities,
-        labels,
-        patient_ids,
-        series_ids,
-        quality_weights,
-    ):
-        patient_id = str(patient_id)
-        series_id = str(series_id)
-        label = int(label)
-        previous = patient_to_label.get(patient_id)
-        if previous is not None and previous != label:
-            raise RuntimeError(
-                f"Patient {patient_id} has inconsistent aggregation labels."
-            )
-        patient_to_label[patient_id] = label
-        nested[patient_id][series_id]["p"].append(float(probability))
-        nested[patient_id][series_id]["w"].append(float(weight))
-
-    ordered_patients = np.asarray(sorted(nested))
-    patient_scores = []
-    patient_labels = []
-    for patient_id in ordered_patients:
-        series_scores = []
-        for series_id in sorted(nested[patient_id]):
-            series_data = nested[patient_id][series_id]
-            series_scores.append(
-                fuse_probabilities(
-                    series_data["p"],
-                    series_data["w"],
-                    fusion_method,
-                )
-            )
-        patient_scores.append(
-            fuse_probabilities(
-                series_scores,
-                np.ones(len(series_scores), dtype=np.float64),
-                fusion_method,
-            )
-        )
-        patient_labels.append(patient_to_label[patient_id])
-
-    return (
-        np.asarray(patient_scores, dtype=np.float64),
-        np.asarray(patient_labels, dtype=np.int64),
-        ordered_patients,
-    )
-
 # =============================
 # PIPELINE STEP 8
 # NESTED PATIENT-LEVEL CROSS-VALIDATION
 # =============================
-
-
-def deterministic_exact_within_patient_deduplication_mask(
-    patient_ids,
-    series_ids,
-    decoded_pixel_hashes,
-    sample_indices,
-):
-    """Keep one deterministic row per exact decoded image within a patient.
-
-    Exact duplicates inside one Directory_* cannot leak across outer folds, but
-    repeated exports can still receive repeated influence during series and
-    patient pooling. This helper collapses every
-
-        (patient_id, decoded_pixel_sha256)
-
-    group to one canonical row selected without labels or model scores. The
-    canonical occurrence is the lexicographically smallest series proxy and,
-    within that proxy, the smallest immutable sample index. If the same decoded
-    image appears in several proxy folders, this rule assigns the retained
-    representative to one deterministic proxy rather than counting it several
-    times. Patient identity remains exactly Directory_*.
-    """
-
-    # Convert all grouping fields to one-dimensional NumPy arrays first.
-    # The explicit dimensionality check is important: indexing a 2-D array can
-    # return another ndarray, and ndarrays are not hashable set elements.
-    patient_ids = np.asarray(patient_ids, dtype=str)
-    series_ids = np.asarray(series_ids, dtype=str)
-    decoded_pixel_hashes = np.asarray(decoded_pixel_hashes, dtype=str)
-    sample_indices = np.asarray(sample_indices, dtype=np.int64)
-
-    for array_name, array in (
-        ("patient_ids", patient_ids),
-        ("series_ids", series_ids),
-        ("decoded_pixel_hashes", decoded_pixel_hashes),
-        ("sample_indices", sample_indices),
-    ):
-        if array.ndim != 1:
-            raise ValueError(
-                f"{array_name} must be one-dimensional for exact "
-                f"within-patient deduplication; received shape {array.shape}."
-            )
-
-    if not (
-        len(patient_ids)
-        == len(series_ids)
-        == len(decoded_pixel_hashes)
-        == len(sample_indices)
-    ):
-        raise ValueError(
-            "Exact-deduplication arrays must have identical lengths."
-        )
-
-    keep = np.zeros(len(patient_ids), dtype=bool)
-    order = np.lexsort(
-        (
-            sample_indices,
-            series_ids,
-            decoded_pixel_hashes,
-            patient_ids,
-        )
-    )
-
-    # NumPy's static type stubs allow scalar indexing to be inferred as either
-    # a scalar or an ndarray. Convert each value explicitly to a native Python
-    # string before constructing the set key. The key is therefore guaranteed
-    # to be hashable both for the type checker and at runtime.
-    seen: set[tuple[str, str]] = set()
-    for raw_index in order:
-        index = int(raw_index)
-        key: tuple[str, str] = (
-            str(patient_ids[index]),
-            str(decoded_pixel_hashes[index]),
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        keep[index] = True
-
-    original_patients = {str(value) for value in patient_ids.tolist()}
-    retained_patients = {str(value) for value in patient_ids[keep].tolist()}
-    if retained_patients != original_patients:
-        missing = sorted(original_patients - retained_patients)
-        raise RuntimeError(
-            "Exact within-patient deduplication removed all rows for "
-            f"patients: {missing}."
-        )
-    return keep
-
-
-def deterministic_series_preserving_slice_dropout_mask(
-    patient_ids,
-    series_ids,
-    dropout_rate,
-):
-    """Return a reproducible label-blind slice-retention mask.
-
-    The attached master script included a useful random slice-dropout robustness
-    experiment, but one unrestricted patient-level draw can remove an entire
-    short series proxy and then conflate missing slices with missing series. This
-    implementation samples independently inside each patient-scoped series proxy
-    and always retains at least one slice. The seed is derived from the global
-    seed, dropout rate, and series ID through SHA-256, so results are independent
-    of Python hash randomization, array traversal order, and batch size.
-
-    The function never reads labels, image pixels, model scores, or fold IDs.
-    It therefore cannot select slices according to outcome or validation
-    performance. The resulting robustness analyses remain exploratory because
-    each rate uses one predeclared deterministic realization.
-    """
-
-    patient_ids = np.asarray(patient_ids).astype(str)
-    series_ids = np.asarray(series_ids).astype(str)
-    if len(patient_ids) != len(series_ids):
-        raise ValueError("patient_ids and series_ids must have equal lengths.")
-    if not 0.0 <= float(dropout_rate) < 1.0:
-        raise ValueError("dropout_rate must lie in [0,1).")
-
-    keep = np.ones(len(series_ids), dtype=bool)
-    if float(dropout_rate) == 0.0:
-        return keep
-
-    for series_id in np.unique(series_ids):
-        indices = np.flatnonzero(series_ids == series_id)
-        series_patients = np.unique(patient_ids[indices])
-        if len(series_patients) != 1:
-            raise RuntimeError(
-                f"Series proxy {series_id} is assigned to multiple patients."
-            )
-
-        # floor(rate*N) matches the attached experiment's intended fraction,
-        # while min(..., N-1) preserves at least one representative slice.
-        n_drop = min(
-            int(np.floor(len(indices) * float(dropout_rate))),
-            max(0, len(indices) - 1),
-        )
-        if n_drop == 0:
-            continue
-
-        seed_material = (
-            f"{RANDOM_SEED}|{float(dropout_rate):.8f}|{series_id}"
-        ).encode("utf-8")
-        local_seed = int(
-            hashlib.sha256(seed_material).hexdigest()[:16],
-            16,
-        ) % (2 ** 32)
-        rng = np.random.default_rng(local_seed)
-        dropped = rng.choice(indices, size=n_drop, replace=False)
-        keep[dropped] = False
-
-    # The per-series retention rule should guarantee patient coverage. Keep the
-    # explicit check because losing a patient would make OOF sets incomparable.
-    retained_patients = set(patient_ids[keep].tolist())
-    original_patients = set(patient_ids.tolist())
-    if retained_patients != original_patients:
-        missing = sorted(original_patients - retained_patients)
-        raise RuntimeError(
-            f"Slice dropout removed all observations for patients: {missing}."
-        )
-
-    return keep
 
 
 def experiment_preparation_cache_key(experiment):
@@ -9346,298 +5743,83 @@ def experiment_preparation_cache_key(experiment):
 def prepare_experiment_data(
     experiment,
     bank,
-    tabular_feature_sets,
     row_mask=None,
     series_to_pooling_cell=None,
 ):
-    """Build one fixed, label-blind representation for an experiment.
+    """Prepare one leakage-free patient embedding table for an experiment."""
 
-    ``row_mask`` is supplied only by the optional manually annotated
-    series/view stage. ``slice_filter='standardized_monai_valid'`` can then be
-    applied identically to a cardiac candidate and its outside-region control.
-    All aligned arrays are filtered together before deduplication, robustness
-    dropout, weighting, or pooling.
-    """
+    if row_mask is not None or series_to_pooling_cell is not None:
+        raise ValueError("Annotated sequence/view subsets are not part of the final pipeline.")
+    if experiment.strategy != "patient_embedding":
+        raise ValueError("The final pipeline supports patient embeddings only.")
+    if experiment.pooling_strategy != "hierarchical":
+        raise ValueError("The final pipeline supports hierarchical pooling only.")
+    if experiment.weighting_mode != "equal":
+        raise ValueError("The final pipeline uses equal slice weights only.")
+    if experiment.classifier_type != "logistic_regression":
+        raise ValueError("The final pipeline uses Logistic Regression only.")
 
+    features = np.asarray(bank["features"][experiment.feature_mode], dtype=np.float32)
     labels = np.asarray(bank["labels"], dtype=np.int64)
     patient_ids = np.asarray(bank["patient_ids"]).astype(str)
     series_ids = np.asarray(bank["series_ids"]).astype(str)
-    decoded_pixel_hashes = np.asarray(bank["decoded_pixel_hashes"])
-    sample_indices = np.asarray(bank["sample_indices"], dtype=np.int64)
+    n_source = int(len(labels))
 
-    if experiment.strategy == "patient_tabular":
-        if row_mask is not None:
-            raise ValueError(
-                "A slice/series row mask cannot be applied to patient-tabular "
-                "controls. Annotated-series analysis is restricted to "
-                "image-based patient-embedding experiments."
-            )
-        if experiment.slice_filter != "all":
-            raise ValueError(
-                "Patient-tabular controls cannot use an image-row slice filter."
-            )
-        X, y, patients, feature_names = tabular_feature_sets[
-            experiment.feature_mode
-        ]
-        return {
-            "unit": "patient",
-            "X": np.asarray(X, dtype=np.float32),
-            "y": np.asarray(y, dtype=np.int64),
-            "patient_ids": np.asarray(patients),
-            "feature_names": tuple(feature_names),
-            "slice_dropout_rate": 0.0,
-            "slice_filter": "all",
-            "n_source_slices": None,
-            "n_retained_slices": None,
-        }
-
-    features = bank["features"][experiment.feature_mode]
-    if experiment.feature_mode.startswith("standardized_"):
-        roi_slice_scores = np.asarray(
-            bank["standardized_roi_slice_scores"],
-            dtype=np.float64,
-        )
-    else:
-        roi_slice_scores = np.asarray(
-            bank["roi_slice_scores"],
-            dtype=np.float64,
-        )
-
-    n_bank_rows = len(labels)
-    eligible_before_slice_filter = np.ones(n_bank_rows, dtype=bool)
-    series_subset_applied = row_mask is not None
-    if row_mask is not None:
-        row_mask = np.asarray(row_mask, dtype=bool)
-        if row_mask.ndim != 1:
-            raise ValueError(
-                "Annotated-series row_mask must be one-dimensional; received "
-                f"shape {row_mask.shape}."
-            )
-        if len(row_mask) != n_bank_rows:
-            raise ValueError(
-                "Annotated-series row_mask length must equal the feature-bank "
-                f"row count ({n_bank_rows}), got {len(row_mask)}."
-            )
-        if not np.any(row_mask):
-            raise ValueError("Annotated-series filtering retained no image rows.")
-        eligible_before_slice_filter &= row_mask
-
-    expected_patients = set(
-        patient_ids[eligible_before_slice_filter].astype(str).tolist()
-    )
-    n_source_slices = int(np.sum(eligible_before_slice_filter))
-
-    combined_mask = eligible_before_slice_filter.copy()
+    mask = np.ones(n_source, dtype=bool)
     if experiment.slice_filter == "standardized_monai_valid":
-        monai_valid = np.asarray(bank["standardized_monai_valid"], dtype=bool)
-        if monai_valid.shape != combined_mask.shape:
-            raise RuntimeError(
-                "standardized_monai_valid does not align with feature-bank rows."
-            )
-        combined_mask &= monai_valid
+        mask &= np.asarray(bank["standardized_monai_valid"], dtype=bool)
     elif experiment.slice_filter != "all":
-        raise ValueError(
-            f"Unsupported experiment slice filter: {experiment.slice_filter!r}."
-        )
+        raise ValueError(f"Unsupported slice filter: {experiment.slice_filter!r}.")
 
-    if not np.any(combined_mask):
-        raise ValueError(
-            f"{experiment.experiment_id}: row and slice filters retained no images."
-        )
-    retained_filter_patients = set(patient_ids[combined_mask].tolist())
-    if retained_filter_patients != expected_patients:
-        missing = sorted(expected_patients - retained_filter_patients)
+    expected_patients = set(patient_ids.tolist())
+    retained_patients = set(patient_ids[mask].tolist())
+    if retained_patients != expected_patients:
         raise RuntimeError(
-            f"{experiment.experiment_id}: slice filtering removed every row "
-            f"for patients {missing}. Matched patient-level comparison would be invalid."
+            f"{experiment.experiment_id}: filtering removed all rows for "
+            f"{sorted(expected_patients - retained_patients)}."
         )
 
-    if not np.all(combined_mask):
-        features = features[combined_mask]
-        labels = labels[combined_mask]
-        patient_ids = patient_ids[combined_mask]
-        series_ids = series_ids[combined_mask]
-        roi_slice_scores = roi_slice_scores[combined_mask]
-        decoded_pixel_hashes = decoded_pixel_hashes[combined_mask]
-        sample_indices = sample_indices[combined_mask]
-
-    n_after_slice_filter = int(len(labels))
-    if experiment.slice_filter != "all":
-        print(
-            f"[SLICE FILTER] {experiment.experiment_id}: retained "
-            f"{n_after_slice_filter}/{n_source_slices} rows using "
-            f"{experiment.slice_filter!r}.",
-            flush=True,
-        )
-
-    # Exact within-patient deduplication is performed after common row filtering
-    # so paired candidate/control experiments retain identical source rows.
-    n_exact_duplicate_rows_removed = 0
-    if experiment.deduplicate_exact_within_patient:
-        exact_keep_mask = deterministic_exact_within_patient_deduplication_mask(
-            patient_ids,
-            series_ids,
-            decoded_pixel_hashes,
-            sample_indices,
-        )
-        n_exact_duplicate_rows_removed = int(
-            len(exact_keep_mask) - int(exact_keep_mask.sum())
-        )
-        features = features[exact_keep_mask]
-        labels = labels[exact_keep_mask]
-        patient_ids = patient_ids[exact_keep_mask]
-        series_ids = series_ids[exact_keep_mask]
-        roi_slice_scores = roi_slice_scores[exact_keep_mask]
-        decoded_pixel_hashes = decoded_pixel_hashes[exact_keep_mask]
-        sample_indices = sample_indices[exact_keep_mask]
-        print(
-            f"[EXACT DEDUP] {experiment.experiment_id}: retained "
-            f"{int(exact_keep_mask.sum())}/{len(exact_keep_mask)} slices; "
-            f"removed={n_exact_duplicate_rows_removed} repeated exact exports.",
-            flush=True,
-        )
-
-    retention_mask = deterministic_series_preserving_slice_dropout_mask(
+    features = features[mask]
+    labels = labels[mask]
+    patient_ids = patient_ids[mask]
+    series_ids = series_ids[mask]
+    X, y, patients = aggregate_patient_embeddings(
+        features,
+        labels,
         patient_ids,
         series_ids,
-        experiment.slice_dropout_rate,
+        slice_weights=np.ones(len(labels), dtype=np.float64),
     )
-    if experiment.slice_dropout_rate > 0.0:
-        features = features[retention_mask]
-        labels = labels[retention_mask]
-        patient_ids = patient_ids[retention_mask]
-        series_ids = series_ids[retention_mask]
-        roi_slice_scores = roi_slice_scores[retention_mask]
-        decoded_pixel_hashes = decoded_pixel_hashes[retention_mask]
-        sample_indices = sample_indices[retention_mask]
-        print(
-            f"[ROBUSTNESS] {experiment.experiment_id}: retained "
-            f"{int(retention_mask.sum())}/{len(retention_mask)} slices "
-            f"after {experiment.slice_dropout_rate:.0%} within-series dropout.",
-            flush=True,
-        )
-
-    slice_weights = build_slice_weights(
-        roi_slice_scores,
-        series_ids,
-        experiment.weighting_mode,
-    )
-
-    if experiment.pooling_strategy == "sequence_view_balanced":
-        if not series_to_pooling_cell:
-            raise ValueError(
-                "sequence_view_balanced pooling requires completed explicit "
-                "sequence/view annotations."
-            )
-        series_to_pooling_cell = {
-            str(key): str(value)
-            for key, value in series_to_pooling_cell.items()
-        }
-
-    if experiment.strategy == "patient_embedding":
-        X, y, patients = aggregate_patient_embeddings(
-            features=features,
-            labels=labels,
-            patient_ids=patient_ids,
-            series_ids=series_ids,
-            slice_weights=slice_weights,
-            pooling_strategy=experiment.pooling_strategy,
-            sample_order_keys=sample_indices,
-            series_to_pooling_cell=series_to_pooling_cell,
-        )
-        return {
-            "unit": "patient",
-            "X": X,
-            "y": y,
-            "patient_ids": patients,
-            "feature_names": tuple(
-                f"embedding_{index:04d}" for index in range(X.shape[1])
-            ),
-            "slice_dropout_rate": float(experiment.slice_dropout_rate),
-            "slice_filter": str(experiment.slice_filter),
-            "deduplicate_exact_within_patient": bool(
-                experiment.deduplicate_exact_within_patient
-            ),
-            "n_exact_duplicate_rows_removed": int(
-                n_exact_duplicate_rows_removed
-            ),
-            "n_source_slices": n_source_slices,
-            "n_after_slice_filter": n_after_slice_filter,
-            "n_retained_slices": int(len(labels)),
-            "annotated_series_subset_applied": bool(series_subset_applied),
-            "sequence_view_balanced_pooling": bool(
-                experiment.pooling_strategy == "sequence_view_balanced"
-            ),
-        }
-
-    if experiment.strategy == "slice_probability_fusion":
-        return {
-            "unit": "slice",
-            "X": features,
-            "y": labels,
-            "patient_ids": patient_ids,
-            "series_ids": series_ids,
-            "slice_weights": slice_weights,
-            "legacy_cache_signature": (
-                experiment.feature_mode,
-                experiment.weighting_mode,
-                experiment.slice_filter,
-                int(features.shape[0]),
-                int(features.shape[1]),
-            ),
-            "slice_dropout_rate": float(experiment.slice_dropout_rate),
-            "slice_filter": str(experiment.slice_filter),
-            "deduplicate_exact_within_patient": bool(
-                experiment.deduplicate_exact_within_patient
-            ),
-            "n_exact_duplicate_rows_removed": int(
-                n_exact_duplicate_rows_removed
-            ),
-            "n_source_slices": n_source_slices,
-            "n_after_slice_filter": n_after_slice_filter,
-            "n_retained_slices": int(len(labels)),
-            "annotated_series_subset_applied": bool(series_subset_applied),
-        }
-
-    raise ValueError(
-        f"Unsupported experiment strategy: {experiment.strategy!r}."
-    )
+    return {
+        "unit": "patient",
+        "X": X,
+        "y": y,
+        "patient_ids": patients,
+        "feature_names": tuple(f"embedding_{i:04d}" for i in range(X.shape[1])),
+        "slice_dropout_rate": 0.0,
+        "slice_filter": str(experiment.slice_filter),
+        "deduplicate_exact_within_patient": False,
+        "n_exact_duplicate_rows_removed": 0,
+        "n_source_slices": n_source,
+        "n_after_slice_filter": int(mask.sum()),
+        "n_retained_slices": int(mask.sum()),
+        "annotated_series_subset_applied": False,
+        "sequence_view_balanced_pooling": False,
+    }
 
 
 def build_patient_classifier(experiment, c_value):
-    """Create a fresh scaler/PCA/linear classifier for patient rows."""
+    """Create the fixed scaler/PCA/Logistic-Regression patient model."""
 
+    if experiment.classifier_type != "logistic_regression":
+        raise ValueError("Only Logistic Regression is supported.")
     steps = [("scaler", StandardScaler())]
     if experiment.use_pca:
-        steps.append(
-            (
-                "pca",
-                PCA(
-                    n_components=PATIENT_PCA_EXPLAINED_VARIANCE,
-                    svd_solver="full",
-                ),
-            )
-        )
-
-    if experiment.classifier_type == "logistic_regression":
-        classifier = LogisticRegression(
-            C=float(c_value),
-            max_iter=LOGISTIC_MAX_ITER,
-            solver="liblinear",
-            random_state=RANDOM_SEED,
-        )
-    elif experiment.classifier_type == "linear_svm":
-        classifier = LinearSVC(
-            C=float(c_value),
-            max_iter=SVM_MAX_ITER,
-            random_state=RANDOM_SEED,
-        )
-    else:
-        raise ValueError(
-            f"Unknown classifier type: {experiment.classifier_type!r}."
-        )
-
-    steps.append(("classifier", classifier))
+        steps.append(("pca", PCA(n_components=PATIENT_PCA_EXPLAINED_VARIANCE, svd_solver="full")))
+    steps.append(("classifier", LogisticRegression(
+        C=float(c_value), max_iter=LOGISTIC_MAX_ITER, solver="liblinear",
+        random_state=RANDOM_SEED,
+    )))
     return Pipeline(steps=steps)
 
 
@@ -9656,30 +5838,9 @@ def fit_patient_classifier(model, X_train, y_train):
 
 
 def patient_model_raw_scores(model, experiment, X_valid):
-    """Return probabilities for LR and margins for Linear SVM."""
+    """Return held-out Logistic-Regression probabilities."""
 
-    if experiment.classifier_type == "logistic_regression":
-        return np.asarray(model.predict_proba(X_valid)[:, 1], dtype=np.float64)
-    return np.asarray(model.decision_function(X_valid), dtype=np.float64)
-
-
-def build_legacy_slice_classifier(c_value):
-    """Create the reviewed legacy slice-level Logistic Regression pipeline."""
-
-    return Pipeline(
-        steps=[
-            ("scaler", StandardScaler()),
-            (
-                "classifier",
-                LogisticRegression(
-                    C=float(c_value),
-                    max_iter=LOGISTIC_MAX_ITER,
-                    solver="liblinear",
-                    random_state=RANDOM_SEED,
-                ),
-            ),
-        ]
-    )
+    return np.asarray(model.predict_proba(X_valid)[:, 1], dtype=np.float64)
 
 
 def fit_predict_raw_for_patient_sets(
@@ -9688,122 +5849,23 @@ def fit_predict_raw_for_patient_sets(
     train_patients,
     valid_patients,
     c_value,
-    legacy_prediction_cache=None,
 ):
-    """Fit one fold-local model and return held-out patient scores.
-
-    For the legacy slice-classifier branch, A3 and A4 have the same training
-    data, weights, classifier and C; only the final fusion rule differs. A
-    process-local cache can therefore reuse the held-out slice probabilities
-    produced by the first variant. This reduces runtime without sharing fitted
-    information across folds and without changing any patient-level result.
-    """
+    """Fit one fold-local patient model and score held-out patients."""
 
     train_patients = set(map(str, train_patients))
     valid_patients = set(map(str, valid_patients))
     overlap = train_patients.intersection(valid_patients)
     if overlap:
         raise RuntimeError(f"Train/validation patient overlap: {sorted(overlap)}")
-
-    if prepared["unit"] == "patient":
-        patient_ids = np.asarray(prepared["patient_ids"])
-        train_mask = np.isin(patient_ids, list(train_patients))
-        valid_mask = np.isin(patient_ids, list(valid_patients))
-
-        if not np.any(train_mask) or not np.any(valid_mask):
-            raise RuntimeError("A patient-level fold side is empty.")
-
-        model = build_patient_classifier(experiment, c_value)
-        fit_patient_classifier(
-            model,
-            prepared["X"][train_mask],
-            prepared["y"][train_mask],
-        )
-        scores = patient_model_raw_scores(
-            model,
-            experiment,
-            prepared["X"][valid_mask],
-        )
-        return (
-            scores,
-            np.asarray(prepared["y"][valid_mask], dtype=np.int64),
-            np.asarray(patient_ids[valid_mask]),
-        )
-
-    slice_patient_ids = np.asarray(prepared["patient_ids"])
-    train_mask = np.isin(slice_patient_ids, list(train_patients))
-    valid_mask = np.isin(slice_patient_ids, list(valid_patients))
+    patient_ids = np.asarray(prepared["patient_ids"]).astype(str)
+    train_mask = np.isin(patient_ids, list(train_patients))
+    valid_mask = np.isin(patient_ids, list(valid_patients))
     if not np.any(train_mask) or not np.any(valid_mask):
-        raise RuntimeError("A legacy slice-level fold side is empty.")
-
-    # The cache key deliberately excludes ``fusion_method`` because fusion is
-    # applied only after the identical held-out slice probabilities are known.
-    # Sorted patient IDs make the key independent of set iteration order.
-    legacy_cache_key = (
-        prepared.get("legacy_cache_signature"),
-        float(c_value),
-        tuple(sorted(train_patients)),
-        tuple(sorted(valid_patients)),
-    )
-
-    cached = (
-        legacy_prediction_cache.get(legacy_cache_key)
-        if legacy_prediction_cache is not None
-        else None
-    )
-
-    if cached is None:
-        training_weights = compute_hierarchical_training_weights(
-            prepared["y"][train_mask],
-            prepared["patient_ids"][train_mask],
-            prepared["series_ids"][train_mask],
-            prepared["slice_weights"][train_mask],
-        )
-        model = build_legacy_slice_classifier(c_value)
-        model.fit(
-            prepared["X"][train_mask],
-            prepared["y"][train_mask],
-            scaler__sample_weight=training_weights,
-            classifier__sample_weight=training_weights,
-        )
-
-        cached = {
-            "slice_probabilities": np.asarray(
-                model.predict_proba(prepared["X"][valid_mask])[:, 1],
-                dtype=np.float64,
-            ),
-            "labels": np.asarray(
-                prepared["y"][valid_mask],
-                dtype=np.int64,
-            ),
-            "patient_ids": np.asarray(
-                prepared["patient_ids"][valid_mask]
-            ),
-            "series_ids": np.asarray(
-                prepared["series_ids"][valid_mask]
-            ),
-            "quality_weights": np.asarray(
-                prepared["slice_weights"][valid_mask],
-                dtype=np.float64,
-            ),
-        }
-        if legacy_prediction_cache is not None:
-            legacy_prediction_cache[legacy_cache_key] = cached
-    else:
-        print(
-            "[LEGACY CACHE] Reusing fold-local slice probabilities; only "
-            f"{experiment.fusion_method} fusion is recomputed.",
-            flush=True,
-        )
-
-    return aggregate_legacy_slice_probabilities(
-        slice_probabilities=cached["slice_probabilities"],
-        labels=cached["labels"],
-        patient_ids=cached["patient_ids"],
-        series_ids=cached["series_ids"],
-        quality_weights=cached["quality_weights"],
-        fusion_method=experiment.fusion_method,
-    )
+        raise RuntimeError("A patient-level fold side is empty.")
+    model = build_patient_classifier(experiment, c_value)
+    fit_patient_classifier(model, prepared["X"][train_mask], prepared["y"][train_mask])
+    scores = patient_model_raw_scores(model, experiment, prepared["X"][valid_mask])
+    return scores, np.asarray(prepared["y"][valid_mask], dtype=np.int64), patient_ids[valid_mask]
 
 
 def create_inner_fold_assignment(
@@ -9853,7 +5915,6 @@ def collect_inner_oof_raw_scores(
     patient_to_group,
     outer_fold_index,
     c_value,
-    legacy_prediction_cache=None,
 ):
     """Generate training-only patient OOF scores for C/threshold selection."""
 
@@ -9876,7 +5937,6 @@ def collect_inner_oof_raw_scores(
             train_patients=inner_train_patients,
             valid_patients=inner_valid_patients,
             c_value=c_value,
-            legacy_prediction_cache=legacy_prediction_cache,
         )
         for patient_id, label, score in zip(patients, labels, scores):
             patient_id = str(patient_id)
@@ -9901,33 +5961,6 @@ def collect_inner_oof_raw_scores(
         dtype=np.float64,
     )
     return ordered_patients, labels, scores, actual_inner_splits
-
-
-def fit_sigmoid_calibrator(raw_scores, labels):
-    """Fit a one-dimensional sigmoid only on inner OOF training scores."""
-
-    raw_scores = np.asarray(raw_scores, dtype=np.float64).reshape(-1, 1)
-    labels = np.asarray(labels, dtype=np.int64)
-    calibrator = LogisticRegression(
-        C=SVM_CALIBRATION_C,
-        solver="lbfgs",
-        max_iter=LOGISTIC_MAX_ITER,
-        random_state=RANDOM_SEED,
-    )
-    # Do not class-balance probability calibration. Balancing would force an
-    # artificial 50/50 prior and distort probability-dependent metrics. Each
-    # inner OOF row already represents exactly one training patient.
-    calibrator.fit(raw_scores, labels)
-    return calibrator
-
-
-def apply_sigmoid_calibrator(calibrator, raw_scores):
-    return np.asarray(
-        calibrator.predict_proba(
-            np.asarray(raw_scores, dtype=np.float64).reshape(-1, 1)
-        )[:, 1],
-        dtype=np.float64,
-    )
 
 
 def select_decision_threshold(labels, probabilities):
@@ -9982,7 +6015,6 @@ def select_c_and_training_threshold(
     outer_train_labels,
     patient_to_group,
     outer_fold_index,
-    legacy_prediction_cache=None,
     verbose=True,
 ):
     """Select C and threshold exclusively from the outer-training cohort."""
@@ -9997,7 +6029,6 @@ def select_c_and_training_threshold(
             patient_to_group=patient_to_group,
             outer_fold_index=outer_fold_index,
             c_value=c_value,
-            legacy_prediction_cache=legacy_prediction_cache,
         )
         inner_auc = float(roc_auc_score(labels, raw_scores))
         candidate_results.append(
@@ -10033,22 +6064,8 @@ def select_c_and_training_threshold(
         key=lambda result: result["c_value"],
     )[0]
 
-    if experiment.classifier_type == "linear_svm":
-        calibrator = fit_sigmoid_calibrator(
-            selected["raw_scores"],
-            selected["labels"],
-        )
-        inner_probabilities = apply_sigmoid_calibrator(
-            calibrator,
-            selected["raw_scores"],
-        )
-    else:
-        calibrator = None
-        inner_probabilities = np.clip(
-            selected["raw_scores"],
-            0.0,
-            1.0,
-        )
+    calibrator = None
+    inner_probabilities = np.clip(selected["raw_scores"], 0.0, 1.0)
 
     threshold = select_decision_threshold(
         selected["labels"],
@@ -10197,7 +6214,6 @@ def run_one_experiment(
     prepared,
     fold_manifest_rows,
     output_dir,
-    legacy_prediction_cache=None,
 ):
     """Run all outer folds and save exactly one OOF row per patient."""
 
@@ -10307,7 +6323,6 @@ def run_one_experiment(
             outer_train_labels=train_labels,
             patient_to_group=patient_to_group,
             outer_fold_index=outer_fold,
-            legacy_prediction_cache=legacy_prediction_cache,
         )
         print(
             f"[OUTER {outer_fold}] selected_C={selection['selected_c']:g}, "
@@ -10326,17 +6341,10 @@ def run_one_experiment(
                 train_patients=train_patients,
                 valid_patients=valid_patients,
                 c_value=selection["selected_c"],
-                legacy_prediction_cache=legacy_prediction_cache,
             )
         )
 
-        if experiment.classifier_type == "linear_svm":
-            probabilities = apply_sigmoid_calibrator(
-                selection["calibrator"],
-                raw_scores,
-            )
-        else:
-            probabilities = np.clip(raw_scores, 0.0, 1.0)
+        probabilities = np.clip(raw_scores, 0.0, 1.0)
 
         evaluated_patients = np.asarray(evaluated_patients)
         sort_order = np.argsort(evaluated_patients.astype(str))
@@ -10723,7 +6731,6 @@ def run_nested_cv_auc_only(
             outer_train_labels=train_labels,
             patient_to_group=patient_to_group,
             outer_fold_index=outer_fold,
-            legacy_prediction_cache=None,
             verbose=verbose,
         )
         raw_scores, valid_labels, evaluated_patients = (
@@ -10733,17 +6740,10 @@ def run_nested_cv_auc_only(
                 train_patients=train_patients,
                 valid_patients=valid_patients,
                 c_value=selection["selected_c"],
-                legacy_prediction_cache=None,
             )
         )
 
-        if experiment.classifier_type == "linear_svm":
-            probabilities = apply_sigmoid_calibrator(
-                selection["calibrator"],
-                raw_scores,
-            )
-        else:
-            probabilities = np.clip(raw_scores, 0.0, 1.0)
+        probabilities = np.clip(raw_scores, 0.0, 1.0)
 
         for patient_id, label, probability in zip(
             evaluated_patients,
@@ -10789,7 +6789,7 @@ def run_nested_cv_auc_only(
     return ordered_patients, labels, scores, folds, selected_cs
 
 
-def audit_v6_prepared_row_contract(prepared_by_id, output_path):
+def audit_exact_support_prepared_row_contract(prepared_by_id, output_path):
     """Verify the patient and source-row contract for A17/A20/C31-C33.
 
     Pixel-level equality is guaranteed by the shared construction helper and is
@@ -10802,12 +6802,12 @@ def audit_v6_prepared_row_contract(prepared_by_id, output_path):
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     exact_ids = (
-        V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID,
-        V6_EXACT_SUPPORT_MASK_CONTROL_EXPERIMENT_ID,
-        V6_SUPPORT_SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID,
-        V6_EXACT_SUPPORT_COMPLEMENT_CONTROL_EXPERIMENT_ID,
+        REFERENCE_EXPERIMENT_ID,
+        MASK_ONLY_CONTROL_EXPERIMENT_ID,
+        SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID,
+        COMPLEMENT_CONTROL_EXPERIMENT_ID,
     )
-    required_ids = exact_ids + (V6_VALID_ONLY_ABLATION_EXPERIMENT_ID,)
+    required_ids = exact_ids + (VALID_ONLY_ABLATION_EXPERIMENT_ID,)
     missing = [
         experiment_id
         for experiment_id in required_ids
@@ -10824,7 +6824,7 @@ def audit_v6_prepared_row_contract(prepared_by_id, output_path):
         )
         return summary
 
-    candidate = prepared_by_id[V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID]
+    candidate = prepared_by_id[REFERENCE_EXPERIMENT_ID]
     candidate_patients = np.asarray(candidate["patient_ids"]).astype(str)
     candidate_labels = np.asarray(candidate["y"], dtype=np.int64)
     candidate_source = int(candidate["n_source_slices"])
@@ -10860,7 +6860,7 @@ def audit_v6_prepared_row_contract(prepared_by_id, output_path):
             "n_patients": int(len(patients)),
         }
 
-    valid_only = prepared_by_id[V6_VALID_ONLY_ABLATION_EXPERIMENT_ID]
+    valid_only = prepared_by_id[VALID_ONLY_ABLATION_EXPERIMENT_ID]
     valid_patients = np.asarray(valid_only["patient_ids"]).astype(str)
     valid_labels = np.asarray(valid_only["y"], dtype=np.int64)
     valid_source = int(valid_only["n_source_slices"])
@@ -10878,7 +6878,7 @@ def audit_v6_prepared_row_contract(prepared_by_id, output_path):
         "status": "OK",
         "exact_all_slice_experiment_ids": list(exact_ids),
         "exact_all_slice_rows": exact_rows,
-        "valid_only_experiment_id": V6_VALID_ONLY_ABLATION_EXPERIMENT_ID,
+        "valid_only_experiment_id": VALID_ONLY_ABLATION_EXPERIMENT_ID,
         "valid_only_n_source_slices": valid_source,
         "valid_only_n_retained_slices": valid_retained,
         "valid_only_retained_fraction": float(
@@ -10897,7 +6897,7 @@ def audit_v6_prepared_row_contract(prepared_by_id, output_path):
         encoding="utf-8",
     )
     print(
-        "[V6 ROW CONTRACT] A17/C31/C32/C33 share "
+        "[EXACT SUPPORT ROW CONTRACT] A17/C31/C32/C33 share "
         f"{candidate_retained} source rows and {len(candidate_patients)} "
         f"patients; A20 retains {valid_retained} rows.",
         flush=True,
@@ -10905,18 +6905,18 @@ def audit_v6_prepared_row_contract(prepared_by_id, output_path):
     return summary
 
 
-def run_v6_candidate_family_nested_selection(
+def run_model_family_nested_selection(
     experiments_by_id,
     prepared_by_id,
     fold_manifest_rows,
     output_dir,
 ):
-    """Evaluate a training-only choice among the predeclared V6 candidates.
+    """Evaluate a training-only choice among the predeclared candidates.
 
     For every outer fold, each candidate independently selects its classifier C
     using only that outer-training cohort. The first candidate whose inner AUC
     lies within the predeclared tolerance of the best candidate is chosen using
-    ``V6_CANDIDATE_FAMILY_NESTED_SELECTION_IDS`` as the deterministic tie-break
+    ``MODEL_FAMILY_NESTED_SELECTION_IDS`` as the deterministic tie-break
     order. Only that chosen model is then fitted on the complete outer-training
     cohort and evaluated on the untouched outer fold.
 
@@ -10928,7 +6928,7 @@ def run_v6_candidate_family_nested_selection(
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    candidate_ids = tuple(V6_CANDIDATE_FAMILY_NESTED_SELECTION_IDS)
+    candidate_ids = tuple(MODEL_FAMILY_NESTED_SELECTION_IDS)
 
     patient_to_fold = {
         str(row["patient_id"]): int(row["outer_fold"])
@@ -10981,7 +6981,7 @@ def run_v6_candidate_family_nested_selection(
     fold_selection_rows = []
 
     print(
-        "[V6 MODEL SELECTION] Running outer-fold candidate-family selection: "
+        "[EXACT SUPPORT MODEL SELECTION] Running outer-fold candidate-family selection: "
         + ", ".join(candidate_ids),
         flush=True,
     )
@@ -11016,7 +7016,6 @@ def run_v6_candidate_family_nested_selection(
                 outer_train_labels=train_labels,
                 patient_to_group=patient_to_group,
                 outer_fold_index=outer_fold,
-                legacy_prediction_cache=None,
                 verbose=False,
             )
             candidate_selections.append(
@@ -11034,7 +7033,7 @@ def run_v6_candidate_family_nested_selection(
             row
             for row in candidate_selections
             if row["inner_auc"]
-            >= best_inner_auc - V6_CANDIDATE_FAMILY_SELECTION_AUC_TOLERANCE
+            >= best_inner_auc - MODEL_FAMILY_SELECTION_AUC_TOLERANCE
         ]
         chosen = min(eligible, key=lambda row: row["order_index"])
         eligible_ids = {
@@ -11069,16 +7068,9 @@ def run_v6_candidate_family_nested_selection(
                 train_patients=train_patients,
                 valid_patients=valid_patients,
                 c_value=chosen_selection["selected_c"],
-                legacy_prediction_cache=None,
             )
         )
-        if chosen_experiment.classifier_type == "linear_svm":
-            probabilities = apply_sigmoid_calibrator(
-                chosen_selection["calibrator"],
-                raw_scores,
-            )
-        else:
-            probabilities = np.clip(raw_scores, 0.0, 1.0)
+        probabilities = np.clip(raw_scores, 0.0, 1.0)
 
         fold_auc = float(roc_auc_score(valid_labels, probabilities))
         fold_selection_rows.append(
@@ -11116,7 +7108,7 @@ def run_v6_candidate_family_nested_selection(
             )
 
         print(
-            f"[V6 MODEL SELECTION] outer_fold={outer_fold}: "
+            f"[EXACT SUPPORT MODEL SELECTION] outer_fold={outer_fold}: "
             f"chosen={chosen_id}, inner_auc={chosen['inner_auc']:.4f}, "
             f"held_out_auc={fold_auc:.4f}",
             flush=True,
@@ -11175,7 +7167,7 @@ def run_v6_candidate_family_nested_selection(
         "candidate_experiment_ids": list(candidate_ids),
         "tie_break_order": list(candidate_ids),
         "inner_auc_tolerance": float(
-            V6_CANDIDATE_FAMILY_SELECTION_AUC_TOLERANCE
+            MODEL_FAMILY_SELECTION_AUC_TOLERANCE
         ),
         "outer_oof_auc": auc,
         "outer_oof_auc_ci": discrimination_intervals["auc"],
@@ -11223,7 +7215,7 @@ def run_v6_candidate_family_nested_selection(
     )
 
     print(
-        f"[V6 MODEL SELECTION] pooled OOF AUC={auc:.4f}, "
+        f"[EXACT SUPPORT MODEL SELECTION] pooled OOF AUC={auc:.4f}, "
         f"AUPRC={auprc:.4f}; selections={selected_counts}",
         flush=True,
     )
@@ -11402,7 +7394,7 @@ def write_repeated_stability_ranking(stability_summaries, output_path):
 
     The ordinary experiment table is retained because it contains complete OOF
     metrics for one frozen fold manifest. For model ranking in this 30-patient
-    cohort, however, V6 gives priority to the median across all predeclared
+    cohort, however, gives priority to the median across all predeclared
     repeated nested-CV splits. This helper makes that ordering explicit rather
     than allowing a single favorable split to define the final ranking.
     """
@@ -11425,8 +7417,8 @@ def write_repeated_stability_ranking(stability_summaries, output_path):
             "status": summary.get("status", "UNKNOWN"),
             "role": experiment.role,
             "description": experiment.description,
-            "is_v6_prospective_candidate": int(
-                experiment_id == V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID
+            "is_primary_candidate": int(
+                experiment_id == REFERENCE_EXPERIMENT_ID
             ),
             "repeats": summary.get("repeats", ""),
             "auc_median": summary.get("auc_median", ""),
@@ -11453,7 +7445,7 @@ def write_repeated_stability_ranking(stability_summaries, output_path):
         "status",
         "role",
         "description",
-        "is_v6_prospective_candidate",
+        "is_primary_candidate",
         "repeats",
         "auc_median",
         "auc_q25",
@@ -11494,7 +7486,7 @@ def print_repeated_stability_ranking(rows):
     )
     print("-" * 154, flush=True)
     for rank, row in enumerate(successful, start=1):
-        marker = " [V6 LOCKED]" if row["is_v6_prospective_candidate"] else ""
+        marker = " [PRIMARY]" if row["is_primary_candidate"] else ""
         experiment_text = (row["experiment_id"] + marker)[:76]
         iqr_text = f"[{float(row['auc_q25']):.4f}, {float(row['auc_q75']):.4f}]"
         print(
@@ -11830,7 +7822,7 @@ def run_selection_adjusted_candidate_family_permutation_test(
     observed_auc_by_id,
     output_dir,
 ):
-    """Run a max-AUROC permutation test across the explored V5 candidates.
+    """Run a max-AUROC permutation test across the explored candidates.
 
     Every permutation uses one common patient-label vector and one common outer
     fold manifest. The complete nested fitting path is rerun separately for each
@@ -12197,11 +8189,8 @@ def compare_experiments_to_baseline(results):
 def compare_predeclared_ablation_pairs(results):
     """Calculate the scientifically matched paired comparisons declared above.
 
-    Unlike the ranking table, which compares every successful experiment with
-    the main baseline for orientation, this table uses the reference chosen for
-    each scientific question. In particular, the legacy slice-classifier branch
-    is compared with A8, which matches no-PCA and fixed-C settings, and the two
-    fusion rules are compared directly with one another.
+    Each row uses the reference declared for that scientific question and the
+    same patient resamples for both scores.
     """
 
     successful = {
@@ -12417,19 +8406,16 @@ def write_master_outputs(
     paired_rows,
     primary_ablation_rows,
     candidate_family_selection_summary,
-    v6_row_contract_summary,
+    exact_support_row_contract_summary,
     comparison_dir,
 ):
-    """Write the cross-experiment CSV/JSON files used for final comparison."""
+    """Write compact cross-experiment tables and one machine-readable report."""
 
     comparison_dir.mkdir(parents=True, exist_ok=True)
-    comparison_lookup = {
-        row["comparison_experiment_id"]: row for row in paired_rows
-    }
+    comparison_lookup = {row["comparison_experiment_id"]: row for row in paired_rows}
     summary_rows = [
         result_summary_row(result, comparison_lookup)
-        for result in results
-        if result.get("status") == "OK"
+        for result in results if result.get("status") == "OK"
     ]
     summary_rows.sort(key=lambda row: (-row["auc"], row["experiment_id"]))
 
@@ -12437,536 +8423,97 @@ def write_master_outputs(
     if summary_rows:
         with open(summary_path, "w", newline="", encoding="utf-8") as file:
             writer = csv.DictWriter(file, fieldnames=list(summary_rows[0]))
-            writer.writeheader()
-            writer.writerows(summary_rows)
+            writer.writeheader(); writer.writerows(summary_rows)
     else:
-        # Keep a visible completion artifact even when every experiment fails.
-        # The detailed error records remain in failed_experiments.csv and in
-        # each experiment's own failure.json file.
-        summary_path.write_text(
-            "experiment_id,status,role,description\n",
-            encoding="utf-8",
-        )
+        summary_path.write_text("experiment_id,status\n", encoding="utf-8")
 
-    # Failures are saved in a dedicated flat CSV in addition to final_report.json
-    # so spreadsheet inspection does not require parsing nested JSON. Tracebacks
-    # are preserved because they are often necessary to distinguish a data
-    # problem from an optional experiment or library failure.
     failure_path = comparison_dir / "failed_experiments.csv"
-    failure_fields = [
-        "experiment_id",
-        "status",
-        "error_type",
-        "error_message",
-        "traceback",
-    ]
+    failure_fields = ["experiment_id", "error_type", "error_message", "traceback"]
     with open(failure_path, "w", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(file, fieldnames=failure_fields)
         writer.writeheader()
-        for failure in failed_results:
-            writer.writerow(
-                {field: failure.get(field, "") for field in failure_fields}
-            )
-
-    prediction_rows = []
-    for result in results:
-        if result.get("status") != "OK":
-            continue
-        experiment_id = result["config"].experiment_id
-        for row in zip(
-            result["patient_ids"],
-            result["labels"],
-            result["folds"],
-            result["probabilities"],
-            result["thresholds"],
-            result["predictions"],
-            result["selected_cs"],
-        ):
-            prediction_rows.append(
-                {
-                    "experiment_id": experiment_id,
-                    "patient_id": str(row[0]),
-                    "true_label": int(row[1]),
-                    "outer_fold": int(row[2]),
-                    "oof_score": float(row[3]),
-                    "training_only_threshold": float(row[4]),
-                    "predicted_label": int(row[5]),
-                    "selected_c": float(row[6]),
-                }
-            )
+        for row in failed_results:
+            writer.writerow({field: row.get(field, "") for field in failure_fields})
 
     prediction_path = comparison_dir / "patient_predictions_all_experiments.csv"
-    prediction_fields = [
-        "experiment_id",
-        "patient_id",
-        "true_label",
-        "outer_fold",
-        "oof_score",
-        "training_only_threshold",
-        "predicted_label",
-        "selected_c",
-    ]
     with open(prediction_path, "w", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=prediction_fields)
-        writer.writeheader()
-        writer.writerows(prediction_rows)
+        fields = ["experiment_id", "patient_id", "true_label", "outer_fold", "oof_score", "predicted_label"]
+        writer = csv.DictWriter(file, fieldnames=fields); writer.writeheader()
+        for result in results:
+            if result.get("status") != "OK":
+                continue
+            for patient_id, label, fold, score, prediction in zip(
+                result["patient_ids"], result["labels"], result["folds"],
+                result["probabilities"], result["predictions"],
+            ):
+                writer.writerow({
+                    "experiment_id": result["config"].experiment_id,
+                    "patient_id": str(patient_id),
+                    "true_label": int(label),
+                    "outer_fold": int(fold),
+                    "oof_score": float(score),
+                    "predicted_label": int(prediction),
+                })
 
-    primary_paired_path = (
-        comparison_dir / "paired_primary_ablation_comparisons.csv"
-    )
-    primary_fields = [
-        "comparison_name",
-        "status",
-        "reference_experiment_id",
-        "comparison_experiment_id",
-        "scientific_question",
-        "reference_auc",
-        "comparison_auc",
-        "delta_auc",
-        "delta_auc_ci_lower",
-        "delta_auc_ci_upper",
-        "bootstrap_probability_delta_above_zero",
-        "missing_experiments",
-    ]
-    with open(primary_paired_path, "w", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=primary_fields)
-        writer.writeheader()
-        for row in primary_ablation_rows:
-            writer.writerow({field: row.get(field, "") for field in primary_fields})
+    for filename, rows in (
+        ("paired_auc_comparisons.csv", paired_rows),
+        ("paired_primary_ablation_comparisons.csv", primary_ablation_rows),
+    ):
+        path = comparison_dir / filename
+        if rows:
+            with open(path, "w", newline="", encoding="utf-8") as file:
+                writer = csv.DictWriter(file, fieldnames=list(rows[0]))
+                writer.writeheader(); writer.writerows(rows)
+        else:
+            path.write_text("status\n", encoding="utf-8")
 
-    paired_path = comparison_dir / "paired_auc_comparisons.csv"
-    if paired_rows:
-        with open(paired_path, "w", newline="", encoding="utf-8") as file:
-            writer = csv.DictWriter(file, fieldnames=list(paired_rows[0]))
-            writer.writeheader()
-            writer.writerows(paired_rows)
-    else:
-        paired_path.write_text(
-            "baseline_experiment_id,comparison_experiment_id,delta_auc," 
-            "delta_auc_ci_lower,delta_auc_ci_upper," 
-            "bootstrap_probability_delta_above_zero\n",
-            encoding="utf-8",
-        )
-
-    summary_lookup = {
-        row["experiment_id"]: row for row in summary_rows
-    }
-    v5_inside = summary_lookup.get(V5_CANDIDATE_EXPERIMENT_ID)
-    v5_outside = summary_lookup.get(
-        V5_MATCHED_OUTSIDE_CONTROL_EXPERIMENT_ID
-    )
-    if v5_inside is not None and v5_outside is not None:
-        v5_matched_contrast = {
-            "status": "OK",
-            "inside_experiment_id": V5_CANDIDATE_EXPERIMENT_ID,
-            "outside_experiment_id": (
-                V5_MATCHED_OUTSIDE_CONTROL_EXPERIMENT_ID
-            ),
-            "inside_auc": float(v5_inside["auc"]),
-            "outside_auc": float(v5_outside["auc"]),
-            "inside_minus_outside_auc": float(
-                v5_inside["auc"] - v5_outside["auc"]
-            ),
-            "row_contract": (
-                "Both experiments use slice_filter=standardized_monai_valid "
-                "and therefore the same patient/series/slice rows."
-            ),
-        }
-    else:
-        v5_matched_contrast = {
-            "status": "UNAVAILABLE",
-            "missing_experiments": [
-                experiment_id
-                for experiment_id, row in (
-                    (V5_CANDIDATE_EXPERIMENT_ID, v5_inside),
-                    (V5_MATCHED_OUTSIDE_CONTROL_EXPERIMENT_ID, v5_outside),
-                )
-                if row is None
-            ],
-        }
-
-    v6_candidate = summary_lookup.get(
-        V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID
-    )
-    v6_comparator_ids = (
-        V6_VALID_ONLY_ABLATION_EXPERIMENT_ID,
-        V6_EXACT_SUPPORT_MASK_CONTROL_EXPERIMENT_ID,
-        V6_SUPPORT_SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID,
-        V6_EXACT_SUPPORT_COMPLEMENT_CONTROL_EXPERIMENT_ID,
-    )
-    v6_comparators = {
-        experiment_id: summary_lookup.get(experiment_id)
-        for experiment_id in v6_comparator_ids
-    }
-    if v6_candidate is None:
-        v6_exact_support_contrast = {
-            "status": "UNAVAILABLE",
-            "missing_experiments": [
-                V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID
-            ],
-        }
-    else:
-        comparison_rows = {}
-        for experiment_id, row in v6_comparators.items():
-            if row is None:
-                comparison_rows[experiment_id] = {
-                    "status": "UNAVAILABLE",
-                    "missing_experiment": experiment_id,
-                }
-            else:
-                comparison_rows[experiment_id] = {
-                    "status": "OK",
-                    "candidate_auc": float(v6_candidate["auc"]),
-                    "comparator_auc": float(row["auc"]),
-                    "candidate_minus_comparator_auc": float(
-                        v6_candidate["auc"] - row["auc"]
-                    ),
-                }
-        v6_exact_support_contrast = {
-            "status": "OK",
-            "candidate_experiment_id": (
-                V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID
-            ),
-            "candidate_auc": float(v6_candidate["auc"]),
-            "comparisons": comparison_rows,
-            "row_contract": (
-                "A17, C31, C32 and C33 use the same patients, series, slices, "
-                "hierarchical pooling and outer folds. A17/C31/C32 share the "
-                "same exact binary support; C32 also preserves the complete "
-                "within-support intensity histogram while destroying spatial "
-                "assignment. C33 uses the exact non-padding complement. A20 "
-                "uses A17 pixels but retains only standardized-MONAI-valid "
-                "slices."
-            ),
-        }
-
-    report = {
-        "baseline_experiment_id": BASELINE_EXPERIMENT_ID,
-        "v5_candidate_experiment_id": V5_CANDIDATE_EXPERIMENT_ID,
-        "v5_matched_inside_outside_contrast": v5_matched_contrast,
-        "v6_prospective_candidate_experiment_id": (
-            V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID
+    final_report = {
+        "pipeline_schema": PIPELINE_SCHEMA_ID,
+        "reference_experiment_id": REFERENCE_EXPERIMENT_ID,
+        "primary_candidate_experiment_id": PRIMARY_CANDIDATE_EXPERIMENT_ID,
+        "successful_experiments": len(summary_rows),
+        "failed_experiments": len(failed_results),
+        "experiment_summary": summary_rows,
+        "paired_auc_comparisons": paired_rows,
+        "predeclared_comparisons": primary_ablation_rows,
+        "model_family_nested_selection": candidate_family_selection_summary,
+        "exact_support_row_contract": exact_support_row_contract_summary,
+        "interpretation": (
+            "Scores are internal patient-level OOF model outputs. Shortcut "
+            "controls and the absence of independent external validation must "
+            "be considered before biological or clinical interpretation."
         ),
-        "v6_exact_support_validation": v6_exact_support_contrast,
-        "v6_candidate_family_nested_selection": (
-            candidate_family_selection_summary
-        ),
-        "v6_exact_support_row_contract": v6_row_contract_summary,
-        "successful_experiments": summary_rows,
-        "failed_experiments": failed_results,
-        "paired_auc_comparisons_vs_baseline": paired_rows,
-        "paired_primary_ablation_comparisons": primary_ablation_rows,
-        "interpretation_rules": {
-            "negative_control_warning_auc": SHORTCUT_WARNING_AUC,
-            "delta_auc_ci": (
-                "A paired CI containing zero does not establish a reliable "
-                "difference between configurations."
-            ),
-            "calibration_warning": (
-                "Logistic-Regression outputs are class-weighted model scores, "
-                "not externally calibrated clinical probabilities. Linear-SVM "
-                "margins receive training-only sigmoid calibration. Brier scores "
-                "must therefore be interpreted as exploratory."
-            ),
-            "v5_region_normalization": (
-                "A16-A20 and C28-C33 compute robust intensity limits only "
-                "from pixels that remain visible after localization when the "
-                "representation contains MRI intensities. C30 and A18 use the "
-                "same gate-valid rows; A17/C31/C32/C33 use exactly matched rows."
-            ),
-            "v6_exact_support_controls": (
-                "C31 removes MRI intensity while preserving A17 support; C32 "
-                "preserves A17 support and its within-support intensity "
-                "histogram but destroys spatial arrangement; C33 exposes only "
-                "the exact non-padding complement. High C31 or C32 performance "
-                "limits claims that A17 relies on localized cardiac texture."
-            ),
-            "candidate_family_selection": (
-                "The V6 candidate-family result chooses model identity and C "
-                "inside each outer-training cohort. It is the preferred internal "
-                "estimate of the complete selection procedure, but remains based "
-                "on the same small cohort."
-            ),
-            "segmentation_representation_control": (
-                "C21-C27 are MONAI-derived representation controls, not pure "
-                "non-anatomical negative controls. Their scores can reflect "
-                "morphology, sequence/view, segmenter confidence, protocol, or "
-                "export effects even though EfficientNet does not receive the "
-                "original MRI intensity image."
-            ),
-            "clinical_warning": (
-                "All scores are exploratory and require independent external "
-                "validation before clinical interpretation."
-            ),
-        },
     }
     (comparison_dir / "final_report.json").write_text(
-        json.dumps(report, indent=2, sort_keys=True),
-        encoding="utf-8",
+        json.dumps(final_report, indent=2, sort_keys=True), encoding="utf-8"
     )
     return summary_rows
 
 
 def print_final_comparison(summary_rows, failed_results=None):
-    """Print scientifically separated result tables and shortcut warnings.
+    """Print one compact table plus explicit shortcut-control warnings."""
 
-    A single global AUC ranking can misleadingly place a negative control above
-    the declared baseline or reward a historical confounded representation. The
-    console therefore separates current standardized candidates, strict
-    shortcut controls, MONAI-derived morphology/confidence controls, historical
-    original-canvas ablations, and robustness experiments.
-    CSV/JSON master files still contain every row for complete analysis.
-    """
+    failed_results = failed_results or []
+    print("\nFINAL PATIENT-LEVEL OOF COMPARISON", flush=True)
+    print("-" * 118, flush=True)
+    print(f"{'Experiment':<61} {'Role':<24} {'AUC [95% CI]':<24}", flush=True)
+    print("-" * 118, flush=True)
+    for row in summary_rows:
+        auc_text = f"{row['auc']:.4f} [{row['auc_ci_lower']:.4f}, {row['auc_ci_upper']:.4f}]"
+        print(f"{row['experiment_id']:<61} {row['role']:<24} {auc_text:<24}", flush=True)
+    print("-" * 118, flush=True)
 
-    if failed_results is None:
-        failed_results = []
-
-    current_candidate_ids = {
-        BASELINE_EXPERIMENT_ID,
-        DEVELOPMENT_BASELINE_EXPERIMENT_ID,
-        "A9_STANDARDIZED_FULL_HIER_LR_PCA",
-        "C9_STANDARDIZED_CENTER_CROP_HIER_LR_PCA",
-        "C13_STANDARDIZED_FIXED_CENTER50_HIER_LR_PCA",
-        "C14_STANDARDIZED_FIXED_CENTER60_HIER_LR_PCA",
-        "C15_STANDARDIZED_FIXED_CENTER70_HIER_LR_PCA",
-        "A10_STANDARDIZED_ROI_ZERO_BG_HIER_LR_PCA",
-        "A11_STANDARDIZED_ROI_BBOX_HIER_LR_PCA",
-        "A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA",
-        "A13_STANDARDIZED_ROI_FIXED_CHUNK_LR_PCA",
-        "A14_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_FIXED_CHUNK_LR_PCA",
-        "A15_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_DEDUP_HIER_LR_PCA",
-        "A16_HEART_CENTERED_FIXED_FOV_REGION_NORM_HIER_LR_PCA",
-        "A17_HARD_SUPPORT_REGION_NORM_HIER_LR_PCA",
-        V5_CANDIDATE_EXPERIMENT_ID,
-        "A19_HEART_CENTERED_FIXED_FOV_REGION_NORM_VALID_ONLY_HIER_MEAN_STD_LR_PCA",
-        V6_VALID_ONLY_ABLATION_EXPERIMENT_ID,
-    }
-
-    groups = (
-        (
-            "CURRENT STANDARDIZED MODELS / LOCALIZATION CANDIDATES",
-            [
-                row
-                for row in summary_rows
-                if row["experiment_id"] in current_candidate_ids
-            ],
-        ),
-        (
-            "NEGATIVE, EXPORT AND STRUCTURAL CONTROLS",
-            [row for row in summary_rows if row["role"] == "negative_control"],
-        ),
-        (
-            "MONAI-DERIVED MORPHOLOGY / CONFIDENCE CONTROLS",
-            [
-                row
-                for row in summary_rows
-                if row["role"] == "segmentation_representation_control"
-            ],
-        ),
-        (
-            "ANATOMY-DESTRUCTION CONTROLS",
-            [
-                row
-                for row in summary_rows
-                if row["role"] == "anatomy_destruction_control"
-            ],
-        ),
-        (
-            "HISTORICAL ORIGINAL-CANVAS MODELS AND METHOD ABLATIONS",
-            [
-                row
-                for row in summary_rows
-                if row["experiment_id"] not in current_candidate_ids
-                and row["role"] not in {
-                    "negative_control",
-                    "segmentation_representation_control",
-                    "anatomy_destruction_control",
-                    "robustness",
-                }
-            ],
-        ),
-        (
-            "ROBUSTNESS EXPERIMENTS",
-            [row for row in summary_rows if row["role"] == "robustness"],
-        ),
-    )
-
-    table_width = 196
-    print("\n" + "=" * table_width, flush=True)
-    print("FINAL MULTI-EXPERIMENT PATIENT-LEVEL COMPARISON", flush=True)
-    print("=" * table_width, flush=True)
-
-    header = (
-        f"{'No.':<4} {'Experiment':<72} {'Role':<36} "
-        f"{'AUC [95% CI]':<25} {'Delta AUC vs baseline':<31} "
-        f"{'Sens.':>7} {'Spec.':>7} {'F1':>7}"
-    )
-
-    for title, rows in groups:
-        if not rows:
-            continue
-        print(f"\n{title}", flush=True)
-        print("-" * table_width, flush=True)
-        print(header, flush=True)
-        print("-" * table_width, flush=True)
-
-        # Master rows are already sorted by decreasing AUC; retain that order
-        # within each scientifically coherent section.
-        for index, row in enumerate(rows, start=1):
-            auc_text = (
-                f"{row['auc']:.4f} "
-                f"[{row['auc_ci_lower']:.4f}, {row['auc_ci_upper']:.4f}]"
-            )
-            if row["delta_auc_vs_baseline"] is None:
-                delta_text = "baseline / unavailable"
-            else:
-                delta_text = (
-                    f"{row['delta_auc_vs_baseline']:+.4f} "
-                    f"[{row['delta_auc_ci_lower']:+.4f}, "
-                    f"{row['delta_auc_ci_upper']:+.4f}]"
-                )
+    for row in summary_rows:
+        if row["role"] in {"negative_control", "segmentation_control", "anatomy_destruction_control"} and row["auc"] >= SHORTCUT_WARNING_AUC:
             print(
-                f"{index:<4} {row['experiment_id']:<72} {row['role']:<36} "
-                f"{auc_text:<25} {delta_text:<31} "
-                f"{row['sensitivity']:>7.3f} {row['specificity']:>7.3f} "
-                f"{row['f1']:>7.3f}",
+                f"[SHORTCUT WARNING] {row['experiment_id']} AUC={row['auc']:.4f} "
+                "exceeds the warning threshold; candidate performance is not "
+                "specific to cardiac pathology in this cohort.",
                 flush=True,
             )
-        print("-" * table_width, flush=True)
-
-    print(
-        "All rows use the same outer patient-fold manifest. Thresholds and "
-        "quantitatively selected C values were learned only from inner OOF "
-        "training predictions. Tables are separated so controls are not "
-        "misrepresented as candidate clinical models.",
-        flush=True,
-    )
-
-    negative_controls = [
-        row
-        for row in summary_rows
-        if row["role"] == "negative_control"
-        and row["auc"] >= SHORTCUT_WARNING_AUC
-    ]
-    if negative_controls:
-        print("\nSHORTCUT / CONFOUNDING WARNINGS", flush=True)
-        for row in negative_controls:
-            print(
-                f"[WARNING] {row['experiment_id']} achieved AUC={row['auc']:.4f} "
-                f">= {SHORTCUT_WARNING_AUC:.2f}. The cohort remains predictable "
-                "from a negative-control representation; anatomical validity is "
-                "therefore not established.",
-                flush=True,
-            )
-    else:
-        print(
-            "\n[CONTROL CHECK] No enabled negative control crossed the configured "
-            f"AUC warning threshold of {SHORTCUT_WARNING_AUC:.2f}.",
-            flush=True,
-        )
-
-    segmentation_controls = [
-        row
-        for row in summary_rows
-        if row["role"] == "segmentation_representation_control"
-        and row["auc"] >= SHORTCUT_WARNING_AUC
-    ]
-    if segmentation_controls:
-        print(
-            "\nMONAI-DERIVED REPRESENTATION FINDINGS",
-            flush=True,
-        )
-        for row in segmentation_controls:
-            print(
-                f"[SEGMENTATION CONTROL] {row['experiment_id']} achieved "
-                f"AUC={row['auc']:.4f}. This means label information remains "
-                "in MONAI-derived probability, morphology, position, scale, "
-                "or confidence structure. It is not, by itself, proof of a "
-                "non-anatomical shortcut because the representation is derived "
-                "from the MRI image.",
-                flush=True,
-            )
-
-    anatomy_destruction_controls = [
-        row
-        for row in summary_rows
-        if row["role"] == "anatomy_destruction_control"
-        and row["auc"] >= SHORTCUT_WARNING_AUC
-    ]
-    if anatomy_destruction_controls:
-        print("\nANATOMY-DESTRUCTION CONTROL FINDINGS", flush=True)
-        for row in anatomy_destruction_controls:
-            print(
-                f"[ANATOMY CONTROL] {row['experiment_id']} achieved "
-                f"AUC={row['auc']:.4f}. The original within-support spatial "
-                "arrangement was destroyed, so a high result indicates that "
-                "support geometry and intensity distribution remain strongly "
-                "predictive even without intact local anatomy.",
-                flush=True,
-            )
-
-    summary_lookup = {row["experiment_id"]: row for row in summary_rows}
-    v5_inside = summary_lookup.get(V5_CANDIDATE_EXPERIMENT_ID)
-    v5_outside = summary_lookup.get(V5_MATCHED_OUTSIDE_CONTROL_EXPERIMENT_ID)
-    if v5_inside is not None and v5_outside is not None:
-        print("\nV5 MATCHED INSIDE / OUTSIDE CHECK", flush=True)
-        print(
-            f"[V5] inside AUC={v5_inside['auc']:.4f}; "
-            f"outside AUC={v5_outside['auc']:.4f}; "
-            f"inside-minus-outside={v5_inside['auc'] - v5_outside['auc']:+.4f}. "
-            "Both use the same standardized-MONAI-valid image rows.",
-            flush=True,
-        )
-
-    v6_candidate = summary_lookup.get(
-        V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID
-    )
-    if v6_candidate is not None:
-        print("\nV6 EXACT-SUPPORT MATCHED CHECKS", flush=True)
-        for comparator_id, label in (
-            (V6_VALID_ONLY_ABLATION_EXPERIMENT_ID, "A20 valid-only"),
-            (V6_EXACT_SUPPORT_MASK_CONTROL_EXPERIMENT_ID, "C31 support-only"),
-            (
-                V6_SUPPORT_SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID,
-                "C32 shuffled-intensity",
-            ),
-            (
-                V6_EXACT_SUPPORT_COMPLEMENT_CONTROL_EXPERIMENT_ID,
-                "C33 exact complement",
-            ),
-        ):
-            comparator = summary_lookup.get(comparator_id)
-            if comparator is None:
-                print(
-                    f"[V6] {label}: unavailable because {comparator_id} did "
-                    "not complete.",
-                    flush=True,
-                )
-                continue
-            print(
-                f"[V6] A17 AUC={v6_candidate['auc']:.4f}; {label} "
-                f"AUC={comparator['auc']:.4f}; "
-                f"A17-minus-control="
-                f"{v6_candidate['auc'] - comparator['auc']:+.4f}.",
-                flush=True,
-            )
-
     if failed_results:
-        print("\nFAILED EXPERIMENTS", flush=True)
-        for failure in failed_results:
-            print(
-                f"[FAILED] {failure.get('experiment_id', 'unknown')}: "
-                f"{failure.get('error_type', 'Error')}: "
-                f"{failure.get('error_message', '')}",
-                flush=True,
-            )
-        print(
-            "Detailed tracebacks: comparison/failed_experiments.csv and each "
-            "experiment's failure.json.",
-            flush=True,
-        )
+        print(f"[WARNING] {len(failed_results)} experiments failed; inspect failed_experiments.csv.", flush=True)
 
-    print("=" * table_width, flush=True)
 
 # =============================
 # PIPELINE STEP 11
@@ -13007,498 +8554,141 @@ def collect_suite_metadata(
     cache_status,
     exact_summary,
     phash_summary,
-    monai_gate_comparison,
     standardized_monai_gate_comparison,
     stability_summary,
     permutation_summary,
     candidate_family_selection_summary,
-    v6_row_contract_summary,
-    series_annotation_summary,
+    exact_support_row_contract_summary,
     successful_results,
     failed_results,
     total_runtime,
 ):
-    """Collect software, model, data, audit and completion metadata."""
+    """Collect compact reproducibility, cohort, audit and completion metadata."""
 
     patient_ids, patient_labels = build_patient_label_table(
-        [sample[1] for sample in samples],
-        [sample[2] for sample in samples],
+        [sample[1] for sample in samples], [sample[2] for sample in samples]
     )
     bundle_root = locate_monai_bundle_root()
-    official_torchscript_path = bundle_root / "models" / "model.ts"
-
-    metadata = {
+    model_path = bundle_root / "models" / "model.ts"
+    return {
+        "pipeline_schema": PIPELINE_SCHEMA_ID,
         "suite_name": SUITE_NAME,
         "suite_configuration_tag": SUITE_CONFIGURATION_TAG,
-        "validation_runtime_profile": VALIDATION_RUNTIME_PROFILE,
-        "stability_panel": STABILITY_PANEL,
-        "baseline_experiment_id": BASELINE_EXPERIMENT_ID,
-        "primary_candidate_experiment_id": PRIMARY_CANDIDATE_EXPERIMENT_ID,
-        "v5_candidate_experiment_id": V5_CANDIDATE_EXPERIMENT_ID,
-        "v5_matched_outside_control_experiment_id": (
-            V5_MATCHED_OUTSIDE_CONTROL_EXPERIMENT_ID
-        ),
-        "v6_prospective_candidate_experiment_id": (
-            V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID
-        ),
-        "v6_valid_only_ablation_experiment_id": (
-            V6_VALID_ONLY_ABLATION_EXPERIMENT_ID
-        ),
-        "v6_exact_support_mask_control_experiment_id": (
-            V6_EXACT_SUPPORT_MASK_CONTROL_EXPERIMENT_ID
-        ),
-        "v6_support_shuffled_intensity_control_experiment_id": (
-            V6_SUPPORT_SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID
-        ),
-        "v6_exact_support_complement_control_experiment_id": (
-            V6_EXACT_SUPPORT_COMPLEMENT_CONTROL_EXPERIMENT_ID
-        ),
-        "development_baseline_experiment_id": (
-            DEVELOPMENT_BASELINE_EXPERIMENT_ID
-        ),
-        "output_directory": str(OUTPUT_DIR),
-        "console_log": str(CONSOLE_LOG_PATH),
         "dataset_path": str(DATASET_PATH),
-        "patient_definition": "Directory_*",
-        "series_definition": "immediate child folder proxy; not DICOM UID",
-        "n_images": int(len(samples)),
-        "n_patients": int(len(patient_ids)),
+        "n_images": len(samples),
+        "n_patients": len(patient_ids),
         "normal_patients": int(np.sum(patient_labels == 0)),
         "sick_patients": int(np.sum(patient_labels == 1)),
+        "patient_definition": "Directory_*",
         "feature_bank_fingerprint": fingerprint,
-        "feature_bank_cache_status": cache_status,
-        "feature_cache_schema": FEATURE_CACHE_SCHEMA_VERSION,
-        "feature_modes_per_encoder_call": FEATURE_MODES_PER_ENCODER_CALL,
-        "v6_support_intensity_shuffle_version": (
-            V6_SUPPORT_INTENSITY_SHUFFLE_VERSION
-        ),
-        "deterministic_execution": {
-            "cublas_workspace_config": os.environ.get(
-                "CUBLAS_WORKSPACE_CONFIG"
-            ),
-            "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
-            "cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
-            "cudnn_allow_tf32": bool(
-                getattr(torch.backends.cudnn, "allow_tf32", False)
-            ),
-            "cuda_matmul_allow_tf32": bool(
-                getattr(
-                    getattr(torch.backends.cuda, "matmul", object()),
-                    "allow_tf32",
-                    False,
-                )
-            ),
-            "deterministic_algorithms_requested": True,
-            "cuda_amp_enabled": bool(USE_CUDA_AMP),
-        },
-        "monai_soft_histogram_bins": MONAI_SOFT_HISTOGRAM_BINS,
-        "monai_soft_block_shuffle_grid": MONAI_SOFT_BLOCK_SHUFFLE_GRID,
-        "monai_soft_block_shuffle_version": MONAI_SOFT_BLOCK_SHUFFLE_VERSION,
-        "monai_canonical_mask_content_fraction": (
-            MONAI_CANONICAL_MASK_CONTENT_FRACTION
-        ),
-        "repeated_stability_comparisons": [
-            {
-                "comparison_name": comparison_name,
-                "reference_experiment_id": reference_id,
-                "comparison_experiment_id": comparison_id,
-                "scientific_question": scientific_question,
-            }
-            for (
-                comparison_name,
-                reference_id,
-                comparison_id,
-                scientific_question,
-            ) in REPEATED_STABILITY_COMPARISONS
-        ],
-        "outer_cv_splits": N_SPLITS,
-        "outer_cv_random_state": CV_RANDOM_STATE,
-        "inner_cv_splits": INNER_CV_SPLITS,
-        "inner_cv_random_state": INNER_CV_RANDOM_STATE,
-        "classifier_c_grid": list(CLASSIFIER_C_GRID),
-        "c_selection_auc_tolerance": C_SELECTION_AUC_TOLERANCE,
-        "svm_calibration_c": SVM_CALIBRATION_C,
-        "threshold_selection_method": THRESHOLD_SELECTION_METHOD,
-        "target_sensitivity": TARGET_SENSITIVITY,
-        "bootstrap_replicates": BOOTSTRAP_REPLICATES,
-        "paired_bootstrap_replicates": PAIRED_BOOTSTRAP_REPLICATES,
-        "bootstrap_confidence": BOOTSTRAP_CONFIDENCE,
-        "use_cuda_amp": USE_CUDA_AMP,
-        "batch_size": BATCH_SIZE,
-        "dataloader_num_workers": DATALOADER_NUM_WORKERS,
-        "python": platform.python_version(),
-        "platform": platform.platform(),
-        "numpy": np.__version__,
-        "torch": torch.__version__,
-        "torchvision": torchvision.__version__,
-        "scikit_learn": sklearn.__version__,
-        "opencv": cv2.__version__,
+        "feature_cache_status": cache_status,
+        "reference_experiment_id": REFERENCE_EXPERIMENT_ID,
+        "primary_candidate_experiment_id": PRIMARY_CANDIDATE_EXPERIMENT_ID,
+        "enabled_experiment_ids": [e.experiment_id for e in get_enabled_experiments()],
+        "validation_runtime_profile": VALIDATION_RUNTIME_PROFILE,
         "device": DEVICE,
+        "python_version": platform.python_version(),
+        "torch_version": torch.__version__,
+        "torchvision_version": torchvision.__version__,
+        "sklearn_version": sklearn.__version__,
+        "opencv_version": cv2.__version__,
+        "monai_bundle": MONAI_BUNDLE_NAME,
+        "monai_bundle_version": MONAI_BUNDLE_VERSION,
         "monai_runtime_source": MONAI_RUNTIME_SOURCE,
-        "monai_runtime_artifact_path": MONAI_RUNTIME_ARTIFACT_PATH,
-        "monai_hf_revision": MONAI_HF_REVISION,
-        "monai_expected_model_ts_sha256": (
-            MONAI_OFFICIAL_TORCHSCRIPT_SHA256
-        ),
-        "monai_expected_model_pt_sha256": MONAI_MODEL_SHA256,
-        "efficientnet_weights": EFFICIENTNET_WEIGHTS_NAME,
-        "provenance_classifier_feature_names": list(
-            PROVENANCE_CLASSIFIER_FEATURE_NAMES
-        ),
-        "standardization_feature_names": list(
-            STANDARDIZATION_FEATURE_NAMES
-        ),
-        "label_blind_standardization": {
-            "lower_percentile": STANDARDIZATION_LOWER_PERCENTILE,
-            "upper_percentile": STANDARDIZATION_UPPER_PERCENTILE,
-            "dark_line_max_mean": STANDARDIZATION_DARK_LINE_MAX_MEAN,
-            "dark_line_max_std": STANDARDIZATION_DARK_LINE_MAX_STD,
-            "dark_pixel_max_value": STANDARDIZATION_DARK_PIXEL_MAX_VALUE,
-            "dark_pixel_min_fraction": (
-                STANDARDIZATION_DARK_PIXEL_MIN_FRACTION
-            ),
-            "max_crop_fraction_per_side": (
-                STANDARDIZATION_MAX_CROP_FRACTION_PER_SIDE
-            ),
-            "minimum_retained_fraction": (
-                STANDARDIZATION_MIN_RETAINED_FRACTION
-            ),
-            "minimum_padding_run": STANDARDIZATION_MIN_PADDING_RUN,
-        },
+        "monai_model_ts_sha256": sha256_file(model_path) if model_path.is_file() else None,
         "exact_duplicate_audit": exact_summary,
         "perceptual_duplicate_audit": phash_summary,
-        "monai_gate_comparison": monai_gate_comparison,
-        "standardized_monai_gate_comparison": (
-            standardized_monai_gate_comparison
-        ),
-        "monai_representation_decomposition": {
-            "soft_histogram_bins": MONAI_SOFT_HISTOGRAM_BINS,
-            "block_shuffle_grid": MONAI_SOFT_BLOCK_SHUFFLE_GRID,
-            "block_shuffle_version": MONAI_SOFT_BLOCK_SHUFFLE_VERSION,
-            "canonical_mask_content_fraction": (
-                MONAI_CANONICAL_MASK_CONTENT_FRACTION
-            ),
-            "interpretation": (
-                "C21-C27 separate intact soft-map information into marginal "
-                "probability distribution, block-local texture, relative "
-                "shape, and absolute position/scale components."
-            ),
-        },
-        "repeated_nested_cv_stability": stability_summary,
-        "patient_label_permutation_test": permutation_summary,
-        "v6_candidate_family_nested_selection": (
-            candidate_family_selection_summary
-        ),
-        "v6_exact_support_row_contract": v6_row_contract_summary,
-        "annotated_series_subset_analysis": series_annotation_summary,
-        "successful_experiment_ids": [
-            result["config"].experiment_id for result in successful_results
-        ],
-        "failed_experiments": failed_results,
+        "monai_gate_comparison": standardized_monai_gate_comparison,
+        "stability_summary": stability_summary,
+        "permutation_summary": permutation_summary,
+        "model_family_nested_selection": candidate_family_selection_summary,
+        "exact_support_row_contract": exact_support_row_contract_summary,
+        "successful_experiments": [r["config"].experiment_id for r in successful_results],
+        "failed_experiments": [r.get("experiment_id") for r in failed_results],
         "total_runtime_seconds": float(total_runtime),
-        "external_validation": {
-            "requested": bool(RUN_EXTERNAL_VALIDATION),
-            "status": (
-                "BLOCKED_REQUIRES_VERIFIED_EXTERNAL_DATA_ADAPTER"
-                if RUN_EXTERNAL_VALIDATION
-                else "SKIPPED_NOT_CONFIGURED"
-            ),
-            "dataset_path": EXTERNAL_DATASET_PATH,
-        },
+        "clinical_status": "exploratory_internal_validation_only",
     }
-    checkpoint_path = bundle_root / "models" / "model.pt"
-
-    if official_torchscript_path.is_file():
-        metadata["monai_actual_model_ts_sha256"] = sha256_file(
-            official_torchscript_path
-        )
-    else:
-        metadata["monai_actual_model_ts_sha256"] = None
-
-    if checkpoint_path.is_file():
-        metadata["monai_actual_model_pt_sha256"] = sha256_file(
-            checkpoint_path
-        )
-    else:
-        metadata["monai_actual_model_pt_sha256"] = None
-
-    if MONAI_TORCHSCRIPT_PATH.is_file():
-        metadata["monai_fallback_torchscript_sha256"] = sha256_file(
-            MONAI_TORCHSCRIPT_PATH
-        )
-    else:
-        metadata["monai_fallback_torchscript_sha256"] = None
-
-    return metadata
 
 
 def write_suite_configuration(output_path, experiments):
-    """Save every predeclared setting before model evaluation starts."""
+    """Save the complete current protocol before evaluation begins."""
 
     configuration = {
+        "pipeline_schema": PIPELINE_SCHEMA_ID,
         "suite_name": SUITE_NAME,
         "suite_configuration_tag": SUITE_CONFIGURATION_TAG,
-        "validation_runtime_profile": VALIDATION_RUNTIME_PROFILE,
-        "stability_panel": STABILITY_PANEL,
-        "baseline_experiment_id": BASELINE_EXPERIMENT_ID,
+        "reference_experiment_id": REFERENCE_EXPERIMENT_ID,
         "primary_candidate_experiment_id": PRIMARY_CANDIDATE_EXPERIMENT_ID,
-        "v5_candidate_experiment_id": V5_CANDIDATE_EXPERIMENT_ID,
-        "v5_matched_outside_control_experiment_id": (
-            V5_MATCHED_OUTSIDE_CONTROL_EXPERIMENT_ID
-        ),
-        "v6_prospective_candidate_experiment_id": (
-            V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID
-        ),
-        "v6_valid_only_ablation_experiment_id": (
-            V6_VALID_ONLY_ABLATION_EXPERIMENT_ID
-        ),
-        "v6_exact_support_mask_control_experiment_id": (
-            V6_EXACT_SUPPORT_MASK_CONTROL_EXPERIMENT_ID
-        ),
-        "v6_support_shuffled_intensity_control_experiment_id": (
-            V6_SUPPORT_SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID
-        ),
-        "v6_exact_support_complement_control_experiment_id": (
-            V6_EXACT_SUPPORT_COMPLEMENT_CONTROL_EXPERIMENT_ID
-        ),
-        "development_baseline_experiment_id": (
-            DEVELOPMENT_BASELINE_EXPERIMENT_ID
-        ),
+        "valid_only_ablation_experiment_id": VALID_ONLY_ABLATION_EXPERIMENT_ID,
+        "control_experiment_ids": [
+            FIXED_PERIPHERY_CONTROL_EXPERIMENT_ID,
+            MASK_ONLY_CONTROL_EXPERIMENT_ID,
+            SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID,
+            COMPLEMENT_CONTROL_EXPERIMENT_ID,
+        ],
         "experiments": [asdict(experiment) for experiment in experiments],
-        "primary_ablation_comparisons": [
-            {
-                "comparison_name": comparison_name,
-                "reference_experiment_id": reference_id,
-                "comparison_experiment_id": comparison_id,
-                "scientific_question": scientific_question,
-            }
-            for (
-                comparison_name,
-                reference_id,
-                comparison_id,
-                scientific_question,
-            ) in PRIMARY_ABLATION_COMPARISONS
-        ],
-        "repeated_stability_comparisons": [
-            {
-                "comparison_name": comparison_name,
-                "reference_experiment_id": reference_id,
-                "comparison_experiment_id": comparison_id,
-                "scientific_question": scientific_question,
-            }
-            for (
-                comparison_name,
-                reference_id,
-                comparison_id,
-                scientific_question,
-            ) in REPEATED_STABILITY_COMPARISONS
-        ],
-        "outer_cv_splits": N_SPLITS,
-        "outer_cv_random_state": CV_RANDOM_STATE,
-        "inner_cv_splits": INNER_CV_SPLITS,
-        "inner_cv_random_state": INNER_CV_RANDOM_STATE,
-        "classifier_c_grid": list(CLASSIFIER_C_GRID),
-        "c_selection_auc_tolerance": C_SELECTION_AUC_TOLERANCE,
-        "logistic_max_iter": LOGISTIC_MAX_ITER,
-        "svm_max_iter": SVM_MAX_ITER,
-        "svm_calibration_c": SVM_CALIBRATION_C,
-        "threshold_selection_method": THRESHOLD_SELECTION_METHOD,
-        "target_sensitivity": TARGET_SENSITIVITY,
-        "bootstrap_replicates": BOOTSTRAP_REPLICATES,
-        "paired_bootstrap_replicates": PAIRED_BOOTSTRAP_REPLICATES,
-        "bootstrap_confidence": BOOTSTRAP_CONFIDENCE,
-        "patient_pca_explained_variance": (
-            PATIENT_PCA_EXPLAINED_VARIANCE
-        ),
-        "batch_size": BATCH_SIZE,
-        "dataloader_num_workers": DATALOADER_NUM_WORKERS,
-        "use_cuda_amp": USE_CUDA_AMP,
-        "deterministic_execution": {
-            "cublas_workspace_config": os.environ.get(
-                "CUBLAS_WORKSPACE_CONFIG"
-            ),
-            "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
-            "cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
-            "cudnn_allow_tf32": bool(
-                getattr(torch.backends.cudnn, "allow_tf32", False)
-            ),
-            "cuda_matmul_allow_tf32": bool(
-                getattr(
-                    getattr(torch.backends.cuda, "matmul", object()),
-                    "allow_tf32",
-                    False,
-                )
-            ),
-            "deterministic_algorithms_requested": True,
+        "primary_ablation_comparisons": PRIMARY_ABLATION_COMPARISONS,
+        "outer_cv": {"splits": N_SPLITS, "random_state": CV_RANDOM_STATE},
+        "inner_cv": {
+            "splits": INNER_CV_SPLITS,
+            "random_state": INNER_CV_RANDOM_STATE,
+            "c_grid": CLASSIFIER_C_GRID,
+            "c_selection_auc_tolerance": C_SELECTION_AUC_TOLERANCE,
+            "threshold_method": THRESHOLD_SELECTION_METHOD,
         },
-        "feature_cache_schema": FEATURE_CACHE_SCHEMA_VERSION,
-        "feature_modes_per_encoder_call": FEATURE_MODES_PER_ENCODER_CALL,
-        "slice_quality_min_weight": SLICE_QUALITY_MIN_WEIGHT,
-        "border_width_fraction": BORDER_WIDTH_FRACTION,
-        "standardized_border_width_fractions": list(
-            STANDARDIZED_BORDER_WIDTH_FRACTIONS
-        ),
-        "standardized_corner_fraction": STANDARDIZED_CORNER_WIDTH_FRACTION,
-        "center_crop_fallback_fraction": CENTER_CROP_FALLBACK_FRACTION,
-        "fixed_center_crop_fractions": list(FIXED_CENTER_CROP_FRACTIONS),
-        "standardized_content_long_side": STANDARDIZED_CONTENT_LONG_SIDE,
-        "fixed_chunk_size": FIXED_CHUNK_SIZE,
-        "fixed_chunk_min_remainder_fraction": (
-            FIXED_CHUNK_MIN_REMAINDER_FRACTION
-        ),
-        "v5_fixed_heart_fov_fraction": V5_FIXED_HEART_FOV_FRACTION,
-        "v5_hard_support_extra_dilation_kernel": (
-            V5_HARD_SUPPORT_EXTRA_DILATION_KERNEL
-        ),
-        "v5_whole_heart_exclusion_center_fraction": (
-            V5_WHOLE_HEART_EXCLUSION_CENTER_FRACTION
-        ),
-        "v5_whole_heart_exclusion_bbox_context_fraction": (
-            V5_WHOLE_HEART_EXCLUSION_BBOX_CONTEXT_FRACTION
-        ),
-        "v5_fixed_periphery_exclusion_fraction": (
-            V5_FIXED_PERIPHERY_EXCLUSION_FRACTION
-        ),
-        "v5_region_norm_lower_percentile": V5_REGION_NORM_LOWER_PERCENTILE,
-        "v5_region_norm_upper_percentile": V5_REGION_NORM_UPPER_PERCENTILE,
-        "v5_region_norm_min_pixels": V5_REGION_NORM_MIN_PIXELS,
-        "v5_region_norm_histogram_bins": V5_REGION_NORM_HISTOGRAM_BINS,
-        "v5_region_norm_min_dynamic_range": (
-            V5_REGION_NORM_MIN_DYNAMIC_RANGE
-        ),
-        "v6_support_intensity_shuffle_version": (
-            V6_SUPPORT_INTENSITY_SHUFFLE_VERSION
-        ),
-        "monai_soft_histogram_bins": MONAI_SOFT_HISTOGRAM_BINS,
-        "monai_soft_block_shuffle_grid": MONAI_SOFT_BLOCK_SHUFFLE_GRID,
-        "monai_soft_block_shuffle_version": (
-            MONAI_SOFT_BLOCK_SHUFFLE_VERSION
-        ),
-        "monai_canonical_mask_content_fraction": (
-            MONAI_CANONICAL_MASK_CONTENT_FRACTION
-        ),
-        "monai_bbox_context_fraction": MONAI_BBOX_CONTEXT_FRACTION,
-        "outside_monai_bbox_context_fraction": (
-            OUTSIDE_MONAI_BBOX_CONTEXT_FRACTION
-        ),
-        "label_blind_standardization": {
-            "lower_percentile": STANDARDIZATION_LOWER_PERCENTILE,
-            "upper_percentile": STANDARDIZATION_UPPER_PERCENTILE,
-            "dark_line_max_mean": STANDARDIZATION_DARK_LINE_MAX_MEAN,
-            "dark_line_max_std": STANDARDIZATION_DARK_LINE_MAX_STD,
-            "dark_pixel_max_value": STANDARDIZATION_DARK_PIXEL_MAX_VALUE,
-            "dark_pixel_min_fraction": (
-                STANDARDIZATION_DARK_PIXEL_MIN_FRACTION
-            ),
-            "max_crop_fraction_per_side": (
-                STANDARDIZATION_MAX_CROP_FRACTION_PER_SIDE
-            ),
-            "minimum_retained_fraction": (
-                STANDARDIZATION_MIN_RETAINED_FRACTION
-            ),
-            "minimum_padding_run": STANDARDIZATION_MIN_PADDING_RUN,
-            "feature_names": list(STANDARDIZATION_FEATURE_NAMES),
+        "bootstrap": {
+            "replicates": BOOTSTRAP_REPLICATES,
+            "paired_replicates": PAIRED_BOOTSTRAP_REPLICATES,
+            "confidence": BOOTSTRAP_CONFIDENCE,
         },
-        "provenance_classifier_feature_names": list(
-            PROVENANCE_CLASSIFIER_FEATURE_NAMES
-        ),
-        "patient_definition": "Directory_*",
-        "audit_exact_decoded_pixel_duplicates": (
-            AUDIT_EXACT_DECODED_PIXEL_DUPLICATES
-        ),
-        "audit_perceptual_near_duplicates": (
-            AUDIT_PERCEPTUAL_NEAR_DUPLICATES
-        ),
-        "phash_hamming_threshold": PHASH_HAMMING_THRESHOLD,
-        "phash_search_method": (
-            "complete_bk_tree_unique_phash_values"
-            if PHASH_USE_COMPLETE_BK_TREE_AUDIT
-            else "unsupported"
-        ),
-        "phash_candidate_interpretation": (
-            "screening candidates requiring manual or stronger similarity review"
-        ),
-        "group_splits_by_exact_duplicates": (
-            GROUP_SPLITS_BY_EXACT_DUPLICATES
-        ),
-        "group_splits_by_phash_candidates": (
-            GROUP_SPLITS_BY_PHASH_CANDIDATES
-        ),
-        "fail_on_cross_patient_exact_duplicates": (
-            FAIL_ON_CROSS_PATIENT_EXACT_DUPLICATES
-        ),
-        "fail_on_cross_label_exact_duplicates": (
-            FAIL_ON_CROSS_LABEL_EXACT_DUPLICATES
-        ),
-        "shortcut_warning_auc": SHORTCUT_WARNING_AUC,
-        "monai_gate_rate_difference_warning": (
-            MONAI_GATE_RATE_DIFFERENCE_WARNING
-        ),
-        "repeated_nested_cv_stability": {
+        "stability": {
             "enabled": RUN_REPEATED_NESTED_CV_STABILITY,
-            "experiment_ids": list(STABILITY_EXPERIMENT_IDS),
             "repeats": REPEATED_NESTED_CV_REPEATS,
-            "random_state": REPEATED_NESTED_CV_RANDOM_STATE,
+            "experiment_ids": list(STABILITY_EXPERIMENT_IDS),
+            "comparisons": REPEATED_STABILITY_COMPARISONS,
         },
-        "patient_label_permutation_test": {
+        "permutation": {
             "enabled": RUN_PATIENT_LABEL_PERMUTATION_TEST,
-            "experiment_ids": list(PERMUTATION_EXPERIMENT_IDS),
             "replicates": LABEL_PERMUTATION_REPLICATES,
-            "random_state": LABEL_PERMUTATION_RANDOM_STATE,
+            "experiment_ids": list(PERMUTATION_EXPERIMENT_IDS),
+            "selection_adjusted_enabled": RUN_SELECTION_ADJUSTED_PERMUTATION_TEST,
+            "selection_adjusted_replicates": SELECTION_ADJUSTED_PERMUTATION_REPLICATES,
+            "selection_adjusted_candidate_ids": list(SELECTION_ADJUSTED_CANDIDATE_EXPERIMENT_IDS),
         },
-        "v6_candidate_family_nested_selection": {
-            "enabled": RUN_V6_CANDIDATE_FAMILY_NESTED_SELECTION,
-            "experiment_ids": list(
-                V6_CANDIDATE_FAMILY_NESTED_SELECTION_IDS
-            ),
-            "inner_auc_tolerance": (
-                V6_CANDIDATE_FAMILY_SELECTION_AUC_TOLERANCE
-            ),
-            "tie_break_order": list(
-                V6_CANDIDATE_FAMILY_NESTED_SELECTION_IDS
-            ),
+        "model_family_nested_selection": {
+            "enabled": RUN_MODEL_FAMILY_NESTED_SELECTION,
+            "experiment_ids": list(MODEL_FAMILY_NESTED_SELECTION_IDS),
+            "auc_tolerance": MODEL_FAMILY_SELECTION_AUC_TOLERANCE,
         },
-        "selection_adjusted_permutation_test": {
-            "enabled": RUN_SELECTION_ADJUSTED_PERMUTATION_TEST,
-            "experiment_ids": list(
-                SELECTION_ADJUSTED_CANDIDATE_EXPERIMENT_IDS
-            ),
-            "replicates": SELECTION_ADJUSTED_PERMUTATION_REPLICATES,
-            "random_state": SELECTION_ADJUSTED_PERMUTATION_RANDOM_STATE,
-            "statistic": "maximum nested-CV AUROC across candidates",
+        "preprocessing": {
+            "img_size": IMG_SIZE,
+            "monai_input_size": MONAI_INPUT_SIZE,
+            "standardized_content_long_side": STANDARDIZED_CONTENT_LONG_SIDE,
+            "center_crop_fallback_fraction": CENTER_CROP_FALLBACK_FRACTION,
+            "hard_support_dilation_kernel": HARD_SUPPORT_DILATION_KERNEL,
+            "fixed_periphery_exclusion_fraction": FIXED_PERIPHERY_EXCLUSION_FRACTION,
+            "region_norm_percentiles": [REGION_NORM_LOWER_PERCENTILE, REGION_NORM_UPPER_PERCENTILE],
+            "region_norm_min_pixels": REGION_NORM_MIN_PIXELS,
+            "region_norm_min_dynamic_range": REGION_NORM_MIN_DYNAMIC_RANGE,
+            "support_intensity_shuffle_schema": SUPPORT_INTENSITY_SHUFFLE_SCHEMA,
         },
-        "annotated_series_subset_analysis": {
-            "enabled": RUN_ANNOTATED_SERIES_SUBSET_ANALYSIS,
-            "annotation_input_path": SERIES_ANNOTATION_INPUT_PATH,
-            "selection_name": ANNOTATED_SERIES_SELECTION_NAME,
-            "require_contains_heart": (
-                ANNOTATED_SERIES_REQUIRE_CONTAINS_HEART
-            ),
-            "exclude_localizers": ANNOTATED_SERIES_EXCLUDE_LOCALIZERS,
-            "exclude_derived_exports": (
-                ANNOTATED_SERIES_EXCLUDE_DERIVED_EXPORTS
-            ),
-            "allowed_sequence_types": list(
-                ANNOTATED_SERIES_ALLOWED_SEQUENCE_TYPES
-            ),
-            "allowed_view_types": list(
-                ANNOTATED_SERIES_ALLOWED_VIEW_TYPES
-            ),
-            "allowed_confidence_values": list(
-                ANNOTATED_SERIES_ALLOWED_CONFIDENCE_VALUES
-            ),
-            "sequence_view_balanced_pooling": bool(
-                ANNOTATED_SERIES_USE_SEQUENCE_VIEW_BALANCED_POOLING
-            ),
-            "experiment_ids": list(ANNOTATED_SERIES_EXPERIMENT_IDS),
+        "models": {
+            "monai_bundle": MONAI_BUNDLE_NAME,
+            "monai_bundle_version": MONAI_BUNDLE_VERSION,
+            "monai_hf_revision": MONAI_HF_REVISION,
+            "efficientnet_weights": EFFICIENTNET_WEIGHTS_NAME,
         },
-        "external_validation_requested": RUN_EXTERNAL_VALIDATION,
-        "external_dataset_path": EXTERNAL_DATASET_PATH,
+        "runtime": {
+            "validation_profile": VALIDATION_RUNTIME_PROFILE,
+            "device_policy": RUNTIME_DEVICE_POLICY,
+            "suite_device_tag": SUITE_DEVICE_TAG,
+            "feature_cache_device_tag": FEATURE_CACHE_DEVICE_TAG,
+            "deterministic_algorithms": True,
+            "cuda_amp": USE_CUDA_AMP,
+        },
     }
-    output_path.write_text(
-        json.dumps(configuration, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(configuration, indent=2, sort_keys=True), encoding="utf-8")
 
 
 def main():
@@ -13510,7 +8700,7 @@ def main():
     experiments = get_enabled_experiments()
 
     print("\n" + "#" * 100, flush=True)
-    print("CAD CARDIAC MRI — MULTI-EXPERIMENT PATIENT-LEVEL SUITE", flush=True)
+    print("CAD CARDIAC MRI — PATIENT-LEVEL RESEARCH PIPELINE", flush=True)
     print("#" * 100, flush=True)
     print(f"[SUITE] Dataset: {DATASET_PATH}", flush=True)
     print(f"[SUITE] Output: {OUTPUT_DIR}", flush=True)
@@ -13534,8 +8724,7 @@ def main():
         f"{VALIDATION_RUNTIME_PROFILE}; stability="
         f"{RUN_REPEATED_NESTED_CV_STABILITY} × "
         f"{REPEATED_NESTED_CV_REPEATS} repeats × "
-        f"{len(STABILITY_EXPERIMENT_IDS)} experiments "
-        f"(panel={STABILITY_PANEL}); ordinary permutation="
+        f"{len(STABILITY_EXPERIMENT_IDS)} experiments; ordinary permutation="
         f"{RUN_PATIENT_LABEL_PERMUTATION_TEST} × "
         f"{LABEL_PERMUTATION_REPLICATES}; selection-adjusted permutation="
         f"{RUN_SELECTION_ADJUSTED_PERMUTATION_TEST} × "
@@ -13592,7 +8781,6 @@ def main():
         "comparison",
         "stability",
         "permutation",
-        "sequence_view_analysis",
     ):
         directory = OUTPUT_DIR / subdirectory_name
         if directory.exists():
@@ -13634,22 +8822,11 @@ def main():
     # ======================================================================
     # MAIN STAGE 4 -- LOAD OR EXTRACT ONE SHARED MULTI-VIEW FEATURE BANK
     # ======================================================================
-    # This is the expensive image-processing stage. On a cache miss, each JPEG
-    # is decoded once. MONAI is run on the original canvas and, separately, on
-    # the label-blind standardized min-max canvas because padding removal and
-    # fixed 240-in-256 geometry can legitimately change its probability map.
-    # EfficientNet uses the aligned robust-percentile classifier canvas. All enabled image
-    # variants are then derived from those aligned tensors/masks. EfficientNet
-    # embeddings are written to memory-mapped arrays for the original views and
-    # for standardized full, ROI, narrow-border, corners, fixed-canvas padding,
-    # MONAI-area-matched and fixed center crops, strict-ROI, outside-bounding-box
-    # and structural-control experiments. Small groups of
-    # modes are concatenated per encoder call to reduce launch overhead.
-    #
-    # Downstream pooling, classifier, PCA, weighting, and fusion ablations reuse
-    # these frozen arrays and therefore do not repeat neural inference. The cache
-    # fingerprint includes dataset metadata and every setting capable of changing
-    # the frozen representations, including AMP/device semantics.
+    # This is the expensive image-processing stage. Each JPEG is decoded once,
+    # standardized once, segmented by MONAI, and converted into the six image
+    # representations required by the active candidate/control panel. Frozen
+    # EfficientNet embeddings are cached and reused by every CPU evaluation.
+    # The fingerprint includes dataset metadata and all feature-affecting settings.
     stage_started = _print_stage_start(
         4,
         "Load or build the shared multi-view feature bank",
@@ -13751,10 +8928,6 @@ def main():
         bank,
         fold_manifest_rows,
     )
-    write_series_annotation_template(
-        OUTPUT_DIR / "audits" / "series_annotation_template.csv",
-        samples,
-    )
     stage_durations["06 Manifests"] = _print_stage_complete(
         6,
         "Create one duplicate-aware outer-fold and cohort manifest",
@@ -13765,29 +8938,16 @@ def main():
     # ======================================================================
     # MAIN STAGE 7 -- BUILD NON-ANATOMICAL CONFOUNDING CONTROLS
     # ======================================================================
-    # Patient-level provenance controls use a conservative subset dominated by
-    # geometry, file size, padding and border structure rather than central
-    # anatomical texture. Standardization-QC controls use only crop/padding and
-    # robust-range metadata produced by the fixed label-blind preprocessing.
-    # Original and standardized MONAI-QC controls summarize gate rate, mask
-    # area, confidence and fallback behavior. All tables are saved descriptively
-    # and evaluated through the same outer folds. A high control AUC indicates
-    # that Normal/Sick may be predictable from acquisition/export/protocol
-    # provenance rather than exclusively from CAD-related anatomy.
+    # These descriptive tables audit whether geometry, file size, padding,
+    # intensity scaling or MONAI gate behavior differ between classes. They are
+    # not classifier experiments and never influence model selection.
     stage_started = _print_stage_start(
         7,
-        "Build and save provenance, standardization and MONAI-QC controls",
+        "Build and save provenance, standardization and MONAI-QC audits",
         "Patient-level aggregation and descriptive audit files.",
     )
     provenance_set = aggregate_patient_provenance_features(bank)
-    provenance_component_sets = build_provenance_component_control_sets(
-        provenance_set
-    )
     standardization_set = aggregate_patient_standardization_features(bank)
-    monai_gate_comparison, monai_qc_set = write_monai_qc_outputs(
-        OUTPUT_DIR / "audits",
-        bank,
-    )
     (
         standardized_monai_gate_comparison,
         standardized_monai_qc_set,
@@ -13799,11 +8959,6 @@ def main():
         OUTPUT_DIR / "audits" / "patient_provenance_features.csv",
         *provenance_set,
     )
-    for control_name, control_set in provenance_component_sets.items():
-        write_patient_tabular_features(
-            OUTPUT_DIR / "audits" / f"patient_{control_name}.csv",
-            *control_set,
-        )
     write_patient_tabular_features(
         OUTPUT_DIR / "audits" / "patient_standardization_features.csv",
         *standardization_set,
@@ -13814,13 +8969,6 @@ def main():
         provenance_set[1],
         provenance_set[3],
     )
-    for control_name, control_set in provenance_component_sets.items():
-        write_tabular_class_summary(
-            OUTPUT_DIR / "audits" / f"{control_name}_class_summary.csv",
-            control_set[0],
-            control_set[1],
-            control_set[3],
-        )
     write_tabular_class_summary(
         OUTPUT_DIR / "audits" / "standardization_class_summary.csv",
         standardization_set[0],
@@ -13828,56 +8976,36 @@ def main():
         standardization_set[3],
     )
     write_tabular_class_summary(
-        OUTPUT_DIR / "audits" / "monai_qc_class_summary.csv",
-        monai_qc_set[0],
-        monai_qc_set[1],
-        monai_qc_set[3],
-    )
-    write_tabular_class_summary(
         OUTPUT_DIR / "audits" / "standardized_monai_qc_class_summary.csv",
         standardized_monai_qc_set[0],
         standardized_monai_qc_set[1],
         standardized_monai_qc_set[3],
     )
-    tabular_feature_sets = {
-        "provenance_only": provenance_set,
-        "monai_qc_only": monai_qc_set,
-        "standardization_qc_only": standardization_set,
-        "standardized_monai_qc_only": standardized_monai_qc_set,
-        **provenance_component_sets,
-    }
     stage_durations["07 QC/provenance controls"] = _print_stage_complete(
         7,
-        "Build and save provenance, standardization and MONAI-QC controls",
+        "Build and save provenance, standardization and MONAI-QC audits",
         stage_started,
-        "Patient-level control matrices are ready for broad and decomposed "
-        "provenance, original/standardized MONAI QC, and standardization geometry.",
+        "Descriptive provenance, standardization and MONAI-QC audits are ready.",
     )
 
     # ======================================================================
     # MAIN STAGE 8 -- RUN THE PREDECLARED EXPERIMENT REGISTRY
     # ======================================================================
-    # Each experiment receives the same frozen outer-fold assignments. Any
-    # quantitatively selected classifier C, SVM sigmoid calibration, or decision
-    # threshold is learned only from inner out-of-fold predictions belonging to
-    # the current outer-training cohort. The outer-validation fold remains
-    # untouched until the configuration for that fold is locked. Prepared
-    # representations are cached in memory, and identical fold-local legacy
-    # slice probabilities are reused between mean-probability and log-odds
-    # fusion so that the fusion ablation changes only the aggregation rule.
+    # Every experiment reuses the same patient folds. Classifier C and the
+    # decision threshold are selected only from inner OOF predictions in the
+    # current outer-training cohort; the outer fold remains untouched.
+    # Prepared patient representations are cached in memory.
     #
     # One experiment failure is written to its own failure.json and does not
     # erase successful results unless FAIL_SUITE_IF_ANY_EXPERIMENT_FAILS=True.
     stage_started = _print_stage_start(
         8,
         "Run every enabled experiment on the shared folds",
-        "Several fold-local fits. Patient-embedding experiments are fast; "
-        "legacy slice classifiers are substantially heavier.",
+        "Fold-local PCA and Logistic Regression fits on patient embeddings.",
     )
     successful_results = []
     failed_results = []
     prepared_cache = {}
-    legacy_prediction_cache = {}
 
     for experiment_index, experiment in enumerate(experiments, start=1):
         print(
@@ -13894,7 +9022,6 @@ def main():
                 prepared_cache[preparation_key] = prepare_experiment_data(
                     experiment,
                     bank,
-                    tabular_feature_sets,
                 )
                 print(
                     f"[SUITE] Prepared data representation {preparation_key} in "
@@ -13907,7 +9034,6 @@ def main():
                 prepared=prepared_cache[preparation_key],
                 fold_manifest_rows=fold_manifest_rows,
                 output_dir=experiment_output,
-                legacy_prediction_cache=legacy_prediction_cache,
             )
             successful_results.append(result)
 
@@ -13970,45 +9096,45 @@ def main():
         experiment.experiment_id: experiment
         for experiment in experiments
     }
-    v6_row_contract_prepared = {
+    exact_support_contract_prepared = {
         experiment_id: prepared_cache[
             experiment_preparation_cache_key(
                 experiments_by_id[experiment_id]
             )
         ]
         for experiment_id in (
-            V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID,
-            V6_VALID_ONLY_ABLATION_EXPERIMENT_ID,
-            V6_EXACT_SUPPORT_MASK_CONTROL_EXPERIMENT_ID,
-            V6_SUPPORT_SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID,
-            V6_EXACT_SUPPORT_COMPLEMENT_CONTROL_EXPERIMENT_ID,
+            REFERENCE_EXPERIMENT_ID,
+            VALID_ONLY_ABLATION_EXPERIMENT_ID,
+            MASK_ONLY_CONTROL_EXPERIMENT_ID,
+            SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID,
+            COMPLEMENT_CONTROL_EXPERIMENT_ID,
         )
         if experiment_id in successful_by_id
     }
-    v6_row_contract_summary = audit_v6_prepared_row_contract(
-        v6_row_contract_prepared,
-        OUTPUT_DIR / "audits" / "v6_exact_support_row_contract.json",
+    exact_support_row_contract_summary = audit_exact_support_prepared_row_contract(
+        exact_support_contract_prepared,
+        OUTPUT_DIR / "audits" / "exact_support_row_contract.json",
     )
     candidate_family_output_dir = (
-        OUTPUT_DIR / "comparison" / "v6_candidate_family_nested_selection"
+        OUTPUT_DIR / "comparison" / "model_family_nested_selection"
     )
     candidate_family_output_dir.mkdir(parents=True, exist_ok=True)
-    if RUN_V6_CANDIDATE_FAMILY_NESTED_SELECTION:
+    if RUN_MODEL_FAMILY_NESTED_SELECTION:
         missing_candidate_ids = [
             experiment_id
-            for experiment_id in V6_CANDIDATE_FAMILY_NESTED_SELECTION_IDS
+            for experiment_id in MODEL_FAMILY_NESTED_SELECTION_IDS
             if experiment_id not in successful_by_id
         ]
         if missing_candidate_ids:
             candidate_family_selection_summary = {
                 "status": "SKIPPED_MISSING_OR_FAILED_EXPERIMENT",
                 "candidate_experiment_ids": list(
-                    V6_CANDIDATE_FAMILY_NESTED_SELECTION_IDS
+                    MODEL_FAMILY_NESTED_SELECTION_IDS
                 ),
                 "missing_experiments": missing_candidate_ids,
             }
             print(
-                "[V6 MODEL SELECTION] SKIPPED because candidates are missing "
+                "[EXACT SUPPORT MODEL SELECTION] SKIPPED because candidates are missing "
                 f"or failed: {missing_candidate_ids}.",
                 flush=True,
             )
@@ -14021,11 +9147,11 @@ def main():
                         )
                     ]
                     for experiment_id in (
-                        V6_CANDIDATE_FAMILY_NESTED_SELECTION_IDS
+                        MODEL_FAMILY_NESTED_SELECTION_IDS
                     )
                 }
                 candidate_family_selection_summary = (
-                    run_v6_candidate_family_nested_selection(
+                    run_model_family_nested_selection(
                         experiments_by_id=experiments_by_id,
                         prepared_by_id=candidate_prepared_by_id,
                         fold_manifest_rows=fold_manifest_rows,
@@ -14040,7 +9166,7 @@ def main():
                     "traceback": traceback.format_exc(),
                 }
                 print(
-                    "[V6 MODEL SELECTION] FAILED: "
+                    "[EXACT SUPPORT MODEL SELECTION] FAILED: "
                     f"{type(error).__name__}: {error}",
                     flush=True,
                 )
@@ -14049,10 +9175,10 @@ def main():
         candidate_family_selection_summary = {
             "status": "SKIPPED_DISABLED",
             "candidate_experiment_ids": list(
-                V6_CANDIDATE_FAMILY_NESTED_SELECTION_IDS
+                MODEL_FAMILY_NESTED_SELECTION_IDS
             ),
         }
-        print("[V6 MODEL SELECTION] SKIPPED by configuration.", flush=True)
+        print("[EXACT SUPPORT MODEL SELECTION] SKIPPED by configuration.", flush=True)
 
     (
         candidate_family_output_dir / "summary.json"
@@ -14071,7 +9197,7 @@ def main():
         paired_rows,
         primary_ablation_rows,
         candidate_family_selection_summary,
-        v6_row_contract_summary,
+        exact_support_row_contract_summary,
         OUTPUT_DIR / "comparison",
     )
     stage_durations["09 Master comparisons"] = _print_stage_complete(
@@ -14088,7 +9214,7 @@ def main():
     # MAIN STAGE 10 -- REPEAT SELECTED NESTED-CV EXPERIMENTS ACROSS SPLITS
     # ======================================================================
     # A single five-fold assignment is statistically fragile when the effective
-    # sample size is only the number of Directory_* folders. The prior run also
+    # sample size is only the number of Directory_* folders. The run also
     # showed that shortcut controls could be nearly as predictive as the primary
     # model. This stage therefore repeats the full nested patient-level fitting
     # path not only for the baseline, but also for the main simple-localization
@@ -14391,98 +9517,17 @@ def main():
         stage_started,
         permutation_summary.get("status", "OK"),
     )
-
     # ======================================================================
-    # MAIN STAGE 12 -- OPTIONAL BLINDED SEQUENCE/VIEW SUBSET ANALYSIS
+    # MAIN STAGE 12 -- PRINT THE FINAL TABLE AND SAVE COMPLETE PROVENANCE
     # ======================================================================
-    # The released JPEG folders do not contain sufficient DICOM metadata to
-    # infer sequence/view identity safely. This stage therefore remains disabled
-    # until a reviewer completes a copy of series_annotation_template.csv. When
-    # enabled, it applies the predeclared annotation filters before pooling,
-    # creates a fresh patient-level fold manifest for the retained cohort, and
-    # reruns only the selected image experiments. Empty annotation fields are
-    # never guessed and Normal/Sick labels remain outside the blinded template.
-    stage_started = _print_stage_start(
-        12,
-        "Run optional annotated sequence/view subset analysis",
-        "Immediate when disabled; otherwise several patient-level nested-CV fits.",
-    )
-    series_annotation_summary = run_annotated_series_subset_analysis(
-        bank=bank,
-        experiments=experiments,
-        tabular_feature_sets=tabular_feature_sets,
-        base_fold_manifest_rows=fold_manifest_rows,
-    )
-    stage_durations["12 Annotated sequence/view subset"] = (
-        _print_stage_complete(
-            12,
-            "Run optional annotated sequence/view subset analysis",
-            stage_started,
-            series_annotation_summary.get("status", "UNKNOWN"),
-        )
-    )
-
-    # ======================================================================
-    # MAIN STAGE 13 -- RECORD, BUT DO NOT FABRICATE, EXTERNAL VALIDATION
-    # ======================================================================
-    # External validation cannot be made valid merely by pointing the script at
-    # an arbitrary cardiac dataset. A verified adapter must first establish a
-    # comparable CAD endpoint, one independent patient unit, image/sequence
-    # compatibility, and a locked preprocessing contract. Until such an adapter
-    # exists, the suite writes an explicit SKIPPED/BLOCKED status instead of
-    # silently adapting parameters after inspecting external labels.
-    stage_started = _print_stage_start(
-        13,
-        "Record external-validation status",
-        "Immediate unless a verified independent-data adapter is later added.",
-    )
-    if RUN_EXTERNAL_VALIDATION:
-        external_status = {
-            "status": "BLOCKED_REQUIRES_VERIFIED_EXTERNAL_DATA_ADAPTER",
-            "dataset_path": EXTERNAL_DATASET_PATH,
-            "reason": (
-                "The external cohort's endpoint, patient mapping, sequence "
-                "contract and preprocessing compatibility must be validated "
-                "before this script can apply a locked model."
-            ),
-        }
-        print(
-            "[EXTERNAL VALIDATION] BLOCKED: a dataset-specific verified adapter "
-            "has not been defined. No external labels were inspected or used.",
-            flush=True,
-        )
-    else:
-        external_status = {
-            "status": "SKIPPED_NOT_CONFIGURED",
-            "dataset_path": None,
-            "reason": "No independent hospital dataset was configured.",
-        }
-        print(
-            "[EXTERNAL VALIDATION] SKIPPED: no independent dataset configured.",
-            flush=True,
-        )
-    (OUTPUT_DIR / "external_validation_status.json").write_text(
-        json.dumps(external_status, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
-    stage_durations["13 External validation status"] = _print_stage_complete(
-        13,
-        "Record external-validation status",
-        stage_started,
-        external_status["status"],
-    )
-
-    # ======================================================================
-    # MAIN STAGE 14 -- PRINT THE FINAL TABLE AND SAVE COMPLETE PROVENANCE
-    # ======================================================================
-    # The final console table ranks successful experiments but also prints
-    # explicit shortcut warnings for negative controls above the configured AUC
-    # threshold. The metadata JSON records software versions, model hashes,
+    # The final console table summarizes successful experiments and prints
+    # shortcut warnings for controls above the configured AUC threshold. The
+    # metadata JSON records software versions, model hashes,
     # feature-bank identity, patient counts, audit summaries, successful and
     # failed experiments, and total runtime. All ordinary print() output and
     # tracebacks are simultaneously preserved in console_output.log.
     stage_started = _print_stage_start(
-        14,
+        12,
         "Print final comparison and save suite metadata",
         "Console table, warnings, metadata JSON and timing summary.",
     )
@@ -14497,17 +9542,13 @@ def main():
         cache_status=cache_status,
         exact_summary=exact_summary,
         phash_summary=phash_summary,
-        monai_gate_comparison=monai_gate_comparison,
-        standardized_monai_gate_comparison=(
-            standardized_monai_gate_comparison
-        ),
+        standardized_monai_gate_comparison=standardized_monai_gate_comparison,
         stability_summary=stability_summary,
         permutation_summary=permutation_summary,
         candidate_family_selection_summary=(
             candidate_family_selection_summary
         ),
-        v6_row_contract_summary=v6_row_contract_summary,
-        series_annotation_summary=series_annotation_summary,
+        exact_support_row_contract_summary=exact_support_row_contract_summary,
         successful_results=successful_results,
         failed_results=failed_results,
         total_runtime=total_runtime,
@@ -14517,8 +9558,8 @@ def main():
         encoding="utf-8",
     )
 
-    stage_durations["14 Final reporting"] = _print_stage_complete(
-        14,
+    stage_durations["12 Final reporting"] = _print_stage_complete(
+        12,
         "Print final comparison and save suite metadata",
         stage_started,
         f"Master summary: {OUTPUT_DIR / 'comparison' / 'experiment_summary.csv'}",
@@ -14580,44 +9621,23 @@ def run_with_console_logging():
             sys.stderr = original_stderr
 
 
-# V7 NOTE: the original V6 entrypoint is replaced by the action-aware
-# Attention U-Net entrypoint appended at the end of this single file.
-
 # ============================================================================
-# EXPERIMENTS DELIBERATELY NOT AUTOMATED IN THIS FILE
+# ATTENTION U-NET, MANUAL REVIEW AND DISK-SAFE KAGGLE CACHE
 # ============================================================================
 #
-# 1. A cardiac-MRI-pretrained encoder comparison requires a public checkpoint
-#    whose exact 2D/temporal input contract can be reconstructed from these
-#    released files. Repeating one JPEG as a fake cine clip is not valid.
-# 2. Automatic sequence/view inference remains prohibited. V6 can run an
-#    optional subset analysis only after a reviewer completes the blinded CSV;
-#    SR_* and series* names alone are never treated as validated sequence labels.
-# 3. True external validation requires an independent cohort adapter with a
-#    comparable CAD endpoint, patient unit and locked preprocessing contract.
-#
-# These are recorded as scientific next steps rather than silently approximated.
-
-# ============================================================================
-# V7.2 ATTENTION U-NET EXTENSION — DISK-SAFE KAGGLE CACHE
-# ============================================================================
-#
-# This extension is intentionally appended after the complete V6 MONAI suite.
-# The original V6 functions, experiments, caches and output contracts above are
-# retained. Attention U-Net runs in a separate workspace and comparison folder,
-# so it cannot silently overwrite or reinterpret the MONAI reference results.
+# Attention U-Net uses the same patient contract but a separate workspace and comparison directory, so segmentation training cannot overwrite MONAI reference outputs.
 # Standardized 256x256 training inputs are now cached in RAM by default on
 # Kaggle; optional disk copies are transient and never required. This prevents
-# a full V6 feature-bank directory from causing a fatal libpng write error.
+# a full feature-bank directory from causing a fatal libpng write error.
 #
 # Available command-line actions:
 #
 #   --attention-action both
-#       Run the complete V6 MONAI suite, then generate/reuse pseudo masks, train
+#       Run the complete MONAI suite, then generate/reuse pseudo masks, train
 #       cross-fitted Attention U-Nets and evaluate AU1-AU5.
 #
 #   --attention-action monai-only
-#       Run only the unchanged V6 MONAI suite.
+#       Run only the unchanged MONAI suite.
 #
 #   --attention-action generate-masks
 #       Build a deterministic, label-blind review/training manifest and generate
@@ -14635,7 +9655,7 @@ def run_with_console_logging():
 #   --attention-action attention-only
 #       Generate/reuse masks, train/reuse cross-fitted checkpoints, infer masks
 #       for all images, extract AU1-AU5 patient embeddings and run classification
-#       comparisons. The V6 suite is not rerun.
+#       comparisons. The suite is not rerun.
 #
 # METHODOLOGICAL LIMITATION:
 # Unless sufficient manual/expert masks or an independently trained checkpoint
@@ -14744,13 +9764,13 @@ ATTENTION_SAVE_ALL_PREDICTED_MASKS = _env_bool(
 # ---------------------------------------------------------------------------
 # ATTENTION IMAGE-CACHE AND STORAGE POLICY
 # ---------------------------------------------------------------------------
-# The V6 multi-view feature bank can consume many gigabytes under
+# The multi-view feature bank can consume many gigabytes under
 # /kaggle/working. Caching another 4,715 standardized 256x256 PNG images in the
 # same persistent output filesystem can therefore exhaust Kaggle's write quota.
 # OpenCV then emits only the uninformative message ``libpng error: Write Error``
 # and ``cv2.imwrite`` returns False.
 #
-# V7.2 treats standardized training-image files as an OPTIONAL acceleration
+# Standardized training-image files are an optional acceleration
 # cache, never as required scientific output. On Kaggle the default is:
 #
 #   - retain recently/all selected 256x256 uint8 images in an in-process LRU;
@@ -14765,10 +9785,6 @@ _ATTENTION_RUNNING_ON_KAGGLE = Path("/kaggle/working").exists()
 ATTENTION_CACHE_TRAINING_IMAGES = _env_bool(
     "CAD_ATTENTION_CACHE_TRAINING_IMAGES",
     not _ATTENTION_RUNNING_ON_KAGGLE,
-)
-ATTENTION_REMOVE_LEGACY_WORKING_IMAGE_CACHE = _env_bool(
-    "CAD_ATTENTION_REMOVE_LEGACY_WORKING_IMAGE_CACHE",
-    _ATTENTION_RUNNING_ON_KAGGLE,
 )
 ATTENTION_STORE_AUTOMATIC_MASKS_IN_TRANSIENT = _env_bool(
     "CAD_ATTENTION_STORE_AUTOMATIC_MASKS_IN_TRANSIENT",
@@ -14872,7 +9888,7 @@ def build_attention_workspace(root=None):
     """Resolve persistent and transient Attention U-Net storage.
 
     Scientific outputs remain under ``root`` so they can be preserved by a
-    Kaggle notebook version. Regenerable standardized training-image cache files
+    Kaggle notebook. Regenerable standardized training-image cache files
     live under ``transient_root``. Kaggle's ``/kaggle/temp`` is preferred for
     these files because filling ``/kaggle/working`` can prevent every later
     result, checkpoint and mask from being saved.
@@ -14923,35 +9939,9 @@ def build_attention_workspace(root=None):
         transient_root = fallback
         transient_root.mkdir(parents=True, exist_ok=True)
 
-    # Earlier V7 builds stored all 256x256 training inputs directly under the
-    # persistent workspace. Those files are fully regenerable and may include a
-    # truncated PNG left by the libpng write failure. Remove only that legacy
-    # image-cache directory; automatic/manual masks and checkpoints are never
-    # touched. Set CAD_ATTENTION_REMOVE_LEGACY_WORKING_IMAGE_CACHE=0 to retain it.
-    legacy_cached_images = root / "training_images_256"
+    # Standardized training images are regenerable and live only in the
+    # configured transient cache directory.
     new_cached_images = transient_root / "training_images_256"
-    if (
-        ATTENTION_REMOVE_LEGACY_WORKING_IMAGE_CACHE
-        and legacy_cached_images.exists()
-        and legacy_cached_images.resolve() != new_cached_images.resolve()
-    ):
-        try:
-            legacy_file_count = sum(
-                1 for path in legacy_cached_images.rglob("*") if path.is_file()
-            )
-            shutil.rmtree(legacy_cached_images)
-            print(
-                "[ATTENTION][CACHE] Removed legacy persistent standardized-"
-                f"image cache ({legacy_file_count} files): "
-                f"{legacy_cached_images}",
-                flush=True,
-            )
-        except OSError as error:
-            print(
-                "[ATTENTION][CACHE][WARNING] Could not remove legacy image "
-                f"cache {legacy_cached_images}: {type(error).__name__}: {error}",
-                flush=True,
-            )
 
     automatic_masks = (
         transient_root / "automatic_masks"
@@ -15648,11 +10638,6 @@ def generate_attention_pseudo_masks(samples, workspace, monai_segmenter=None):
 
 
 # ---------------------------------------------------------------------------
-# INTERACTIVE MANUAL MASK EDITOR — V12 TRANSPARENT-MASK RESET FIX
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
 # ATTENTION U-NET ARCHITECTURE
 # ---------------------------------------------------------------------------
 
@@ -16258,7 +11243,7 @@ def create_attention_exact_support_mask(hard_mask_224, valid_mask, content_mask)
                 width,
                 (height - 1) / 2.0,
                 (width - 1) / 2.0,
-                V5_FIXED_HEART_FOV_FRACTION,
+                HARD_SUPPORT_FALLBACK_FRACTION,
             )
             support[index, 0, top:bottom, left:right] = 1.0
     return (support * (content_mask > 0.5).float()).clamp(0.0, 1.0)
@@ -16715,9 +11700,6 @@ def extract_attention_patient_feature_bank(samples, workspace, checkpoint_map):
             "training_image_ram_cache_mb": int(
                 ATTENTION_RAM_IMAGE_CACHE_MB
             ),
-            "legacy_working_image_cache_auto_remove": bool(
-                ATTENTION_REMOVE_LEGACY_WORKING_IMAGE_CACHE
-            ),
         },
         "retained_slice_counts": dict(pool.retained_slice_counts),
         "patient_level_fallbacks": dict(pool.patient_level_fallbacks),
@@ -16753,11 +11735,6 @@ ATTENTION_EXPERIMENTS = (
             "fixed-centre fallback, hierarchical patient pooling, PCA and LR."
         ),
         feature_mode=ATTENTION_FEATURE_MODES[0],
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
         role="attention_candidate",
     ),
     ExperimentConfig(
@@ -16768,22 +11745,12 @@ ATTENTION_EXPERIMENTS = (
             "and is listed in feature-bank metadata rather than being deleted."
         ),
         feature_mode=ATTENTION_FEATURE_MODES[1],
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
         role="attention_ablation",
     ),
     ExperimentConfig(
         experiment_id="AU3_ATTENTION_EXACT_SUPPORT_MASK_ONLY_HIER_LR_PCA",
         description="Exact Attention U-Net support geometry with MRI intensity removed.",
         feature_mode=ATTENTION_FEATURE_MODES[2],
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
         role="segmentation_representation_control",
     ),
     ExperimentConfig(
@@ -16793,11 +11760,6 @@ ATTENTION_EXPERIMENTS = (
             "spatial intensity assignment deterministically destroyed."
         ),
         feature_mode=ATTENTION_FEATURE_MODES[3],
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
         role="anatomy_destruction_control",
     ),
     ExperimentConfig(
@@ -16807,18 +11769,13 @@ ATTENTION_EXPERIMENTS = (
             "Attention U-Net support."
         ),
         feature_mode=ATTENTION_FEATURE_MODES[4],
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
         role="negative_control",
     ),
 )
 
 
 def _load_or_create_classification_fold_manifest(samples, workspace):
-    """Reuse V6 patient folds when present; otherwise create the same contract."""
+    """Reuse patient folds when present; otherwise create the same contract."""
 
     candidate_paths = [OUTPUT_DIR / "manifests" / "patient_fold_manifest.csv"]
     candidate_paths.extend(
@@ -16842,7 +11799,7 @@ def _load_or_create_classification_fold_manifest(samples, workspace):
             "duplicate_component_id",
         }.issubset(rows[0]):
             print(
-                f"[ATTENTION][CV] Reusing V6 fold manifest: {path}",
+                f"[ATTENTION][CV] Reusing fold manifest: {path}",
                 flush=True,
             )
             return rows, path
@@ -16912,11 +11869,11 @@ def _read_oof_prediction_csv(path):
     )
 
 
-def _find_v6_a17_predictions():
+def _find_monai_candidate_predictions():
     direct = (
         OUTPUT_DIR
         / "experiments"
-        / V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID
+        / PRIMARY_CANDIDATE_EXPERIMENT_ID
         / "patient_oof_predictions.csv"
     )
     if direct.is_file():
@@ -16924,7 +11881,7 @@ def _find_v6_a17_predictions():
     candidates = sorted(
         OUTPUT_ROOT.glob(
             "multi_experiment_suite__*/experiments/"
-            f"{V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID}/patient_oof_predictions.csv"
+            f"{PRIMARY_CANDIDATE_EXPERIMENT_ID}/patient_oof_predictions.csv"
         ),
         key=lambda path: path.stat().st_mtime_ns,
         reverse=True,
@@ -17042,38 +11999,38 @@ def evaluate_attention_feature_bank(samples, workspace, bank):
         )
 
     monai_comparison = {"status": "UNAVAILABLE"}
-    a17_path = _find_v6_a17_predictions()
-    if a17_path is not None:
-        a17_patients, a17_labels, a17_scores = _read_oof_prediction_csv(a17_path)
+    monai_path = _find_monai_candidate_predictions()
+    if monai_path is not None:
+        monai_patients, monai_labels, monai_scores = _read_oof_prediction_csv(monai_path)
         order = np.argsort(au1["patient_ids"].astype(str))
         au1_patients = au1["patient_ids"][order].astype(str)
         au1_labels = au1["labels"][order]
         au1_scores = au1["probabilities"][order]
-        if np.array_equal(a17_patients, au1_patients) and np.array_equal(a17_labels, au1_labels):
+        if np.array_equal(monai_patients, au1_patients) and np.array_equal(monai_labels, au1_labels):
             comparison = paired_auc_difference_interval(
                 au1_labels,
-                a17_scores,
+                monai_scores,
                 au1_scores,
                 random_state=ATTENTION_RANDOM_SEED + 91_000,
             )
             monai_comparison = {
                 "status": "OK",
-                "monai_experiment_id": V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID,
-                "monai_prediction_csv": str(a17_path),
+                "monai_experiment_id": PRIMARY_CANDIDATE_EXPERIMENT_ID,
+                "monai_prediction_csv": str(monai_path),
                 "attention_experiment_id": ATTENTION_EXPERIMENTS[0].experiment_id,
-                "monai_auc": float(roc_auc_score(a17_labels, a17_scores)),
+                "monai_auc": float(roc_auc_score(monai_labels, monai_scores)),
                 "attention_auc": float(roc_auc_score(au1_labels, au1_scores)),
                 "attention_minus_monai": comparison,
             }
         else:
             monai_comparison = {
                 "status": "PATIENT_OR_LABEL_MISMATCH",
-                "monai_prediction_csv": str(a17_path),
+                "monai_prediction_csv": str(monai_path),
             }
 
     summary = {
         "status": "OK",
-        "attention_extension_version": "7.2-disk-safe-fast-validation-profile",
+        "pipeline_component_schema": "attention-current",
         "storage_policy": {
             "persistent_workspace": str(workspace.root),
             "transient_root": str(workspace.transient_root),
@@ -17108,7 +12065,7 @@ def evaluate_attention_feature_bank(samples, workspace, bank):
         "repeated_nested_cv": stability,
         "au1_vs_controls": pairwise,
         "au1_patient_label_permutation": permutation,
-        "au1_vs_monai_a17": monai_comparison,
+        "au1_vs_monai_primary": monai_comparison,
         "methodological_limitation": (
             "If pseudo masks dominate supervision, Attention U-Net remains a "
             "cross-fitted distillation of MONAI rather than an independent expert "
@@ -17163,12 +12120,10 @@ def validate_attention_extension():
 
 
 # ============================================================================
-# V13 FULL-COHORT MONAI / ATTENTION U-NET MASK REVIEW EXTENSION
+# FULL-COHORT MONAI / ATTENTION U-NET MASK REVIEW
 # ============================================================================
 #
-# This extension is executed AFTER the main V7.2 pipeline-definition cell. It
-# preserves the original segmentation/classification implementation and adds a
-# separate full-cohort review workflow:
+# This section adds a full-cohort review workflow:
 #
 #   * every one of the 63,425 image rows can appear in the HTML editor;
 #   * MONAI masks can be generated for all rows or only for a selected queue;
@@ -17188,10 +12143,10 @@ def validate_attention_extension():
 # workspace by default. Manual masks and review history remain persistent under
 # /kaggle/working/cad_attention_unet_workspace.
 
-from collections import defaultdict as _v13_defaultdict
-from datetime import datetime as _v13_datetime, timezone as _v13_timezone
+from collections import defaultdict as _review_defaultdict
+from datetime import datetime as _review_datetime, timezone as _review_timezone
 
-ATTENTION_FULL_REVIEW_VERSION = "v13-full-cohort-iterative-review"
+ATTENTION_REVIEW_SCHEMA = "cad-mask-review-current"
 ATTENTION_REVIEW_SCOPES = (
     "all",
     "diverse",
@@ -17202,46 +12157,24 @@ ATTENTION_REVIEW_SCOPES = (
     "reviewed",
 )
 ATTENTION_ACTION_CHOICES = (
-    "both",
-    "monai-only",
-    "attention-only",
-    "generate-masks",
-    "train-attention",
-    "edit-masks",
-    "generate-all-monai-masks",
-    "generate-all-attention-masks",
-    "retrain-regenerate-attention",
-    # V15 staged-device actions.
     "build-monai-feature-cache",
+    "generate-all-monai-masks",
     "monai-cpu-from-cache",
+    "edit-existing-masks",
+    "retrain-regenerate-attention",
     "build-attention-feature-cache",
     "evaluate-attention-cpu",
-    "edit-existing-masks",
-    "release-gpu",
 )
 
-GPU_ACCELERATED_ACTIONS = {
-    "both",
-    "monai-only",
-    "attention-only",
-    "generate-masks",
-    "train-attention",
-    "generate-all-monai-masks",
-    "generate-all-attention-masks",
-    "retrain-regenerate-attention",
-    "build-monai-feature-cache",
-    "build-attention-feature-cache",
-}
 CPU_CACHE_ONLY_ACTIONS = {
     "monai-cpu-from-cache",
     "evaluate-attention-cpu",
     "edit-existing-masks",
-    "release-gpu",
 }
 
 
 def build_monai_feature_cache_only(dataset_path=None):
-    """GPU stage: create/reuse the shared V6 frozen feature bank only.
+    """GPU stage: create/reuse the shared frozen feature bank only.
 
     No patient classifier, stability analysis or permutation test is run here.
     Those CPU-heavy stages can be executed later through
@@ -17402,7 +12335,7 @@ def attention_prediction_generation_path(workspace):
     return Path(workspace.root) / "attention_unet_prediction_generation.json"
 
 
-def _v13_atomic_csv(rows, path, fieldnames):
+def _review_atomic_csv(rows, path, fieldnames):
     """Write a CSV atomically without assuming the training-manifest schema."""
 
     path = Path(path)
@@ -17425,7 +12358,7 @@ def _v13_atomic_csv(rows, path, fieldnames):
         raise
 
 
-def _v13_read_csv_by_token(path):
+def _review_read_csv_by_token(path):
     path = Path(path)
     if not path.is_file():
         return {}
@@ -17437,7 +12370,7 @@ def _v13_read_csv_by_token(path):
         }
 
 
-def _v13_to_float(value, default=float("nan")):
+def _review_to_float(value, default=float("nan")):
     try:
         text = str(value).strip()
         if not text:
@@ -17447,7 +12380,7 @@ def _v13_to_float(value, default=float("nan")):
         return float(default)
 
 
-def _v13_to_int(value, default=-1):
+def _review_to_int(value, default=-1):
     try:
         text = str(value).strip()
         if not text:
@@ -17467,10 +12400,10 @@ def build_attention_full_review_manifest(samples, workspace, refresh=False):
     """
 
     path = attention_full_review_manifest_path(workspace)
-    existing = {} if refresh else _v13_read_csv_by_token(path)
+    existing = {} if refresh else _review_read_csv_by_token(path)
 
     # Merge QC already known from the compact training manifest.
-    compact = _v13_read_csv_by_token(workspace.manifest_csv)
+    compact = _review_read_csv_by_token(workspace.manifest_csv)
     for token, row in compact.items():
         existing.setdefault(token, {}).update(
             {
@@ -17562,7 +12495,7 @@ def build_attention_full_review_manifest(samples, workspace, refresh=False):
     )
     for index, row in enumerate(rows):
         row["review_index"] = int(index)
-    _v13_atomic_csv(rows, path, ATTENTION_REVIEW_MANIFEST_FIELDS)
+    _review_atomic_csv(rows, path, ATTENTION_REVIEW_MANIFEST_FIELDS)
     print(
         f"[ATTENTION][REVIEW] Full manifest: {len(rows)} images -> {path}",
         flush=True,
@@ -17587,7 +12520,7 @@ def read_attention_full_review_manifest(workspace):
     return rows
 
 
-def _v13_append_review_event(
+def _review_append_review_event(
     workspace,
     row,
     source,
@@ -17606,7 +12539,7 @@ def _v13_append_review_event(
     if mask is not None:
         area = float((np.asarray(mask) > 0).mean())
     event = {
-        "timestamp_utc": _v13_datetime.now(_v13_timezone.utc).isoformat(),
+        "timestamp_utc": _review_datetime.now(_review_timezone.utc).isoformat(),
         "review_round": int(review_round),
         "review_source": str(source),
         "action": str(action),
@@ -17632,7 +12565,7 @@ def _v13_append_review_event(
         writer.writerow(event)
 
 
-def _v13_reviewed_tokens(workspace, source=None, review_round=None):
+def _review_reviewed_tokens(workspace, source=None, review_round=None):
     path = attention_review_history_path(workspace)
     if not path.is_file():
         return set()
@@ -17641,7 +12574,7 @@ def _v13_reviewed_tokens(workspace, source=None, review_round=None):
         for row in csv.DictReader(file):
             if source is not None and row.get("review_source") != source:
                 continue
-            if review_round is not None and _v13_to_int(
+            if review_round is not None and _review_to_int(
                 row.get("review_round"), -1
             ) != int(review_round):
                 continue
@@ -17655,7 +12588,7 @@ def _v13_reviewed_tokens(workspace, source=None, review_round=None):
     return tokens
 
 
-def _v13_round_robin_diverse(rows, limit, source, seed):
+def _review_round_robin_diverse(rows, limit, source, seed):
     """Select a deterministic patient/series-balanced high-value queue."""
 
     rows = list(rows)
@@ -17666,17 +12599,17 @@ def _v13_round_robin_diverse(rows, limit, source, seed):
         token = row["image_token"]
         hashed = hashlib.sha256(f"{seed}|{token}".encode()).hexdigest()
         if source == "attention":
-            valid = _v13_to_int(row.get("attention_valid"), -1)
-            dice = _v13_to_float(row.get("dice_attention_vs_monai"), 1.0)
-            peak = _v13_to_float(
+            valid = _review_to_int(row.get("attention_valid"), -1)
+            dice = _review_to_float(row.get("dice_attention_vs_monai"), 1.0)
+            peak = _review_to_float(
                 row.get("attention_peak_probability"), 1.0
             )
-            area = _v13_to_float(row.get("attention_area_ratio"), 0.15)
+            area = _review_to_float(row.get("attention_area_ratio"), 0.15)
         else:
-            valid = _v13_to_int(row.get("monai_valid"), -1)
+            valid = _review_to_int(row.get("monai_valid"), -1)
             dice = 1.0
-            peak = _v13_to_float(row.get("monai_peak_probability"), 1.0)
-            area = _v13_to_float(row.get("monai_area_ratio"), 0.15)
+            peak = _review_to_float(row.get("monai_peak_probability"), 1.0)
+            area = _review_to_float(row.get("monai_area_ratio"), 0.15)
         # invalid / low agreement / low confidence / extreme-area rows first.
         return (
             1 if bool(row.get("_reviewed_current_round", False)) else 0,
@@ -17687,7 +12620,7 @@ def _v13_round_robin_diverse(rows, limit, source, seed):
             hashed,
         )
 
-    by_patient_series = _v13_defaultdict(lambda: _v13_defaultdict(list))
+    by_patient_series = _review_defaultdict(lambda: _review_defaultdict(list))
     for row in rows:
         by_patient_series[row["patient_id"]][row["series_id"]].append(row)
     patient_queues = {}
@@ -17747,8 +12680,8 @@ def select_attention_review_rows(
         )
 
     rows = [dict(row) for row in rows]
-    reviewed = _v13_reviewed_tokens(workspace, source=source)
-    current_round_reviewed = _v13_reviewed_tokens(
+    reviewed = _review_reviewed_tokens(workspace, source=source)
+    current_round_reviewed = _review_reviewed_tokens(
         workspace, source=source, review_round=review_round
     )
 
@@ -17764,7 +12697,7 @@ def select_attention_review_rows(
         ]
     elif scope == "invalid":
         field = "attention_valid" if source == "attention" else "monai_valid"
-        rows = [row for row in rows if _v13_to_int(row.get(field), -1) == 0]
+        rows = [row for row in rows if _review_to_int(row.get(field), -1) == 0]
     elif scope == "disagreement":
         if source != "attention":
             raise ValueError("disagreement scope is available for Attention only.")
@@ -17772,12 +12705,12 @@ def select_attention_review_rows(
             row
             for row in rows
             if np.isfinite(
-                _v13_to_float(row.get("dice_attention_vs_monai"))
+                _review_to_float(row.get("dice_attention_vs_monai"))
             )
         ]
         rows.sort(
             key=lambda row: (
-                _v13_to_float(row.get("dice_attention_vs_monai"), 1.0),
+                _review_to_float(row.get("dice_attention_vs_monai"), 1.0),
                 row["patient_id"],
                 row["series_id"],
                 row["image_token"],
@@ -17791,7 +12724,7 @@ def select_attention_review_rows(
             row["_reviewed_current_round"] = (
                 row["image_token"] in current_round_reviewed
             )
-        rows = _v13_round_robin_diverse(
+        rows = _review_round_robin_diverse(
             rows, int(limit), source, int(seed)
         )
     elif int(limit) > 0:
@@ -17807,7 +12740,7 @@ def select_attention_review_rows(
     return rows
 
 
-def _v13_manifest_image_loader(rows):
+def _review_manifest_image_loader(rows):
     return DataLoader(
         _AttentionManifestImageDataset(rows),
         batch_size=ATTENTION_INFERENCE_BATCH_SIZE,
@@ -17848,7 +12781,7 @@ def generate_monai_review_masks(
 
     report_attention_storage(workspace)
     model = build_monai_segmenter().to(DEVICE).eval()
-    loader = _v13_manifest_image_loader(missing)
+    loader = _review_manifest_image_loader(missing)
     print(
         f"[ATTENTION][MONAI REVIEW] Generating {len(missing)} masks "
         f"for a {len(target_rows)}-row review queue.",
@@ -17896,12 +12829,12 @@ def generate_monai_review_masks(
                 )
                 completed += 1
             if batch_number % 50 == 0:
-                _v13_atomic_csv(
+                _review_atomic_csv(
                     full_rows,
                     attention_full_review_manifest_path(workspace),
                     ATTENTION_REVIEW_MANIFEST_FIELDS,
                 )
-    _v13_atomic_csv(
+    _review_atomic_csv(
         full_rows,
         attention_full_review_manifest_path(workspace),
         ATTENTION_REVIEW_MANIFEST_FIELDS,
@@ -17917,7 +12850,7 @@ def generate_monai_review_masks(
     return [refreshed[row["image_token"]] for row in target_rows]
 
 
-def _v13_checkpoint_fingerprint(checkpoint_map):
+def _review_checkpoint_fingerprint(checkpoint_map):
     hasher = hashlib.sha256()
     for fold in sorted(checkpoint_map):
         path = Path(checkpoint_map[fold])
@@ -17942,7 +12875,7 @@ def generate_attention_review_masks(
         if rows is None
         else [full_by_token[row["image_token"]] for row in rows]
     )
-    fingerprint = _v13_checkpoint_fingerprint(checkpoint_map)
+    fingerprint = _review_checkpoint_fingerprint(checkpoint_map)
     metadata_path = attention_prediction_generation_path(workspace)
     previous_fingerprint = ""
     if metadata_path.is_file():
@@ -17972,7 +12905,7 @@ def generate_attention_review_masks(
         )
         return target_rows
 
-    by_fold = _v13_defaultdict(list)
+    by_fold = _review_defaultdict(list)
     for row in missing:
         by_fold[int(row["segmentation_fold"])].append(row)
     print(
@@ -18047,7 +12980,7 @@ def generate_attention_review_masks(
                             )
                     generated += 1
                 if batch_number % 50 == 0:
-                    _v13_atomic_csv(
+                    _review_atomic_csv(
                         full_rows,
                         attention_full_review_manifest_path(workspace),
                         ATTENTION_REVIEW_MANIFEST_FIELDS,
@@ -18056,7 +12989,7 @@ def generate_attention_review_masks(
         if DEVICE == "cuda":
             torch.cuda.empty_cache()
 
-    _v13_atomic_csv(
+    _review_atomic_csv(
         full_rows,
         attention_full_review_manifest_path(workspace),
         ATTENTION_REVIEW_MANIFEST_FIELDS,
@@ -18065,12 +12998,12 @@ def generate_attention_review_masks(
         json.dumps(
             {
                 "status": "OK",
-                "version": ATTENTION_FULL_REVIEW_VERSION,
+                "version": ATTENTION_REVIEW_SCHEMA,
                 "checkpoint_fingerprint": fingerprint,
                 "generated_masks": int(generated),
                 "target_rows": int(len(target_rows)),
-                "timestamp_utc": _v13_datetime.now(
-                    _v13_timezone.utc
+                "timestamp_utc": _review_datetime.now(
+                    _review_timezone.utc
                 ).isoformat(),
             },
             indent=2,
@@ -18099,12 +13032,12 @@ def select_attention_training_rows(samples, workspace):
     are never discarded merely because their image was outside that subset.
     """
 
-    existing = _v13_read_csv_by_token(workspace.manifest_csv)
-    review_existing = _v13_read_csv_by_token(
+    existing = _review_read_csv_by_token(workspace.manifest_csv)
+    review_existing = _review_read_csv_by_token(
         attention_full_review_manifest_path(workspace)
     )
     all_rows = {}
-    by_series = _v13_defaultdict(list)
+    by_series = _review_defaultdict(list)
     for image_path, _label, patient_id, series_id in samples:
         token = attention_image_token(image_path, patient_id, series_id)
         row = {
@@ -18126,7 +13059,7 @@ def select_attention_training_rows(samples, workspace):
                 ordered, ATTENTION_MAX_TRAIN_SLICES_PER_SERIES
             )
         )
-    by_patient = _v13_defaultdict(list)
+    by_patient = _review_defaultdict(list)
     for row in series_selected:
         by_patient[row["patient_id"]].append(row)
     selected = {}
@@ -18195,7 +13128,7 @@ def select_attention_training_rows(samples, workspace):
 # HTML EDITOR PATCH: strict source, review log and rapid-review buttons.
 # ---------------------------------------------------------------------------
 
-class AttentionMaskEditor:
+class BaseAttentionMaskEditor:
     """
     Kaggle-safe manual mask editor.
 
@@ -18205,7 +13138,7 @@ class AttentionMaskEditor:
     drawing/erasing in the browser and synchronizes the mask to a standard
     Textarea widget, so no custom Jupyter widget model is required.
 
-    Public behavior is kept compatible with the previous editor:
+    Public controls:
       Previous / Next / Save manual / Reset to auto / Reset to image (no mask) / Clear
       brush slider, left-draw/right-erase, D/E keyboard modes, S/R/C/N/P.
 
@@ -18526,7 +13459,7 @@ class AttentionMaskEditor:
           // Explicit mouse/pointer handling.  Kaggle/JupyterLab can treat
           // ordinary left-button drags specially unless the canvas claims the
           // pointer immediately.  We therefore handle BOTH Pointer Events and
-          // legacy Mouse Events and use the actual button state.
+          // Mouse Events and use the actual button state.
           function beginDraw(e) {{
             if (e.button !== undefined && e.button !== 0 && e.button !== 2) return;
             e.preventDefault();
@@ -18838,10 +13771,7 @@ class AttentionMaskEditor:
         return self
 
 
-_AttentionMaskEditorV12 = AttentionMaskEditor
-
-
-class AttentionMaskEditor(_AttentionMaskEditorV12):
+class AttentionMaskEditor(BaseAttentionMaskEditor):
     """Full-cohort iterative editor with persistent review tracking."""
 
     def __init__(
@@ -18974,7 +13904,7 @@ class AttentionMaskEditor(_AttentionMaskEditorV12):
         )
 
     def _log(self, action, mask=None):
-        _v13_append_review_event(
+        _review_append_review_event(
             self.workspace,
             self.rows[self.index],
             self.base_source,
@@ -19100,16 +14030,18 @@ def open_attention_mask_editor(
 
 
 def _parse_attention_arguments(argv=None):
+    """Parse one explicit staged action; combined execution is intentionally disabled."""
+
     parser = argparse.ArgumentParser(
         description=(
-            "CAD MRI MONAI + Attention U-Net pipeline with full-cohort "
-            "iterative HTML mask review."
+            "CAD MRI patient-level pipeline with staged GPU generation, "
+            "CPU review and cached statistical evaluation."
         )
     )
     parser.add_argument(
         "--attention-action",
         choices=ATTENTION_ACTION_CHOICES,
-        default="both",
+        required=True,
     )
     parser.add_argument("--attention-work-root", default=None)
     parser.add_argument("--attention-editor-index", type=int, default=0)
@@ -19134,11 +14066,6 @@ def _parse_attention_arguments(argv=None):
     parser.add_argument("--attention-editor-seed", type=int, default=42)
     parser.add_argument("--attention-review-round", type=int, default=1)
     parser.add_argument(
-        "--attention-force-regenerate",
-        action="store_true",
-        help="Regenerate masks even when cached files are present.",
-    )
-    parser.add_argument(
         "--attention-dataset-path",
         default=str(DATASET_PATH),
     )
@@ -19147,18 +14074,15 @@ def _parse_attention_arguments(argv=None):
         choices=RUNTIME_DEVICE_CHOICES,
         default=os.environ.get("CAD_RUNTIME_DEVICE", "auto"),
         help=(
-            "auto/cpu/cuda. Use cuda only for neural inference/training and "
-            "cpu for review, CV, stability and permutation stages."
+            "Use cuda for neural inference/training and cpu for review, CV, "
+            "stability and permutation stages."
         ),
     )
     parser.add_argument(
         "--feature-cache-device-tag",
         choices=RUNTIME_DEVICE_CHOICES,
         default=os.environ.get("CAD_FEATURE_CACHE_DEVICE_TAG", "auto"),
-        help=(
-            "Device identity embedded in the frozen V6 feature-cache key. "
-            "Use cuda during CPU evaluation when the bank was built on GPU."
-        ),
+        help="Device identity of the frozen feature cache.",
     )
     parser.add_argument(
         "--keep-gpu-memory",
@@ -19168,7 +14092,7 @@ def _parse_attention_arguments(argv=None):
     args, unknown = parser.parse_known_args(argv)
     if unknown:
         print(
-            f"[ATTENTION][CLI] Ignoring unrecognized notebook arguments: {unknown}",
+            f"[PIPELINE][CLI] Ignoring unrecognized notebook arguments: {unknown}",
             flush=True,
         )
     if args.attention_editor_limit < 0:
@@ -19178,8 +14102,9 @@ def _parse_attention_arguments(argv=None):
     return args
 
 
+
 def run_attention_pipeline(samples, workspace, action):
-    """Execute original actions plus staged CPU/GPU review actions."""
+    """Execute one neural or cached Attention/segmentation stage."""
 
     validate_attention_extension()
 
@@ -19200,34 +14125,22 @@ def run_attention_pipeline(samples, workspace, action):
             "manifest": str(attention_full_review_manifest_path(workspace)),
         }
 
-    training_rows = generate_attention_pseudo_masks(samples, workspace)
-    if action == "generate-masks":
-        return {
-            "status": "MASKS_GENERATED",
-            "manifest": str(workspace.manifest_csv),
-        }
-    if action in {"edit-masks", "edit-existing-masks"}:
-        return {"status": "EDITOR_READY"}
-
-    checkpoint_map = train_attention_unet_crossfit(training_rows, workspace)
-    if action == "train-attention":
-        clear_attention_image_ram_cache()
-        return {
-            "status": "TRAINING_COMPLETED",
-            "checkpoints": {
-                str(key): str(value) for key, value in checkpoint_map.items()
-            },
-        }
-    if action in {
-        "generate-all-attention-masks",
+    if action not in {
         "retrain-regenerate-attention",
+        "build-attention-feature-cache",
     }:
+        raise ValueError(f"Unsupported Attention stage: {action!r}.")
+
+    training_rows = generate_attention_pseudo_masks(samples, workspace)
+    checkpoint_map = train_attention_unet_crossfit(training_rows, workspace)
+
+    if action == "retrain-regenerate-attention":
         rows = generate_attention_review_masks(
             samples,
             workspace,
             checkpoint_map,
             rows=None,
-            force=(action == "retrain-regenerate-attention"),
+            force=True,
         )
         clear_attention_image_ram_cache()
         return {
@@ -19240,18 +14153,17 @@ def run_attention_pipeline(samples, workspace, action):
     bank = extract_attention_patient_feature_bank(
         samples, workspace, checkpoint_map
     )
-    if action == "build-attention-feature-cache":
-        return {
-            "status": "ATTENTION_FEATURE_CACHE_READY",
-            "fingerprint": bank["fingerprint"],
-            "n_patients": int(len(bank["patient_ids"])),
-            "output": str(workspace.comparison_output),
-        }
-    return evaluate_attention_feature_bank(samples, workspace, bank)
+    return {
+        "status": "ATTENTION_FEATURE_CACHE_READY",
+        "fingerprint": bank["fingerprint"],
+        "n_patients": int(len(bank["patient_ids"])),
+        "output": str(workspace.comparison_output),
+    }
 
 
-def attention_v7_entrypoint(argv=None):
-    """V15 entrypoint with explicit staged CPU/GPU execution."""
+
+def run_cad_pipeline(argv=None):
+    """Dispatch one explicit CPU/GPU pipeline stage."""
 
     args = _parse_attention_arguments(argv)
     action = args.attention_action
@@ -19261,15 +14173,10 @@ def attention_v7_entrypoint(argv=None):
         requested_device = "cpu"
     set_runtime_device(
         requested=requested_device,
-        context=f"attention action {action}",
+        context=f"pipeline action {action}",
         strict_cuda=(requested_device == "cuda"),
     )
     set_feature_cache_device_tag(args.feature_cache_device_tag)
-
-    if action == "release-gpu":
-        release_gpu_resources("explicit release-gpu action")
-        set_runtime_device("cpu", context="after release-gpu")
-        return {"status": "GPU_RESOURCES_RELEASED", "device": DEVICE}
 
     if action == "build-monai-feature-cache":
         try:
@@ -19294,58 +14201,14 @@ def attention_v7_entrypoint(argv=None):
             if not args.keep_gpu_memory:
                 release_gpu_resources(action)
 
-    if action in {"both", "monai-only"}:
-        try:
-            run_with_console_logging()
-            if action == "monai-only":
-                return
-        finally:
-            if action == "monai-only" and not args.keep_gpu_memory:
-                release_gpu_resources(action)
-
     workspace = build_attention_workspace(args.attention_work_root)
     samples = load_samples(Path(args.attention_dataset_path))
 
-    if action in {"edit-masks", "edit-existing-masks"}:
+    if action == "edit-existing-masks":
         validate_attention_extension()
-        full_rows = build_attention_full_review_manifest(samples, workspace)
-        existing_only = action == "edit-existing-masks"
-
-        if not existing_only:
-            # Scopes requiring whole-cohort QC generate any missing source masks.
-            if (
-                args.attention_editor_base == "monai"
-                and args.attention_editor_scope == "invalid"
-            ):
-                full_rows = generate_monai_review_masks(
-                    samples,
-                    workspace,
-                    rows=None,
-                    force=args.attention_force_regenerate,
-                )
-            if (
-                args.attention_editor_base == "attention"
-                and args.attention_editor_scope == "disagreement"
-            ):
-                full_rows = generate_monai_review_masks(
-                    samples, workspace, rows=None, force=False
-                )
-                training_rows = generate_attention_pseudo_masks(
-                    samples, workspace
-                )
-                checkpoint_map = train_attention_unet_crossfit(
-                    training_rows, workspace
-                )
-                full_rows = generate_attention_review_masks(
-                    samples,
-                    workspace,
-                    checkpoint_map,
-                    rows=None,
-                    force=args.attention_force_regenerate,
-                )
-
+        rows = build_attention_full_review_manifest(samples, workspace)
         queue = select_attention_review_rows(
-            full_rows,
+            rows,
             workspace,
             source=args.attention_editor_base,
             scope=args.attention_editor_scope,
@@ -19353,59 +14216,22 @@ def attention_v7_entrypoint(argv=None):
             seed=args.attention_editor_seed,
             review_round=args.attention_review_round,
         )
+        queue = [
+            row for row in queue
+            if _review_mask_exists(row, args.attention_editor_base)
+        ]
         if not queue:
-            raise RuntimeError("The requested review queue is empty.")
-
-        if existing_only:
-            original_count = len(queue)
-            queue = [
-                row
-                for row in queue
-                if _review_mask_exists(row, args.attention_editor_base)
-            ]
-            skipped = original_count - len(queue)
-            if skipped:
-                print(
-                    f"[ATTENTION][EDITOR][CPU] Skipped {skipped} rows whose "
-                    f"{args.attention_editor_base} mask is not present on disk.",
-                    flush=True,
-                )
-            if not queue:
-                raise RuntimeError(
-                    "No existing masks are available for this CPU-only queue. "
-                    "Run the corresponding generate-all-* action in a GPU "
-                    "session and persist masks under /kaggle/working first."
-                )
-        elif args.attention_editor_base == "monai":
-            queue = generate_monai_review_masks(
-                samples,
-                workspace,
-                rows=queue,
-                force=args.attention_force_regenerate,
+            raise RuntimeError(
+                "No existing masks match this review queue. Run the corresponding "
+                "GPU generation stage first."
             )
-        else:
-            training_rows = generate_attention_pseudo_masks(samples, workspace)
-            checkpoint_map = train_attention_unet_crossfit(
-                training_rows, workspace
-            )
-            queue = generate_attention_review_masks(
-                samples,
-                workspace,
-                checkpoint_map,
-                rows=queue,
-                force=args.attention_force_regenerate,
-            )
-
         print(
-            f"[ATTENTION][EDITOR] Opening {args.attention_editor_base} "
-            f"queue row {args.attention_editor_index} of {len(queue)}; "
+            f"[ATTENTION][EDITOR][CPU] Opening {args.attention_editor_base} "
+            f"row {args.attention_editor_index} of {len(queue)}; "
             f"scope={args.attention_editor_scope}; "
-            f"round={args.attention_review_round}; "
-            f"existing_only={existing_only}. Class labels are hidden.",
+            f"round={args.attention_review_round}. Class labels are hidden.",
             flush=True,
         )
-        if not args.keep_gpu_memory:
-            release_gpu_resources(action)
         return open_attention_mask_editor(
             workspace,
             start_index=args.attention_editor_index,
@@ -19429,32 +14255,25 @@ def attention_v7_entrypoint(argv=None):
         sys.stderr = TeeStream(original_stderr, log_file)
         try:
             print("\n" + "#" * 100, flush=True)
-            print(
-                "CAD CARDIAC MRI — V15 STAGED CPU/GPU MASK REVIEW",
-                flush=True,
-            )
+            print("CAD CARDIAC MRI — STAGED PIPELINE", flush=True)
             print("#" * 100, flush=True)
-            print(f"[ATTENTION] action={action}", flush=True)
-            print(f"[ATTENTION] runtime_device={DEVICE}", flush=True)
+            print(f"[PIPELINE] action={action}", flush=True)
+            print(f"[PIPELINE] runtime_device={DEVICE}", flush=True)
             print(
-                "[ATTENTION] feature_cache_device_tag="
+                "[PIPELINE] feature_cache_device_tag="
                 f"{resolved_feature_cache_device_tag()}",
                 flush=True,
             )
-            print(f"[ATTENTION] workspace={workspace.root}", flush=True)
-            print(
-                f"[ATTENTION] transient_root={workspace.transient_root}",
-                flush=True,
-            )
+            print(f"[PIPELINE] workspace={workspace.root}", flush=True)
             summary = run_attention_pipeline(samples, workspace, action)
             print(
-                "[ATTENTION] Completed with status="
+                "[PIPELINE] Completed with status="
                 f"{summary.get('status', 'OK')}",
                 flush=True,
             )
             return summary
         except Exception:
-            print("\n[ATTENTION] FATAL ERROR", flush=True)
+            print("\n[PIPELINE] FATAL ERROR", flush=True)
             traceback.print_exc(file=sys.stdout)
             raise
         finally:
@@ -19466,12 +14285,13 @@ def attention_v7_entrypoint(argv=None):
             sys.stderr = original_stderr
 
 
+
 print(
-    "[ATTENTION][V15] Staged CPU/GPU full-cohort review extension loaded.",
+    "[PIPELINE] Staged CPU/GPU subsystem loaded.",
     flush=True,
 )
 print(
-    "[ATTENTION][V15] GPU actions: build-monai-feature-cache, "
+    "[PIPELINE] GPU actions: build-monai-feature-cache, "
     "generate-all-monai-masks, retrain-regenerate-attention, "
     "build-attention-feature-cache. CPU actions: monai-cpu-from-cache, "
     "evaluate-attention-cpu, edit-existing-masks.",
@@ -19480,9 +14300,8 @@ print(
 
 
 # ---------------------------------------------------------------------------
-# FINAL V15 STANDALONE ENTRYPOINT
+# STANDALONE ENTRYPOINT
 # ---------------------------------------------------------------------------
-# At this point the V13 definitions above have replaced the V7.2 review
-# entrypoint while preserving the complete original pipeline source.
+# The script requires one explicit staged action.
 if __name__ == "__main__":
-    attention_v7_entrypoint()
+    run_cad_pipeline()
