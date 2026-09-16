@@ -1,836 +1,110 @@
 #%% ============================================================
-# 🧠 CAD Detection from Cardiac MRI – V7 MONAI + Cross-Fitted Attention U-Net Patient-Level Pipeline (Single File)
-# ============================================================
+"""CAD cardiac-MRI patient-level pipeline — lean V17 edition.
 
-# ============================================================================
-# V15 STAGED CPU / GPU KAGGLE WORKFLOW NOTE
-# ============================================================================
-#
-# The pipeline can now be executed in explicit device stages:
-#
-#   GPU-only expensive stages:
-#       build-monai-feature-cache
-#       generate-all-monai-masks
-#       train-attention / retrain-regenerate-attention
-#       generate-all-attention-masks
-#       build-attention-feature-cache
-#
-#   CPU-only stages that require existing cached artifacts:
-#       monai-cpu-from-cache
-#       evaluate-attention-cpu
-#       edit-existing-masks
-#
-# ``--runtime-device cpu|cuda|auto`` controls where PyTorch work is placed.
-# ``--feature-cache-device-tag cuda`` lets a CPU evaluation session address a
-# frozen feature bank that was originally created in a GPU session. CPU-only
-# actions refuse to rebuild missing neural caches, so they cannot silently spend
-# hours performing inference on CPU.
-#
-# IMPORTANT KAGGLE QUOTA NOTE:
-# Moving tensors to CPU releases CUDA memory but does not detach the accelerator
-# from the notebook session. To conserve GPU quota, change Kaggle Accelerator to
-# None and restart before the CPU stages; enable GPU and restart only for the GPU
-# stages. Persist automatic/predicted review masks under /kaggle/working when
-# crossing sessions.
-# ============================================================================
+DATA CONTRACT
+-------------
+* ``Directory_*`` is the patient identifier and never crosses train/validation
+  folds. ``series*``/``SR_*`` folders are series proxies, not DICOM UIDs.
+* The top-level Normal/Sick folder supplies one patient label. Slice labels are
+  never treated as independent observations in the recommended model.
 
-# ============================================================================
-# V13 PAIRED PYTHON / NOTEBOOK SYNCHRONIZATION NOTE
-# ============================================================================
-#
-# This attached Python source already contains the complete V13 full-cohort
-# MONAI / Attention U-Net review extension. It is now explicitly paired with
-# ``cad-cardiac-mri-project-dvm(2)_full_mask_review_v13.ipynb``. No original
-# implementation code or detailed methodological comment was removed.
-#
-# Available V13 actions include:
-#   generate-all-monai-masks, generate-all-attention-masks,
-#   retrain-regenerate-attention, and edit-masks with all/diverse/
-#   unreviewed/invalid/disagreement/manual/reviewed queues.
-# ============================================================================
+PIPELINE
+--------
+1. Discover JPEG slices and preserve patient/series grouping.
+2. Standardize geometry and create aligned MONAI/classifier intensity views.
+3. Use the pinned MONAI ventricular model for cardiac localization; reject
+   implausible masks and use the declared fallback instead of deleting slices.
+4. Extract frozen EfficientNet-B0 embeddings for the candidate and controls.
+5. Pool slice embeddings: slice -> series proxy -> patient.
+6. Fit PCA + linear classifiers only inside training folds. Hyperparameters and
+   decision thresholds are selected from inner patient-level OOF predictions.
+7. Evaluate with patient-level nested CV, bootstrap intervals, repeated-CV and
+   patient-label permutation tests.
+8. Optionally train a cross-fitted Attention U-Net from MONAI pseudo-masks plus
+   every saved manual correction, generate AU1-AU5 representations, and compare
+   them with the locked MONAI A17 candidate.
 
-# ============================================================================
-# V7.2 FAST-VALIDATION RUNTIME NOTE
-# ============================================================================
-#
-# The default CAD_VALIDATION_PROFILE is ``fast``:
-#   - 10 repeated nested-CV seeds on a focused 10-experiment MONAI panel;
-#   - 200 ordinary label permutations;
-#   - 100 selection-adjusted candidate-family permutations;
-#   - 10 repeated-CV seeds and 200 permutations for Attention U-Net.
-# Use CAD_VALIDATION_PROFILE=full before executing the script to restore the
-# original 50-repeat / 1000-permutation final-analysis workload.
+KAGGLE DEVICE STAGES
+--------------------
+GPU is used only for MONAI/EfficientNet inference and Attention U-Net
+training/inference. HTML review and cached statistical evaluation run on CPU.
+The default registry contains 11 candidate/control experiments. Use the staged
+actions exposed by ``attention_v7_entrypoint``; CPU-only actions refuse to
+rebuild missing neural caches.
 
-
-# ============================================================================
-# V7 EXTENSION NOTE
-# ============================================================================
-#
-# The complete, previously validated V6 MONAI suite is retained below. V7 adds
-# a separate cross-fitted Attention U-Net segmentation branch, automatic MONAI
-# pseudo-mask generation, manual graphical mask correction, AU1-AU5 controls,
-# and a direct patient-level comparison with MONAI A17. Use --help to list the
-# action-aware entrypoint options. The Attention U-Net extension starts after
-# the unchanged V6 definitions near the end of this single file.
-#
-# ============================================================================
-# OVERVIEW
-# ============================================================================
-#
-# This script implements a COMPLETE EXECUTION PIPELINE for exploratory
-# patient-level CAD (Coronary Artery Disease) classification from 2D cardiac
-# MRI JPEG exports. It is "end-to-end" only in the operational sense that it
-# runs from files to patient scores; it is NOT an end-to-end jointly trained
-# neural network because MONAI and EfficientNet remain frozen:
-#
-#   CAD Cardiac MRI Dataset
-#   https://www.kaggle.com/datasets/danialsharifrazi/cad-cardiac-mri-dataset/data
-#
-# PATIENT IDENTIFIER USED BY THIS IMPLEMENTATION (VALIDATED FOR THIS RELEASE):
-#
-#   patient_id = Directory_*
-#
-# The parent folder supplies the patient-level class label:
-#
-#   Normal/Directory_* -> label 0
-#   Sick/Directory_*   -> label 1
-#
-# IMPORTANT: SR_* / series* folders are NOT treated as patients. They are used
-# as folder-defined SERIES PROXIES belonging to the Directory_* patient. Because
-# the release contains JPEG files rather than the original DICOM metadata, these
-# folder names must not be described as validated DICOM SeriesInstanceUIDs.
-# All images and all series proxies from one Directory_* remain together in
-# every train/validation split and are combined into one patient-level score.
-#
-# The architecture combines:
-#
-#   1. Patient-level grouping with patient_id fixed to Directory_*
-#   2. Optional pretrained MONAI ventricular segmentation (short-axis-specific)
-#   3. Confidence-gated soft ROI extraction with full-image fallback
-#   4. Explicitly pinned ImageNet EfficientNet-B0 feature extraction
-#   5. Optional series-local slice-quality weighting (disabled by default)
-#   6. Recommended direct patient-level training after hierarchical EMBEDDING
-#      pooling: slices → series proxy → patient
-#   7. Optional legacy weakly supervised slice classifier followed by
-#      hierarchical probability fusion, retained as an ablation
-#   8. Stratified K-fold evaluation defined directly on Directory_* patients
-#   9. Pooled out-of-fold AUC with a patient-level bootstrap confidence interval
-#  10. Exact decoded-pixel duplicate auditing across Directory_* patients
-#  11. Reusable feature caching and machine-readable QC/result files
-#  12. One shared multi-view feature bank for original and label-blind
-#      standardized image/ROI/negative-control representations
-#  13. Exact-duplicate-aware patient folds plus perceptual near-duplicate
-#      candidate auditing
-#  14. Nested patient-level cross-validation for classifier C and a decision
-#      threshold selected only from outer-training data
-#  15. Logistic Regression, Linear SVM, pooling, weighting, PCA and legacy
-#      probability-fusion ablations executed through one experiment registry
-#  16. Paired patient-bootstrap comparisons and class-specific provenance /
-#      MONAI-gate negative controls
-#  17. Label-blind removal of only consecutive dark, nearly uniform native
-#      padding followed by separate MONAI min-max and classifier robust scaling
-#  18. Fixed-content geometry: the longest retained side is always 240 pixels
-#      inside a centered 256x256 canvas, including controlled upsampling
-#  19. A standardized development baseline plus a locked strict-ROI primary
-#      candidate and narrow-border, corner, padding, fixed-center and
-#      outside-ventricular-box controls
-#  20. Separate MONAI inference and QC on original versus standardized canvases
-#  21. Folder-independent fixed-chunk pooling and decomposed structural controls
-#      for slice count, series count, series length, geometry and file size
-#  22. Conservative C selection: the smallest C within a predeclared inner-AUC
-#      tolerance of the best candidate is chosen
-#  23. Repeated nested patient-level CV for the locked candidate, direct
-#      localization comparators, pooling/deduplication variants and major
-#      shortcut controls rather than only one favorable split
-#  24. A profile-controlled patient-label permutation test for the prospectively
-#      locked V6 A17 candidate, repeating its complete nested fitting path
-#  25. Same-seed paired repeated-CV deltas for A12, A17, A20 and the exact-
-#      support candidate/control panel rather than only one favorable split
-#  26. Soft-mask-only, hard-mask-only and MONAI-box-only morphology controls
-#  27. Exact within-patient deduplication and blinded pHash/series review files
-#  28. MONAI soft-map decomposition into distribution-only, block-shuffled,
-#      canonicalized-soft and canonicalized-hard representations
-#  29. Separate reporting for segmentation-derived representation controls,
-#      which are neither candidate clinical models nor purely non-anatomical
-#      negative controls
-#  30. Optional blinded series-annotation subset analysis enabled only by an
-#      explicitly supplied completed annotation CSV
-#  31. A raw standardized intensity canvas whose values are not globally scaled
-#      before the final cardiac/extracardiac region is selected
-#  32. Fixed-FOV heart-centred and binary-hard-support candidate branches that
-#      use MONAI for localization without injecting soft confidence as brightness
-#  33. Region-specific robust scaling calculated only from pixels that remain
-#      visible in the final inside or outside representation
-#  34. A conservative outside-whole-heart proxy and a MONAI-independent fixed
-#      periphery control, including a matched A18/C30 common-valid-slice test
-#  35. Optional hierarchical mean-plus-standard-deviation pooling and corrected
-#      fixed-chunk handling for very small final remainders
-#  36. Optional equal pooling over explicitly annotated (sequence, view) cells,
-#      with no automatic inference from SR_*/series* folder names
-#  37. Exact A17-matched controls: support geometry only (C31), within-support
-#      intensity shuffling (C32), and the exact non-padding complement (C33)
-#  38. An A20 gate-valid-only ablation that uses the identical A17 image branch
-#      while removing fixed-centre fallback slices
-#  39. Outer-fold candidate-family selection in which model identity and C are
-#      selected solely from each outer-training cohort
-#  40. A maximum-AUROC permutation statistic across the declared V5 candidate
-#      family, correcting the signal test for post-hoc representation selection
-#  41. Deterministic final-run settings with CUDA AMP disabled and deterministic
-#      cuDNN/algorithm requests recorded in the metadata
-#
-# IMPORTANT METHODOLOGICAL CHANGES:
-# The original version used one 80/20 split and discarded roughly half of the
-# slices using a standard-deviation cutoff. This revision instead:
-#
-#   - performs cross-validation on the validated Directory_* patient units;
-#   - keeps every successfully decoded slice by default; an unreadable file
-#     raises an explicit error instead of being silently omitted;
-#   - keeps standard deviation only as an OPTIONAL, non-clinical heuristic;
-#   - uses direct patient-level embedding pooling as the recommended default,
-#     thereby avoiding repeated patient labels being treated as independent
-#     slice observations;
-#   - retains the prior slice-classifier/fusion method only as a selectable
-#     weakly supervised ablation;
-#   - when the slice method is selected, scales sample-weight mass to the number
-#     of training patients, because globally multiplying sample weights changes
-#     the effective regularization of a regularized Logistic Regression model;
-#   - reports patient-level bootstrap confidence intervals for discrimination
-#     and threshold-dependent metrics;
-#   - selects classifier C and the operating threshold only inside the
-#     outer-training cohort through duplicate-aware inner CV;
-#   - uses one authoritative outer-fold manifest for every experiment;
-#   - preserves the original min-max/full-canvas pipeline as a historical
-#     reference and B1 as the standardized development baseline, while locking
-#     A12 (zero-background ROI plus fixed-center fallback) as the primary
-#     candidate after the prior Kaggle audit;
-#   - makes standardized content scale fixed rather than native-size-dependent;
-#   - keeps MONAI on a min-max intensity view while EfficientNet receives a
-#     robustly scaled view of exactly the same retained crop and geometry;
-#   - evaluates whether apparent performance survives narrow-border, corner,
-#     padding, MONAI-independent fixed-center, strict-ROI and outside-box controls;
-#   - decomposes broad provenance into separate count, folder-length, geometry
-#     and file-size controls;
-#   - repeats a profile-selected candidate/control panel across deterministic
-#     outer splits and calculates same-seed paired delta-AUC distributions;
-#   - repeats the configured patient-level fitting path after a profile-controlled
-#     number of label permutations to obtain an empirical null AUC distribution;
-#   - tests whether A12 depends on folder-proxy pooling, repeated exact exports,
-#     or MONAI mask/box morphology without MRI intensities;
-#   - writes blinded pHash review panels and a blinded series/view annotation
-#     template while keeping labels in separate key files;
-#   - decomposes the high-performing MONAI soft-map control into probability-
-#     distribution, globally block-shuffled, canonicalized-soft and
-#     canonicalized-hard controls so confidence, morphology, position and
-#     scale are not conflated;
-#   - classifies MONAI-derived mask controls separately from strict negative
-#     controls because a segmentation map can contain genuine anatomy as well
-#     as sequence/protocol information;
-#   - can optionally rerun a focused model/control panel on manually annotated
-#     series proxies without inferring sequence or view from folder names, and
-#     can weight each annotated (sequence, view) cell equally;
-#   - preserves A12 as the locked V4 reference and A18 as the prospectively
-#     declared V5 candidate that did not confirm, without rewriting that history;
-#   - prospectively locks A17 as the V6 candidate before evaluating the new
-#     exact-support controls;
-#   - constructs V5/V6 inside and outside branches from an unscaled standardized
-#     canvas, then estimates robust intensity limits only inside the final visible
-#     region so removed heart pixels cannot affect an outside control;
-#   - evaluates A18 and C30 on exactly the same standardized-MONAI-valid slices;
-#   - removes MONAI soft-confidence modulation from A16-A20 and uses a single
-#     authoritative binary-support function for A17, A20 and C31-C33;
-#   - tests whether A17 performance survives removal of intensities (C31),
-#     destruction of within-support spatial arrangement while preserving the
-#     histogram (C32), and exposure of only the exact complement (C33);
-#   - estimates the complete A17/A20/A12 model-selection procedure with model
-#     identity and C chosen inside each outer-training cohort;
-#   - reports a max-statistic permutation test across A12/A16/A17/A18/A19 so the
-#     exploratory selection of A17 after V5 is not presented as predeclared;
-#   - disables CUDA AMP and requests deterministic kernels for the final V6 run;
-#   - merges a fixed-chunk remainder smaller than half a nominal chunk into the
-#     preceding chunk so one residual slice cannot receive full chunk weight;
-#   - saves OOF predictions, fold assignments, paired comparisons, duplicate
-#     audits, provenance/standardization controls and original/standardized
-#     MONAI QC summaries.
-#
-# The Scientific Reports paper reports 1,224 original participants, but this
-# script does NOT infer the number of computational patient units from that
-# paper-level count. Under the validated mapping requested here, the number of
-# patients used by the code is exactly the number of discovered Directory_*
-# folders containing images. This distinction is important for correct claims
-# about sample size and statistical uncertainty.
-#
-# The segmentation stage uses the official MONAI Model Zoo bundle:
-#
-#   ventricular_short_axis_3label, version 0.3.5
-#
-# The bundle contains a pretrained 2D residual U-Net (MONAI UNet with residual
-# units) that produces four output channels:
-#
-#   0 = background
-#   1 = left-ventricular blood pool
-#   2 = left-ventricular myocardium
-#   3 = right-ventricular blood pool
-#
-# IMPORTANT DOMAIN LIMITATION:
-# The MONAI model was trained for 2D short-axis cardiac MR images. The CAD
-# dataset also contains heterogeneous series, including long-axis images,
-# localizers, derived exports, and possibly other acquisition types. For that
-# reason, this script does NOT trust every segmentation unconditionally.
-# A plausibility gate checks mask size and confidence. If a mask is implausible,
-# the full image is used instead of a potentially destructive ROI mask.
-#
-# Required runtime for the normal path:
-#
-#   Python 3.10 or newer
-#   pip install huggingface_hub
-#   pip install torch torchvision opencv-python numpy "scikit-learn>=1.1" matplotlib tqdm
-#
-# MONAI itself is only required for the exceptional fallback that reconstructs
-# the network from ``models/model.pt`` when the official ``models/model.ts``
-# artifact cannot be loaded:
-#
-#   pip install monai==1.6.0
-#
-# StandardScaler.fit(sample_weight=...) is required. Use mutually compatible
-# torch/torchvision builds for the installed CUDA runtime.
-#
-# NOTE ABOUT THE PRETRAINED SEGMENTER:
-# The bundle metadata identifies version 0.3.5 and records the original bundle
-# environment as MONAI 1.3.0 / PyTorch 1.13.0. The Hugging Face repository is
-# pinned to a specific commit and the official model.ts/model.pt digests are
-# checked before use. The official TorchScript artifact is the preferred path:
-# it can be loaded directly by PyTorch and avoids both the slow MONAI import and
-# a locally re-traced copy during ordinary first and later executions.
-#
-# Set AUTO_DOWNLOAD_MONAI_BUNDLE = False for an offline environment and place
-# the pinned bundle files under the configured MONAI bundle directory.
-#
-# ============================================================================
-# STANDARDIZED REFERENCE AND PROSPECTIVE V5 PIPELINE FLOW
-# ============================================================================
-#
-# Raw MRI JPEG slice
-#    ↓
-# Detect consecutive edge rows/columns that are BOTH dark and nearly uniform
-# using one fixed label-blind rule with conservative crop safety limits
-#    ↓
-# Remove only the accepted native padding; preserve the complete retained field
-# of view and save crop/padding geometry as QC metadata
-#    ↓
-# Create three intensity views of the SAME retained crop:
-#   - min-max scaling to [0,1] for MONAI
-#   - robust 1st/99th-percentile scaling to [0,1] for EfficientNet
-#   - raw uint8/255 intensity for V5 post-localization region scaling
-#    ↓
-# Resize the retained content's longest side to exactly 240 pixels (up or down)
-# and center both aligned views in a 256×256 zero-padded canvas
-#    ↓
-# Pinned pretrained MONAI residual U-Net on the min-max standardized canvas
-#    ↓
-# Confidence-gated soft ROI on the robust classifier view or standardized
-# full-image fallback
-#
-# Prospective V5 A18 branch in parallel:
-#   - require a plausible standardized MONAI mask
-#   - centre a fixed 65% square FOV on the hard-mask centroid
-#   - estimate robust limits only from non-padding pixels inside that FOV
-#   - crop and resize directly to 224x224, without surrounding canvas padding
-#
-# Matched V5 C30 control in parallel:
-#   - use the exact same plausible-mask slice rows as A18
-#   - exclude a predeclared conservative whole-heart proxy
-#   - estimate robust limits only from the remaining extracardiac pixels
-#    ↓
-# Custom 256→224 whole-canvas resize + ImageNet mean/std normalization
-#    ↓
-# Frozen EfficientNet-B0 feature encoding
-#    ↓
-# 1280D feature vector per successfully decoded slice
-#    ↓
-# Hierarchical embedding pooling inside each folder-defined series proxy
-#    ↓
-# Equal-weight pooling across a Directory_* patient's series proxies
-#    ↓
-# Fold-local PCA + Logistic Regression trained on one vector per patient
-#    ↓
-# Nested-CV out-of-fold patient-level CAD-associated MODEL SCORE
-#
-# Historical B0 reference:
-#   original per-image min-max scaling + original full canvas + MONAI soft ROI
-#
-# Optional legacy ablation:
-#   slice Logistic Regression → series fusion → patient fusion
-#
-# ============================================================================
-# DETAILED DATA CONTRACT AND SHAPE TRACE
-# ============================================================================
-#
-# The pipeline passes a small number of clearly defined objects from one stage
-# to the next. Keeping these contracts explicit makes it easier to debug shape,
-# grouping, leakage, and caching errors:
-#
-#   A. ``samples`` -- Python list created by ``load_samples``
-#
-#      Each element is:
-#
-#          (image_path, label, patient_id, series_id)
-#
-#      where ``patient_id`` is always Directory_* and ``series_id`` is a
-#      patient-scoped folder proxy such as Directory_24/SR_3. The label is
-#      metadata only during frozen image processing; it is never supplied to
-#      MONAI or EfficientNet.
-#
-#   B. One ``MRIDataset`` item -- tensors plus immutable metadata
-#
-#          classification_image          : original [3,224,224] min-max view
-#          monai_image                   : original [1,256,256] MONAI canvas
-#          standardized_classification   : standardized [3,224,224] view
-#          standardized_monai_image      : standardized [1,256,256] canvas
-#          standardized_raw_classification: raw [3,224,224] uint8/255 view
-#          detected_padding_image        : [3,224,224] binary padding control
-#          label                         : scalar 0 or 1
-#          patient_id                    : Directory_* string
-#          series_id                     : patient-scoped folder-proxy string
-#          sample_index                  : deterministic position in ``samples``
-#          decoded_pixel_hash            : exact decoded-pixel SHA-256 string
-#          perceptual_hash               : 64-bit DCT pHash candidate key
-#          provenance_features          : native export/style feature vector
-#          standardization_features     : crop/padding/robust-range QC vector
-#
-#   C. One DataLoader batch -- the same objects with a leading batch dimension
-#
-#          images                       : original [B,3,224,224]
-#          monai_images                 : original [B,1,256,256]
-#          standardized_images          : standardized [B,3,224,224]
-#          standardized_monai_images    : standardized [B,1,256,256]
-#          standardized_raw_images      : raw uint8/255 [B,3,224,224]
-#          detected_padding_images      : binary-control [B,3,224,224]
-#
-#   D. MONAI outputs -- produced when a selected experiment requires MONAI
-#
-#          logits                  : [B, 4, 256, 256]
-#          heart probability       : [B, 1, 256, 256]
-#          aligned ROI probability : [B, 1, 224, 224]
-#          valid_mask              : [B], one plausibility decision per slice
-#
-#      Historical/reference branches retain their declared fallback behavior.
-#      A18 and C30 instead apply one common valid-slice filter, so neither side
-#      receives zero embeddings or full-image fallbacks for invalid masks.
-#
-#   E. EfficientNet output
-#
-#          slice embedding : [B, 1280]
-#
-#      The 1000-class ImageNet head is removed. These vectors are frozen image
-#      descriptors, not CAD predictions.
-#
-#   F. Cached extraction arrays -- one row per decoded JPEG slice
-#
-#      Original full/ROI/border/outside-mask embeddings and standardized
-#      full/ROI/narrow-border/corner/center-crop/strict-ROI/outside-box and V5
-#      fixed-FOV/hard-support/outside-whole-heart/fixed-periphery
-#      embeddings are stored in one shared feature bank. Labels, patient IDs,
-#      series IDs, original and standardized MONAI QC, ROI slice scores, exact/
-#      perceptual hashes, provenance features and standardization QC remain in
-#      one-to-one row alignment. Any feature-affecting setting changes the
-#      feature-bank fingerprint.
-#
-#   G. Recommended supervised input
-#
-#      Slice embeddings are normally pooled within each series proxy, then
-#      equally across all proxies of one Directory_* patient. A19 concatenates
-#      series mean and standard deviation; the optional annotated analysis can
-#      instead average series inside each explicit (sequence, view) cell and then
-#      weight cells equally. The classifier still receives one row per patient.
-#
-#   H. Evaluation output
-#
-#      Every Directory_* patient receives exactly one outer out-of-fold score,
-#      fold identifier, training-only threshold and predicted label for every
-#      experiment. ROC-AUC, AUPRC, Brier score, sensitivity, specificity, PPV,
-#      NPV, F1 and patient-bootstrap confidence intervals are calculated from
-#      those patient rows. Experiment differences use paired resampling of the
-#      same patients.
-#
-# TRAINED VERSUS FROZEN COMPONENTS
-# --------------------------------
-#
-#   Frozen / inference-only:
-#       - MONAI ventricular segmenter
-#       - ImageNet EfficientNet-B0 encoder
-#       - deterministic image preprocessing and pooling rules
-#
-#   Fitted separately inside every outer/inner training partition:
-#       - StandardScaler
-#       - optional PCA
-#       - Logistic Regression or Linear SVM
-#       - optional one-dimensional sigmoid calibrator for SVM margins
-#       - classifier C and the decision threshold selected by inner OOF data
-#
-# This distinction is central to leakage control. Validation-patient labels and
-# embeddings are never used to fit fold-local preprocessing, classification,
-# calibration, hyperparameter selection or threshold selection.
-#
-# ============================================================================
-# ============================================================================
-# WHY THIS PIPELINE?
-# ============================================================================
-#
-# Medical MRI datasets are usually:
-#
-#   - Small relative to natural-image datasets
-#   - Noisy
-#   - Heterogeneous across scanners, protocols, views, and exports
-#   - Difficult and expensive to annotate
-#
-# Therefore:
-#
-#   - A cardiac-MRI-pretrained segmenter is preferable to a randomly
-#     initialized segmentation head.
-#   - Soft ROI weighting reduces irrelevant anatomy without deleting all
-#     contextual information.
-#   - Confidence gating protects the pipeline when the pretrained segmenter is
-#     applied outside its original short-axis domain.
-#   - Transfer learning improves feature quality when labeled CAD data are
-#     limited.
-#   - All slices are retained by default; optional quality weights are computed
-#     only inside their own series and are treated as a heuristic, not a clinical
-#     image-quality measurement.
-#   - Hierarchical aggregation prevents a very long folder-defined series proxy
-#     from dominating simply because it contains more exported JPEG frames.
-#   - The recommended classifier receives one pooled embedding per patient, so
-#     the effective labeled sample size is the number of Directory_* folders,
-#     not the number of JPEG slices.
-#   - The optional legacy slice classifier uses hierarchical weights so patients
-#     and their folder-defined series proxies receive controlled nominal influence.
-#   - Patient-level splitting prevents images or series proxies from the same
-#     Directory_* patient from appearing in both training and validation folds.
-#   - Exact cross-patient duplicate components can be kept in the same fold,
-#     because patient-only splitting does not prevent copied visual content
-#     from crossing partitions.
-#   - Original and standardized border-only, corner-only, padding-only,
-#     outside-mask/outside-box, provenance-only, standardization-QC and MONAI-QC
-#     controls test whether apparent performance can be explained by
-#     non-anatomical shortcuts or protocol/export differences.
-#
-# The pipeline approximates the following reasoning process:
-#
-#   "Localize cardiac anatomy when reliable → inspect informative slices from
-#    every folder proxy → combine patient evidence → classify the patient."
-#
-# This is an exploratory patient-level classifier under the validated dataset
-# mapping that every Directory_* is one patient. The top-level Normal/Sick
-# folder supplies the patient-level class label. The recommended strategy trains
-# directly on one pooled vector per Directory_* patient. If the optional legacy
-# strategy propagates that label to every slice, its supervision is weak because
-# individual slices are not independently annotated for CAD and are strongly
-# correlated within the same patient.
-#
-# ============================================================================
-
-# ============================================================================
-# MULTI-EXPERIMENT EXTENSION
-# ============================================================================
-#
-# The detailed flow above describes the standardized development branch B1.
-# A12 remains the locked V4 reference, A18 remains the prospectively failed V5
-# candidate, and A17 is prospectively locked for V6 before the new controls are
-# evaluated. Historical, deconfounding and prior validation experiments remain
-# available for transparent comparison. The complete default registry contains
-# 58 experiments:
-#
-#   ORIGINAL / HISTORICAL SUITE
-#   B0  Original MONAI ROI + hierarchical pooling + Logistic Regression + PCA
-#   A1  Original full image instead of original MONAI ROI
-#   C1  Original 15% border-only negative control
-#   C2  Original outside-MONAI-mask negative control
-#   C3  Export/provenance metadata-only classifier
-#   C4  Original MONAI-QC-only classifier
-#   A2  Flat slice-to-patient embedding pooling
-#   A3  Legacy slice classifier + log-odds fusion
-#   A4  Legacy slice classifier + mean-probability fusion
-#   A5  Linear SVM instead of Logistic Regression
-#   A6  Optional series-local slice-quality weighting heuristic
-#   A7  PCA disabled while C remains selected inside training data
-#   A8  No-PCA, fixed-C patient model matched to the legacy branch
-#   R1/R2/R3  Deterministic 10%/25%/50% within-series slice dropout
-#
-#   DECONFOUNDING EXTENSION
-#   B1  Label-blind standardized MONAI ROI (development baseline)
-#   A9  Standardized full image
-#   C5  Standardized outer 5% only
-#   C6  Standardized outer 10% only
-#   C7  Detected native/canvas padding mask only
-#   C8  Standardized corners only
-#   C9  MONAI-area-matched standardized center crop
-#   A10 Standardized MONAI soft ROI with zero background
-#   A11 Standardized MONAI bounding-box crop with fixed context
-#   C10 Standardized signal outside a larger MONAI bounding box
-#   C11 Standardization geometry/QC features only
-#   C12 Standardized MONAI gate/QC features only
-#
-#   SECOND-STAGE GEOMETRY / STRUCTURE EXTENSION
-#   C13/C14/C15  Fixed 50%/60%/70% center crops independent of MONAI
-#   A12 Strict zero-background ROI with fixed 60% center-crop fallback
-#   A13 Folder-independent fixed-size chunk pooling
-#   C16 Slice-count-only control
-#   C17 Series-proxy-count-only control
-#   C18 Series-proxy-length-only control
-#   C19 Native-geometry-only control
-#   C20 File-size/compression-proxy-only control
-#
-#   PRIMARY-CANDIDATE VALIDATION EXTENSION
-#   A14 A12 pixels with folder-independent fixed-chunk pooling
-#   A15 A12 after exact within-patient decoded-pixel deduplication
-#   C21 Standardized soft MONAI probability-map-only control
-#   C22 Standardized hard MONAI mask-only control
-#   C23 Standardized MONAI bounding-box-geometry-only control
-#
-#   V4 MONAI-REPRESENTATION DECOMPOSITION EXTENSION (retained)
-#   C24 Soft-MONAI probability-distribution/CDF-only control
-#   C25 Deterministically block-shuffled soft-MONAI-map control
-#   C26 Canonicalized hard-mask relative-shape control
-#   C27 Canonicalized soft-mask morphology/confidence control
-#
-#   V5 REGION-NORMALIZED EXTENSION
-#   A16 Heart-centred fixed FOV with post-localization region scaling
-#   A17 Binary hard support with region-only scaling
-#   A18 A16 on the common standardized-MONAI-valid slice set (prospective)
-#   A19 A18 with mean-plus-standard-deviation series summaries
-#   C28 Conservative outside-whole-heart proxy with independent scaling
-#   C29 Fixed MONAI-independent peripheral control with independent scaling
-#   C30 C28 on exactly the same valid slice set as A18
-#
-#   V6 EXACT-SUPPORT VALIDATION EXTENSION
-#   A20 A17 pixels on standardized-MONAI-valid slices only
-#   C31 Exact binary support used by A17, with all MRI intensity removed
-#   C32 Exact A17 support and intensity histogram after deterministic spatial
-#       shuffling of within-support values
-#   C33 Independently normalized exact non-padding complement of A17 support
-#
-# Every enabled experiment uses the SAME duplicate-aware outer patient-fold
-# manifest. Classifier C and the decision threshold are selected only from each
-# outer-training cohort through inner patient-level OOF predictions. Linear-SVM
-# margins are calibrated by a sigmoid fitted only to inner OOF training scores.
-# The active validation profile determines both the repeated-CV panel and the
-# replicate counts. The default fast profile reruns a focused A12/A17/A20 and
-# exact-support/control panel over 10 identical outer-split seeds, uses 200 direct
-# label permutations, and uses 100 candidate-family maximum-AUROC permutations.
-# The full profile restores the original 50/1000/1000 workload. No favorable
-# split or permutation is selected.
-#
-# A single script launch does NOT mean one classifier represents every ablation.
-# It means the expensive operations are shared correctly:
-#
-#   JPEG decoding + MONAI inference + frozen EfficientNet encoding
-#       ↓
-#   one cached multi-view feature bank
-#       ↓
-#   several independent fold-local classifiers and aggregation rules
-#       ↓
-#   one paired patient-level comparison report
-#
-# The following experiments remain deliberately external to this file until a
-# valid input contract is available:
-#
-#   - a cardiac-MRI-pretrained encoder requiring verified sequence/frame order;
-#   - automatic sequence/view inference from folder names. The script can rerun
-#     selected experiments only after a blinded reviewer supplies a completed
-#     annotation CSV; it never invents those labels itself;
-#   - true external validation requiring an independent cohort adapter and a
-#     comparable patient-level CAD endpoint.
-#
-# ============================================================================
-# PRINCIPAL OUTPUT PACKAGE
-# ============================================================================
-#
-#   console_output.log
-#   suite_configuration.json
-#   manifests/cohort_manifest.csv
-#   manifests/patient_fold_manifest.csv
-#   audits/exact_decoded_pixel_duplicate_groups.csv
-#   audits/perceptual_near_duplicate_patient_pairs.csv
-#   audits/phash_review_panels/*.png
-#   audits/series_annotation_template.csv
-#   audits/series_annotation_label_key.csv
-#   audits/series_annotation_analysis_status.json
-#   sequence_view_analysis/<selection_name>/patient_fold_manifest.csv
-#   sequence_view_analysis/<selection_name>/comparison/experiment_summary.csv
-#   audits/monai_qc_by_patient.csv
-#   audits/monai_gate_class_comparison.json
-#   audits/patient_provenance_features.csv
-#   audits/patient_standardization_features.csv
-#   audits/standardized_monai_qc_by_patient.csv
-#   audits/standardized_monai_gate_class_comparison.json
-#   audits/v6_exact_support_row_contract.json
-#   experiments/<experiment_id>/patient_oof_predictions.csv
-#   experiments/<experiment_id>/fold_metrics.csv
-#   experiments/<experiment_id>/summary.json
-#   comparison/experiment_summary.csv
-#   comparison/patient_predictions_all_experiments.csv
-#   comparison/paired_auc_comparisons.csv
-#   comparison/paired_primary_ablation_comparisons.csv
-#   comparison/failed_experiments.csv
-#   comparison/final_report.json
-#   comparison/v6_candidate_family_nested_selection/fold_candidate_inner_selection.csv
-#   comparison/v6_candidate_family_nested_selection/fold_selected_model.csv
-#   comparison/v6_candidate_family_nested_selection/patient_oof_predictions.csv
-#   comparison/v6_candidate_family_nested_selection/summary.json
-#   stability/<experiment_id>/repeated_nested_cv_runs.csv
-#   stability/<experiment_id>/repeated_nested_cv_oof_predictions.csv
-#   stability/<experiment_id>/patient_score_stability.csv
-#   stability/<experiment_id>/repeated_nested_cv_summary.json
-#   stability/repeated_nested_cv_summary.json
-#   stability/repeated_nested_cv_ranking.csv
-#   stability/repeated_nested_cv_paired_deltas.csv
-#   stability/repeated_nested_cv_paired_comparisons.csv
-#   stability/repeated_nested_cv_paired_comparisons.json
-#   permutation/<experiment_id>/patient_label_permutation_auc.csv
-#   permutation/<experiment_id>/patient_label_permutation_summary.json
-#   permutation/selection_adjusted_candidate_family/selection_adjusted_permutation_candidate_auc.csv
-#   permutation/selection_adjusted_candidate_family/selection_adjusted_permutation_maximum_auc.csv
-#   permutation/selection_adjusted_candidate_family/selection_adjusted_permutation_summary.json
-#   permutation/patient_label_permutation_summary.json
-#
-# All ordinary print() messages, tqdm progress and tracebacks are duplicated to
-# both the live console and ``console_output.log``.
-#
-# ============================================================================
+SCIENTIFIC LIMITS
+-----------------
+This is an exploratory model on 30 Directory_* patients, not an externally
+validated clinical system. MONAI was trained for short-axis cardiac MRI while
+this JPEG cohort is heterogeneous. High-performing border/outside/provenance
+controls must be reported as evidence of possible acquisition/export shortcuts.
+"""
 
 # =============================
-# IMPORTS
 # =============================
 
 import csv
-# Standard-library CSV writer used for reproducible machine-readable outputs.
 
 import gc
-# Explicit garbage collection is used when a GPU stage finishes so references
-# can be released before ``torch.cuda.empty_cache()`` is called.
 
 import shutil
-# Removes incomplete feature-bank directories before a deliberate rebuild.
 
 import sys
-# Redirects ordinary print() and tqdm output to both console and log file.
 
 import traceback
-# Saves visible stack traces when one experiment fails while the suite continues.
 
 from collections import OrderedDict, defaultdict
-# ``defaultdict`` supports duplicate/patient/series aggregation. ``OrderedDict``
-# implements the bounded in-process LRU for standardized Attention inputs.
 
 from dataclasses import asdict, dataclass, replace
-# Immutable experiment configurations and reproducible JSON serialization.
 
 from itertools import combinations
-# Creates patient-pair edges inside cross-patient duplicate groups.
 
 
 import hashlib
-# Used for checkpoint verification and feature-cache fingerprints.
 
 import math
-# Supplies gcd for the deterministic within-support affine permutation control.
-# Checksum verification makes the experiment more reproducible and helps detect
-# corrupted or unintended model files.
 
 import json
-# Serializes run configuration, software versions and evaluation summaries.
 
 import os
-# OS interaction (files, paths, environment variables).
-# Used for:
-#   - traversing dataset folders
-#   - building portable paths
-#   - detecting Kaggle versus local execution
-#   - reading optional bundle path overrides
 
-# cuBLAS requires this workspace contract for deterministic CUDA matrix
-# multiplication on supported toolkits. It is set before importing torch and
-# before any CUDA context can be created. Existing user configuration is kept.
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 import platform
-# Records operating-system and Python runtime information for reproducibility.
 
 import time
-# High-resolution wall-clock timing used by the console progress messages.
-# ``time.perf_counter`` is monotonic and is appropriate for measuring stage,
-# model-loading, cache, fold, and end-to-end execution durations.
 
 from pathlib import Path
-# Object-oriented path manipulation.
-# Used to manage the MONAI bundle directory and checkpoint files safely.
 
 import cv2
-# OpenCV image processing library.
-# Used for:
-#   - grayscale JPEG loading
-#   - aspect-ratio-preserving resizing
-#   - creating fixed-size inputs for MONAI and EfficientNet
 
 import numpy as np
-# Core numerical computation library.
-# Used for:
-#   - image preprocessing
-#   - probability fusion
-#   - feature and label arrays
-#   - deterministic patient shuffling
 
 from tqdm import tqdm
-# Progress visualization utility.
-# Useful for monitoring segmentation and feature extraction over many slices.
 
 import torch
-# PyTorch Deep Learning framework.
-# Provides:
-#   - tensor computation
-#   - GPU acceleration
-#   - model inference
 
 import torch.nn as nn
-# Neural-network module API.
-# Used for the EfficientNet feature-extractor wrapper.
 
 import torch.nn.functional as F
-# Functional tensor operations.
-# Used for:
-#   - softmax over MONAI output channels
-#   - mask dilation with max pooling
-#   - mask resizing from 256×256 to 224×224
 
 from torch.utils.data import Dataset, DataLoader
-# Dataset utilities for batching and deterministic inference.
 
 import torchvision
-# Used only to report the exact torchvision version in the run metadata.
 
 import torchvision.transforms as transforms
-# Converts NumPy HWC arrays to PyTorch CHW tensors.
-# EfficientNet normalization is intentionally applied AFTER ROI extraction.
 
 from torchvision import models
-# Provides ImageNet-pretrained EfficientNet-B0.
 
 # IMPORTANT STARTUP OPTIMIZATION:
-#
 # MONAI is intentionally NOT imported at module startup or on the normal model
-# loading path. The pinned bundle already provides ``models/model.ts``; the
-# script downloads that file with huggingface_hub and loads it directly through
-# ``torch.jit.load``. MONAI UNet is imported lazily only if the official
 # TorchScript artifact cannot be used and reconstruction from model.pt is needed.
 
 import sklearn
-# Used to record the exact scikit-learn version in the run metadata.
 
 from sklearn.decomposition import PCA
-# Optional fold-local dimensionality reduction for the very small patient cohort.
 
 from sklearn.linear_model import LogisticRegression
-# Linear probabilistic classifier. By default it is trained on one pooled
-# embedding per Directory_* patient; slice-level training is an optional ablation.
 
 from sklearn.metrics import (
     average_precision_score,
@@ -839,35 +113,24 @@ from sklearn.metrics import (
     roc_auc_score,
     roc_curve,
 )
-# Patient-level discrimination, calibration and threshold metrics.
 
 from sklearn.model_selection import StratifiedKFold
-# Standard patient-level splitter used when every duplicate component contains
-# exactly one patient. StratifiedGroupKFold is imported lazily when confirmed
-# cross-patient duplicate components must remain together.
 
 from sklearn.pipeline import Pipeline
-# Bundles fold-local standardization, optional PCA, and the selected linear
-# classifier so no validation-patient feature is used to fit preprocessing.
 
 from sklearn.preprocessing import StandardScaler
-# Standardizes embeddings or tabular controls inside each fold.
 
 from sklearn.svm import LinearSVC
-# Linear maximum-margin classifier used in the declared SVM ablation.
 
 from IPython.display import display, HTML, Javascript
-
-import matplotlib.pyplot as plt
-# Visualization utility for inspecting:
-#   - the padded input
-#   - the MONAI cardiac probability map
-#   - the confidence-gated soft ROI
 
 
 # =============================
 # CONFIGURATION
 # =============================
+
+ESSENTIAL_PIPELINE_VERSION = "v17-lean"
+
 
 IMG_SIZE = 224
 # EfficientNet-B0 input resolution.
@@ -1111,9 +374,8 @@ class ExperimentConfig:
     enabled: bool = True
 
 
-# Every enabled experiment is launched automatically by main(). To run a
-# smaller preliminary suite, set EXPERIMENTS_TO_RUN to a tuple of IDs. Keep it
-# as None to run every configuration whose enabled field is True.
+# The registry is intentionally focused on 11 candidate/control models.
+# The complete historical registry remains in the full-source backup.
 EXPERIMENTS_TO_RUN = None
 
 PRIMARY_CANDIDATE_EXPERIMENT_ID = (
@@ -1144,1278 +406,267 @@ V6_SUPPORT_SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID = (
 V6_EXACT_SUPPORT_COMPLEMENT_CONTROL_EXPERIMENT_ID = (
     "C33_A17_EXACT_SUPPORT_COMPLEMENT_REGION_NORM_HIER_LR_PCA"
 )
-DEVELOPMENT_BASELINE_EXPERIMENT_ID = "B1_STANDARDIZED_ROI_HIER_LR_PCA"
+DEVELOPMENT_BASELINE_EXPERIMENT_ID = None
 BASELINE_EXPERIMENT_ID = PRIMARY_CANDIDATE_EXPERIMENT_ID
-# The strict zero-background ROI with fixed-center fallback is now the locked
-# primary candidate for all final baseline-relative tables. B1 remains enabled
-# as the earlier standardized development baseline and is never deleted.
+# A12 is the locked reference for all final baseline-relative tables. The
+# separate B1 development branch is retained only in the full V16 backup.
 
+# Final compact panel: locked references/candidates plus controls needed to
+# interpret localization, fallback behavior and shortcut risk.
 EXPERIMENT_REGISTRY = (
     ExperimentConfig(
-        experiment_id="B0_ROI_HIER_LR_PCA",
-        description=(
-            "Historical original-canvas reference: confidence-gated MONAI ROI, "
-            "equal slice weights, hierarchical embedding pooling, PCA and "
-            "Logistic Regression."
-        ),
-        feature_mode="monai_roi",
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical",
-        weighting_mode="equal",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
-        role="historical_baseline",
-    ),
+                experiment_id="A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA",
+                description=(
+                    "Zero-background standardized MONAI ROI for valid masks, with a "
+                    "fixed 60% center crop rather than the full image when the gate fails."
+                ),
+                feature_mode="standardized_roi_zero_bg_center_fallback",
+                strategy="patient_embedding",
+                pooling_strategy="hierarchical",
+                weighting_mode="equal",
+                classifier_type="logistic_regression",
+                use_pca=True,
+                tune_c=True,
+                role="baseline",
+            ),
     ExperimentConfig(
-        experiment_id="A1_FULL_HIER_LR_PCA",
-        description="Full-image ablation with all downstream settings unchanged.",
-        feature_mode="full_image",
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical",
-        weighting_mode="equal",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
-    ),
+                experiment_id="A16_HEART_CENTERED_FIXED_FOV_REGION_NORM_HIER_LR_PCA",
+                description=(
+                    "Fixed-size field of view centred on the valid MONAI hard-mask "
+                    "centroid, with image-centre fallback. Intensities are robustly "
+                    "scaled only inside the retained non-padding crop after cardiac "
+                    "localization; no soft MONAI confidence is multiplied into MRI pixels."
+                ),
+                feature_mode="standardized_heart_centered_fixed_fov_region_norm",
+                strategy="patient_embedding",
+                pooling_strategy="hierarchical",
+                weighting_mode="equal",
+                classifier_type="logistic_regression",
+                use_pca=True,
+                tune_c=True,
+                role="v5_candidate",
+            ),
     ExperimentConfig(
-        experiment_id="C1_BORDER_ONLY_HIER_LR_PCA",
-        description=(
-            "Negative control retaining only the outer image border; a high AUC "
-            "would indicate export/style shortcut risk."
-        ),
-        feature_mode="border_only",
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical",
-        weighting_mode="equal",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
-        role="negative_control",
-    ),
+                experiment_id="A17_HARD_SUPPORT_REGION_NORM_HIER_LR_PCA",
+                description=(
+                    "Binary dilated cardiac support with region-only robust scaling and "
+                    "fixed-centre fallback. It tests whether MRI intensity remains "
+                    "predictive after removing soft-segmenter confidence modulation."
+                ),
+                feature_mode="standardized_hard_support_region_norm",
+                strategy="patient_embedding",
+                pooling_strategy="hierarchical",
+                weighting_mode="equal",
+                classifier_type="logistic_regression",
+                use_pca=True,
+                tune_c=True,
+                role="v6_prospective_candidate",
+            ),
     ExperimentConfig(
-        experiment_id="C2_OUTSIDE_MONAI_MASK_HIER_LR_PCA",
-        description=(
-            "Negative control retaining signal outside the dilated MONAI soft "
-            "mask. The mask is applied unconditionally and remains a proxy, not "
-            "validated anatomy."
-        ),
-        feature_mode="outside_heart",
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical",
-        weighting_mode="equal",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
-        role="negative_control",
-    ),
+                experiment_id="A18_HEART_CENTERED_FIXED_FOV_REGION_NORM_VALID_ONLY_HIER_LR_PCA",
+                description=(
+                    "Prospective V5 candidate: A16 pixels restricted to the standardized "
+                    "MONAI gate-valid slice set. The matched C30 outside control uses "
+                    "exactly the same patient, series and slice rows."
+                ),
+                feature_mode="standardized_heart_centered_fixed_fov_region_norm",
+                strategy="patient_embedding",
+                pooling_strategy="hierarchical",
+                weighting_mode="equal",
+                classifier_type="logistic_regression",
+                use_pca=True,
+                tune_c=True,
+                slice_filter="standardized_monai_valid",
+                role="v5_prospective_candidate",
+            ),
     ExperimentConfig(
-        experiment_id="C3_EXPORT_PROVENANCE_ONLY_LR",
-        description=(
-            "Patient classifier using only the conservative export/provenance "
-            "subset: native geometry, file-size-per-pixel, padding and border "
-            "statistics. Central intensity, entropy and sharpness are excluded."
-        ),
-        feature_mode="provenance_only",
-        strategy="patient_tabular",
-        pooling_strategy="patient_tabular",
-        weighting_mode="not_applicable",
-        classifier_type="logistic_regression",
-        use_pca=False,
-        tune_c=True,
-        role="negative_control",
-    ),
+                experiment_id="A19_HEART_CENTERED_FIXED_FOV_REGION_NORM_VALID_ONLY_HIER_MEAN_STD_LR_PCA",
+                description=(
+                    "A18 representation with mean-plus-standard-deviation summaries "
+                    "inside each folder-defined series proxy before equal patient pooling. "
+                    "It tests whether within-series heterogeneity adds stable information."
+                ),
+                feature_mode="standardized_heart_centered_fixed_fov_region_norm",
+                strategy="patient_embedding",
+                pooling_strategy="hierarchical_mean_std",
+                weighting_mode="equal",
+                classifier_type="logistic_regression",
+                use_pca=True,
+                tune_c=True,
+                slice_filter="standardized_monai_valid",
+                role="v5_ablation",
+            ),
     ExperimentConfig(
-        experiment_id="C4_MONAI_QC_ONLY_LR",
-        description=(
-            "Patient classifier using only MONAI gate/QC statistics. A high AUC "
-            "would suggest protocol or sequence confounding."
-        ),
-        feature_mode="monai_qc_only",
-        strategy="patient_tabular",
-        pooling_strategy="patient_tabular",
-        weighting_mode="not_applicable",
-        classifier_type="logistic_regression",
-        use_pca=False,
-        tune_c=True,
-        role="negative_control",
-    ),
+                experiment_id="C29_FIXED_PERIPHERY_REGION_NORM_HIER_LR_PCA",
+                description=(
+                    "MONAI-independent peripheral control retaining only pixels outside "
+                    "a fixed central square and scaling intensities only in that periphery."
+                ),
+                feature_mode="standardized_fixed_periphery_region_norm",
+                strategy="patient_embedding",
+                pooling_strategy="hierarchical",
+                weighting_mode="equal",
+                classifier_type="logistic_regression",
+                use_pca=True,
+                tune_c=True,
+                role="negative_control",
+            ),
     ExperimentConfig(
-        experiment_id="A2_ROI_FLAT_LR_PCA",
-        description=(
-            "Flat slice-to-patient embedding mean; long series can dominate "
-            "because the series hierarchy is intentionally removed."
-        ),
-        feature_mode="monai_roi",
-        strategy="patient_embedding",
-        pooling_strategy="flat",
-        weighting_mode="equal",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
-    ),
+                experiment_id="C30_OUTSIDE_WHOLE_HEART_REGION_NORM_VALID_ONLY_HIER_LR_PCA",
+                description=(
+                    "Matched outside-heart control for A18. It uses the same standardized "
+                    "MONAI gate-valid rows and independent region-only scaling, so the "
+                    "inside/outside comparison cannot be driven by gate-failure frequency."
+                ),
+                feature_mode="standardized_outside_whole_heart_region_norm",
+                strategy="patient_embedding",
+                pooling_strategy="hierarchical",
+                weighting_mode="equal",
+                classifier_type="logistic_regression",
+                use_pca=True,
+                tune_c=True,
+                slice_filter="standardized_monai_valid",
+                role="negative_control",
+            ),
     ExperimentConfig(
-        experiment_id="A3_ROI_LEGACY_LOGODDS_LR",
-        description=(
-            "Legacy weakly supervised slice classifier with hierarchical "
-            "log-odds fusion; retained only as an ablation."
-        ),
-        feature_mode="monai_roi",
-        strategy="slice_probability_fusion",
-        pooling_strategy="probability_fusion",
-        weighting_mode="equal",
-        classifier_type="logistic_regression",
-        fusion_method="log_odds",
-        use_pca=False,
-        tune_c=False,
-        fixed_c=1.0,
-    ),
+                experiment_id="A20_HARD_SUPPORT_REGION_NORM_VALID_ONLY_HIER_LR_PCA",
+                description=(
+                    "A17 pixels restricted to standardized MONAI gate-valid slices. "
+                    "This isolates whether A17's performance depends on its fixed "
+                    "central-square fallback for gate-invalid images."
+                ),
+                feature_mode="standardized_hard_support_region_norm",
+                strategy="patient_embedding",
+                pooling_strategy="hierarchical",
+                weighting_mode="equal",
+                classifier_type="logistic_regression",
+                use_pca=True,
+                tune_c=True,
+                slice_filter="standardized_monai_valid",
+                role="v6_ablation",
+            ),
     ExperimentConfig(
-        experiment_id="A4_ROI_LEGACY_MEANPROB_LR",
-        description=(
-            "Same legacy slice classifier as A3, but mean-probability fusion "
-            "replaces log-odds fusion."
-        ),
-        feature_mode="monai_roi",
-        strategy="slice_probability_fusion",
-        pooling_strategy="probability_fusion",
-        weighting_mode="equal",
-        classifier_type="logistic_regression",
-        fusion_method="mean_probability",
-        use_pca=False,
-        tune_c=False,
-        fixed_c=1.0,
-    ),
+                experiment_id="C31_A17_EXACT_SUPPORT_MASK_ONLY_HIER_LR_PCA",
+                description=(
+                    "Exact binary-support control for A17. It uses the identical "
+                    "additional dilation, fixed-centre fallback, content mask, slice "
+                    "rows, pooling and folds, but removes every MRI intensity value."
+                ),
+                feature_mode="standardized_a17_exact_support_mask_only",
+                strategy="patient_embedding",
+                pooling_strategy="hierarchical",
+                weighting_mode="equal",
+                classifier_type="logistic_regression",
+                use_pca=True,
+                tune_c=True,
+                role="segmentation_representation_control",
+            ),
     ExperimentConfig(
-        experiment_id="A5_ROI_HIER_LINEAR_SVM_PCA",
-        description=(
-            "Linear SVM ablation. Fold-local sigmoid calibration is learned only "
-            "from inner out-of-fold training scores."
-        ),
-        feature_mode="monai_roi",
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical",
-        weighting_mode="equal",
-        classifier_type="linear_svm",
-        use_pca=True,
-        tune_c=True,
-    ),
+                experiment_id="C32_A17_SUPPORT_INTENSITY_AFFINE_SHUFFLED_HIER_LR_PCA",
+                description=(
+                    "Anatomy-destruction control for A17. The exact A17 support and "
+                    "within-support intensity histogram are retained, while a "
+                    "deterministic per-image affine permutation destroys the original "
+                    "spatial arrangement without using labels or patient identifiers."
+                ),
+                feature_mode="standardized_a17_support_intensity_affine_shuffled",
+                strategy="patient_embedding",
+                pooling_strategy="hierarchical",
+                weighting_mode="equal",
+                classifier_type="logistic_regression",
+                use_pca=True,
+                tune_c=True,
+                role="anatomy_destruction_control",
+            ),
     ExperimentConfig(
-        experiment_id="A6_ROI_HIER_LR_QUALITY_PCA",
-        description=(
-            "Optional series-local intensity-standard-deviation weighting "
-            "heuristic; every slice remains included."
-        ),
-        feature_mode="monai_roi",
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical",
-        weighting_mode="quality",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
-    ),
-    ExperimentConfig(
-        experiment_id="A7_ROI_HIER_LR_NO_PCA",
-        description="PCA-off ablation with all other baseline settings unchanged.",
-        feature_mode="monai_roi",
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical",
-        weighting_mode="equal",
-        classifier_type="logistic_regression",
-        use_pca=False,
-        tune_c=True,
-    ),
-    ExperimentConfig(
-        experiment_id="A8_ROI_HIER_LR_NO_PCA_FIXEDC",
-        description=(
-            "Matched patient-embedding reference for the legacy slice-classifier "
-            "ablation: no PCA and fixed C=1.0, so A8 versus A3 isolates the "
-            "training/pooling strategy rather than changing PCA or C selection."
-        ),
-        feature_mode="monai_roi",
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical",
-        weighting_mode="equal",
-        classifier_type="logistic_regression",
-        use_pca=False,
-        tune_c=False,
-        fixed_c=1.0,
-        role="matched_reference",
-    ),
-    # ------------------------------------------------------------------
-    # DECONFOUNDING EXTENSION
-    # ------------------------------------------------------------------
-    # These experiments were added after the first complete suite showed that
-    # border-only, outside-mask, and provenance-only controls retained
-    # substantial predictive signal. They preserve the original B0 result for
-    # historical comparison but introduce a new label-blind standardized
-    # baseline and controls that isolate padding, corners, central cropping,
-    # stricter ROI removal, and preprocessing geometry.
-    ExperimentConfig(
-        experiment_id="B1_STANDARDIZED_ROI_HIER_LR_PCA",
-        description=(
-            "Primary deconfounded baseline: label-blind dark-padding removal, "
-            "fixed-content 240-in-256 geometry, MONAI min-max input separated "
-            "from robust classifier scaling, confidence-gated soft ROI, "
-            "hierarchical embedding pooling, PCA and Logistic Regression."
-        ),
-        feature_mode="standardized_monai_roi",
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical",
-        weighting_mode="equal",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
-        role="development_baseline",
-    ),
-    ExperimentConfig(
-        experiment_id="A9_STANDARDIZED_FULL_HIER_LR_PCA",
-        description=(
-            "Label-blind standardized full-image ablation with all downstream "
-            "settings matched to the deconfounded baseline."
-        ),
-        feature_mode="standardized_full_image",
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical",
-        weighting_mode="equal",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
-    ),
-    ExperimentConfig(
-        experiment_id="C5_STANDARDIZED_BORDER05_HIER_LR_PCA",
-        description=(
-            "Negative control retaining only the outer 5% of the standardized "
-            "image. High AUC indicates residual padding/export shortcut risk."
-        ),
-        feature_mode="standardized_border_05",
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical",
-        weighting_mode="equal",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
-        role="negative_control",
-    ),
-    ExperimentConfig(
-        experiment_id="C6_STANDARDIZED_BORDER10_HIER_LR_PCA",
-        description=(
-            "Negative control retaining only the outer 10% of the standardized "
-            "image. This is stricter than the original 15% border control."
-        ),
-        feature_mode="standardized_border_10",
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical",
-        weighting_mode="equal",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
-        role="negative_control",
-    ),
-    ExperimentConfig(
-        experiment_id="C7_DETECTED_PADDING_MASK_HIER_LR_PCA",
-        description=(
-            "Negative control using only the fixed-canvas padding geometry after "
-            "label-blind native dark-padding removal and content-size normalization."
-        ),
-        feature_mode="detected_padding_mask",
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical",
-        weighting_mode="equal",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
-        role="negative_control",
-    ),
-    ExperimentConfig(
-        experiment_id="C8_STANDARDIZED_CORNERS_HIER_LR_PCA",
-        description=(
-            "Negative control retaining only four standardized-image corners; "
-            "it targets scanner overlays, crop geometry, and export templates."
-        ),
-        feature_mode="standardized_corners",
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical",
-        weighting_mode="equal",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
-        role="negative_control",
-    ),
-    ExperimentConfig(
-        experiment_id="C9_STANDARDIZED_CENTER_CROP_HIER_LR_PCA",
-        description=(
-            "Area-matched central-crop control. It tests whether MONAI adds "
-            "anatomical localization beyond simply concentrating on the center."
-        ),
-        feature_mode="standardized_center_crop",
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical",
-        weighting_mode="equal",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
-        role="localization_control",
-    ),
-    ExperimentConfig(
-        experiment_id="A10_STANDARDIZED_ROI_ZERO_BG_HIER_LR_PCA",
-        description=(
-            "Strict standardized soft ROI with zero background for valid MONAI "
-            "masks and full-image fallback for invalid masks."
-        ),
-        feature_mode="standardized_roi_zero_background",
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical",
-        weighting_mode="equal",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
-    ),
-    ExperimentConfig(
-        experiment_id="A11_STANDARDIZED_ROI_BBOX_HIER_LR_PCA",
-        description=(
-            "Strict standardized crop around the dilated MONAI hard-mask "
-            "bounding box with a fixed label-blind context margin."
-        ),
-        feature_mode="standardized_roi_bbox",
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical",
-        weighting_mode="equal",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
-    ),
-    ExperimentConfig(
-        experiment_id="C10_STANDARDIZED_OUTSIDE_LARGE_BBOX_HIER_LR_PCA",
-        description=(
-            "Strict control retaining only pixels outside an enlarged MONAI "
-            "ventricular bounding box; invalid masks yield a zero image rather "
-            "than a full-image fallback. This is not a validated outside-heart mask."
-        ),
-        feature_mode="standardized_outside_large_bbox",
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical",
-        weighting_mode="equal",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
-        role="negative_control",
-    ),
-    ExperimentConfig(
-        experiment_id="C11_STANDARDIZATION_QC_ONLY_LR",
-        description=(
-            "Patient classifier using only label-blind crop fractions and robust "
-            "intensity-scaling limits generated by standardization."
-        ),
-        feature_mode="standardization_qc_only",
-        strategy="patient_tabular",
-        pooling_strategy="patient_tabular",
-        weighting_mode="not_applicable",
-        classifier_type="logistic_regression",
-        use_pca=False,
-        tune_c=True,
-        role="negative_control",
-    ),
-    ExperimentConfig(
-        experiment_id="C12_STANDARDIZED_MONAI_QC_ONLY_LR",
-        description=(
-            "Patient classifier using only MONAI gate/QC statistics produced "
-            "after label-blind standardization."
-        ),
-        feature_mode="standardized_monai_qc_only",
-        strategy="patient_tabular",
-        pooling_strategy="patient_tabular",
-        weighting_mode="not_applicable",
-        classifier_type="logistic_regression",
-        use_pca=False,
-        tune_c=True,
-        role="negative_control",
-    ),
-    # ------------------------------------------------------------------
-    # SECOND DECONFOUNDING EXTENSION
-    # ------------------------------------------------------------------
-    # The first standardized run showed that a MONAI-area-matched center crop
-    # could outperform the soft ROI and that padding geometry remained
-    # predictive. The following experiments therefore use center crops whose
-    # fractions are fixed independently of MONAI, a stricter zero-background
-    # ROI with fixed-center fallback, folder-independent fixed-chunk pooling,
-    # and single-family provenance controls that identify which structural
-    # variable can classify the released cohort.
-    ExperimentConfig(
-        experiment_id="C13_STANDARDIZED_FIXED_CENTER50_HIER_LR_PCA",
-        description=(
-            "Fixed 50% central crop after label-blind geometry standardization. "
-            "Crop size is independent of MONAI masks, labels and model scores."
-        ),
-        feature_mode="standardized_fixed_center_50",
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical",
-        weighting_mode="equal",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
-        role="localization_control",
-    ),
-    ExperimentConfig(
-        experiment_id="C14_STANDARDIZED_FIXED_CENTER60_HIER_LR_PCA",
-        description=(
-            "Fixed 60% central crop after label-blind geometry standardization. "
-            "This is the predeclared simple-localization candidate for stability analysis."
-        ),
-        feature_mode="standardized_fixed_center_60",
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical",
-        weighting_mode="equal",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
-        role="localization_control",
-    ),
-    ExperimentConfig(
-        experiment_id="C15_STANDARDIZED_FIXED_CENTER70_HIER_LR_PCA",
-        description=(
-            "Fixed 70% central crop after label-blind geometry standardization. "
-            "It tests whether retaining more central context changes ranking."
-        ),
-        feature_mode="standardized_fixed_center_70",
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical",
-        weighting_mode="equal",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
-        role="localization_control",
-    ),
-    ExperimentConfig(
-        experiment_id="A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA",
-        description=(
-            "Zero-background standardized MONAI ROI for valid masks, with a "
-            "fixed 60% center crop rather than the full image when the gate fails."
-        ),
-        feature_mode="standardized_roi_zero_bg_center_fallback",
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical",
-        weighting_mode="equal",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
-        role="baseline",
-    ),
-    ExperimentConfig(
-        experiment_id="A13_STANDARDIZED_ROI_FIXED_CHUNK_LR_PCA",
-        description=(
-            "Folder-independent fixed-size chunk pooling over standardized ROI "
-            "slice order. It tests whether SR_*/series* export partitioning itself "
-            "creates the apparent advantage of hierarchical folder pooling."
-        ),
-        feature_mode="standardized_monai_roi",
-        strategy="patient_embedding",
-        pooling_strategy="fixed_chunk",
-        weighting_mode="equal",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
-    ),
-    ExperimentConfig(
-        experiment_id="A14_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_FIXED_CHUNK_LR_PCA",
-        description=(
-            "Primary-candidate pixels with folder-independent fixed-size chunk "
-            "pooling. This isolates the effect of SR_*/series* proxy boundaries "
-            "while keeping the strict ROI/fallback representation unchanged."
-        ),
-        feature_mode="standardized_roi_zero_bg_center_fallback",
-        strategy="patient_embedding",
-        pooling_strategy="fixed_chunk",
-        weighting_mode="equal",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
-    ),
-    ExperimentConfig(
-        experiment_id="A15_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_DEDUP_HIER_LR_PCA",
-        description=(
-            "Primary-candidate pixels after deterministic exact decoded-pixel "
-            "deduplication inside each Directory_* patient. Hierarchical pooling "
-            "is otherwise unchanged, so repeated identical exports cannot receive "
-            "multiple nominal contributions."
-        ),
-        feature_mode="standardized_roi_zero_bg_center_fallback",
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical",
-        weighting_mode="equal",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
-        deduplicate_exact_within_patient=True,
-    ),
-    ExperimentConfig(
-        experiment_id="C16_N_SLICES_ONLY_LR",
-        description="Negative control using only the number of exported slices per Directory_* patient.",
-        feature_mode="n_slices_only",
-        strategy="patient_tabular",
-        pooling_strategy="patient_tabular",
-        weighting_mode="not_applicable",
-        classifier_type="logistic_regression",
-        use_pca=False,
-        tune_c=True,
-        role="negative_control",
-    ),
-    ExperimentConfig(
-        experiment_id="C17_N_SERIES_ONLY_LR",
-        description="Negative control using only the number of folder-defined series proxies per patient.",
-        feature_mode="n_series_only",
-        strategy="patient_tabular",
-        pooling_strategy="patient_tabular",
-        weighting_mode="not_applicable",
-        classifier_type="logistic_regression",
-        use_pca=False,
-        tune_c=True,
-        role="negative_control",
-    ),
-    ExperimentConfig(
-        experiment_id="C18_SERIES_LENGTH_ONLY_LR",
-        description="Negative control using only mean and maximum folder-proxy lengths.",
-        feature_mode="series_length_only",
-        strategy="patient_tabular",
-        pooling_strategy="patient_tabular",
-        weighting_mode="not_applicable",
-        classifier_type="logistic_regression",
-        use_pca=False,
-        tune_c=True,
-        role="negative_control",
-    ),
-    ExperimentConfig(
-        experiment_id="C19_NATIVE_GEOMETRY_ONLY_LR",
-        description=(
-            "Negative control using only patient-aggregated native height, width "
-            "and aspect-ratio features; image counts and file size are excluded."
-        ),
-        feature_mode="native_geometry_only",
-        strategy="patient_tabular",
-        pooling_strategy="patient_tabular",
-        weighting_mode="not_applicable",
-        classifier_type="logistic_regression",
-        use_pca=False,
-        tune_c=True,
-        role="negative_control",
-    ),
-    ExperimentConfig(
-        experiment_id="C20_FILE_SIZE_ONLY_LR",
-        description=(
-            "Negative control using only patient-aggregated file-size and bytes-"
-            "per-native-pixel statistics; geometry and image counts are excluded."
-        ),
-        feature_mode="file_size_only",
-        strategy="patient_tabular",
-        pooling_strategy="patient_tabular",
-        weighting_mode="not_applicable",
-        classifier_type="logistic_regression",
-        use_pca=False,
-        tune_c=True,
-        role="negative_control",
-    ),
-    ExperimentConfig(
-        experiment_id="C21_STANDARDIZED_SOFT_MONAI_MASK_ONLY_HIER_LR_PCA",
-        description=(
-            "Segmentation-derived control encoding only the standardized dilated soft MONAI "
-            "probability map for gate-valid slices; invalid slices are all zero. "
-            "It tests whether mask shape/confidence alone predicts the class."
-        ),
-        feature_mode="standardized_soft_monai_mask_only",
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical",
-        weighting_mode="equal",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
-        role="segmentation_representation_control",
-    ),
-    ExperimentConfig(
-        experiment_id="C22_STANDARDIZED_HARD_MONAI_MASK_ONLY_HIER_LR_PCA",
-        description=(
-            "Segmentation-derived control encoding only the standardized dilated hard MONAI "
-            "mask for gate-valid slices; invalid slices are all zero. It removes "
-            "MRI intensities while preserving mask morphology and position."
-        ),
-        feature_mode="standardized_hard_monai_mask_only",
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical",
-        weighting_mode="equal",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
-        role="segmentation_representation_control",
-    ),
-    ExperimentConfig(
-        experiment_id="C23_STANDARDIZED_MONAI_BBOX_MASK_ONLY_HIER_LR_PCA",
-        description=(
-            "Segmentation-derived control encoding only a binary rectangle around each valid "
-            "standardized MONAI hard-mask bounding box; invalid slices are zero. "
-            "It tests whether ROI location and extent alone encode the label."
-        ),
-        feature_mode="standardized_monai_bbox_mask_only",
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical",
-        weighting_mode="equal",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
-        role="segmentation_representation_control",
-    ),
-    ExperimentConfig(
-        experiment_id="C24_STANDARDIZED_SOFT_MONAI_HISTOGRAM_ONLY_HIER_LR_PCA",
-        description=(
-            "Segmentation-derived distribution control encoding only a fixed-bin "
-            "cumulative histogram of the standardized soft MONAI probability "
-            "map. Original pixel position and mask morphology are absent."
-        ),
-        feature_mode="standardized_soft_monai_histogram_only",
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical",
-        weighting_mode="equal",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
-        role="segmentation_representation_control",
-    ),
-    ExperimentConfig(
-        experiment_id="C25_STANDARDIZED_SOFT_MONAI_BLOCK_SHUFFLED_HIER_LR_PCA",
-        description=(
-            "Segmentation-derived control preserving each soft MONAI map's "
-            "probability values and local within-block texture while applying a "
-            "deterministic per-image global block permutation that destroys the "
-            "original global shape and location."
-        ),
-        feature_mode="standardized_soft_monai_block_shuffled",
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical",
-        weighting_mode="equal",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
-        role="segmentation_representation_control",
-    ),
-    ExperimentConfig(
-        experiment_id="C26_STANDARDIZED_CANONICAL_HARD_MONAI_MASK_ONLY_HIER_LR_PCA",
-        description=(
-            "Segmentation-derived control that crops each valid hard MONAI mask "
-            "to its own bounding box, preserves relative shape, then centers it "
-            "at one fixed scale. Absolute mask position and size are removed."
-        ),
-        feature_mode="standardized_canonical_hard_monai_mask_only",
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical",
-        weighting_mode="equal",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
-        role="segmentation_representation_control",
-    ),
-    ExperimentConfig(
-        experiment_id="C27_STANDARDIZED_CANONICAL_SOFT_MONAI_MASK_ONLY_HIER_LR_PCA",
-        description=(
-            "Segmentation-derived control that canonicalizes the valid soft "
-            "MONAI probability map to a fixed centered scale using the hard-mask "
-            "bounding box. Relative morphology and confidence remain, while "
-            "absolute position and extent are removed."
-        ),
-        feature_mode="standardized_canonical_soft_monai_mask_only",
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical",
-        weighting_mode="equal",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
-        role="segmentation_representation_control",
-    ),
-    # ------------------------------------------------------------------
-    # V5 REGION-NORMALIZED CARDIAC / EXTRACARDIAC EXTENSION
-    # ------------------------------------------------------------------
-    ExperimentConfig(
-        experiment_id="A16_HEART_CENTERED_FIXED_FOV_REGION_NORM_HIER_LR_PCA",
-        description=(
-            "Fixed-size field of view centred on the valid MONAI hard-mask "
-            "centroid, with image-centre fallback. Intensities are robustly "
-            "scaled only inside the retained non-padding crop after cardiac "
-            "localization; no soft MONAI confidence is multiplied into MRI pixels."
-        ),
-        feature_mode="standardized_heart_centered_fixed_fov_region_norm",
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical",
-        weighting_mode="equal",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
-        role="v5_candidate",
-    ),
-    ExperimentConfig(
-        experiment_id="A17_HARD_SUPPORT_REGION_NORM_HIER_LR_PCA",
-        description=(
-            "Binary dilated cardiac support with region-only robust scaling and "
-            "fixed-centre fallback. It tests whether MRI intensity remains "
-            "predictive after removing soft-segmenter confidence modulation."
-        ),
-        feature_mode="standardized_hard_support_region_norm",
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical",
-        weighting_mode="equal",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
-        role="v6_prospective_candidate",
-    ),
-    ExperimentConfig(
-        experiment_id="A18_HEART_CENTERED_FIXED_FOV_REGION_NORM_VALID_ONLY_HIER_LR_PCA",
-        description=(
-            "Prospective V5 candidate: A16 pixels restricted to the standardized "
-            "MONAI gate-valid slice set. The matched C30 outside control uses "
-            "exactly the same patient, series and slice rows."
-        ),
-        feature_mode="standardized_heart_centered_fixed_fov_region_norm",
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical",
-        weighting_mode="equal",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
-        slice_filter="standardized_monai_valid",
-        role="v5_prospective_candidate",
-    ),
-    ExperimentConfig(
-        experiment_id="A19_HEART_CENTERED_FIXED_FOV_REGION_NORM_VALID_ONLY_HIER_MEAN_STD_LR_PCA",
-        description=(
-            "A18 representation with mean-plus-standard-deviation summaries "
-            "inside each folder-defined series proxy before equal patient pooling. "
-            "It tests whether within-series heterogeneity adds stable information."
-        ),
-        feature_mode="standardized_heart_centered_fixed_fov_region_norm",
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical_mean_std",
-        weighting_mode="equal",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
-        slice_filter="standardized_monai_valid",
-        role="v5_ablation",
-    ),
-    ExperimentConfig(
-        experiment_id="C28_OUTSIDE_WHOLE_HEART_REGION_NORM_HIER_LR_PCA",
-        description=(
-            "Conservative outside-heart proxy using region-only normalization. "
-            "It removes the union of a large fixed central square, a mask-centred "
-            "square and a substantially enlarged ventricular box. Invalid masks "
-            "still receive the fixed central exclusion instead of an all-zero image."
-        ),
-        feature_mode="standardized_outside_whole_heart_region_norm",
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical",
-        weighting_mode="equal",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
-        role="negative_control",
-    ),
-    ExperimentConfig(
-        experiment_id="C29_FIXED_PERIPHERY_REGION_NORM_HIER_LR_PCA",
-        description=(
-            "MONAI-independent peripheral control retaining only pixels outside "
-            "a fixed central square and scaling intensities only in that periphery."
-        ),
-        feature_mode="standardized_fixed_periphery_region_norm",
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical",
-        weighting_mode="equal",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
-        role="negative_control",
-    ),
-    ExperimentConfig(
-        experiment_id="C30_OUTSIDE_WHOLE_HEART_REGION_NORM_VALID_ONLY_HIER_LR_PCA",
-        description=(
-            "Matched outside-heart control for A18. It uses the same standardized "
-            "MONAI gate-valid rows and independent region-only scaling, so the "
-            "inside/outside comparison cannot be driven by gate-failure frequency."
-        ),
-        feature_mode="standardized_outside_whole_heart_region_norm",
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical",
-        weighting_mode="equal",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
-        slice_filter="standardized_monai_valid",
-        role="negative_control",
-    ),
-    # ------------------------------------------------------------------
-    # V6 EXACTLY MATCHED A17 VALIDATION CONTROLS
-    # ------------------------------------------------------------------
-    ExperimentConfig(
-        experiment_id="A20_HARD_SUPPORT_REGION_NORM_VALID_ONLY_HIER_LR_PCA",
-        description=(
-            "A17 pixels restricted to standardized MONAI gate-valid slices. "
-            "This isolates whether A17's performance depends on its fixed "
-            "central-square fallback for gate-invalid images."
-        ),
-        feature_mode="standardized_hard_support_region_norm",
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical",
-        weighting_mode="equal",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
-        slice_filter="standardized_monai_valid",
-        role="v6_ablation",
-    ),
-    ExperimentConfig(
-        experiment_id="C31_A17_EXACT_SUPPORT_MASK_ONLY_HIER_LR_PCA",
-        description=(
-            "Exact binary-support control for A17. It uses the identical "
-            "additional dilation, fixed-centre fallback, content mask, slice "
-            "rows, pooling and folds, but removes every MRI intensity value."
-        ),
-        feature_mode="standardized_a17_exact_support_mask_only",
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical",
-        weighting_mode="equal",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
-        role="segmentation_representation_control",
-    ),
-    ExperimentConfig(
-        experiment_id="C32_A17_SUPPORT_INTENSITY_AFFINE_SHUFFLED_HIER_LR_PCA",
-        description=(
-            "Anatomy-destruction control for A17. The exact A17 support and "
-            "within-support intensity histogram are retained, while a "
-            "deterministic per-image affine permutation destroys the original "
-            "spatial arrangement without using labels or patient identifiers."
-        ),
-        feature_mode="standardized_a17_support_intensity_affine_shuffled",
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical",
-        weighting_mode="equal",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
-        role="anatomy_destruction_control",
-    ),
-    ExperimentConfig(
-        experiment_id="C33_A17_EXACT_SUPPORT_COMPLEMENT_REGION_NORM_HIER_LR_PCA",
-        description=(
-            "Exact complement control for A17. It retains and independently "
-            "normalizes only non-padding pixels outside the exact binary support "
-            "used by A17, including the matched fixed-centre fallback."
-        ),
-        feature_mode="standardized_a17_exact_support_complement_region_norm",
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical",
-        weighting_mode="equal",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
-        role="negative_control",
-    ),
-    ExperimentConfig(
-        experiment_id="R1_ROI_HIER_LR_PCA_DROP10",
-        description=(
-            "Exploratory robustness control after deterministic 10% slice "
-            "dropout within each series proxy; at least one slice per proxy is retained."
-        ),
-        feature_mode="monai_roi",
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical",
-        weighting_mode="equal",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
-        slice_dropout_rate=0.10,
-        role="robustness",
-    ),
-    ExperimentConfig(
-        experiment_id="R2_ROI_HIER_LR_PCA_DROP25",
-        description=(
-            "Exploratory robustness control after deterministic 25% slice "
-            "dropout within each series proxy; at least one slice per proxy is retained."
-        ),
-        feature_mode="monai_roi",
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical",
-        weighting_mode="equal",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
-        slice_dropout_rate=0.25,
-        role="robustness",
-    ),
-    ExperimentConfig(
-        experiment_id="R3_ROI_HIER_LR_PCA_DROP50",
-        description=(
-            "Exploratory robustness control after deterministic 50% slice "
-            "dropout within each series proxy; at least one slice per proxy is retained."
-        ),
-        feature_mode="monai_roi",
-        strategy="patient_embedding",
-        pooling_strategy="hierarchical",
-        weighting_mode="equal",
-        classifier_type="logistic_regression",
-        use_pca=True,
-        tune_c=True,
-        slice_dropout_rate=0.50,
-        role="robustness",
-    ),
-)
-
-# These comparisons are declared before evaluation. The first identifier is the
+                experiment_id="C33_A17_EXACT_SUPPORT_COMPLEMENT_REGION_NORM_HIER_LR_PCA",
+                description=(
+                    "Exact complement control for A17. It retains and independently "
+                    "normalizes only non-padding pixels outside the exact binary support "
+                    "used by A17, including the matched fixed-centre fallback."
+                ),
+                feature_mode="standardized_a17_exact_support_complement_region_norm",
+                strategy="patient_embedding",
+                pooling_strategy="hierarchical",
+                weighting_mode="equal",
+                classifier_type="logistic_regression",
+                use_pca=True,
+                tune_c=True,
+                role="negative_control",
+            ),
+)# These comparisons are declared before evaluation. The first identifier is the
 # reference and the second is the changed configuration, so Delta-AUROC is
 # calculated as ``comparison - reference``. A8 exists specifically to make the
 # legacy strategy comparison clean: A8 and A3 use the same ROI features, equal
 # weights, Logistic Regression, no PCA, and fixed C=1.0.
 PRIMARY_ABLATION_COMPARISONS = (
     (
-        "ORIGINAL_ROI_VS_LABEL_BLIND_STANDARDIZED_ROI",
-        "B0_ROI_HIER_LR_PCA",
-        "B1_STANDARDIZED_ROI_HIER_LR_PCA",
-        "How does label-blind padding removal and robust scaling change the original ROI baseline?",
-    ),
-    (
-        "STANDARDIZED_ROI_VS_STANDARDIZED_FULL_IMAGE",
-        "B1_STANDARDIZED_ROI_HIER_LR_PCA",
-        "A9_STANDARDIZED_FULL_HIER_LR_PCA",
-        "After export standardization, does MONAI ROI still improve over the full image?",
-    ),
-    (
-        "STANDARDIZED_ROI_VS_AREA_MATCHED_CENTER_CROP",
-        "B1_STANDARDIZED_ROI_HIER_LR_PCA",
-        "C9_STANDARDIZED_CENTER_CROP_HIER_LR_PCA",
-        "Does MONAI localization outperform a similarly sized central crop?",
-    ),
-    (
-        "STANDARDIZED_ROI_VS_FIXED_CENTER_50",
-        "B1_STANDARDIZED_ROI_HIER_LR_PCA",
-        "C13_STANDARDIZED_FIXED_CENTER50_HIER_LR_PCA",
-        "Does the standardized ROI outperform a MONAI-independent fixed 50 percent center crop?",
-    ),
-    (
-        "STANDARDIZED_ROI_VS_FIXED_CENTER_60",
-        "B1_STANDARDIZED_ROI_HIER_LR_PCA",
-        "C14_STANDARDIZED_FIXED_CENTER60_HIER_LR_PCA",
-        "Does the standardized ROI outperform a MONAI-independent fixed 60 percent center crop?",
-    ),
-    (
-        "STANDARDIZED_ROI_VS_FIXED_CENTER_70",
-        "B1_STANDARDIZED_ROI_HIER_LR_PCA",
-        "C15_STANDARDIZED_FIXED_CENTER70_HIER_LR_PCA",
-        "Does the standardized ROI outperform a MONAI-independent fixed 70 percent center crop?",
-    ),
-    (
-        "STANDARDIZED_SOFT_ROI_VS_ZERO_BACKGROUND_CENTER_FALLBACK",
-        "B1_STANDARDIZED_ROI_HIER_LR_PCA",
-        "A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA",
-        "Does strict zero-background ROI with fixed-center fallback improve the standardized soft ROI?",
-    ),
-    (
-        "PRIMARY_CANDIDATE_VS_FIXED_CENTER_60",
-        "C14_STANDARDIZED_FIXED_CENTER60_HIER_LR_PCA",
-        "A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA",
-        "Does the locked strict-ROI candidate outperform a simple MONAI-independent fixed 60 percent center crop?",
-    ),
-    (
-        "PRIMARY_CANDIDATE_VS_STANDARDIZED_FULL_IMAGE",
-        "A9_STANDARDIZED_FULL_HIER_LR_PCA",
-        "A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA",
-        "Does the locked strict-ROI candidate outperform the fully standardized image?",
-    ),
-    (
-        "PRIMARY_CANDIDATE_VS_OUTSIDE_LARGE_BOUNDING_BOX",
-        "C10_STANDARDIZED_OUTSIDE_LARGE_BBOX_HIER_LR_PCA",
-        "A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA",
-        "Does the locked strict-ROI candidate outperform signal outside the enlarged MONAI ventricular bounding box?",
-    ),
-    (
-        "PRIMARY_CANDIDATE_VS_ZERO_BACKGROUND_FULL_FALLBACK",
-        "A10_STANDARDIZED_ROI_ZERO_BG_HIER_LR_PCA",
-        "A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA",
-        "Does fixed-center fallback improve strict zero-background ROI relative to full-image fallback?",
-    ),
-    (
-        "PRIMARY_CANDIDATE_VS_MONAI_BOUNDING_BOX_CROP",
-        "A11_STANDARDIZED_ROI_BBOX_HIER_LR_PCA",
-        "A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA",
-        "Does soft strict ROI with fixed-center fallback outperform a hard MONAI bounding-box crop?",
-    ),
-    (
-        "PRIMARY_CANDIDATE_HIERARCHICAL_VS_FIXED_CHUNK_POOLING",
-        "A14_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_FIXED_CHUNK_LR_PCA",
-        "A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA",
-        "With identical primary-candidate pixels, does folder-defined hierarchical pooling outperform fixed-size folder-independent chunks?",
-    ),
-    (
-        "PRIMARY_CANDIDATE_VS_EXACT_WITHIN_PATIENT_DEDUPLICATION",
-        "A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA",
-        "A15_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_DEDUP_HIER_LR_PCA",
-        "How does collapsing exact repeated pixel exports within each patient change the locked primary candidate?",
-    ),
-    (
-        "PRIMARY_CANDIDATE_VS_SOFT_MONAI_MASK_ONLY",
-        "C21_STANDARDIZED_SOFT_MONAI_MASK_ONLY_HIER_LR_PCA",
-        "A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA",
-        "Does MRI intensity inside the strict ROI add information beyond the soft MONAI probability-map shape and confidence?",
-    ),
-    (
-        "PRIMARY_CANDIDATE_VS_HARD_MONAI_MASK_ONLY",
-        "C22_STANDARDIZED_HARD_MONAI_MASK_ONLY_HIER_LR_PCA",
-        "A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA",
-        "Does MRI intensity add information beyond dilated hard-mask morphology and position?",
-    ),
-    (
-        "PRIMARY_CANDIDATE_VS_MONAI_BBOX_MASK_ONLY",
-        "C23_STANDARDIZED_MONAI_BBOX_MASK_ONLY_HIER_LR_PCA",
-        "A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA",
-        "Does MRI intensity add information beyond MONAI bounding-box location and extent?",
-    ),
-    (
-        "PRIMARY_CANDIDATE_VS_SOFT_MONAI_HISTOGRAM_ONLY",
-        "C24_STANDARDIZED_SOFT_MONAI_HISTOGRAM_ONLY_HIER_LR_PCA",
-        "A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA",
-        "Does MRI intensity add information beyond the soft-map probability distribution when original spatial structure is removed?",
-    ),
-    (
-        "PRIMARY_CANDIDATE_VS_BLOCK_SHUFFLED_SOFT_MONAI_MAP",
-        "C25_STANDARDIZED_SOFT_MONAI_BLOCK_SHUFFLED_HIER_LR_PCA",
-        "A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA",
-        "Does MRI intensity add information beyond a soft map whose global shape and location are destroyed by deterministic block shuffling?",
-    ),
-    (
-        "PRIMARY_CANDIDATE_VS_CANONICAL_HARD_MONAI_MASK",
-        "C26_STANDARDIZED_CANONICAL_HARD_MONAI_MASK_ONLY_HIER_LR_PCA",
-        "A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA",
-        "Does MRI intensity add information beyond hard-mask relative shape after absolute position and scale are removed?",
-    ),
-    (
-        "PRIMARY_CANDIDATE_VS_CANONICAL_SOFT_MONAI_MASK",
-        "C27_STANDARDIZED_CANONICAL_SOFT_MONAI_MASK_ONLY_HIER_LR_PCA",
-        "A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA",
-        "Does MRI intensity add information beyond canonicalized soft-mask morphology and confidence?",
-    ),
-    (
-        "SOFT_MONAI_SPATIAL_MAP_VS_HISTOGRAM_ONLY",
-        "C24_STANDARDIZED_SOFT_MONAI_HISTOGRAM_ONLY_HIER_LR_PCA",
-        "C21_STANDARDIZED_SOFT_MONAI_MASK_ONLY_HIER_LR_PCA",
-        "How much information is added by the original soft-map spatial arrangement beyond its probability distribution?",
-    ),
-    (
-        "SOFT_MONAI_SPATIAL_MAP_VS_BLOCK_SHUFFLED",
-        "C25_STANDARDIZED_SOFT_MONAI_BLOCK_SHUFFLED_HIER_LR_PCA",
-        "C21_STANDARDIZED_SOFT_MONAI_MASK_ONLY_HIER_LR_PCA",
-        "How much information is added by intact global soft-mask morphology and location beyond block-shuffled local probability texture?",
-    ),
-    (
-        "POSITIONED_HARD_MASK_VS_CANONICAL_HARD_SHAPE",
-        "C26_STANDARDIZED_CANONICAL_HARD_MONAI_MASK_ONLY_HIER_LR_PCA",
-        "C22_STANDARDIZED_HARD_MONAI_MASK_ONLY_HIER_LR_PCA",
-        "How much information is added by absolute hard-mask position and scale beyond canonicalized relative shape?",
-    ),
-    (
-        "POSITIONED_SOFT_MASK_VS_CANONICAL_SOFT_SHAPE",
-        "C27_STANDARDIZED_CANONICAL_SOFT_MONAI_MASK_ONLY_HIER_LR_PCA",
-        "C21_STANDARDIZED_SOFT_MONAI_MASK_ONLY_HIER_LR_PCA",
-        "How much information is added by absolute soft-mask position and scale beyond canonicalized morphology and confidence?",
-    ),
-    (
-        "STANDARDIZED_HIERARCHICAL_VS_FIXED_CHUNK_POOLING",
-        "B1_STANDARDIZED_ROI_HIER_LR_PCA",
-        "A13_STANDARDIZED_ROI_FIXED_CHUNK_LR_PCA",
-        "Does folder-defined hierarchical pooling outperform folder-independent fixed-size chunks?",
-    ),
-    (
-        "STANDARDIZED_SOFT_ROI_VS_ZERO_BACKGROUND",
-        "B1_STANDARDIZED_ROI_HIER_LR_PCA",
-        "A10_STANDARDIZED_ROI_ZERO_BG_HIER_LR_PCA",
-        "Is retaining 15 percent background context necessary after standardization?",
-    ),
-    (
-        "STANDARDIZED_SOFT_ROI_VS_BOUNDING_BOX_CROP",
-        "B1_STANDARDIZED_ROI_HIER_LR_PCA",
-        "A11_STANDARDIZED_ROI_BBOX_HIER_LR_PCA",
-        "Does a stricter MONAI bounding-box crop preserve useful patient signal?",
-    ),
-    (
-        "STANDARDIZED_ROI_VS_OUTSIDE_LARGE_BOUNDING_BOX",
-        "B1_STANDARDIZED_ROI_HIER_LR_PCA",
-        "C10_STANDARDIZED_OUTSIDE_LARGE_BBOX_HIER_LR_PCA",
-        "How much predictive signal remains after removing an enlarged MONAI region?",
-    ),
-    (
-        "STANDARDIZED_ROI_VS_STANDARDIZED_BORDER_05",
-        "B1_STANDARDIZED_ROI_HIER_LR_PCA",
-        "C5_STANDARDIZED_BORDER05_HIER_LR_PCA",
-        "Can the outer 5 percent of standardized images still classify the cohort?",
-    ),
-    (
-        "STANDARDIZED_ROI_VS_STANDARDIZED_BORDER_10",
-        "B1_STANDARDIZED_ROI_HIER_LR_PCA",
-        "C6_STANDARDIZED_BORDER10_HIER_LR_PCA",
-        "Can the outer 10 percent of standardized images still classify the cohort?",
-    ),
-    (
-        "STANDARDIZED_ROI_VS_DETECTED_PADDING_MASK",
-        "B1_STANDARDIZED_ROI_HIER_LR_PCA",
-        "C7_DETECTED_PADDING_MASK_HIER_LR_PCA",
-        "Does detected padding geometry alone encode the class label?",
-    ),
-    (
-        "STANDARDIZED_ROI_VS_STANDARDIZED_CORNERS",
-        "B1_STANDARDIZED_ROI_HIER_LR_PCA",
-        "C8_STANDARDIZED_CORNERS_HIER_LR_PCA",
-        "Do image corners retain scanner/export shortcut information?",
-    ),
-    (
-        "ROI_VS_FULL_IMAGE",
-        "B0_ROI_HIER_LR_PCA",
-        "A1_FULL_HIER_LR_PCA",
-        "Does confidence-gated MONAI ROI improve patient-level discrimination?",
-    ),
-    (
-        "HIERARCHICAL_VS_FLAT_POOLING",
-        "B0_ROI_HIER_LR_PCA",
-        "A2_ROI_FLAT_LR_PCA",
-        "Does series-aware hierarchical embedding pooling improve over a flat slice mean?",
-    ),
-    (
-        "PATIENT_EMBEDDING_VS_LEGACY_SLICE_CLASSIFIER",
-        "A8_ROI_HIER_LR_NO_PCA_FIXEDC",
-        "A3_ROI_LEGACY_LOGODDS_LR",
-        "What changes when one-patient-row training is replaced by repeated-label slice training?",
-    ),
-    (
-        "LOGODDS_VS_MEAN_PROBABILITY_FUSION",
-        "A3_ROI_LEGACY_LOGODDS_LR",
-        "A4_ROI_LEGACY_MEANPROB_LR",
-        "Within the same legacy slice classifier, does mean-probability fusion differ from log-odds fusion?",
-    ),
-    (
-        "LOGISTIC_REGRESSION_VS_LINEAR_SVM",
-        "B0_ROI_HIER_LR_PCA",
-        "A5_ROI_HIER_LINEAR_SVM_PCA",
-        "Does the result depend on the selected linear classifier family?",
-    ),
-    (
-        "EQUAL_VS_QUALITY_SLICE_WEIGHTS",
-        "B0_ROI_HIER_LR_PCA",
-        "A6_ROI_HIER_LR_QUALITY_PCA",
-        "Does the optional series-local intensity-variation heuristic improve pooling?",
-    ),
-    (
-        "PCA_ON_VS_PCA_OFF",
-        "B0_ROI_HIER_LR_PCA",
-        "A7_ROI_HIER_LR_NO_PCA",
-        "Does fold-local PCA improve the high-dimensional small-patient setting?",
-    ),
-    (
-        "ROBUSTNESS_AFTER_10_PERCENT_SLICE_DROPOUT",
-        "B0_ROI_HIER_LR_PCA",
-        "R1_ROI_HIER_LR_PCA_DROP10",
-        "How stable is the patient model after deterministic 10% within-series slice removal?",
-    ),
-    (
-        "ROBUSTNESS_AFTER_25_PERCENT_SLICE_DROPOUT",
-        "B0_ROI_HIER_LR_PCA",
-        "R2_ROI_HIER_LR_PCA_DROP25",
-        "How stable is the patient model after deterministic 25% within-series slice removal?",
-    ),
-    (
-        "ROBUSTNESS_AFTER_50_PERCENT_SLICE_DROPOUT",
-        "B0_ROI_HIER_LR_PCA",
-        "R3_ROI_HIER_LR_PCA_DROP50",
-        "How stable is the patient model after deterministic 50% within-series slice removal?",
-    ),
-    (
         "A12_VS_V5_FIXED_FOV_REGION_NORMALIZATION",
         PRIMARY_CANDIDATE_EXPERIMENT_ID,
         "A16_HEART_CENTERED_FIXED_FOV_REGION_NORM_HIER_LR_PCA",
-        "Does post-localization region-only intensity scaling improve over A12's soft-probability-weighted pixels?",
+        "Post-localization region scaling versus the locked A12 reference.",
     ),
     (
         "V5_ALL_SLICES_VS_GATE_VALID_ONLY",
         "A16_HEART_CENTERED_FIXED_FOV_REGION_NORM_HIER_LR_PCA",
         V5_CANDIDATE_EXPERIMENT_ID,
-        "Does excluding standardized MONAI gate-invalid slices improve the fixed-FOV candidate?",
+        "Effect of excluding standardized MONAI gate-invalid slices.",
     ),
     (
         "V5_FIXED_FOV_VS_HARD_SUPPORT",
-        "A17_HARD_SUPPORT_REGION_NORM_HIER_LR_PCA",
+        V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID,
         V5_CANDIDATE_EXPERIMENT_ID,
-        "Does a fixed heart-centred field of view outperform a zero-background binary support?",
+        "Fixed heart-centred FOV versus zero-background hard support.",
     ),
     (
         "V5_HIERARCHICAL_MEAN_VS_MEAN_STD",
         V5_CANDIDATE_EXPERIMENT_ID,
         "A19_HEART_CENTERED_FIXED_FOV_REGION_NORM_VALID_ONLY_HIER_MEAN_STD_LR_PCA",
-        "Does within-series embedding dispersion add information beyond the series mean?",
+        "Series mean versus mean-plus-standard-deviation summaries.",
     ),
     (
         "V5_MATCHED_INSIDE_VS_OUTSIDE_WHOLE_HEART",
         V5_MATCHED_OUTSIDE_CONTROL_EXPERIMENT_ID,
         V5_CANDIDATE_EXPERIMENT_ID,
-        "On exactly the same gate-valid slices, how much more predictive is the heart-centred region than the conservative outside-heart proxy?",
+        "Matched valid-slice outside-heart control versus the V5 cardiac region.",
     ),
     (
         "V5_CANDIDATE_VS_MONAI_INDEPENDENT_PERIPHERY",
         "C29_FIXED_PERIPHERY_REGION_NORM_HIER_LR_PCA",
         V5_CANDIDATE_EXPERIMENT_ID,
-        "Does the V5 cardiac candidate outperform a fixed, independently normalized image periphery?",
-    ),
-    (
-        "V5_OUTSIDE_ALL_SLICES_VS_GATE_VALID_ONLY",
-        "C28_OUTSIDE_WHOLE_HEART_REGION_NORM_HIER_LR_PCA",
-        V5_MATCHED_OUTSIDE_CONTROL_EXPERIMENT_ID,
-        "How much does using the common gate-valid slice set change the conservative outside-heart control?",
-    ),
-    (
-        "V5_CANDIDATE_VS_BLOCK_SHUFFLED_SOFT_MAP",
-        "C25_STANDARDIZED_SOFT_MONAI_BLOCK_SHUFFLED_HIER_LR_PCA",
-        V5_CANDIDATE_EXPERIMENT_ID,
-        "Does region-normalized cardiac MRI intensity add information beyond block-local MONAI confidence texture?",
-    ),
-    (
-        "V5_CANDIDATE_VS_CANONICAL_SOFT_MASK",
-        "C27_STANDARDIZED_CANONICAL_SOFT_MONAI_MASK_ONLY_HIER_LR_PCA",
-        V5_CANDIDATE_EXPERIMENT_ID,
-        "Does the V5 intensity candidate add information beyond canonicalized MONAI morphology and confidence?",
+        "Cardiac candidate versus a fixed MONAI-independent periphery.",
     ),
     (
         "A12_VS_V6_PROSPECTIVE_A17",
         PRIMARY_CANDIDATE_EXPERIMENT_ID,
         V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID,
-        "Does the prospectively locked V6 hard-support candidate outperform the locked A12 reference?",
+        "Prospectively locked A17 versus the locked A12 reference.",
     ),
     (
         "A17_ALL_SLICES_VS_A20_VALID_ONLY",
         V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID,
         V6_VALID_ONLY_ABLATION_EXPERIMENT_ID,
-        "Does removing A17 gate-invalid fallback slices improve or reduce discrimination?",
+        "Effect of removing A17 fixed-centre fallback slices.",
     ),
     (
         "C31_EXACT_SUPPORT_MASK_ONLY_VS_A17",
         V6_EXACT_SUPPORT_MASK_CONTROL_EXPERIMENT_ID,
         V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID,
-        "How much information do MRI intensities add beyond the exact support geometry visible to A17?",
+        "MRI intensities plus support versus exact support geometry alone.",
     ),
     (
         "C32_SHUFFLED_SUPPORT_INTENSITY_VS_A17",
         V6_SUPPORT_SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID,
         V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID,
-        "Does intact within-support spatial anatomy add information beyond the same support and intensity distribution?",
+        "Intact spatial anatomy versus the same support and shuffled histogram.",
     ),
     (
         "C33_EXACT_COMPLEMENT_VS_A17",
         V6_EXACT_SUPPORT_COMPLEMENT_CONTROL_EXPERIMENT_ID,
         V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID,
-        "On exactly matched rows and complementary pixels, how much more predictive is the A17 support than its exterior?",
+        "A17 support versus its independently normalized exact complement.",
     ),
 )
-
 N_SPLITS = 5
 CV_RANDOM_STATE = RANDOM_SEED
 INNER_CV_SPLITS = 3
@@ -2638,20 +889,9 @@ ANNOTATED_SERIES_USE_SEQUENCE_VIEW_BALANCED_POOLING = True
 
 ANNOTATED_SERIES_EXPERIMENT_IDS = (
     PRIMARY_CANDIDATE_EXPERIMENT_ID,
-    "A14_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_FIXED_CHUNK_LR_PCA",
-    "C10_STANDARDIZED_OUTSIDE_LARGE_BBOX_HIER_LR_PCA",
-    "C14_STANDARDIZED_FIXED_CENTER60_HIER_LR_PCA",
-    "C21_STANDARDIZED_SOFT_MONAI_MASK_ONLY_HIER_LR_PCA",
-    "C22_STANDARDIZED_HARD_MONAI_MASK_ONLY_HIER_LR_PCA",
-    "C23_STANDARDIZED_MONAI_BBOX_MASK_ONLY_HIER_LR_PCA",
-    "C24_STANDARDIZED_SOFT_MONAI_HISTOGRAM_ONLY_HIER_LR_PCA",
-    "C25_STANDARDIZED_SOFT_MONAI_BLOCK_SHUFFLED_HIER_LR_PCA",
-    "C26_STANDARDIZED_CANONICAL_HARD_MONAI_MASK_ONLY_HIER_LR_PCA",
-    "C27_STANDARDIZED_CANONICAL_SOFT_MONAI_MASK_ONLY_HIER_LR_PCA",
     "A16_HEART_CENTERED_FIXED_FOV_REGION_NORM_HIER_LR_PCA",
     V5_CANDIDATE_EXPERIMENT_ID,
     "A19_HEART_CENTERED_FIXED_FOV_REGION_NORM_VALID_ONLY_HIER_MEAN_STD_LR_PCA",
-    "C28_OUTSIDE_WHOLE_HEART_REGION_NORM_HIER_LR_PCA",
     "C29_FIXED_PERIPHERY_REGION_NORM_HIER_LR_PCA",
     V5_MATCHED_OUTSIDE_CONTROL_EXPERIMENT_ID,
     V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID,
@@ -2659,8 +899,7 @@ ANNOTATED_SERIES_EXPERIMENT_IDS = (
     V6_EXACT_SUPPORT_MASK_CONTROL_EXPERIMENT_ID,
     V6_SUPPORT_SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID,
     V6_EXACT_SUPPORT_COMPLEMENT_CONTROL_EXPERIMENT_ID,
-)
-# The pipeline never infers sequence or view from SR_*/series* folder names.
+)# The pipeline never infers sequence or view from SR_*/series* folder names.
 # When this optional stage is enabled, the user must point to a completed copy
 # of the blinded series_annotation_template.csv stored outside the current run
 # directory. Only explicitly annotated series proxies are retained, and a fresh
@@ -2771,56 +1010,23 @@ REPEATED_NESTED_CV_REPEATS = _validation_env_positive_int(
 REPEATED_NESTED_CV_RANDOM_STATE = RANDOM_SEED + 20_000
 
 # The complete panel is retained verbatim for the ``full`` profile.
-FULL_STABILITY_EXPERIMENT_IDS = (
-    DEVELOPMENT_BASELINE_EXPERIMENT_ID,
-    "A9_STANDARDIZED_FULL_HIER_LR_PCA",
-    "A10_STANDARDIZED_ROI_ZERO_BG_HIER_LR_PCA",
-    "A11_STANDARDIZED_ROI_BBOX_HIER_LR_PCA",
-    "C14_STANDARDIZED_FIXED_CENTER60_HIER_LR_PCA",
-    PRIMARY_CANDIDATE_EXPERIMENT_ID,
-    "A14_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_FIXED_CHUNK_LR_PCA",
-    "A15_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_DEDUP_HIER_LR_PCA",
-    "C10_STANDARDIZED_OUTSIDE_LARGE_BBOX_HIER_LR_PCA",
-    "C5_STANDARDIZED_BORDER05_HIER_LR_PCA",
-    "C6_STANDARDIZED_BORDER10_HIER_LR_PCA",
-    "C7_DETECTED_PADDING_MASK_HIER_LR_PCA",
-    "C21_STANDARDIZED_SOFT_MONAI_MASK_ONLY_HIER_LR_PCA",
-    "C22_STANDARDIZED_HARD_MONAI_MASK_ONLY_HIER_LR_PCA",
-    "C23_STANDARDIZED_MONAI_BBOX_MASK_ONLY_HIER_LR_PCA",
-    "C24_STANDARDIZED_SOFT_MONAI_HISTOGRAM_ONLY_HIER_LR_PCA",
-    "C25_STANDARDIZED_SOFT_MONAI_BLOCK_SHUFFLED_HIER_LR_PCA",
-    "C26_STANDARDIZED_CANONICAL_HARD_MONAI_MASK_ONLY_HIER_LR_PCA",
-    "C27_STANDARDIZED_CANONICAL_SOFT_MONAI_MASK_ONLY_HIER_LR_PCA",
-    "A16_HEART_CENTERED_FIXED_FOV_REGION_NORM_HIER_LR_PCA",
-    "A17_HARD_SUPPORT_REGION_NORM_HIER_LR_PCA",
-    V5_CANDIDATE_EXPERIMENT_ID,
-    "A19_HEART_CENTERED_FIXED_FOV_REGION_NORM_VALID_ONLY_HIER_MEAN_STD_LR_PCA",
-    "C28_OUTSIDE_WHOLE_HEART_REGION_NORM_HIER_LR_PCA",
-    "C29_FIXED_PERIPHERY_REGION_NORM_HIER_LR_PCA",
-    V5_MATCHED_OUTSIDE_CONTROL_EXPERIMENT_ID,
-    V6_VALID_ONLY_ABLATION_EXPERIMENT_ID,
-    V6_EXACT_SUPPORT_MASK_CONTROL_EXPERIMENT_ID,
-    V6_SUPPORT_SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID,
-    V6_EXACT_SUPPORT_COMPLEMENT_CONTROL_EXPERIMENT_ID,
+FULL_STABILITY_EXPERIMENT_IDS = tuple(
+    experiment.experiment_id for experiment in EXPERIMENT_REGISTRY
 )
-
 # The default fast panel concentrates repeated split-sensitivity analysis on the
 # main historical/current candidates and the controls needed to interpret A17.
 # All other enabled experiments still receive their ordinary nested 5-fold OOF
 # evaluation in stage 8; only their additional repeated-CV reruns are omitted.
 FOCUSED_STABILITY_EXPERIMENT_IDS = (
-    DEVELOPMENT_BASELINE_EXPERIMENT_ID,
     PRIMARY_CANDIDATE_EXPERIMENT_ID,
     V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID,
     V6_VALID_ONLY_ABLATION_EXPERIMENT_ID,
+    "C29_FIXED_PERIPHERY_REGION_NORM_HIER_LR_PCA",
+    V5_MATCHED_OUTSIDE_CONTROL_EXPERIMENT_ID,
     V6_EXACT_SUPPORT_MASK_CONTROL_EXPERIMENT_ID,
     V6_SUPPORT_SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID,
     V6_EXACT_SUPPORT_COMPLEMENT_CONTROL_EXPERIMENT_ID,
-    "C28_OUTSIDE_WHOLE_HEART_REGION_NORM_HIER_LR_PCA",
-    "C29_FIXED_PERIPHERY_REGION_NORM_HIER_LR_PCA",
-    V5_MATCHED_OUTSIDE_CONTROL_EXPERIMENT_ID,
 )
-
 STABILITY_PANEL = os.environ.get(
     "CAD_STABILITY_PANEL",
     _VALIDATION_PROFILE_DEFAULTS["stability_panel"],
@@ -2843,205 +1049,36 @@ STABILITY_EXPERIMENT_IDS = (
 # second because it asks whether collapsing repeats improves the locked model.
 REPEATED_STABILITY_COMPARISONS = (
     (
-        "A12_VS_FIXED_CENTER_60",
-        "C14_STANDARDIZED_FIXED_CENTER60_HIER_LR_PCA",
-        PRIMARY_CANDIDATE_EXPERIMENT_ID,
-        "Strict MONAI ROI versus a simple fixed central crop.",
-    ),
-    (
-        "A12_VS_STANDARDIZED_FULL_IMAGE",
-        "A9_STANDARDIZED_FULL_HIER_LR_PCA",
-        PRIMARY_CANDIDATE_EXPERIMENT_ID,
-        "Strict MONAI ROI versus the standardized full image.",
-    ),
-    (
-        "A12_VS_OUTSIDE_LARGE_BBOX",
-        "C10_STANDARDIZED_OUTSIDE_LARGE_BBOX_HIER_LR_PCA",
-        PRIMARY_CANDIDATE_EXPERIMENT_ID,
-        "Strict ROI versus pixels outside the enlarged ventricular box.",
-    ),
-    (
-        "A12_VS_ZERO_BG_FULL_FALLBACK",
-        "A10_STANDARDIZED_ROI_ZERO_BG_HIER_LR_PCA",
-        PRIMARY_CANDIDATE_EXPERIMENT_ID,
-        "Fixed-center fallback versus full-image fallback.",
-    ),
-    (
-        "A12_VS_MONAI_BBOX_CROP",
-        "A11_STANDARDIZED_ROI_BBOX_HIER_LR_PCA",
-        PRIMARY_CANDIDATE_EXPERIMENT_ID,
-        "Soft strict ROI versus hard MONAI bounding-box crop.",
-    ),
-    (
-        "A12_HIERARCHICAL_VS_FIXED_CHUNK",
-        "A14_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_FIXED_CHUNK_LR_PCA",
-        PRIMARY_CANDIDATE_EXPERIMENT_ID,
-        "Identical pixels with hierarchical versus folder-independent chunks.",
-    ),
-    (
-        "A12_VS_EXACT_DEDUP",
-        PRIMARY_CANDIDATE_EXPERIMENT_ID,
-        "A15_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_DEDUP_HIER_LR_PCA",
-        "Effect of collapsing exact repeated exports within patients.",
-    ),
-    (
-        "A12_VS_SOFT_MASK_ONLY",
-        "C21_STANDARDIZED_SOFT_MONAI_MASK_ONLY_HIER_LR_PCA",
-        PRIMARY_CANDIDATE_EXPERIMENT_ID,
-        "MRI intensities versus soft-mask morphology/confidence only.",
-    ),
-    (
-        "A12_VS_HARD_MASK_ONLY",
-        "C22_STANDARDIZED_HARD_MONAI_MASK_ONLY_HIER_LR_PCA",
-        PRIMARY_CANDIDATE_EXPERIMENT_ID,
-        "MRI intensities versus hard-mask morphology only.",
-    ),
-    (
-        "A12_VS_BBOX_MASK_ONLY",
-        "C23_STANDARDIZED_MONAI_BBOX_MASK_ONLY_HIER_LR_PCA",
-        PRIMARY_CANDIDATE_EXPERIMENT_ID,
-        "MRI intensities versus MONAI bounding-box geometry only.",
-    ),
-    (
-        "A12_VS_SOFT_HISTOGRAM_ONLY",
-        "C24_STANDARDIZED_SOFT_MONAI_HISTOGRAM_ONLY_HIER_LR_PCA",
-        PRIMARY_CANDIDATE_EXPERIMENT_ID,
-        "MRI intensities versus soft-map probability distribution only.",
-    ),
-    (
-        "A12_VS_BLOCK_SHUFFLED_SOFT_MAP",
-        "C25_STANDARDIZED_SOFT_MONAI_BLOCK_SHUFFLED_HIER_LR_PCA",
-        PRIMARY_CANDIDATE_EXPERIMENT_ID,
-        "MRI intensities versus block-shuffled soft-map probabilities.",
-    ),
-    (
-        "A12_VS_CANONICAL_HARD_MASK",
-        "C26_STANDARDIZED_CANONICAL_HARD_MONAI_MASK_ONLY_HIER_LR_PCA",
-        PRIMARY_CANDIDATE_EXPERIMENT_ID,
-        "MRI intensities versus canonicalized hard-mask relative shape.",
-    ),
-    (
-        "A12_VS_CANONICAL_SOFT_MASK",
-        "C27_STANDARDIZED_CANONICAL_SOFT_MONAI_MASK_ONLY_HIER_LR_PCA",
-        PRIMARY_CANDIDATE_EXPERIMENT_ID,
-        "MRI intensities versus canonicalized soft morphology/confidence.",
-    ),
-    (
-        "SOFT_SPATIAL_MAP_VS_HISTOGRAM_ONLY",
-        "C24_STANDARDIZED_SOFT_MONAI_HISTOGRAM_ONLY_HIER_LR_PCA",
-        "C21_STANDARDIZED_SOFT_MONAI_MASK_ONLY_HIER_LR_PCA",
-        "Intact soft-map spatial arrangement versus probability distribution only.",
-    ),
-    (
-        "SOFT_SPATIAL_MAP_VS_BLOCK_SHUFFLED",
-        "C25_STANDARDIZED_SOFT_MONAI_BLOCK_SHUFFLED_HIER_LR_PCA",
-        "C21_STANDARDIZED_SOFT_MONAI_MASK_ONLY_HIER_LR_PCA",
-        "Intact global soft-map morphology/location versus block-shuffled control.",
-    ),
-    (
-        "POSITIONED_HARD_MASK_VS_CANONICAL_HARD",
-        "C26_STANDARDIZED_CANONICAL_HARD_MONAI_MASK_ONLY_HIER_LR_PCA",
-        "C22_STANDARDIZED_HARD_MONAI_MASK_ONLY_HIER_LR_PCA",
-        "Absolute hard-mask position/scale plus shape versus relative shape only.",
-    ),
-    (
-        "POSITIONED_SOFT_MASK_VS_CANONICAL_SOFT",
-        "C27_STANDARDIZED_CANONICAL_SOFT_MONAI_MASK_ONLY_HIER_LR_PCA",
-        "C21_STANDARDIZED_SOFT_MONAI_MASK_ONLY_HIER_LR_PCA",
-        "Absolute soft-mask position/scale plus confidence versus canonicalized morphology/confidence.",
-    ),
-    (
-        "CANONICAL_SOFT_MASK_VS_HISTOGRAM_ONLY",
-        "C24_STANDARDIZED_SOFT_MONAI_HISTOGRAM_ONLY_HIER_LR_PCA",
-        "C27_STANDARDIZED_CANONICAL_SOFT_MONAI_MASK_ONLY_HIER_LR_PCA",
-        "Canonicalized soft morphology/confidence versus probability distribution only.",
-    ),
-    (
-        "A12_VS_A16_REGION_NORMALIZED_FIXED_FOV",
-        PRIMARY_CANDIDATE_EXPERIMENT_ID,
-        "A16_HEART_CENTERED_FIXED_FOV_REGION_NORM_HIER_LR_PCA",
-        "Locked A12 versus the all-slice V5 region-normalized fixed-FOV candidate.",
-    ),
-    (
-        "A16_ALL_VS_A18_VALID_ONLY",
-        "A16_HEART_CENTERED_FIXED_FOV_REGION_NORM_HIER_LR_PCA",
-        V5_CANDIDATE_EXPERIMENT_ID,
-        "All slices versus the prospective common-valid-slice V5 candidate.",
-    ),
-    (
-        "A17_HARD_SUPPORT_VS_A18_FIXED_FOV",
-        "A17_HARD_SUPPORT_REGION_NORM_HIER_LR_PCA",
-        V5_CANDIDATE_EXPERIMENT_ID,
-        "Binary support versus fixed heart-centred FOV after region normalization.",
-    ),
-    (
-        "A18_MEAN_VS_A19_MEAN_STD",
-        V5_CANDIDATE_EXPERIMENT_ID,
-        "A19_HEART_CENTERED_FIXED_FOV_REGION_NORM_VALID_ONLY_HIER_MEAN_STD_LR_PCA",
-        "Series means versus mean-plus-standard-deviation summaries.",
-    ),
-    (
-        "C30_MATCHED_OUTSIDE_VS_A18_INSIDE",
-        V5_MATCHED_OUTSIDE_CONTROL_EXPERIMENT_ID,
-        V5_CANDIDATE_EXPERIMENT_ID,
-        "Same-slice conservative outside-heart control versus heart-centred candidate.",
-    ),
-    (
-        "C29_FIXED_PERIPHERY_VS_A18_INSIDE",
-        "C29_FIXED_PERIPHERY_REGION_NORM_HIER_LR_PCA",
-        V5_CANDIDATE_EXPERIMENT_ID,
-        "MONAI-independent periphery versus prospective V5 cardiac candidate.",
-    ),
-    (
-        "C28_ALL_VS_C30_VALID_ONLY_OUTSIDE",
-        "C28_OUTSIDE_WHOLE_HEART_REGION_NORM_HIER_LR_PCA",
-        V5_MATCHED_OUTSIDE_CONTROL_EXPERIMENT_ID,
-        "All-slice versus gate-valid-only conservative outside-heart control.",
-    ),
-    (
-        "C25_BLOCK_SHUFFLED_SOFT_MAP_VS_A18",
-        "C25_STANDARDIZED_SOFT_MONAI_BLOCK_SHUFFLED_HIER_LR_PCA",
-        V5_CANDIDATE_EXPERIMENT_ID,
-        "Block-shuffled MONAI confidence texture versus region-normalized MRI intensity.",
-    ),
-    (
-        "C27_CANONICAL_SOFT_MASK_VS_A18",
-        "C27_STANDARDIZED_CANONICAL_SOFT_MONAI_MASK_ONLY_HIER_LR_PCA",
-        V5_CANDIDATE_EXPERIMENT_ID,
-        "Canonicalized soft morphology/confidence versus region-normalized MRI intensity.",
-    ),
-    (
         "A12_VS_A17_PROSPECTIVE_V6",
         PRIMARY_CANDIDATE_EXPERIMENT_ID,
         V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID,
-        "Locked A12 reference versus prospectively locked V6 hard-support candidate.",
+        "Locked A12 versus prospectively locked A17.",
     ),
     (
         "A17_ALL_VS_A20_VALID_ONLY",
         V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID,
         V6_VALID_ONLY_ABLATION_EXPERIMENT_ID,
-        "All A17 slices versus gate-valid-only A20 using identical pixels.",
+        "All A17 slices versus gate-valid-only A20.",
     ),
     (
         "C31_EXACT_SUPPORT_MASK_ONLY_VS_A17",
         V6_EXACT_SUPPORT_MASK_CONTROL_EXPERIMENT_ID,
         V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID,
-        "MRI intensity plus exact support versus exact support geometry alone.",
+        "MRI intensity plus support versus exact support geometry alone.",
     ),
     (
         "C32_SHUFFLED_INTENSITY_VS_A17",
         V6_SUPPORT_SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID,
         V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID,
-        "Intact spatial anatomy versus the same support and intensity histogram after deterministic shuffling.",
+        "Intact anatomy versus shuffled within-support intensities.",
     ),
     (
         "C33_EXACT_COMPLEMENT_VS_A17",
         V6_EXACT_SUPPORT_COMPLEMENT_CONTROL_EXPERIMENT_ID,
         V6_PROSPECTIVE_CANDIDATE_EXPERIMENT_ID,
-        "Exact A17 support versus its independently normalized matched complement.",
+        "Exact support versus its matched complement.",
     ),
 )
-
 # Preserve the complete paired-comparison registry for full reporting. Under
 # the focused stability panel, keep only comparisons whose two experiments are
 # actually rerun. The ordinary stage-8 paired comparisons remain unchanged.
@@ -3126,9 +1163,6 @@ FAIL_SUITE_IF_ANY_EXPERIMENT_FAILS = False
 
 SHORTCUT_WARNING_AUC = 0.65
 MONAI_GATE_RATE_DIFFERENCE_WARNING = 0.20
-
-DEBUG_VISUALIZATION = False
-DEBUG_INDICES = "10%"
 
 RUN_EXTERNAL_VALIDATION = False
 EXTERNAL_DATASET_PATH = None
@@ -3618,23 +1652,6 @@ def _print_stage_complete(stage_number, title, started_at, details=None):
     return float(elapsed)
 
 
-def _print_stage_skipped(stage_number, title, reason):
-    """Print an explicit message when a stage is safely bypassed."""
-
-    print("\n" + "=" * 78, flush=True)
-    print(
-        f"[PIPELINE {stage_number:02d}/{PIPELINE_STAGE_COUNT:02d}] "
-        f"SKIPPED: {title}",
-        flush=True,
-    )
-    print(
-        f"[PIPELINE {stage_number:02d}/{PIPELINE_STAGE_COUNT:02d}] "
-        f"Reason: {reason}",
-        flush=True,
-    )
-    print("=" * 78, flush=True)
-
-
 def _print_detail(message):
     """Print a flushed substage message when detailed logging is enabled."""
 
@@ -3846,65 +1863,20 @@ def validate_configuration():
                 )
 
     valid_feature_modes = {
-        "monai_roi",
-        "full_image",
-        "border_only",
-        "outside_heart",
-        "standardized_monai_roi",
-        "standardized_full_image",
-        "standardized_border_05",
-        "standardized_border_10",
-        "detected_padding_mask",
-        "standardized_corners",
-        "standardized_center_crop",
-        "standardized_fixed_center_50",
-        "standardized_fixed_center_60",
-        "standardized_fixed_center_70",
-        "standardized_roi_zero_background",
-        "standardized_roi_zero_bg_center_fallback",
-        "standardized_roi_bbox",
-        "standardized_outside_large_bbox",
-        "standardized_soft_monai_mask_only",
-        "standardized_hard_monai_mask_only",
-        "standardized_monai_bbox_mask_only",
-        "standardized_soft_monai_histogram_only",
-        "standardized_soft_monai_block_shuffled",
-        "standardized_canonical_hard_monai_mask_only",
-        "standardized_canonical_soft_monai_mask_only",
-        "standardized_heart_centered_fixed_fov_region_norm",
-        "standardized_hard_support_region_norm",
-        "standardized_a17_exact_support_mask_only",
-        "standardized_a17_support_intensity_affine_shuffled",
-        "standardized_a17_exact_support_complement_region_norm",
-        "standardized_outside_whole_heart_region_norm",
-        "standardized_fixed_periphery_region_norm",
-        "provenance_only",
-        "monai_qc_only",
-        "standardization_qc_only",
-        "standardized_monai_qc_only",
-        "n_slices_only",
-        "n_series_only",
-        "series_length_only",
-        "native_geometry_only",
-        "file_size_only",
+        'standardized_roi_zero_bg_center_fallback',
+        'standardized_heart_centered_fixed_fov_region_norm',
+        'standardized_hard_support_region_norm',
+        'standardized_outside_whole_heart_region_norm',
+        'standardized_fixed_periphery_region_norm',
+        'standardized_a17_exact_support_mask_only',
+        'standardized_a17_support_intensity_affine_shuffled',
+        'standardized_a17_exact_support_complement_region_norm',
     }
-    valid_strategies = {
-        "patient_embedding",
-        "slice_probability_fusion",
-        "patient_tabular",
-    }
-    valid_pooling = {
-        "hierarchical",
-        "hierarchical_mean_std",
-        "sequence_view_balanced",
-        "flat",
-        "fixed_chunk",
-        "probability_fusion",
-        "patient_tabular",
-    }
-    valid_weighting = {"equal", "quality", "not_applicable"}
-    valid_classifiers = {"logistic_regression", "linear_svm"}
-    valid_fusion = {None, "log_odds", "mean_probability"}
+    valid_strategies = {"patient_embedding"}
+    valid_pooling = {"hierarchical", "hierarchical_mean_std"}
+    valid_weighting = {"equal"}
+    valid_classifiers = {"logistic_regression"}
+    valid_fusion = {None}
 
     for experiment in experiments:
         if experiment.feature_mode not in valid_feature_modes:
@@ -4457,8 +2429,6 @@ def validate_configuration():
             f"{EFFICIENTNET_WEIGHTS_NAME!r}."
         )
 
-    _parse_debug_indices(DEBUG_INDICES)
-
     if RUN_EXTERNAL_VALIDATION and not EXTERNAL_DATASET_PATH:
         raise ValueError(
             "RUN_EXTERNAL_VALIDATION=True requires EXTERNAL_DATASET_PATH."
@@ -4503,7 +2473,6 @@ def scale_intensity_0_1(image):
     # Linear min-max scaling maps the darkest pixel to 0 and the brightest
     # pixel to 1 while preserving within-image intensity ordering.
     return (image - minimum) / (maximum - minimum)
-
 
 
 def _is_dark_uniform_edge_line(line):
@@ -4664,51 +2633,6 @@ def robust_scale_intensity_0_1(image):
     scaled = np.clip(image_float, lower, upper)
     scaled = (scaled - lower) / max(upper - lower, 1e-8)
     return scaled.astype(np.float32, copy=False), lower, upper
-
-
-def zero_pad_binary_mask_to_monai_canvas(mask):
-    """Place a binary native mask in the same 256x256 geometry as its image.
-
-    The canvas is initialized to one because pixels introduced by the pipeline's
-    own square padding are also padding. Inside the transformed native field of
-    view, the supplied mask marks detected native padding with one and retained
-    content with zero. Nearest-neighbor interpolation preserves this binary
-    interpretation when an oversized source image must be downscaled.
-    """
-
-    mask = np.asarray(mask, dtype=np.float32)
-    if mask.ndim != 2:
-        raise ValueError(f"Expected a 2D padding mask, got {mask.shape}.")
-
-    height, width = mask.shape
-    if height <= 0 or width <= 0:
-        raise ValueError(f"Invalid padding-mask dimensions: {mask.shape}.")
-
-    scale = min(
-        1.0,
-        MONAI_INPUT_SIZE / height,
-        MONAI_INPUT_SIZE / width,
-    )
-    resized_height = max(1, int(round(height * scale)))
-    resized_width = max(1, int(round(width * scale)))
-
-    if resized_height != height or resized_width != width:
-        resized = cv2.resize(
-            mask,
-            (resized_width, resized_height),
-            interpolation=cv2.INTER_NEAREST,
-        )
-    else:
-        resized = mask
-
-    canvas = np.ones(
-        (MONAI_INPUT_SIZE, MONAI_INPUT_SIZE),
-        dtype=np.float32,
-    )
-    top = (MONAI_INPUT_SIZE - resized_height) // 2
-    left = (MONAI_INPUT_SIZE - resized_width) // 2
-    canvas[top:top + resized_height, left:left + resized_width] = resized
-    return np.clip(canvas, 0.0, 1.0)
 
 
 def _fixed_content_canvas_geometry(height, width):
@@ -6805,121 +4729,6 @@ def normalize_for_efficientnet(images):
     return (images - mean) / std
 
 
-def debug_visualization(
-    images,
-    roi_probability,
-    hard_mask,
-    roi_images,
-    scores,
-    valid_masks,
-    area_ratios,
-    peak_probabilities,
-    mean_foreground_probabilities,
-    labels,
-    patient_ids,
-    series_ids,
-    sample_indices,
-):
-    """
-    Save MONAI segmentation and ROI sanity-check figures.
-
-    Each row shows:
-
-        1. Aligned input image
-        2. Soft MONAI cardiac probability map
-        3. Dilated hard cardiac mask
-        4. Confidence-gated ROI used by EfficientNet
-
-    The titles also report:
-
-        - mask plausibility status
-        - predicted cardiac area ratio
-        - peak cardiac probability
-        - mean foreground confidence
-        - ROI intensity standard deviation
-
-    Examples are selected deterministically from the complete image list using
-    DEBUG_INDICES (all images or a configured percentage).
-    Visual review is mandatory before treating the pretrained masks as useful
-    ROI proposals on this heterogeneous dataset. It still does not constitute a
-    quantitative segmentation validation because no ground-truth masks exist.
-    """
-
-    images = images.detach().cpu()
-    roi_probability = roi_probability.detach().cpu()
-    hard_mask = hard_mask.detach().cpu()
-    roi_images = roi_images.detach().cpu()
-    scores = scores.detach().cpu()
-    valid_masks = valid_masks.detach().cpu()
-    area_ratios = area_ratios.detach().cpu()
-    peak_probabilities = peak_probabilities.detach().cpu()
-    mean_foreground_probabilities = (
-        mean_foreground_probabilities.detach().cpu()
-    )
-
-    DEBUG_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    for i in range(images.shape[0]):
-
-        fig, axes = plt.subplots(1, 4, figsize=(16, 4))
-
-        axes[0].imshow(
-            images[i].permute(1, 2, 0).numpy(),
-            vmin=0.0,
-            vmax=1.0,
-        )
-        axes[0].set_title("Aligned input")
-        axes[0].axis("off")
-
-        axes[1].imshow(
-            roi_probability[i, 0].numpy(),
-            cmap="magma",
-            vmin=0.0,
-            vmax=1.0,
-        )
-        axes[1].set_title(
-            "MONAI P(heart)\n"
-            f"peak={peak_probabilities[i]:.3f}, "
-            f"mean_fg={mean_foreground_probabilities[i]:.3f}"
-        )
-        axes[1].axis("off")
-
-        axes[2].imshow(
-            hard_mask[i, 0].numpy(),
-            cmap="gray",
-            vmin=0.0,
-            vmax=1.0,
-        )
-        axes[2].set_title(
-            f"Mask valid={bool(valid_masks[i])}\n"
-            f"area={area_ratios[i]:.4f}"
-        )
-        axes[2].axis("off")
-
-        axes[3].imshow(
-            roi_images[i].permute(1, 2, 0).numpy(),
-            vmin=0.0,
-            vmax=1.0,
-        )
-        axes[3].set_title(f"ROI / fallback\nstd={scores[i]:.3f}")
-        axes[3].axis("off")
-
-        plt.tight_layout()
-
-        safe_series = str(series_ids[i]).replace("/", "__").replace("\\", "__")
-        output_name = (
-            f"label{int(labels[i])}_{patient_ids[i]}_{safe_series}_"
-            f"sample{int(sample_indices[i])}.png"
-        )
-
-        plt.savefig(
-            DEBUG_OUTPUT_DIR / output_name,
-            dpi=150,
-        )
-
-        plt.close(fig)
-
-
 # =============================
 # PIPELINE STEP 4
 # EFFICIENTNET-B0 FEATURE EXTRACTION
@@ -6991,7 +4800,6 @@ class FeatureExtractor(nn.Module):
         return self.model(x)
 
 
-
 # =============================
 # PIPELINE STEP 5
 # MULTI-VIEW FEATURE BANK
@@ -7039,102 +4847,23 @@ def _normalize_quality_weights(scores, minimum_weight=SLICE_QUALITY_MIN_WEIGHT):
     return weights
 
 
-def _parse_debug_indices(selection):
-    """Return None for full selection or a percentage in [0,100]."""
-
-    if isinstance(selection, str):
-        normalized = selection.strip().lower()
-        if normalized == "full":
-            return None
-        if not normalized.endswith("%"):
-            raise ValueError(
-                'DEBUG_INDICES must be "full" or a percentage such as "10%".'
-            )
-        numeric_value = normalized[:-1].strip()
-    elif isinstance(selection, (int, float)) and not isinstance(selection, bool):
-        numeric_value = selection
-    else:
-        raise ValueError(
-            'DEBUG_INDICES must be "full" or a percentage such as "10%".'
-        )
-
-    try:
-        percentage = float(numeric_value)
-    except (TypeError, ValueError) as error:
-        raise ValueError(
-            'DEBUG_INDICES must be "full" or a percentage such as "10%".'
-        ) from error
-
-    if not np.isfinite(percentage) or not 0.0 <= percentage <= 100.0:
-        raise ValueError("DEBUG_INDICES percentage must lie in [0,100].")
-    return percentage
-
-
-def choose_debug_sample_indices(samples, selection):
-    """Choose all images or an evenly spaced deterministic percentage."""
-
-    percentage = _parse_debug_indices(selection)
-    n_images = len(samples)
-    if n_images == 0:
-        return set()
-    if percentage is None or percentage == 100.0:
-        return set(range(n_images))
-    if percentage == 0.0:
-        return set()
-
-    n_select = min(
-        n_images,
-        max(1, int(np.ceil(n_images * percentage / 100.0))),
-    )
-    return set(np.linspace(0, n_images - 1, n_select, dtype=int).tolist())
-
-
 def required_efficientnet_feature_modes(experiments):
-    """Return ordered image modes needed by the selected registry."""
+    """Return the ordered EfficientNet views used by the final registry."""
 
     canonical_order = (
-        # Original representations retained for direct comparison.
-        "monai_roi",
-        "full_image",
-        "border_only",
-        "outside_heart",
-        # Label-blind standardized/deconfounding representations.
-        "standardized_monai_roi",
-        "standardized_full_image",
-        "standardized_border_05",
-        "standardized_border_10",
-        "detected_padding_mask",
-        "standardized_corners",
-        "standardized_center_crop",
-        "standardized_fixed_center_50",
-        "standardized_fixed_center_60",
-        "standardized_fixed_center_70",
-        "standardized_roi_zero_background",
-        "standardized_roi_zero_bg_center_fallback",
-        "standardized_roi_bbox",
-        "standardized_outside_large_bbox",
-        "standardized_soft_monai_mask_only",
-        "standardized_hard_monai_mask_only",
-        "standardized_monai_bbox_mask_only",
-        "standardized_soft_monai_histogram_only",
-        "standardized_soft_monai_block_shuffled",
-        "standardized_canonical_hard_monai_mask_only",
-        "standardized_canonical_soft_monai_mask_only",
-        # V5 region-normalized intensity representations.
-        "standardized_heart_centered_fixed_fov_region_norm",
-        "standardized_hard_support_region_norm",
-        # V6 exactly matched A17 controls.
-        "standardized_a17_exact_support_mask_only",
-        "standardized_a17_support_intensity_affine_shuffled",
-        "standardized_a17_exact_support_complement_region_norm",
-        "standardized_outside_whole_heart_region_norm",
-        "standardized_fixed_periphery_region_norm",
+        'standardized_roi_zero_bg_center_fallback',
+        'standardized_heart_centered_fixed_fov_region_norm',
+        'standardized_hard_support_region_norm',
+        'standardized_outside_whole_heart_region_norm',
+        'standardized_fixed_periphery_region_norm',
+        'standardized_a17_exact_support_mask_only',
+        'standardized_a17_support_intensity_affine_shuffled',
+        'standardized_a17_exact_support_complement_region_norm',
     )
-    requested = {
-        experiment.feature_mode
-        for experiment in experiments
-        if experiment.feature_mode in canonical_order
-    }
+    requested = {experiment.feature_mode for experiment in experiments}
+    unknown = sorted(requested - set(canonical_order))
+    if unknown:
+        raise ValueError(f"Unsupported final feature modes: {unknown}")
     return tuple(mode for mode in canonical_order if mode in requested)
 
 
@@ -7397,56 +5126,6 @@ def load_feature_bank(cache_dir, expected_fingerprint, required_modes):
     return bank
 
 
-def create_border_only_images(images, border_fraction=BORDER_WIDTH_FRACTION):
-    """Retain only a fixed outer border and set the central region to zero."""
-
-    border_fraction = float(border_fraction)
-    if not 0.0 < border_fraction < 0.5:
-        raise ValueError("border_fraction must lie in (0,0.5).")
-
-    height, width = images.shape[-2:]
-    border = max(1, int(round(min(height, width) * border_fraction)))
-    border_mask = torch.ones(
-        1,
-        1,
-        height,
-        width,
-        device=images.device,
-        dtype=images.dtype,
-    )
-    if height > 2 * border and width > 2 * border:
-        border_mask[:, :, border:height - border, border:width - border] = 0.0
-    return images * border_mask
-
-
-def create_corner_only_images(
-    images,
-    corner_fraction=STANDARDIZED_CORNER_WIDTH_FRACTION,
-):
-    """Retain only four square image corners as an export-template control."""
-
-    corner_fraction = float(corner_fraction)
-    if not 0.0 < corner_fraction < 0.5:
-        raise ValueError("corner_fraction must lie in (0,0.5).")
-
-    height, width = images.shape[-2:]
-    corner_height = max(1, int(round(height * corner_fraction)))
-    corner_width = max(1, int(round(width * corner_fraction)))
-    mask = torch.zeros(
-        1,
-        1,
-        height,
-        width,
-        device=images.device,
-        dtype=images.dtype,
-    )
-    mask[:, :, :corner_height, :corner_width] = 1.0
-    mask[:, :, :corner_height, width - corner_width:] = 1.0
-    mask[:, :, height - corner_height:, :corner_width] = 1.0
-    mask[:, :, height - corner_height:, width - corner_width:] = 1.0
-    return images * mask
-
-
 def _hard_mask_bounding_box(mask_2d):
     """Return inclusive-exclusive bounding-box coordinates or None."""
 
@@ -7496,69 +5175,6 @@ def _resize_single_crop(image, top, bottom, left, right, output_size):
         mode="bilinear",
         align_corners=False,
     )[0]
-
-
-def create_center_crop_area_matched_images(
-    images,
-    hard_mask,
-    valid_mask,
-):
-    """Create a central crop with the same HxW as each MONAI mask bounding box.
-
-    This control separates the effect of anatomical localization from the much
-    simpler effect of zooming into the image center. Invalid/empty masks use one
-    fixed predeclared crop fraction rather than a label- or score-dependent rule.
-    """
-
-    height, width = images.shape[-2:]
-    output = []
-    for index in range(images.shape[0]):
-        box = None
-        if bool(valid_mask[index].item()):
-            box = _hard_mask_bounding_box(hard_mask[index, 0])
-
-        if box is None:
-            crop_height = max(2, int(round(height * CENTER_CROP_FALLBACK_FRACTION)))
-            crop_width = max(2, int(round(width * CENTER_CROP_FALLBACK_FRACTION)))
-        else:
-            top, bottom, left, right = box
-            crop_height = max(2, bottom - top)
-            crop_width = max(2, right - left)
-
-        center_y = height // 2
-        center_x = width // 2
-        top = center_y - crop_height // 2
-        left = center_x - crop_width // 2
-        bottom = top + crop_height
-        right = left + crop_width
-
-        # Shift the box back inside the image without changing its size where
-        # possible. Final clipping occurs in _resize_single_crop.
-        if top < 0:
-            bottom -= top
-            top = 0
-        if left < 0:
-            right -= left
-            left = 0
-        if bottom > height:
-            top -= bottom - height
-            bottom = height
-        if right > width:
-            left -= right - width
-            right = width
-
-        output.append(
-            _resize_single_crop(
-                images[index],
-                top,
-                bottom,
-                left,
-                right,
-                (height, width),
-            )
-        )
-
-    return torch.stack(output, dim=0)
 
 
 def create_fixed_fraction_center_crop_images(images, crop_fraction):
@@ -7624,92 +5240,6 @@ def apply_zero_background_roi_with_fixed_center_fallback(
     )
     selector = valid_mask.view(-1, 1, 1, 1)
     return torch.where(selector, strict_roi, fixed_center)
-
-
-def create_monai_bounding_box_crop_images(
-    images,
-    hard_mask,
-    valid_mask,
-    context_fraction=MONAI_BBOX_CONTEXT_FRACTION,
-):
-    """Crop around a valid MONAI hard-mask box and resize to EfficientNet size.
-
-    Invalid masks preserve the full standardized image, matching the baseline's
-    safety principle. The context fraction is fixed and label-blind.
-    """
-
-    context_fraction = float(context_fraction)
-    if context_fraction < 0.0:
-        raise ValueError("context_fraction cannot be negative.")
-
-    height, width = images.shape[-2:]
-    output = []
-    for index in range(images.shape[0]):
-        box = None
-        if bool(valid_mask[index].item()):
-            box = _hard_mask_bounding_box(hard_mask[index, 0])
-
-        if box is None:
-            output.append(images[index])
-            continue
-
-        top, bottom, left, right = box
-        box_height = bottom - top
-        box_width = right - left
-        margin = int(round(max(box_height, box_width) * context_fraction))
-        output.append(
-            _resize_single_crop(
-                images[index],
-                top - margin,
-                bottom + margin,
-                left - margin,
-                right + margin,
-                (height, width),
-            )
-        )
-
-    return torch.stack(output, dim=0)
-
-
-def create_outside_monai_bounding_box_images(
-    images,
-    hard_mask,
-    valid_mask,
-    context_fraction=OUTSIDE_MONAI_BBOX_CONTEXT_FRACTION,
-):
-    """Retain only pixels outside an enlarged valid MONAI bounding box.
-
-    Invalid or empty masks yield an all-zero control image. Returning the full
-    image in those cases would allow fallback frequency itself to inject the
-    complete anatomy/export signal into a supposedly outside-region control.
-    """
-
-    context_fraction = float(context_fraction)
-    if context_fraction < 0.0:
-        raise ValueError("context_fraction cannot be negative.")
-
-    height, width = images.shape[-2:]
-    output = torch.zeros_like(images)
-    for index in range(images.shape[0]):
-        if not bool(valid_mask[index].item()):
-            continue
-        box = _hard_mask_bounding_box(hard_mask[index, 0])
-        if box is None:
-            continue
-
-        top, bottom, left, right = box
-        box_height = bottom - top
-        box_width = right - left
-        margin = int(round(max(box_height, box_width) * context_fraction))
-        top = max(0, top - margin)
-        bottom = min(height, bottom + margin)
-        left = max(0, left - margin)
-        right = min(width, right + margin)
-
-        output[index] = images[index]
-        output[index, :, top:bottom, left:right] = 0.0
-
-    return output
 
 
 def _fixed_square_bounds(height, width, center_y, center_x, fraction):
@@ -8373,377 +5903,6 @@ def create_fixed_periphery_region_normalized_images(raw_images, content_mask):
     return _robust_scale_visible_regions(raw_images, visible)
 
 
-def create_soft_monai_mask_only_images(roi_probability, valid_mask):
-    """Encode only the standardized soft MONAI map as a three-channel image.
-
-    MRI intensities are deliberately excluded. Gate-valid slices retain the
-    dilated soft probability map; gate-invalid slices become all zero so the
-    control cannot receive the full image through a fallback branch. A high
-    patient-level AUC would indicate that mask shape, position, extent, or
-    confidence alone is associated with the released Normal/Sick label.
-    """
-
-    if roi_probability.ndim != 4 or roi_probability.shape[1] != 1:
-        raise ValueError(
-            "Soft MONAI mask-only input must have shape [B,1,H,W]."
-        )
-    selector = valid_mask.view(-1, 1, 1, 1).to(roi_probability.dtype)
-    soft_map = roi_probability.clamp(0.0, 1.0) * selector
-    return soft_map.repeat(1, 3, 1, 1)
-
-
-def create_hard_monai_mask_only_images(hard_mask, valid_mask):
-    """Encode only the dilated standardized hard MONAI mask.
-
-    This control removes both MRI intensity and soft confidence. It preserves
-    only mask morphology and spatial position for gate-valid slices. Invalid
-    slices are all zero, which keeps gate failure from exposing full-image
-    anatomy or export style.
-    """
-
-    if hard_mask.ndim != 4 or hard_mask.shape[1] != 1:
-        raise ValueError(
-            "Hard MONAI mask-only input must have shape [B,1,H,W]."
-        )
-    selector = valid_mask.view(-1, 1, 1, 1).to(hard_mask.dtype)
-    binary_mask = (hard_mask > 0.5).to(hard_mask.dtype) * selector
-    return binary_mask.repeat(1, 3, 1, 1)
-
-
-def create_monai_bbox_mask_only_images(hard_mask, valid_mask):
-    """Encode only MONAI bounding-box geometry as a binary image.
-
-    One filled rectangle is drawn around each gate-valid dilated hard mask. MRI
-    intensities and within-box mask morphology are discarded. The experiment
-    therefore tests whether box location and extent alone encode cohort
-    provenance or class. Invalid/empty masks yield an all-zero image.
-    """
-
-    if hard_mask.ndim != 4 or hard_mask.shape[1] != 1:
-        raise ValueError(
-            "MONAI bounding-box mask input must have shape [B,1,H,W]."
-        )
-
-    batch_size, _, height, width = hard_mask.shape
-    output = torch.zeros(
-        batch_size,
-        3,
-        height,
-        width,
-        device=hard_mask.device,
-        dtype=hard_mask.dtype,
-    )
-    for index in range(batch_size):
-        if not bool(valid_mask[index].item()):
-            continue
-        box = _hard_mask_bounding_box(hard_mask[index, 0])
-        if box is None:
-            continue
-        top, bottom, left, right = box
-        output[index, :, top:bottom, left:right] = 1.0
-    return output
-
-
-
-def create_soft_monai_histogram_only_images(
-    roi_probability,
-    valid_mask,
-    histogram_bins=MONAI_SOFT_HISTOGRAM_BINS,
-):
-    """Encode only the soft-map probability distribution as a CDF image.
-
-    This segmentation-derived control deliberately removes every original
-    spatial coordinate. For each gate-valid slice, the dilated MONAI
-    probabilities are summarized into a fixed-bin histogram and cumulative
-    distribution function (CDF). The one-dimensional CDF is then repeated over
-    image rows and copied to three channels so the same frozen EfficientNet
-    encoder can be used. Gate-invalid slices remain all zero, matching C21's
-    no-full-image-fallback policy.
-
-    The resulting image is synthetic and must not be interpreted anatomically.
-    Its purpose is to test whether the empirical confidence/probability
-    distribution alone can explain the high performance of the intact soft-map
-    representation. Original mask location, connected components, contour shape,
-    and local spatial adjacency are absent.
-    """
-
-    if roi_probability.ndim != 4 or roi_probability.shape[1] != 1:
-        raise ValueError(
-            "Soft MONAI histogram input must have shape [B,1,H,W]."
-        )
-    histogram_bins = int(histogram_bins)
-    if histogram_bins < 2:
-        raise ValueError("histogram_bins must be at least 2.")
-
-    batch_size, _, height, width = roi_probability.shape
-    output = torch.zeros(
-        batch_size,
-        1,
-        height,
-        width,
-        device=roi_probability.device,
-        dtype=roi_probability.dtype,
-    )
-
-    for index in range(batch_size):
-        if not bool(valid_mask[index].item()):
-            continue
-
-        values = roi_probability[index, 0].float().clamp(0.0, 1.0)
-        histogram = torch.histc(
-            values,
-            bins=histogram_bins,
-            min=0.0,
-            max=1.0,
-        )
-        total = histogram.sum()
-        if not bool(torch.isfinite(total).item()) or float(total.item()) <= 0.0:
-            continue
-
-        cdf = torch.cumsum(histogram, dim=0) / total
-        cdf_line = F.interpolate(
-            cdf.view(1, 1, histogram_bins),
-            size=width,
-            mode="linear",
-            align_corners=False,
-        ).view(width)
-        output[index, 0] = cdf_line.view(1, width).expand(height, width)
-
-    return output.repeat(1, 3, 1, 1).to(roi_probability.dtype)
-
-
-def create_block_shuffled_soft_monai_mask_only_images(
-    roi_probability,
-    valid_mask,
-    decoded_pixel_hashes,
-    block_grid=MONAI_SOFT_BLOCK_SHUFFLE_GRID,
-):
-    """Destroy global soft-mask shape/location while preserving local blocks.
-
-    The gate-valid 224x224 probability map is divided into a fixed block grid.
-    Blocks are permuted independently for each image using a deterministic seed
-    derived from the image's exact decoded-pixel SHA-256. No label, patient ID,
-    series ID, fold assignment, or model score contributes to the permutation.
-
-    This preserves:
-        - the complete soft-probability histogram;
-        - all pixel values;
-        - local texture within each block.
-
-    It destroys:
-        - the original global mask contour;
-        - original absolute location;
-        - long-range spatial relationships between blocks.
-
-    The control is complementary to the CDF/histogram-only representation. A
-    high score here but a lower histogram-only score suggests that local
-    within-block confidence texture contributes beyond the marginal
-    distribution. Gate-invalid slices remain all zero.
-    """
-
-    if roi_probability.ndim != 4 or roi_probability.shape[1] != 1:
-        raise ValueError(
-            "Block-shuffled soft MONAI input must have shape [B,1,H,W]."
-        )
-
-    batch_size, _, height, width = roi_probability.shape
-    block_grid = int(block_grid)
-    if block_grid <= 1:
-        raise ValueError("block_grid must be greater than 1.")
-    if height % block_grid != 0 or width % block_grid != 0:
-        raise ValueError(
-            f"Soft-map size {(height, width)} must be divisible by block_grid="
-            f"{block_grid}."
-        )
-    if len(decoded_pixel_hashes) != batch_size:
-        raise ValueError(
-            "decoded_pixel_hashes must contain one value per soft MONAI map."
-        )
-
-    selector = valid_mask.view(-1, 1, 1, 1).to(roi_probability.dtype)
-    soft_maps = roi_probability.clamp(0.0, 1.0) * selector
-    output = torch.zeros_like(soft_maps)
-    block_height = height // block_grid
-    block_width = width // block_grid
-    n_blocks = block_grid * block_grid
-
-    for index in range(batch_size):
-        if not bool(valid_mask[index].item()):
-            continue
-
-        seed_material = (
-            f"{MONAI_SOFT_BLOCK_SHUFFLE_VERSION}|"
-            f"{str(decoded_pixel_hashes[index])}"
-        ).encode("utf-8")
-        seed = int(hashlib.sha256(seed_material).hexdigest()[:16], 16) % (
-            2 ** 32
-        )
-        permutation = np.random.default_rng(seed).permutation(n_blocks)
-        permutation_tensor = torch.as_tensor(
-            permutation,
-            dtype=torch.long,
-            device=roi_probability.device,
-        )
-
-        blocks = (
-            soft_maps[index, 0]
-            .reshape(block_grid, block_height, block_grid, block_width)
-            .permute(0, 2, 1, 3)
-            .reshape(n_blocks, block_height, block_width)
-        )
-        shuffled_blocks = blocks.index_select(0, permutation_tensor)
-        shuffled_map = (
-            shuffled_blocks
-            .reshape(block_grid, block_grid, block_height, block_width)
-            .permute(0, 2, 1, 3)
-            .reshape(height, width)
-        )
-        output[index, 0] = shuffled_map
-
-    return output.repeat(1, 3, 1, 1)
-
-
-def _create_canonicalized_monai_map_only_images(
-    source_map,
-    hard_mask,
-    valid_mask,
-    *,
-    binary,
-    content_fraction=MONAI_CANONICAL_MASK_CONTENT_FRACTION,
-):
-    """Canonicalize one MONAI-derived map to fixed centered location and scale.
-
-    The gate-valid hard mask defines the source bounding box. The corresponding
-    hard or soft map is cropped to that box, square-padded without anisotropic
-    stretching, resized to one predeclared target side, and centered in the
-    original classifier canvas. This removes absolute position and original
-    extent while preserving relative contour geometry; the soft variant also
-    preserves within-mask confidence gradients. Invalid/empty masks produce an
-    all-zero image.
-    """
-
-    if source_map.ndim != 4 or source_map.shape[1] != 1:
-        raise ValueError("Canonical source_map must have shape [B,1,H,W].")
-    if hard_mask.shape != source_map.shape:
-        raise ValueError(
-            "Canonical source_map and hard_mask must have identical shapes."
-        )
-
-    content_fraction = float(content_fraction)
-    if not 0.0 < content_fraction <= 1.0:
-        raise ValueError("content_fraction must lie in (0,1].")
-
-    batch_size, _, height, width = source_map.shape
-    target_side = max(
-        2,
-        int(round(min(height, width) * content_fraction)),
-    )
-    target_top = (height - target_side) // 2
-    target_left = (width - target_side) // 2
-    output = torch.zeros_like(source_map)
-
-    for index in range(batch_size):
-        if not bool(valid_mask[index].item()):
-            continue
-        box = _hard_mask_bounding_box(hard_mask[index, 0])
-        if box is None:
-            continue
-
-        top, bottom, left, right = box
-        crop = source_map[index:index + 1, :, top:bottom, left:right]
-        if crop.numel() == 0:
-            continue
-        if binary:
-            crop = (crop > 0.5).to(source_map.dtype)
-        else:
-            crop = crop.clamp(0.0, 1.0)
-
-        crop_height = int(crop.shape[-2])
-        crop_width = int(crop.shape[-1])
-        square_side = max(crop_height, crop_width)
-        square = torch.zeros(
-            1,
-            1,
-            square_side,
-            square_side,
-            device=source_map.device,
-            dtype=source_map.dtype,
-        )
-        square_top = (square_side - crop_height) // 2
-        square_left = (square_side - crop_width) // 2
-        square[
-            :,
-            :,
-            square_top:square_top + crop_height,
-            square_left:square_left + crop_width,
-        ] = crop
-
-        if binary:
-            resized = F.interpolate(
-                square,
-                size=(target_side, target_side),
-                mode="nearest",
-            )
-            resized = (resized > 0.5).to(source_map.dtype)
-        else:
-            resized = F.interpolate(
-                square,
-                size=(target_side, target_side),
-                mode="bilinear",
-                align_corners=False,
-            ).clamp(0.0, 1.0)
-
-        output[
-            index:index + 1,
-            :,
-            target_top:target_top + target_side,
-            target_left:target_left + target_side,
-        ] = resized
-
-    return output.repeat(1, 3, 1, 1)
-
-
-def create_canonicalized_hard_monai_mask_only_images(
-    hard_mask,
-    valid_mask,
-):
-    """Retain relative hard-mask shape while removing location and scale."""
-
-    return _create_canonicalized_monai_map_only_images(
-        hard_mask,
-        hard_mask,
-        valid_mask,
-        binary=True,
-    )
-
-
-def create_canonicalized_soft_monai_mask_only_images(
-    roi_probability,
-    hard_mask,
-    valid_mask,
-):
-    """Retain canonical soft morphology/confidence without absolute geometry."""
-
-    return _create_canonicalized_monai_map_only_images(
-        roi_probability,
-        hard_mask,
-        valid_mask,
-        binary=False,
-    )
-
-
-def create_outside_monai_mask_images(images, roi_probability):
-    """Retain signal outside the dilated soft MONAI probability map.
-
-    The inverse map is applied even when the plausibility gate is false. This is
-    deliberate: the control asks whether non-ROI/export context is predictive,
-    but it must not be described as a validated extracardiac-anatomy mask.
-    """
-
-    outside_weight = (1.0 - roi_probability.clamp(0.0, 1.0)).repeat(1, 3, 1, 1)
-    return images * outside_weight
-
-
 def extract_feature_bank(
     dataset,
     monai_segmenter,
@@ -8751,7 +5910,6 @@ def extract_feature_bank(
     required_modes,
     cache_dir,
     fingerprint,
-    debug=False,
 ):
     """
     Run the shared frozen image-processing stage and build one aligned feature
@@ -8803,27 +5961,17 @@ def extract_feature_bank(
 
     # MONAI is loaded only when an enabled image view actually needs its mask.
     # The full-image and border-only controls can otherwise run without MONAI.
-    original_monai_modes = {"monai_roi", "outside_heart"}
+    # The final panel uses only standardized MONAI-derived views.
+    original_monai_modes = set()
     standardized_monai_modes = {
-        "standardized_monai_roi",
-        "standardized_center_crop",
-        "standardized_roi_zero_background",
-        "standardized_roi_zero_bg_center_fallback",
-        "standardized_roi_bbox",
-        "standardized_outside_large_bbox",
-        "standardized_soft_monai_mask_only",
-        "standardized_hard_monai_mask_only",
-        "standardized_monai_bbox_mask_only",
-        "standardized_soft_monai_histogram_only",
-        "standardized_soft_monai_block_shuffled",
-        "standardized_canonical_hard_monai_mask_only",
-        "standardized_canonical_soft_monai_mask_only",
-        "standardized_heart_centered_fixed_fov_region_norm",
-        "standardized_hard_support_region_norm",
-        "standardized_a17_exact_support_mask_only",
-        "standardized_a17_support_intensity_affine_shuffled",
-        "standardized_a17_exact_support_complement_region_norm",
-        "standardized_outside_whole_heart_region_norm",
+        'standardized_roi_zero_bg_center_fallback',
+        'standardized_heart_centered_fixed_fov_region_norm',
+        'standardized_hard_support_region_norm',
+        'standardized_outside_whole_heart_region_norm',
+        'standardized_fixed_periphery_region_norm',
+        'standardized_a17_exact_support_mask_only',
+        'standardized_a17_support_intensity_affine_shuffled',
+        'standardized_a17_exact_support_complement_region_norm',
     }
     need_original_monai = any(
         mode in original_monai_modes for mode in required_modes
@@ -8932,11 +6080,6 @@ def extract_feature_bank(
         1,
         PROGRESS_PRINT_EVERY_N_BATCHES,
         total_batches // 20,
-    )
-    debug_indices = (
-        choose_debug_sample_indices(dataset.samples, DEBUG_INDICES)
-        if debug and need_monai
-        else set()
     )
     autocast_enabled = USE_CUDA_AMP and DEVICE == "cuda"
     extraction_started_at = time.perf_counter()
@@ -9128,67 +6271,7 @@ def extract_feature_bank(
             standardized_content_mask = (
                 1.0 - detected_padding_images[:, 0:1]
             ).clamp(0.0, 1.0)
-            if "monai_roi" in required_modes:
-                variants["monai_roi"] = roi_images
-            if "full_image" in required_modes:
-                variants["full_image"] = images
-            if "border_only" in required_modes:
-                variants["border_only"] = create_border_only_images(images)
-            if "outside_heart" in required_modes:
-                variants["outside_heart"] = create_outside_monai_mask_images(
-                    images,
-                    roi_probability,
-                )
 
-            if "standardized_monai_roi" in required_modes:
-                variants["standardized_monai_roi"] = standardized_roi_images
-            if "standardized_full_image" in required_modes:
-                variants["standardized_full_image"] = standardized_images
-            if "standardized_border_05" in required_modes:
-                variants["standardized_border_05"] = create_border_only_images(
-                    standardized_images,
-                    border_fraction=STANDARDIZED_BORDER_WIDTH_FRACTIONS[0],
-                )
-            if "standardized_border_10" in required_modes:
-                variants["standardized_border_10"] = create_border_only_images(
-                    standardized_images,
-                    border_fraction=STANDARDIZED_BORDER_WIDTH_FRACTIONS[1],
-                )
-            if "detected_padding_mask" in required_modes:
-                variants["detected_padding_mask"] = detected_padding_images
-            if "standardized_corners" in required_modes:
-                variants["standardized_corners"] = create_corner_only_images(
-                    standardized_images
-                )
-            if "standardized_center_crop" in required_modes:
-                variants["standardized_center_crop"] = (
-                    create_center_crop_area_matched_images(
-                        standardized_images,
-                        standardized_hard_mask,
-                        standardized_valid_mask,
-                    )
-                )
-            if "standardized_fixed_center_50" in required_modes:
-                variants["standardized_fixed_center_50"] = (
-                    create_fixed_fraction_center_crop_images(
-                        standardized_images,
-                        FIXED_CENTER_CROP_FRACTIONS[0],
-                    )
-                )
-            if "standardized_fixed_center_60" in required_modes:
-                variants["standardized_fixed_center_60"] = (
-                    create_fixed_fraction_center_crop_images(
-                        standardized_images,
-                        FIXED_CENTER_CROP_FRACTIONS[1],
-                    )
-                )
-            if "standardized_fixed_center_70" in required_modes:
-                variants["standardized_fixed_center_70"] = (
-                    create_fixed_fraction_center_crop_images(
-                        standardized_images,
-                        FIXED_CENTER_CROP_FRACTIONS[2],
-                    )
-                )
             if "standardized_roi_zero_bg_center_fallback" in required_modes:
                 variants["standardized_roi_zero_bg_center_fallback"] = (
                     apply_zero_background_roi_with_fixed_center_fallback(
@@ -9198,42 +6281,14 @@ def extract_feature_bank(
                         fallback_fraction=CENTER_CROP_FALLBACK_FRACTION,
                     )
                 )
-            if "standardized_roi_zero_background" in required_modes:
-                variants["standardized_roi_zero_background"] = (
-                    apply_confidence_gated_soft_roi(
-                        standardized_images,
-                        standardized_roi_probability,
-                        standardized_valid_mask,
-                        background_weight=0.0,
-                    )
-                )
-            if "standardized_roi_bbox" in required_modes:
-                variants["standardized_roi_bbox"] = (
-                    create_monai_bounding_box_crop_images(
-                        standardized_images,
+            if "standardized_heart_centered_fixed_fov_region_norm" in required_modes:
+                variants["standardized_heart_centered_fixed_fov_region_norm"] = (
+                    create_heart_centered_fixed_fov_region_normalized_images(
+                        standardized_raw_images,
                         standardized_hard_mask,
                         standardized_valid_mask,
+                        standardized_content_mask,
                     )
-                )
-            if "standardized_outside_large_bbox" in required_modes:
-                variants["standardized_outside_large_bbox"] = (
-                    create_outside_monai_bounding_box_images(
-                        standardized_images,
-                        standardized_hard_mask,
-                        standardized_valid_mask,
-                    )
-                )
-            if (
-                "standardized_heart_centered_fixed_fov_region_norm"
-                in required_modes
-            ):
-                variants[
-                    "standardized_heart_centered_fixed_fov_region_norm"
-                ] = create_heart_centered_fixed_fov_region_normalized_images(
-                    standardized_raw_images,
-                    standardized_hard_mask,
-                    standardized_valid_mask,
-                    standardized_content_mask,
                 )
             if "standardized_hard_support_region_norm" in required_modes:
                 variants["standardized_hard_support_region_norm"] = (
@@ -9241,6 +6296,22 @@ def extract_feature_bank(
                         standardized_raw_images,
                         standardized_hard_mask,
                         standardized_valid_mask,
+                        standardized_content_mask,
+                    )
+                )
+            if "standardized_outside_whole_heart_region_norm" in required_modes:
+                variants["standardized_outside_whole_heart_region_norm"] = (
+                    create_outside_whole_heart_region_normalized_images(
+                        standardized_raw_images,
+                        standardized_hard_mask,
+                        standardized_valid_mask,
+                        standardized_content_mask,
+                    )
+                )
+            if "standardized_fixed_periphery_region_norm" in required_modes:
+                variants["standardized_fixed_periphery_region_norm"] = (
+                    create_fixed_periphery_region_normalized_images(
+                        standardized_raw_images,
                         standardized_content_mask,
                     )
                 )
@@ -9252,101 +6323,23 @@ def extract_feature_bank(
                         standardized_content_mask,
                     )
                 )
-            if (
-                "standardized_a17_support_intensity_affine_shuffled"
-                in required_modes
-            ):
-                variants[
-                    "standardized_a17_support_intensity_affine_shuffled"
-                ] = create_a17_support_intensity_affine_shuffled_images(
-                    standardized_raw_images,
-                    standardized_hard_mask,
-                    standardized_valid_mask,
-                    standardized_content_mask,
-                    decoded_pixel_hashes,
+            if "standardized_a17_support_intensity_affine_shuffled" in required_modes:
+                variants["standardized_a17_support_intensity_affine_shuffled"] = (
+                    create_a17_support_intensity_affine_shuffled_images(
+                        standardized_raw_images,
+                        standardized_hard_mask,
+                        standardized_valid_mask,
+                        standardized_content_mask,
+                        decoded_pixel_hashes,
+                    )
                 )
-            if (
-                "standardized_a17_exact_support_complement_region_norm"
-                in required_modes
-            ):
-                variants[
-                    "standardized_a17_exact_support_complement_region_norm"
-                ] = (
+            if "standardized_a17_exact_support_complement_region_norm" in required_modes:
+                variants["standardized_a17_exact_support_complement_region_norm"] = (
                     create_a17_exact_support_complement_region_normalized_images(
                         standardized_raw_images,
                         standardized_hard_mask,
                         standardized_valid_mask,
                         standardized_content_mask,
-                    )
-                )
-            if (
-                "standardized_outside_whole_heart_region_norm"
-                in required_modes
-            ):
-                variants[
-                    "standardized_outside_whole_heart_region_norm"
-                ] = create_outside_whole_heart_region_normalized_images(
-                    standardized_raw_images,
-                    standardized_hard_mask,
-                    standardized_valid_mask,
-                    standardized_content_mask,
-                )
-            if "standardized_fixed_periphery_region_norm" in required_modes:
-                variants["standardized_fixed_periphery_region_norm"] = (
-                    create_fixed_periphery_region_normalized_images(
-                        standardized_raw_images,
-                        standardized_content_mask,
-                    )
-                )
-            if "standardized_soft_monai_mask_only" in required_modes:
-                variants["standardized_soft_monai_mask_only"] = (
-                    create_soft_monai_mask_only_images(
-                        standardized_roi_probability,
-                        standardized_valid_mask,
-                    )
-                )
-            if "standardized_hard_monai_mask_only" in required_modes:
-                variants["standardized_hard_monai_mask_only"] = (
-                    create_hard_monai_mask_only_images(
-                        standardized_hard_mask,
-                        standardized_valid_mask,
-                    )
-                )
-            if "standardized_monai_bbox_mask_only" in required_modes:
-                variants["standardized_monai_bbox_mask_only"] = (
-                    create_monai_bbox_mask_only_images(
-                        standardized_hard_mask,
-                        standardized_valid_mask,
-                    )
-                )
-            if "standardized_soft_monai_histogram_only" in required_modes:
-                variants["standardized_soft_monai_histogram_only"] = (
-                    create_soft_monai_histogram_only_images(
-                        standardized_roi_probability,
-                        standardized_valid_mask,
-                    )
-                )
-            if "standardized_soft_monai_block_shuffled" in required_modes:
-                variants["standardized_soft_monai_block_shuffled"] = (
-                    create_block_shuffled_soft_monai_mask_only_images(
-                        standardized_roi_probability,
-                        standardized_valid_mask,
-                        decoded_pixel_hashes,
-                    )
-                )
-            if "standardized_canonical_hard_monai_mask_only" in required_modes:
-                variants["standardized_canonical_hard_monai_mask_only"] = (
-                    create_canonicalized_hard_monai_mask_only_images(
-                        standardized_hard_mask,
-                        standardized_valid_mask,
-                    )
-                )
-            if "standardized_canonical_soft_monai_mask_only" in required_modes:
-                variants["standardized_canonical_soft_monai_mask_only"] = (
-                    create_canonicalized_soft_monai_mask_only_images(
-                        standardized_roi_probability,
-                        standardized_hard_mask,
-                        standardized_valid_mask,
                     )
                 )
 
@@ -9465,28 +6458,6 @@ def extract_feature_bank(
                     perceptual_hashes[local_position]
                 )
 
-            if debug_indices:
-                selected_positions = [
-                    position
-                    for position, global_index in enumerate(index_values.tolist())
-                    if global_index in debug_indices
-                ]
-                if selected_positions:
-                    debug_visualization(
-                        images[selected_positions],
-                        roi_probability[selected_positions],
-                        hard_mask[selected_positions],
-                        roi_images[selected_positions],
-                        roi_scores[selected_positions],
-                        valid_mask[selected_positions],
-                        area_ratio[selected_positions],
-                        peak_probability[selected_positions],
-                        mean_foreground_probability[selected_positions],
-                        labels[selected_positions],
-                        [patient_ids[i] for i in selected_positions],
-                        [series_ids[i] for i in selected_positions],
-                        sample_indices[selected_positions],
-                    )
 
             processed_slices += len(index_values)
             if (
@@ -9618,27 +6589,14 @@ def load_or_extract_feature_bank(samples, required_modes, fingerprint, cache_dir
     # the mask-only controls; such a run must still load the segmenter even when
     # B1 is not selected as an incidental MONAI-dependent companion.
     monai_dependent_modes = {
-        "monai_roi",
-        "outside_heart",
-        "standardized_monai_roi",
-        "standardized_center_crop",
-        "standardized_roi_zero_background",
-        "standardized_roi_zero_bg_center_fallback",
-        "standardized_roi_bbox",
-        "standardized_outside_large_bbox",
-        "standardized_soft_monai_mask_only",
-        "standardized_hard_monai_mask_only",
-        "standardized_monai_bbox_mask_only",
-        "standardized_soft_monai_histogram_only",
-        "standardized_soft_monai_block_shuffled",
-        "standardized_canonical_hard_monai_mask_only",
-        "standardized_canonical_soft_monai_mask_only",
-        "standardized_heart_centered_fixed_fov_region_norm",
-        "standardized_hard_support_region_norm",
-        "standardized_a17_exact_support_mask_only",
-        "standardized_a17_support_intensity_affine_shuffled",
-        "standardized_a17_exact_support_complement_region_norm",
-        "standardized_outside_whole_heart_region_norm",
+        'standardized_roi_zero_bg_center_fallback',
+        'standardized_heart_centered_fixed_fov_region_norm',
+        'standardized_hard_support_region_norm',
+        'standardized_outside_whole_heart_region_norm',
+        'standardized_fixed_periphery_region_norm',
+        'standardized_a17_exact_support_mask_only',
+        'standardized_a17_support_intensity_affine_shuffled',
+        'standardized_a17_exact_support_complement_region_norm',
     }
     need_monai = any(
         mode in monai_dependent_modes for mode in required_modes
@@ -9661,7 +6619,6 @@ def load_or_extract_feature_bank(samples, required_modes, fingerprint, cache_dir
         required_modes=required_modes,
         cache_dir=runtime_cache_dir,
         fingerprint=fingerprint,
-        debug=DEBUG_VISUALIZATION,
     )
 
     del feature_extractor
@@ -9831,10 +6788,6 @@ def audit_exact_decoded_pixel_duplicates(
         )
 
     return summary, patient_edges
-
-
-def _phash_hamming_distance(first_hash, second_hash):
-    return (int(str(first_hash), 16) ^ int(str(second_hash), 16)).bit_count()
 
 
 def _prepare_phash_review_tile(image_path, title, tile_size=384):
@@ -11399,7 +8352,6 @@ def aggregate_patient_monai_qc_features(bank):
         )
     y = np.asarray(patient_labels, dtype=np.int64)
     return X, y, ordered_patients, feature_names
-
 
 
 def aggregate_patient_standardization_features(bank):
@@ -13835,7 +10787,6 @@ def run_nested_cv_auc_only(
         dtype=np.float64,
     )
     return ordered_patients, labels, scores, folds, selected_cs
-
 
 
 def audit_v6_prepared_row_contract(prepared_by_id, output_path):
@@ -17695,7 +14646,6 @@ def run_with_console_logging():
 
 import argparse
 from contextlib import contextmanager
-from matplotlib.widgets import Button, Slider
 
 
 # ---------------------------------------------------------------------------
@@ -17883,14 +14833,7 @@ ATTENTION_EXTERNAL_WEIGHTS = os.environ.get(
 ATTENTION_FEATURE_CACHE_SCHEMA = (
     "2026-09-11-attention-unet-crossfit-patient-disk-safe-v2"
 )
-ATTENTION_ACTION_CHOICES = (
-    "both",
-    "monai-only",
-    "attention-only",
-    "generate-masks",
-    "train-attention",
-    "edit-masks",
-)
+
 ATTENTION_FEATURE_MODES = (
     "AU1_ATTENTION_HARD_SUPPORT_REGION_NORM",
     "AU2_ATTENTION_HARD_SUPPORT_REGION_NORM_VALID_ONLY",
@@ -18127,88 +15070,6 @@ def build_attention_patient_folds(samples):
         patient_id: int(index % ATTENTION_SEGMENTATION_FOLDS)
         for index, patient_id in enumerate(ordered)
     }
-
-
-def select_attention_training_rows(samples, workspace):
-    """Select a deterministic, label-blind subset for segmentation supervision."""
-
-    existing = {}
-    if workspace.manifest_csv.is_file():
-        with open(workspace.manifest_csv, newline="", encoding="utf-8") as file:
-            existing = {
-                row["image_token"]: row for row in csv.DictReader(file)
-            }
-
-    by_series = defaultdict(list)
-    for image_path, _label, patient_id, series_id in samples:
-        token = attention_image_token(image_path, patient_id, series_id)
-        by_series[str(series_id)].append(
-            {
-                "image_token": token,
-                "image_path": str(image_path),
-                "patient_id": str(patient_id),
-                "series_id": str(series_id),
-            }
-        )
-
-    series_selected = []
-    for series_id in sorted(by_series):
-        rows = sorted(by_series[series_id], key=lambda row: row["image_token"])
-        series_selected.extend(
-            _evenly_spaced_subset(
-                rows, ATTENTION_MAX_TRAIN_SLICES_PER_SERIES
-            )
-        )
-
-    by_patient = defaultdict(list)
-    for row in series_selected:
-        by_patient[row["patient_id"]].append(row)
-
-    selected = []
-    for patient_id in sorted(by_patient):
-        patient_rows = sorted(
-            by_patient[patient_id], key=lambda row: row["image_token"]
-        )
-        selected.extend(
-            _evenly_spaced_subset(
-                patient_rows, ATTENTION_MAX_TRAIN_SLICES_PER_PATIENT
-            )
-        )
-
-    patient_to_fold = build_attention_patient_folds(samples)
-    manifest_rows = []
-    for index, row in enumerate(sorted(selected, key=lambda x: x["image_token"])):
-        token = row["image_token"]
-        old = existing.get(token, {})
-        automatic_path = workspace.automatic_masks / f"{token}.png"
-        manual_path = workspace.manual_masks / f"{token}.png"
-        predicted_path = workspace.predicted_masks / f"{token}.png"
-        cached_image_path = workspace.cached_images / f"{token}.png"
-        manifest_rows.append(
-            {
-                "manifest_index": int(index),
-                "image_token": token,
-                "image_path": row["image_path"],
-                "patient_id": row["patient_id"],
-                "series_id": row["series_id"],
-                "segmentation_fold": int(
-                    patient_to_fold[row["patient_id"]]
-                ),
-                "cached_image_path": str(cached_image_path),
-                "automatic_mask_path": str(automatic_path),
-                "manual_mask_path": str(manual_path),
-                "predicted_attention_mask_path": str(predicted_path),
-                "monai_valid": old.get("monai_valid", ""),
-                "monai_area_ratio": old.get("monai_area_ratio", ""),
-                "monai_peak_probability": old.get(
-                    "monai_peak_probability", ""
-                ),
-                "manual_mask_exists": int(manual_path.is_file()),
-            }
-        )
-
-    write_attention_manifest(manifest_rows, workspace.manifest_csv)
-    return manifest_rows
 
 
 def write_attention_manifest(rows, path):
@@ -18603,20 +15464,6 @@ def load_attention_segmentation_image(row):
     return encoded
 
 
-def ensure_cached_attention_image(row):
-    """Best-effort compatibility wrapper for the former mandatory PNG cache.
-
-    The image is always prepared and placed in RAM when enabled. A Path is
-    returned only when optional disk caching is enabled and the atomic write
-    succeeds; otherwise ``None`` is returned. Internal datasets no longer depend
-    on this function or on the existence of a cached PNG file.
-    """
-
-    load_attention_segmentation_image(row)
-    path = Path(row["cached_image_path"])
-    return path if path.is_file() else None
-
-
 # ---------------------------------------------------------------------------
 # AUTOMATIC MONAI PSEUDO-MASK GENERATION
 # ---------------------------------------------------------------------------
@@ -18803,667 +15650,6 @@ def generate_attention_pseudo_masks(samples, workspace, monai_segmenter=None):
 # ---------------------------------------------------------------------------
 # INTERACTIVE MANUAL MASK EDITOR — V12 TRANSPARENT-MASK RESET FIX
 # ---------------------------------------------------------------------------
-
-class AttentionMaskEditor:
-    """
-    Kaggle-safe manual mask editor.
-
-    This implementation deliberately does NOT use ipympl/jupyter-matplotlib.
-    It uses standard ipywidgets (which Kaggle/JupyterLab supports) plus an
-    HTML5 canvas rendered in an Output widget. The canvas handles mouse
-    drawing/erasing in the browser and synchronizes the mask to a standard
-    Textarea widget, so no custom Jupyter widget model is required.
-
-    Public behavior is kept compatible with the previous editor:
-      Previous / Next / Save manual / Reset to auto / Reset to image (no mask) / Clear
-      brush slider, left-draw/right-erase, D/E keyboard modes, S/R/C/N/P.
-
-    Button semantics:
-      - Reset to auto: restore automatic mask and orange comparison overlay.
-      - Reset to image: show the raw MRI with no mask overlay at all.
-      - Clear: clear only the editable mask while keeping auto mask in orange.
-    """
-
-    def __init__(
-        self,
-        rows,
-        workspace,
-        start_index=0,
-        brush_radius=8,
-        base_source="attention",
-    ):
-        if not rows:
-            raise ValueError("The mask editor requires at least one manifest row.")
-        if base_source not in {"attention", "monai"}:
-            raise ValueError("base_source must be 'attention' or 'monai'.")
-
-        import base64
-        import uuid
-        import ipywidgets as widgets
-        from IPython.display import display, HTML, clear_output
-
-        self.rows = list(rows)
-        self.workspace = workspace
-        self.index = int(np.clip(start_index, 0, len(rows) - 1))
-        self.brush_radius = int(max(1, brush_radius))
-        self.base_source = base_source
-        self.mode = "draw"
-        self.image = None
-        # ``auto_mask`` is the immutable automatic mask loaded from MONAI or
-        # Attention U-Net. ``base_mask`` is only the orange comparison overlay
-        # currently shown by the browser canvas and can temporarily be hidden.
-        self.auto_mask = None
-        self.base_mask = None
-        self.mask = None
-
-        self._base64 = base64
-        self._uuid = uuid.uuid4().hex[:12]
-        self._clear_output = clear_output
-
-        self.output = widgets.Output()
-        self.mask_sync = widgets.Textarea(
-            value="",
-            placeholder=f"CAD_MASK_SYNC_{self._uuid}",
-            layout=widgets.Layout(width="1px", height="1px", display="none"),
-        )
-
-        self.previous_button = widgets.Button(description="Previous")
-        self.next_button = widgets.Button(description="Next")
-        self.save_button = widgets.Button(description="Save manual")
-        self.reset_button = widgets.Button(description="Reset to auto")
-        self.clear_drawn_button = widgets.Button(description="Reset to image (no mask)")
-        self.clear_button = widgets.Button(description="Clear")
-        self.brush_slider = widgets.IntSlider(
-            description="Brush",
-            value=self.brush_radius,
-            min=1,
-            max=30,
-            step=1,
-            continuous_update=True,
-        )
-        self.status = widgets.HTML()
-
-        self.previous_button.on_click(self._previous_click)
-        self.next_button.on_click(self._next_click)
-        self.save_button.on_click(self._save_click)
-        self.reset_button.on_click(self._reset_click)
-        self.clear_drawn_button.on_click(self._clear_drawn_click)
-        self.clear_button.on_click(self._clear_click)
-        self.brush_slider.observe(self._brush_changed, names="value")
-        self.mask_sync.observe(self._mask_sync_changed, names="value")
-
-        self.controls = widgets.VBox([
-            widgets.HBox([
-                self.previous_button,
-                self.next_button,
-                self.save_button,
-                self.reset_button,
-                self.clear_drawn_button,
-                self.clear_button,
-            ]),
-            widgets.HBox([self.brush_slider, self.status]),
-            self.mask_sync,
-            self.output,
-        ])
-
-        self.load_current()
-
-    def _brush_changed(self, change):
-        self.brush_radius = int(change["new"])
-        if hasattr(self, "output") and hasattr(self, "mask") and self.mask is not None:
-            self._render()
-
-    def _automatic_mask_path(self, row):
-        attention_path = Path(row["predicted_attention_mask_path"])
-        monai_path = Path(row["automatic_mask_path"])
-        if self.base_source == "attention" and attention_path.is_file():
-            return attention_path
-        return monai_path
-
-    def load_current(self):
-        row = self.rows[self.index]
-        image = load_attention_segmentation_image(row)
-        automatic_path = self._automatic_mask_path(row)
-        if not automatic_path.is_file():
-            raise FileNotFoundError(
-                f"Automatic mask unavailable. Run generate-masks first: {automatic_path}"
-            )
-
-        automatic = cv2.imread(str(automatic_path), cv2.IMREAD_GRAYSCALE)
-        if automatic is None:
-            raise RuntimeError(f"Could not load automatic mask: {automatic_path}")
-        automatic = cv2.resize(
-            automatic,
-            (ATTENTION_INPUT_SIZE, ATTENTION_INPUT_SIZE),
-            interpolation=cv2.INTER_NEAREST,
-        )
-
-        manual_path = Path(row["manual_mask_path"])
-        if manual_path.is_file():
-            manual = cv2.imread(str(manual_path), cv2.IMREAD_GRAYSCALE)
-            if manual is None:
-                raise RuntimeError(f"Could not load manual mask: {manual_path}")
-            manual = cv2.resize(
-                manual,
-                (ATTENTION_INPUT_SIZE, ATTENTION_INPUT_SIZE),
-                interpolation=cv2.INTER_NEAREST,
-            )
-            current = manual > 127
-        else:
-            current = automatic > 127
-
-        self.image = image.astype(np.float32) / 255.0
-        self.auto_mask = (automatic > 127).astype(np.uint8)
-        self.base_mask = self.auto_mask.copy()
-        self.mask = current.astype(np.uint8)
-        self._render()
-
-    def _png_data_uri(self, rgb_float):
-        arr = np.clip(np.round(rgb_float * 255.0), 0, 255).astype(np.uint8)
-        ok, buf = cv2.imencode(".png", cv2.cvtColor(arr, cv2.COLOR_RGB2BGR))
-        if not ok:
-            raise RuntimeError("Could not encode editor image.")
-        return "data:image/png;base64," + self._base64.b64encode(buf.tobytes()).decode("ascii")
-
-    def _mask_data_uri(self, mask):
-        """Encode a binary mask as a transparent PNG for the HTML canvas.
-
-        A plain grayscale PNG is opaque even where its value is zero. The old
-        canvas code recolored images through ``source-in``, which uses alpha,
-        not grayscale intensity. Consequently, a zero-valued mask still had an
-        opaque alpha channel over the entire 256x256 image and Reset/Clear
-        appeared to create a full-frame mask.
-
-        This encoder makes background pixels transparent black and foreground
-        pixels opaque white. Therefore the orange/magenta overlays are limited
-        to true mask pixels, and an all-zero mask produces no overlay at all.
-        """
-
-        binary = (np.asarray(mask) > 0).astype(np.uint8)
-        bgra = np.zeros((*binary.shape, 4), dtype=np.uint8)
-        foreground = binary * 255
-        bgra[..., 0] = foreground
-        bgra[..., 1] = foreground
-        bgra[..., 2] = foreground
-        bgra[..., 3] = foreground
-        ok, buf = cv2.imencode(".png", bgra)
-        if not ok:
-            raise RuntimeError("Could not encode transparent editor mask.")
-        return (
-            "data:image/png;base64,"
-            + self._base64.b64encode(buf.tobytes()).decode("ascii")
-        )
-
-    def _render(self):
-        """Render a Kaggle-safe interactive HTML5 canvas.
-
-        IMPORTANT: JavaScript placed inside HTML output is not reliably executed
-        by Kaggle/JupyterLab. Therefore the canvas markup is emitted as HTML and
-        the event handlers are injected separately with IPython.display.Javascript.
-        This avoids both jupyter-matplotlib/ipympl and inert <script> tags.
-        """
-        row = self.rows[self.index]
-        image_uri = self._png_data_uri(np.stack([self.image] * 3, axis=-1))
-        base_uri = self._mask_data_uri(self.base_mask)
-        mask_uri = self._mask_data_uri(self.mask)
-        sync_placeholder = f"CAD_MASK_SYNC_{self._uuid}"
-        canvas_id = f"cad_canvas_{self._uuid}"
-
-        html = f"""
-        <div id="cad_editor_wrap_{self._uuid}" style="font-family:Arial,sans-serif;max-width:900px">
-          <div style="margin-bottom:6px;font-size:14px">
-            <b>{self.index + 1}/{len(self.rows)}</b>
-            &nbsp;|&nbsp; {row['patient_id']}
-            &nbsp;|&nbsp; {row['series_id']}
-            &nbsp;|&nbsp; base={self.base_source}
-          </div>
-          <canvas id="{canvas_id}" width="{ATTENTION_INPUT_SIZE*3}"
-                  height="{ATTENTION_INPUT_SIZE*3}"
-                  style="width:768px;height:768px;max-width:100%;border:1px solid #999;
-                         cursor:crosshair;image-rendering:auto;touch-action:none;
-                         user-select:none;-webkit-user-select:none;"></canvas>
-          <div style="font-size:12px;margin-top:5px">
-            <b>Left drag = draw</b> &nbsp;|&nbsp; <b>Right drag = erase</b> &nbsp;|&nbsp;
-            D/E = mode &nbsp;|&nbsp; S = save &nbsp;|&nbsp; R = reset &nbsp;|&nbsp;
-            C = clear &nbsp;|&nbsp; N/P = navigate
-          </div>
-        </div>
-        """
-
-        js = f"""
-        (() => {{
-          const canvas = document.getElementById({json.dumps(canvas_id)});
-          if (!canvas) return;
-          const ctx = canvas.getContext('2d');
-          const W = {ATTENTION_INPUT_SIZE};
-          const H = {ATTENTION_INPUT_SIZE};
-          const SCALE = 3;
-          const initialRadius = {int(self.brush_radius)};
-          const syncPlaceholder = {json.dumps(sync_placeholder)};
-          const image = new Image();
-          const base = new Image();
-          const maskCanvas = document.createElement('canvas');
-          maskCanvas.width = W; maskCanvas.height = H;
-          const maskCtx = maskCanvas.getContext('2d', {{willReadFrequently:true}});
-          const initialMask = new Image();
-          const imageUri = {json.dumps(image_uri)};
-          const baseUri = {json.dumps(base_uri)};
-          const maskUri = {json.dumps(mask_uri)};
-
-          let drawing = false;
-          let erase = false;
-          let mode = {json.dumps(self.mode)};
-          let lastPoint = null;
-
-          function findHidden() {{
-            return Array.from(document.querySelectorAll('textarea'))
-              .find(x => x.placeholder === syncPlaceholder);
-          }}
-
-          function initMask() {{
-            maskCtx.clearRect(0, 0, W, H);
-            maskCtx.drawImage(initialMask, 0, 0, W, H);
-            drawScene();
-          }}
-
-          function drawScene() {{
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
-            ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
-
-            const tmp = document.createElement('canvas');
-            tmp.width = canvas.width; tmp.height = canvas.height;
-            const tc = tmp.getContext('2d');
-            tc.globalAlpha = 0.35;
-            tc.drawImage(base, 0, 0, canvas.width, canvas.height);
-            tc.globalCompositeOperation = 'source-in';
-            tc.fillStyle = 'rgb(255,165,0)';
-            tc.fillRect(0, 0, canvas.width, canvas.height);
-            ctx.drawImage(tmp, 0, 0);
-
-            const tmp2 = document.createElement('canvas');
-            tmp2.width = canvas.width; tmp2.height = canvas.height;
-            const t2 = tmp2.getContext('2d');
-            t2.globalAlpha = 0.50;
-            t2.drawImage(maskCanvas, 0, 0, canvas.width, canvas.height);
-            t2.globalCompositeOperation = 'source-in';
-            t2.fillStyle = 'rgb(255,0,200)';
-            t2.fillRect(0, 0, canvas.width, canvas.height);
-            ctx.drawImage(tmp2, 0, 0);
-          }}
-
-          function syncToPython() {{
-            const hidden = findHidden();
-            if (!hidden) return;
-            hidden.value = maskCanvas.toDataURL('image/png').split(',')[1];
-            hidden.dispatchEvent(new Event('input', {{bubbles:true}}));
-            hidden.dispatchEvent(new Event('change', {{bubbles:true}}));
-          }}
-
-          function point(e) {{
-            const r = canvas.getBoundingClientRect();
-            return {{
-              x: Math.max(0, Math.min(W - 1, ((e.clientX - r.left) / r.width) * W)),
-              y: Math.max(0, Math.min(H - 1, ((e.clientY - r.top) / r.height) * H))
-            }};
-          }}
-
-          function paintAt(p, doErase) {{
-            const radius = initialRadius;
-            maskCtx.save();
-            maskCtx.globalCompositeOperation = doErase ? 'destination-out' : 'source-over';
-            maskCtx.fillStyle = 'white';
-            maskCtx.strokeStyle = 'white';
-            maskCtx.lineWidth = radius * 2;
-            maskCtx.lineCap = 'round';
-            maskCtx.lineJoin = 'round';
-            if (lastPoint) {{
-              maskCtx.beginPath();
-              maskCtx.moveTo(lastPoint.x, lastPoint.y);
-              maskCtx.lineTo(p.x, p.y);
-              maskCtx.stroke();
-            }} else {{
-              maskCtx.beginPath();
-              maskCtx.arc(p.x, p.y, radius, 0, 2 * Math.PI);
-              maskCtx.fill();
-            }}
-            maskCtx.restore();
-            lastPoint = p;
-            drawScene();
-          }}
-
-
-          // Explicit mouse/pointer handling.  Kaggle/JupyterLab can treat
-          // ordinary left-button drags specially unless the canvas claims the
-          // pointer immediately.  We therefore handle BOTH Pointer Events and
-          // legacy Mouse Events and use the actual button state.
-          function beginDraw(e) {{
-            if (e.button !== undefined && e.button !== 0 && e.button !== 2) return;
-            e.preventDefault();
-            e.stopPropagation();
-            drawing = true;
-            erase = (e.button === 2) || (mode === 'erase');
-            lastPoint = null;
-            try {{ canvas.setPointerCapture?.(e.pointerId); }} catch (_) {{}}
-            paintAt(point(e), erase);
-          }}
-
-          function moveDraw(e) {{
-            if (!drawing) return;
-            // With Pointer Events, buttons is a bit mask: 1=left, 2=right.
-            if (e.buttons !== undefined && e.buttons === 0) {{
-              finishDraw(e);
-              return;
-            }}
-            e.preventDefault();
-            e.stopPropagation();
-            paintAt(point(e), erase);
-          }}
-
-          function finishDraw(e) {{
-            if (!drawing) return;
-            e.preventDefault?.();
-            e.stopPropagation?.();
-            drawing = false;
-            lastPoint = null;
-            try {{ canvas.releasePointerCapture?.(e.pointerId); }} catch (_) {{}}
-            syncToPython();
-          }}
-
-          canvas.addEventListener('contextmenu', e => {{
-            e.preventDefault();
-            e.stopPropagation();
-          }}, true);
-
-          // Pointer Events: primary path for modern Chrome/Kaggle.
-          canvas.addEventListener('pointerdown', beginDraw, true);
-          canvas.addEventListener('pointermove', moveDraw, true);
-          canvas.addEventListener('pointerup', finishDraw, true);
-          canvas.addEventListener('pointercancel', finishDraw, true);
-
-          // Mouse fallback: this also makes left-button drawing work if the
-          // browser/Jupyter environment does not deliver pointer events.
-          canvas.addEventListener('mousedown', e => {{
-            if (e.button === 0 || e.button === 2) beginDraw(e);
-          }}, true);
-          canvas.addEventListener('mousemove', moveDraw, true);
-          canvas.addEventListener('mouseup', finishDraw, true);
-
-          canvas.addEventListener('mouseleave', e => {{
-            if (drawing && e.buttons === 0) finishDraw(e);
-          }}, true);
-
-          // Prevent browser text selection / drag behavior over the canvas.
-          canvas.addEventListener('dragstart', e => e.preventDefault(), true);
-          canvas.style.userSelect = 'none';
-          canvas.style.webkitUserSelect = 'none';
-
-          window.addEventListener('keydown', e => {{
-            const k = (e.key || '').toLowerCase();
-            if (['d','e','s','r','c','n','p'].includes(k)) e.preventDefault();
-            if (k === 'd') mode = 'draw';
-            else if (k === 'e') mode = 'erase';
-            else if (k === 's') Array.from(document.querySelectorAll('button')).find(x => x.innerText === 'Save manual')?.click();
-            else if (k === 'r') Array.from(document.querySelectorAll('button')).find(x => x.innerText === 'Reset to auto')?.click();
-            else if (k === 'c') Array.from(document.querySelectorAll('button')).find(x => x.innerText === 'Clear')?.click();
-            else if (k === 'n') Array.from(document.querySelectorAll('button')).find(x => x.innerText === 'Next')?.click();
-            else if (k === 'p') Array.from(document.querySelectorAll('button')).find(x => x.innerText === 'Previous')?.click();
-          }});
-
-          function loadDataImage(target, source, label) {{
-            return new Promise((resolve, reject) => {{
-              target.onload = resolve;
-              target.onerror = () => reject(
-                new Error(`Could not load ${{label}} data URI`)
-              );
-              target.src = source;
-            }});
-          }}
-
-          Promise.all([
-            loadDataImage(image, imageUri, 'MRI'),
-            loadDataImage(base, baseUri, 'automatic mask'),
-            loadDataImage(initialMask, maskUri, 'editable mask')
-          ]).then(initMask).catch(error => {{
-            console.error('[ATTENTION][EDITOR] Canvas initialization failed:', error);
-          }});
-        }})();
-        """
-
-        with self.output:
-            self._clear_output(wait=True)
-            display(HTML(html))
-            display(Javascript(js))
-
-        self.status.value = (
-            f"<span style='margin-left:12px'>"
-            f"<b>Mode:</b> {self.mode} &nbsp; "
-            f"<b>Index:</b> {self.index + 1}/{len(self.rows)}</span>"
-        )
-
-    def _sync_mask_to_frontend(self):
-        """Synchronize the current Python mask with the hidden HTML widget.
-
-        The same transparent-PNG contract used by the visible canvas is used
-        here. This prevents a zero mask from acquiring an opaque full-frame
-        background during a Reset/Clear round trip.
-        """
-
-        if self.mask is None:
-            return
-        value = self._mask_data_uri(self.mask).split(",", 1)[1]
-        if self.mask_sync.value != value:
-            self.mask_sync.value = value
-
-    def _mask_sync_changed(self, change):
-        value = change.get("new", "")
-        if not value:
-            return
-        try:
-            raw = self._base64.b64decode(value)
-            decoded = cv2.imdecode(
-                np.frombuffer(raw, np.uint8),
-                cv2.IMREAD_UNCHANGED,
-            )
-            if decoded is None:
-                return
-
-            # Browser canvases export transparent pixels. Use the alpha channel
-            # explicitly when available, so transparent RGB values can never be
-            # interpreted as foreground over the whole image.
-            if decoded.ndim == 3 and decoded.shape[2] == 4:
-                alpha = decoded[..., 3]
-                gray = cv2.cvtColor(decoded[..., :3], cv2.COLOR_BGR2GRAY)
-                binary = ((alpha > 8) & (gray > 127)).astype(np.uint8)
-            elif decoded.ndim == 3:
-                gray = cv2.cvtColor(decoded, cv2.COLOR_BGR2GRAY)
-                binary = (gray > 127).astype(np.uint8)
-            else:
-                binary = (decoded > 127).astype(np.uint8)
-
-            binary = cv2.resize(
-                binary,
-                (ATTENTION_INPUT_SIZE, ATTENTION_INPUT_SIZE),
-                interpolation=cv2.INTER_NEAREST,
-            )
-            self.mask = (binary > 0).astype(np.uint8)
-        except Exception as exc:
-            print(f"[ATTENTION][EDITOR][WARNING] Mask sync failed: {exc}", flush=True)
-
-    def _previous_click(self, _button):
-        self.previous()
-
-    def _next_click(self, _button):
-        self.next()
-
-    def _save_click(self, _button):
-        self.save()
-
-    def _button_error(self, action, error):
-        """Expose callback failures instead of letting ipywidgets hide them."""
-
-        message = f"{action} failed: {type(error).__name__}: {error}"
-        self.status.value = (
-            "<span style='margin-left:12px;color:#b00020'><b>"
-            + message
-            + "</b></span>"
-        )
-        print(f"[ATTENTION][EDITOR][ERROR] {message}", flush=True)
-
-    def _reset_click(self, _button):
-        try:
-            self.reset()
-        except Exception as error:
-            self._button_error("Reset to auto", error)
-
-    def _clear_drawn_click(self, _button):
-        try:
-            self.reset_to_image()
-        except Exception as error:
-            self._button_error("Reset to image", error)
-
-    def _clear_click(self, _button):
-        try:
-            self.clear()
-        except Exception as error:
-            self._button_error("Clear", error)
-
-    def _paint(self, event, erase=False):
-        # Retained for API compatibility; browser canvas handles painting.
-        return
-
-    def _on_press(self, event):
-        return
-
-    def _on_release(self, event):
-        return
-
-    def _on_motion(self, event):
-        return
-
-    def _on_key(self, event):
-        key = str(getattr(event, "key", "") or "").lower()
-        if key == "d":
-            self.mode = "draw"
-        elif key == "e":
-            self.mode = "erase"
-        elif key == "s":
-            self.save()
-        elif key == "r":
-            self.reset()
-        elif key == "c":
-            self.clear()
-        elif key in {"n", "right"}:
-            self.next()
-        elif key in {"p", "left"}:
-            self.previous()
-        self.status.value = (
-            f"<span style='margin-left:12px'><b>Mode:</b> {self.mode}</span>"
-        )
-
-    def save(self):
-        row = self.rows[self.index]
-        path = Path(row["manual_mask_path"])
-        _atomic_cv2_write(
-            path,
-            self.mask.astype(np.uint8) * 255,
-            required=True,
-            purpose="manual Attention U-Net mask",
-        )
-        overlay_path = self.workspace.mask_overlays / f"{row['image_token']}.png"
-        base = np.stack([self.image] * 3, axis=-1)
-        overlay = base.copy()
-        overlay[..., 0] = np.maximum(overlay[..., 0], self.mask * 0.90)
-        overlay[..., 1] *= (1.0 - 0.45 * self.mask)
-        overlay[..., 2] *= (1.0 - 0.45 * self.mask)
-        _atomic_cv2_write(
-            overlay_path,
-            cv2.cvtColor(
-                np.clip(np.round(overlay * 255.0), 0, 255).astype(np.uint8),
-                cv2.COLOR_RGB2BGR,
-            ),
-            required=False,
-            purpose="optional manual-mask review overlay",
-        )
-        row["manual_mask_exists"] = 1
-        write_attention_manifest(self.rows, self.workspace.manifest_csv)
-        print(f"[ATTENTION][EDITOR] Saved manual mask: {path}", flush=True)
-
-    def reset(self):
-        """Restore the immutable automatic mask and its orange reference."""
-
-        if self.auto_mask is None:
-            raise RuntimeError("Automatic mask is not loaded.")
-        self.base_mask = self.auto_mask.copy()
-        self.mask = self.auto_mask.copy()
-        self._sync_mask_to_frontend()
-        self._render()
-        self.status.value = (
-            "<span style='margin-left:12px'><b>Reset:</b> automatic mask "
-            "restored.</span>"
-        )
-
-    def reset_to_image(self):
-        """Show only the raw MRI, hiding automatic and editable overlays."""
-
-        if self.auto_mask is None:
-            raise RuntimeError("Automatic mask is not loaded.")
-        self.base_mask = np.zeros_like(self.auto_mask, dtype=np.uint8)
-        self.mask = np.zeros_like(self.auto_mask, dtype=np.uint8)
-        self._sync_mask_to_frontend()
-        self._render()
-        self.status.value = (
-            "<span style='margin-left:12px'><b>Raw MRI:</b> all mask "
-            "overlays hidden. This is not saved until Save manual is pressed."
-            "</span>"
-        )
-
-    def clear(self):
-        """Clear the editable mask while retaining auto mask as orange guide."""
-
-        if self.auto_mask is None:
-            raise RuntimeError("Automatic mask is not loaded.")
-        self.base_mask = self.auto_mask.copy()
-        self.mask = np.zeros_like(self.auto_mask, dtype=np.uint8)
-        self._sync_mask_to_frontend()
-        self._render()
-        self.status.value = (
-            "<span style='margin-left:12px'><b>Editable mask cleared.</b> "
-            "The automatic mask remains visible in orange as a guide.</span>"
-        )
-
-    def next(self):
-        if self.index < len(self.rows) - 1:
-            self.index += 1
-            self.load_current()
-
-    def previous(self):
-        if self.index > 0:
-            self.index -= 1
-            self.load_current()
-
-    def show(self):
-        from IPython.display import display
-        display(self.controls)
-        return self
-
-
-def open_attention_mask_editor(
-    workspace,
-    start_index=0,
-    brush_radius=8,
-    base_source="attention",
-):
-    """Open the Kaggle-safe HTML5 canvas editor."""
-    rows = read_attention_manifest(workspace)
-    global _ACTIVE_ATTENTION_MASK_EDITOR
-    _ACTIVE_ATTENTION_MASK_EDITOR = AttentionMaskEditor(
-        rows,
-        workspace,
-        start_index=start_index,
-        brush_radius=brush_radius,
-        base_source=base_source,
-    )
-    return _ACTIVE_ATTENTION_MASK_EDITOR.show()
 
 
 # ---------------------------------------------------------------------------
@@ -20976,168 +17162,6 @@ def validate_attention_extension():
     )
 
 
-def run_attention_pipeline(samples, workspace, action):
-    """Execute mask generation, training and/or AU1-AU5 evaluation."""
-
-    validate_attention_extension()
-    rows = select_attention_training_rows(samples, workspace)
-    if action in {"generate-masks", "train-attention", "attention-only", "both", "edit-masks"}:
-        rows = generate_attention_pseudo_masks(samples, workspace)
-    if action == "generate-masks":
-        return {"status": "MASKS_GENERATED", "manifest": str(workspace.manifest_csv)}
-    if action == "edit-masks":
-        return {"status": "EDITOR_READY", "manifest": str(workspace.manifest_csv)}
-
-    checkpoint_map = train_attention_unet_crossfit(rows, workspace)
-    if action == "train-attention":
-        clear_attention_image_ram_cache()
-        return {
-            "status": "TRAINING_COMPLETED",
-            "checkpoints": {str(k): str(v) for k, v in checkpoint_map.items()},
-        }
-    # Full-dataset Attention inference does not use the 4,715-image training LRU.
-    # Release it before allocating EfficientNet and AU1-AU5 batch tensors.
-    clear_attention_image_ram_cache()
-    bank = extract_attention_patient_feature_bank(samples, workspace, checkpoint_map)
-    return evaluate_attention_feature_bank(samples, workspace, bank)
-
-
-def _parse_attention_arguments(argv=None):
-    parser = argparse.ArgumentParser(
-        description=(
-            "CAD MRI V6 MONAI suite plus cross-fitted Attention U-Net masks, "
-            "manual editor and AU1-AU5 comparison."
-        )
-    )
-    parser.add_argument(
-        "--attention-action",
-        choices=ATTENTION_ACTION_CHOICES,
-        default="both",
-        help="Execution action; default: both.",
-    )
-    parser.add_argument(
-        "--attention-work-root",
-        default=None,
-        help="Workspace for masks/checkpoints; defaults to Kaggle working storage.",
-    )
-    parser.add_argument(
-        "--attention-editor-index",
-        type=int,
-        default=0,
-        help="Initial manifest row shown by edit-masks.",
-    )
-    parser.add_argument(
-        "--attention-brush-radius",
-        type=int,
-        default=8,
-        help="Initial editor brush radius in pixels.",
-    )
-    parser.add_argument(
-        "--attention-editor-base",
-        choices=("attention", "monai"),
-        default="attention",
-        help="Automatic mask shown beneath manual edits.",
-    )
-    parser.add_argument(
-        "--attention-dataset-path",
-        default=str(DATASET_PATH),
-        help="Dataset root containing Normal and Sick folders.",
-    )
-    args, unknown = parser.parse_known_args(argv)
-    if unknown:
-        print(
-            f"[ATTENTION][CLI] Ignoring unrecognized notebook arguments: {unknown}",
-            flush=True,
-        )
-    return args
-
-
-def attention_v7_entrypoint(argv=None):
-    """Top-level CLI entrypoint for V6 MONAI and the V7 Attention extension."""
-
-    refresh_runtime_device("Attention entrypoint")
-    args = _parse_attention_arguments(argv)
-    action = args.attention_action
-    if action in {"both", "monai-only"}:
-        run_with_console_logging()
-        if action == "monai-only":
-            return
-
-    workspace = build_attention_workspace(args.attention_work_root)
-    dataset_path = Path(args.attention_dataset_path)
-    samples = load_samples(dataset_path)
-
-    if action == "edit-masks":
-        validate_attention_extension()
-        rows = generate_attention_pseudo_masks(samples, workspace)
-        print(
-            f"[ATTENTION][EDITOR] Opening row {args.attention_editor_index} of "
-            f"{len(rows)}. Class labels are not displayed.",
-            flush=True,
-        )
-        open_attention_mask_editor(
-            workspace,
-            start_index=args.attention_editor_index,
-            brush_radius=args.attention_brush_radius,
-            base_source=args.attention_editor_base,
-        )
-        return
-
-    workspace.console_log.parent.mkdir(parents=True, exist_ok=True)
-    original_stdout = sys.stdout
-    original_stderr = sys.stderr
-    with open(workspace.console_log, "a", encoding="utf-8", buffering=1) as log_file:
-        sys.stdout = TeeStream(original_stdout, log_file)
-        sys.stderr = TeeStream(original_stderr, log_file)
-        try:
-            print("\n" + "#" * 100, flush=True)
-            print(
-                "CAD CARDIAC MRI — V7.2 ATTENTION U-NET EXTENSION "
-                "(DISK-SAFE + PROFILE-CONTROLLED VALIDATION)",
-                flush=True,
-            )
-            print("#" * 100, flush=True)
-            print(f"[ATTENTION] action={action}", flush=True)
-            print(f"[ATTENTION] workspace={workspace.root}", flush=True)
-            print(
-                f"[ATTENTION] transient_root={workspace.transient_root}",
-                flush=True,
-            )
-            print(
-                f"[ATTENTION] automatic_masks={workspace.automatic_masks}",
-                flush=True,
-            )
-            print(f"[ATTENTION] comparison_output={workspace.comparison_output}", flush=True)
-            summary = run_attention_pipeline(samples, workspace, action)
-            print(
-                "[ATTENTION] Completed with status="
-                f"{summary.get('status', 'OK')}. Outputs: "
-                f"{workspace.comparison_output}",
-                flush=True,
-            )
-        except Exception:
-            print("\n[ATTENTION] FATAL ERROR", flush=True)
-            traceback.print_exc(file=sys.stdout)
-            raise
-        finally:
-            sys.stdout.flush()
-            sys.stderr.flush()
-            sys.stdout = original_stdout
-            sys.stderr = original_stderr
-
-
-# ---------------------------------------------------------------------------
-# ORIGINAL V7.2 STANDALONE ENTRYPOINT (PRESERVED FOR TRACEABILITY)
-# ---------------------------------------------------------------------------
-# The original file ended with the following two lines:
-#
-# if __name__ == "__main__":
-#     attention_v7_entrypoint()
-#
-# They are intentionally moved below the V13 override. Calling the original
-# entrypoint here would start the V7.2 action before the V13 full-cohort review
-# functions, CLI options and iterative editor were defined.
-
 # ============================================================================
 # V13 FULL-COHORT MONAI / ATTENTION U-NET MASK REVIEW EXTENSION
 # ============================================================================
@@ -22170,6 +18194,649 @@ def select_attention_training_rows(samples, workspace):
 # ---------------------------------------------------------------------------
 # HTML EDITOR PATCH: strict source, review log and rapid-review buttons.
 # ---------------------------------------------------------------------------
+
+class AttentionMaskEditor:
+    """
+    Kaggle-safe manual mask editor.
+
+    This implementation deliberately does NOT use ipympl/jupyter-matplotlib.
+    It uses standard ipywidgets (which Kaggle/JupyterLab supports) plus an
+    HTML5 canvas rendered in an Output widget. The canvas handles mouse
+    drawing/erasing in the browser and synchronizes the mask to a standard
+    Textarea widget, so no custom Jupyter widget model is required.
+
+    Public behavior is kept compatible with the previous editor:
+      Previous / Next / Save manual / Reset to auto / Reset to image (no mask) / Clear
+      brush slider, left-draw/right-erase, D/E keyboard modes, S/R/C/N/P.
+
+    Button semantics:
+      - Reset to auto: restore automatic mask and orange comparison overlay.
+      - Reset to image: show the raw MRI with no mask overlay at all.
+      - Clear: clear only the editable mask while keeping auto mask in orange.
+    """
+
+    def __init__(
+        self,
+        rows,
+        workspace,
+        start_index=0,
+        brush_radius=8,
+        base_source="attention",
+    ):
+        if not rows:
+            raise ValueError("The mask editor requires at least one manifest row.")
+        if base_source not in {"attention", "monai"}:
+            raise ValueError("base_source must be 'attention' or 'monai'.")
+
+        import base64
+        import uuid
+        import ipywidgets as widgets
+        from IPython.display import display, HTML, clear_output
+
+        self.rows = list(rows)
+        self.workspace = workspace
+        self.index = int(np.clip(start_index, 0, len(rows) - 1))
+        self.brush_radius = int(max(1, brush_radius))
+        self.base_source = base_source
+        self.mode = "draw"
+        self.image = None
+        # ``auto_mask`` is the immutable automatic mask loaded from MONAI or
+        # Attention U-Net. ``base_mask`` is only the orange comparison overlay
+        # currently shown by the browser canvas and can temporarily be hidden.
+        self.auto_mask = None
+        self.base_mask = None
+        self.mask = None
+
+        self._base64 = base64
+        self._uuid = uuid.uuid4().hex[:12]
+        self._clear_output = clear_output
+
+        self.output = widgets.Output()
+        self.mask_sync = widgets.Textarea(
+            value="",
+            placeholder=f"CAD_MASK_SYNC_{self._uuid}",
+            layout=widgets.Layout(width="1px", height="1px", display="none"),
+        )
+
+        self.previous_button = widgets.Button(description="Previous")
+        self.next_button = widgets.Button(description="Next")
+        self.save_button = widgets.Button(description="Save manual")
+        self.reset_button = widgets.Button(description="Reset to auto")
+        self.clear_drawn_button = widgets.Button(description="Reset to image (no mask)")
+        self.clear_button = widgets.Button(description="Clear")
+        self.brush_slider = widgets.IntSlider(
+            description="Brush",
+            value=self.brush_radius,
+            min=1,
+            max=30,
+            step=1,
+            continuous_update=True,
+        )
+        self.status = widgets.HTML()
+
+        self.previous_button.on_click(self._previous_click)
+        self.next_button.on_click(self._next_click)
+        self.save_button.on_click(self._save_click)
+        self.reset_button.on_click(self._reset_click)
+        self.clear_drawn_button.on_click(self._clear_drawn_click)
+        self.clear_button.on_click(self._clear_click)
+        self.brush_slider.observe(self._brush_changed, names="value")
+        self.mask_sync.observe(self._mask_sync_changed, names="value")
+
+        self.controls = widgets.VBox([
+            widgets.HBox([
+                self.previous_button,
+                self.next_button,
+                self.save_button,
+                self.reset_button,
+                self.clear_drawn_button,
+                self.clear_button,
+            ]),
+            widgets.HBox([self.brush_slider, self.status]),
+            self.mask_sync,
+            self.output,
+        ])
+
+        self.load_current()
+
+    def _brush_changed(self, change):
+        self.brush_radius = int(change["new"])
+        if hasattr(self, "output") and hasattr(self, "mask") and self.mask is not None:
+            self._render()
+
+    def _automatic_mask_path(self, row):
+        attention_path = Path(row["predicted_attention_mask_path"])
+        monai_path = Path(row["automatic_mask_path"])
+        if self.base_source == "attention" and attention_path.is_file():
+            return attention_path
+        return monai_path
+
+    def load_current(self):
+        row = self.rows[self.index]
+        image = load_attention_segmentation_image(row)
+        automatic_path = self._automatic_mask_path(row)
+        if not automatic_path.is_file():
+            raise FileNotFoundError(
+                f"Automatic mask unavailable. Run generate-masks first: {automatic_path}"
+            )
+
+        automatic = cv2.imread(str(automatic_path), cv2.IMREAD_GRAYSCALE)
+        if automatic is None:
+            raise RuntimeError(f"Could not load automatic mask: {automatic_path}")
+        automatic = cv2.resize(
+            automatic,
+            (ATTENTION_INPUT_SIZE, ATTENTION_INPUT_SIZE),
+            interpolation=cv2.INTER_NEAREST,
+        )
+
+        manual_path = Path(row["manual_mask_path"])
+        if manual_path.is_file():
+            manual = cv2.imread(str(manual_path), cv2.IMREAD_GRAYSCALE)
+            if manual is None:
+                raise RuntimeError(f"Could not load manual mask: {manual_path}")
+            manual = cv2.resize(
+                manual,
+                (ATTENTION_INPUT_SIZE, ATTENTION_INPUT_SIZE),
+                interpolation=cv2.INTER_NEAREST,
+            )
+            current = manual > 127
+        else:
+            current = automatic > 127
+
+        self.image = image.astype(np.float32) / 255.0
+        self.auto_mask = (automatic > 127).astype(np.uint8)
+        self.base_mask = self.auto_mask.copy()
+        self.mask = current.astype(np.uint8)
+        self._render()
+
+    def _png_data_uri(self, rgb_float):
+        arr = np.clip(np.round(rgb_float * 255.0), 0, 255).astype(np.uint8)
+        ok, buf = cv2.imencode(".png", cv2.cvtColor(arr, cv2.COLOR_RGB2BGR))
+        if not ok:
+            raise RuntimeError("Could not encode editor image.")
+        return "data:image/png;base64," + self._base64.b64encode(buf.tobytes()).decode("ascii")
+
+    def _mask_data_uri(self, mask):
+        """Encode a binary mask as a transparent PNG for the HTML canvas.
+
+        A plain grayscale PNG is opaque even where its value is zero. The old
+        canvas code recolored images through ``source-in``, which uses alpha,
+        not grayscale intensity. Consequently, a zero-valued mask still had an
+        opaque alpha channel over the entire 256x256 image and Reset/Clear
+        appeared to create a full-frame mask.
+
+        This encoder makes background pixels transparent black and foreground
+        pixels opaque white. Therefore the orange/magenta overlays are limited
+        to true mask pixels, and an all-zero mask produces no overlay at all.
+        """
+
+        binary = (np.asarray(mask) > 0).astype(np.uint8)
+        bgra = np.zeros((*binary.shape, 4), dtype=np.uint8)
+        foreground = binary * 255
+        bgra[..., 0] = foreground
+        bgra[..., 1] = foreground
+        bgra[..., 2] = foreground
+        bgra[..., 3] = foreground
+        ok, buf = cv2.imencode(".png", bgra)
+        if not ok:
+            raise RuntimeError("Could not encode transparent editor mask.")
+        return (
+            "data:image/png;base64,"
+            + self._base64.b64encode(buf.tobytes()).decode("ascii")
+        )
+
+    def _render(self):
+        """Render a Kaggle-safe interactive HTML5 canvas.
+
+        IMPORTANT: JavaScript placed inside HTML output is not reliably executed
+        by Kaggle/JupyterLab. Therefore the canvas markup is emitted as HTML and
+        the event handlers are injected separately with IPython.display.Javascript.
+        This avoids both jupyter-matplotlib/ipympl and inert <script> tags.
+        """
+        row = self.rows[self.index]
+        image_uri = self._png_data_uri(np.stack([self.image] * 3, axis=-1))
+        base_uri = self._mask_data_uri(self.base_mask)
+        mask_uri = self._mask_data_uri(self.mask)
+        sync_placeholder = f"CAD_MASK_SYNC_{self._uuid}"
+        canvas_id = f"cad_canvas_{self._uuid}"
+
+        html = f"""
+        <div id="cad_editor_wrap_{self._uuid}" style="font-family:Arial,sans-serif;max-width:900px">
+          <div style="margin-bottom:6px;font-size:14px">
+            <b>{self.index + 1}/{len(self.rows)}</b>
+            &nbsp;|&nbsp; {row['patient_id']}
+            &nbsp;|&nbsp; {row['series_id']}
+            &nbsp;|&nbsp; base={self.base_source}
+          </div>
+          <canvas id="{canvas_id}" width="{ATTENTION_INPUT_SIZE*3}"
+                  height="{ATTENTION_INPUT_SIZE*3}"
+                  style="width:768px;height:768px;max-width:100%;border:1px solid #999;
+                         cursor:crosshair;image-rendering:auto;touch-action:none;
+                         user-select:none;-webkit-user-select:none;"></canvas>
+          <div style="font-size:12px;margin-top:5px">
+            <b>Left drag = draw</b> &nbsp;|&nbsp; <b>Right drag = erase</b> &nbsp;|&nbsp;
+            D/E = mode &nbsp;|&nbsp; S = save &nbsp;|&nbsp; R = reset &nbsp;|&nbsp;
+            C = clear &nbsp;|&nbsp; N/P = navigate
+          </div>
+        </div>
+        """
+
+        js = f"""
+        (() => {{
+          const canvas = document.getElementById({json.dumps(canvas_id)});
+          if (!canvas) return;
+          const ctx = canvas.getContext('2d');
+          const W = {ATTENTION_INPUT_SIZE};
+          const H = {ATTENTION_INPUT_SIZE};
+          const SCALE = 3;
+          const initialRadius = {int(self.brush_radius)};
+          const syncPlaceholder = {json.dumps(sync_placeholder)};
+          const image = new Image();
+          const base = new Image();
+          const maskCanvas = document.createElement('canvas');
+          maskCanvas.width = W; maskCanvas.height = H;
+          const maskCtx = maskCanvas.getContext('2d', {{willReadFrequently:true}});
+          const initialMask = new Image();
+          const imageUri = {json.dumps(image_uri)};
+          const baseUri = {json.dumps(base_uri)};
+          const maskUri = {json.dumps(mask_uri)};
+
+          let drawing = false;
+          let erase = false;
+          let mode = {json.dumps(self.mode)};
+          let lastPoint = null;
+
+          function findHidden() {{
+            return Array.from(document.querySelectorAll('textarea'))
+              .find(x => x.placeholder === syncPlaceholder);
+          }}
+
+          function initMask() {{
+            maskCtx.clearRect(0, 0, W, H);
+            maskCtx.drawImage(initialMask, 0, 0, W, H);
+            drawScene();
+          }}
+
+          function drawScene() {{
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+
+            const tmp = document.createElement('canvas');
+            tmp.width = canvas.width; tmp.height = canvas.height;
+            const tc = tmp.getContext('2d');
+            tc.globalAlpha = 0.35;
+            tc.drawImage(base, 0, 0, canvas.width, canvas.height);
+            tc.globalCompositeOperation = 'source-in';
+            tc.fillStyle = 'rgb(255,165,0)';
+            tc.fillRect(0, 0, canvas.width, canvas.height);
+            ctx.drawImage(tmp, 0, 0);
+
+            const tmp2 = document.createElement('canvas');
+            tmp2.width = canvas.width; tmp2.height = canvas.height;
+            const t2 = tmp2.getContext('2d');
+            t2.globalAlpha = 0.50;
+            t2.drawImage(maskCanvas, 0, 0, canvas.width, canvas.height);
+            t2.globalCompositeOperation = 'source-in';
+            t2.fillStyle = 'rgb(255,0,200)';
+            t2.fillRect(0, 0, canvas.width, canvas.height);
+            ctx.drawImage(tmp2, 0, 0);
+          }}
+
+          function syncToPython() {{
+            const hidden = findHidden();
+            if (!hidden) return;
+            hidden.value = maskCanvas.toDataURL('image/png').split(',')[1];
+            hidden.dispatchEvent(new Event('input', {{bubbles:true}}));
+            hidden.dispatchEvent(new Event('change', {{bubbles:true}}));
+          }}
+
+          function point(e) {{
+            const r = canvas.getBoundingClientRect();
+            return {{
+              x: Math.max(0, Math.min(W - 1, ((e.clientX - r.left) / r.width) * W)),
+              y: Math.max(0, Math.min(H - 1, ((e.clientY - r.top) / r.height) * H))
+            }};
+          }}
+
+          function paintAt(p, doErase) {{
+            const radius = initialRadius;
+            maskCtx.save();
+            maskCtx.globalCompositeOperation = doErase ? 'destination-out' : 'source-over';
+            maskCtx.fillStyle = 'white';
+            maskCtx.strokeStyle = 'white';
+            maskCtx.lineWidth = radius * 2;
+            maskCtx.lineCap = 'round';
+            maskCtx.lineJoin = 'round';
+            if (lastPoint) {{
+              maskCtx.beginPath();
+              maskCtx.moveTo(lastPoint.x, lastPoint.y);
+              maskCtx.lineTo(p.x, p.y);
+              maskCtx.stroke();
+            }} else {{
+              maskCtx.beginPath();
+              maskCtx.arc(p.x, p.y, radius, 0, 2 * Math.PI);
+              maskCtx.fill();
+            }}
+            maskCtx.restore();
+            lastPoint = p;
+            drawScene();
+          }}
+
+
+          // Explicit mouse/pointer handling.  Kaggle/JupyterLab can treat
+          // ordinary left-button drags specially unless the canvas claims the
+          // pointer immediately.  We therefore handle BOTH Pointer Events and
+          // legacy Mouse Events and use the actual button state.
+          function beginDraw(e) {{
+            if (e.button !== undefined && e.button !== 0 && e.button !== 2) return;
+            e.preventDefault();
+            e.stopPropagation();
+            drawing = true;
+            erase = (e.button === 2) || (mode === 'erase');
+            lastPoint = null;
+            try {{ canvas.setPointerCapture?.(e.pointerId); }} catch (_) {{}}
+            paintAt(point(e), erase);
+          }}
+
+          function moveDraw(e) {{
+            if (!drawing) return;
+            // With Pointer Events, buttons is a bit mask: 1=left, 2=right.
+            if (e.buttons !== undefined && e.buttons === 0) {{
+              finishDraw(e);
+              return;
+            }}
+            e.preventDefault();
+            e.stopPropagation();
+            paintAt(point(e), erase);
+          }}
+
+          function finishDraw(e) {{
+            if (!drawing) return;
+            e.preventDefault?.();
+            e.stopPropagation?.();
+            drawing = false;
+            lastPoint = null;
+            try {{ canvas.releasePointerCapture?.(e.pointerId); }} catch (_) {{}}
+            syncToPython();
+          }}
+
+          canvas.addEventListener('contextmenu', e => {{
+            e.preventDefault();
+            e.stopPropagation();
+          }}, true);
+
+          // Pointer Events: primary path for modern Chrome/Kaggle.
+          canvas.addEventListener('pointerdown', beginDraw, true);
+          canvas.addEventListener('pointermove', moveDraw, true);
+          canvas.addEventListener('pointerup', finishDraw, true);
+          canvas.addEventListener('pointercancel', finishDraw, true);
+
+          // Mouse fallback: this also makes left-button drawing work if the
+          // browser/Jupyter environment does not deliver pointer events.
+          canvas.addEventListener('mousedown', e => {{
+            if (e.button === 0 || e.button === 2) beginDraw(e);
+          }}, true);
+          canvas.addEventListener('mousemove', moveDraw, true);
+          canvas.addEventListener('mouseup', finishDraw, true);
+
+          canvas.addEventListener('mouseleave', e => {{
+            if (drawing && e.buttons === 0) finishDraw(e);
+          }}, true);
+
+          // Prevent browser text selection / drag behavior over the canvas.
+          canvas.addEventListener('dragstart', e => e.preventDefault(), true);
+          canvas.style.userSelect = 'none';
+          canvas.style.webkitUserSelect = 'none';
+
+          window.addEventListener('keydown', e => {{
+            const k = (e.key || '').toLowerCase();
+            if (['d','e','s','r','c','n','p'].includes(k)) e.preventDefault();
+            if (k === 'd') mode = 'draw';
+            else if (k === 'e') mode = 'erase';
+            else if (k === 's') Array.from(document.querySelectorAll('button')).find(x => x.innerText === 'Save manual')?.click();
+            else if (k === 'r') Array.from(document.querySelectorAll('button')).find(x => x.innerText === 'Reset to auto')?.click();
+            else if (k === 'c') Array.from(document.querySelectorAll('button')).find(x => x.innerText === 'Clear')?.click();
+            else if (k === 'n') Array.from(document.querySelectorAll('button')).find(x => x.innerText === 'Next')?.click();
+            else if (k === 'p') Array.from(document.querySelectorAll('button')).find(x => x.innerText === 'Previous')?.click();
+          }});
+
+          function loadDataImage(target, source, label) {{
+            return new Promise((resolve, reject) => {{
+              target.onload = resolve;
+              target.onerror = () => reject(
+                new Error(`Could not load ${{label}} data URI`)
+              );
+              target.src = source;
+            }});
+          }}
+
+          Promise.all([
+            loadDataImage(image, imageUri, 'MRI'),
+            loadDataImage(base, baseUri, 'automatic mask'),
+            loadDataImage(initialMask, maskUri, 'editable mask')
+          ]).then(initMask).catch(error => {{
+            console.error('[ATTENTION][EDITOR] Canvas initialization failed:', error);
+          }});
+        }})();
+        """
+
+        with self.output:
+            self._clear_output(wait=True)
+            display(HTML(html))
+            display(Javascript(js))
+
+        self.status.value = (
+            f"<span style='margin-left:12px'>"
+            f"<b>Mode:</b> {self.mode} &nbsp; "
+            f"<b>Index:</b> {self.index + 1}/{len(self.rows)}</span>"
+        )
+
+    def _sync_mask_to_frontend(self):
+        """Synchronize the current Python mask with the hidden HTML widget.
+
+        The same transparent-PNG contract used by the visible canvas is used
+        here. This prevents a zero mask from acquiring an opaque full-frame
+        background during a Reset/Clear round trip.
+        """
+
+        if self.mask is None:
+            return
+        value = self._mask_data_uri(self.mask).split(",", 1)[1]
+        if self.mask_sync.value != value:
+            self.mask_sync.value = value
+
+    def _mask_sync_changed(self, change):
+        value = change.get("new", "")
+        if not value:
+            return
+        try:
+            raw = self._base64.b64decode(value)
+            decoded = cv2.imdecode(
+                np.frombuffer(raw, np.uint8),
+                cv2.IMREAD_UNCHANGED,
+            )
+            if decoded is None:
+                return
+
+            # Browser canvases export transparent pixels. Use the alpha channel
+            # explicitly when available, so transparent RGB values can never be
+            # interpreted as foreground over the whole image.
+            if decoded.ndim == 3 and decoded.shape[2] == 4:
+                alpha = decoded[..., 3]
+                gray = cv2.cvtColor(decoded[..., :3], cv2.COLOR_BGR2GRAY)
+                binary = ((alpha > 8) & (gray > 127)).astype(np.uint8)
+            elif decoded.ndim == 3:
+                gray = cv2.cvtColor(decoded, cv2.COLOR_BGR2GRAY)
+                binary = (gray > 127).astype(np.uint8)
+            else:
+                binary = (decoded > 127).astype(np.uint8)
+
+            binary = cv2.resize(
+                binary,
+                (ATTENTION_INPUT_SIZE, ATTENTION_INPUT_SIZE),
+                interpolation=cv2.INTER_NEAREST,
+            )
+            self.mask = (binary > 0).astype(np.uint8)
+        except Exception as exc:
+            print(f"[ATTENTION][EDITOR][WARNING] Mask sync failed: {exc}", flush=True)
+
+    def _previous_click(self, _button):
+        self.previous()
+
+    def _next_click(self, _button):
+        self.next()
+
+    def _save_click(self, _button):
+        self.save()
+
+    def _button_error(self, action, error):
+        """Expose callback failures instead of letting ipywidgets hide them."""
+
+        message = f"{action} failed: {type(error).__name__}: {error}"
+        self.status.value = (
+            "<span style='margin-left:12px;color:#b00020'><b>"
+            + message
+            + "</b></span>"
+        )
+        print(f"[ATTENTION][EDITOR][ERROR] {message}", flush=True)
+
+    def _reset_click(self, _button):
+        try:
+            self.reset()
+        except Exception as error:
+            self._button_error("Reset to auto", error)
+
+    def _clear_drawn_click(self, _button):
+        try:
+            self.reset_to_image()
+        except Exception as error:
+            self._button_error("Reset to image", error)
+
+    def _clear_click(self, _button):
+        try:
+            self.clear()
+        except Exception as error:
+            self._button_error("Clear", error)
+
+    def _paint(self, event, erase=False):
+        # Retained for API compatibility; browser canvas handles painting.
+        return
+
+    def _on_press(self, event):
+        return
+
+    def _on_release(self, event):
+        return
+
+    def _on_motion(self, event):
+        return
+
+    def _on_key(self, event):
+        key = str(getattr(event, "key", "") or "").lower()
+        if key == "d":
+            self.mode = "draw"
+        elif key == "e":
+            self.mode = "erase"
+        elif key == "s":
+            self.save()
+        elif key == "r":
+            self.reset()
+        elif key == "c":
+            self.clear()
+        elif key in {"n", "right"}:
+            self.next()
+        elif key in {"p", "left"}:
+            self.previous()
+        self.status.value = (
+            f"<span style='margin-left:12px'><b>Mode:</b> {self.mode}</span>"
+        )
+
+    def save(self):
+        row = self.rows[self.index]
+        path = Path(row["manual_mask_path"])
+        _atomic_cv2_write(
+            path,
+            self.mask.astype(np.uint8) * 255,
+            required=True,
+            purpose="manual Attention U-Net mask",
+        )
+        overlay_path = self.workspace.mask_overlays / f"{row['image_token']}.png"
+        base = np.stack([self.image] * 3, axis=-1)
+        overlay = base.copy()
+        overlay[..., 0] = np.maximum(overlay[..., 0], self.mask * 0.90)
+        overlay[..., 1] *= (1.0 - 0.45 * self.mask)
+        overlay[..., 2] *= (1.0 - 0.45 * self.mask)
+        _atomic_cv2_write(
+            overlay_path,
+            cv2.cvtColor(
+                np.clip(np.round(overlay * 255.0), 0, 255).astype(np.uint8),
+                cv2.COLOR_RGB2BGR,
+            ),
+            required=False,
+            purpose="optional manual-mask review overlay",
+        )
+        row["manual_mask_exists"] = 1
+        write_attention_manifest(self.rows, self.workspace.manifest_csv)
+        print(f"[ATTENTION][EDITOR] Saved manual mask: {path}", flush=True)
+
+    def reset(self):
+        """Restore the immutable automatic mask and its orange reference."""
+
+        if self.auto_mask is None:
+            raise RuntimeError("Automatic mask is not loaded.")
+        self.base_mask = self.auto_mask.copy()
+        self.mask = self.auto_mask.copy()
+        self._sync_mask_to_frontend()
+        self._render()
+        self.status.value = (
+            "<span style='margin-left:12px'><b>Reset:</b> automatic mask "
+            "restored.</span>"
+        )
+
+    def reset_to_image(self):
+        """Show only the raw MRI, hiding automatic and editable overlays."""
+
+        if self.auto_mask is None:
+            raise RuntimeError("Automatic mask is not loaded.")
+        self.base_mask = np.zeros_like(self.auto_mask, dtype=np.uint8)
+        self.mask = np.zeros_like(self.auto_mask, dtype=np.uint8)
+        self._sync_mask_to_frontend()
+        self._render()
+        self.status.value = (
+            "<span style='margin-left:12px'><b>Raw MRI:</b> all mask "
+            "overlays hidden. This is not saved until Save manual is pressed."
+            "</span>"
+        )
+
+    def clear(self):
+        """Clear the editable mask while retaining auto mask as orange guide."""
+
+        if self.auto_mask is None:
+            raise RuntimeError("Automatic mask is not loaded.")
+        self.base_mask = self.auto_mask.copy()
+        self.mask = np.zeros_like(self.auto_mask, dtype=np.uint8)
+        self._sync_mask_to_frontend()
+        self._render()
+        self.status.value = (
+            "<span style='margin-left:12px'><b>Editable mask cleared.</b> "
+            "The automatic mask remains visible in orange as a guide.</span>"
+        )
+
+    def next(self):
+        if self.index < len(self.rows) - 1:
+            self.index += 1
+            self.load_current()
+
+    def previous(self):
+        if self.index > 0:
+            self.index -= 1
+            self.load_current()
+
+    def show(self):
+        from IPython.display import display
+        display(self.controls)
+        return self
+
 
 _AttentionMaskEditorV12 = AttentionMaskEditor
 
