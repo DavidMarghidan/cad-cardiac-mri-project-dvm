@@ -13302,7 +13302,17 @@ class AttentionEvaluationManager:
                 }
 
         patient_to_fold = AttentionDataManager.build_attention_patient_folds(samples)
-        review_rows = AttentionDataManager.read_attention_manifest(workspace)
+        try:
+            review_rows = AttentionDataManager.read_attention_manifest(workspace)
+        except FileNotFoundError:
+            try:
+                review_rows = MaskReviewManager.read_attention_full_review_manifest(
+                    workspace
+                )
+            except FileNotFoundError:
+                review_rows = MaskReviewManager.build_attention_full_review_manifest(
+                    samples, workspace
+                )
         review_by_token = {row["image_token"]: row for row in review_rows}
         review_tokens = set(review_by_token)
         pool = _StreamingHierarchicalAttentionPool(SETTINGS_ATTENTION.ATTENTION_FEATURE_MODES)
