@@ -77,8 +77,8 @@ CPU. Results are exploratory and not externally validated clinical outputs.
 # Important settings are summarized by RuntimeSettings, ValidationSettings,
 # MonaiSettings, FeatureBankSettings, AuditSettings, AttentionSettings and
 # ReviewSettings. Functional operations are grouped in manager classes near the
-# end of this file. Module-level aliases preserve the existing API and cached
-# workflow behavior.
+# end of this file. Operational code calls those class methods directly,
+# which keeps VS Code Outline authoritative and avoids a duplicate module API.
 # ---------------------------------------------------------------------------
 
 
@@ -1414,8 +1414,8 @@ class MRIDataset(Dataset):
         digest.update(np.asarray(image.shape, dtype=np.int32).tobytes())
         digest.update(image.tobytes(order="C"))
         decoded_pixel_hash = digest.hexdigest()
-        perceptual_hash = compute_dct_perceptual_hash(image)
-        provenance_features = compute_image_provenance_features(image, image_path)
+        perceptual_hash = ImagePreprocessor.compute_dct_perceptual_hash(image)
+        provenance_features = ImagePreprocessor.compute_image_provenance_features(image, image_path)
 
         (
             classifier_canvas,
@@ -1423,7 +1423,7 @@ class MRIDataset(Dataset):
             raw_canvas,
             padding_canvas,
             standardization_features,
-        ) = build_label_blind_standardized_image(image)
+        ) = ImagePreprocessor.build_label_blind_standardized_image(image)
 
         classifier_gray = cv2.resize(
             classifier_canvas, (SETTINGS_PREPROCESSING.IMG_SIZE, SETTINGS_PREPROCESSING.IMG_SIZE), interpolation=cv2.INTER_AREA
@@ -1574,7 +1574,7 @@ class FeatureExtractor(nn.Module):
         print(
             "[MODEL][EfficientNet] Backbone initialized and ImageNet "
             f"classifier removed in "
-            f"{_format_elapsed_time(time.perf_counter() - initialization_started_at)}.",
+            f"{RuntimeManager._format_elapsed_time(time.perf_counter() - initialization_started_at)}.",
             flush=True,
         )
 
@@ -2024,7 +2024,7 @@ class _AttentionManifestImageDataset(Dataset):
 
     def __getitem__(self, index):
         row = self.rows[index]
-        image = load_attention_segmentation_image(row)
+        image = AttentionDataManager.load_attention_segmentation_image(row)
         tensor = torch.from_numpy(image.astype(np.float32) / 255.0).unsqueeze(0)
         return tensor, int(index)
 
@@ -2047,7 +2047,7 @@ class AttentionConvBlock(nn.Module):
 
     def __init__(self, in_channels, out_channels):
         super().__init__()
-        groups = _group_count(out_channels)
+        groups = AttentionTrainingManager._group_count(out_channels)
         self.block = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, 3, padding=1, bias=False),
             nn.GroupNorm(groups, out_channels),
@@ -2066,7 +2066,7 @@ class AttentionGate(nn.Module):
 
     def __init__(self, gating_channels, skip_channels, inter_channels):
         super().__init__()
-        groups = _group_count(inter_channels)
+        groups = AttentionTrainingManager._group_count(inter_channels)
         self.gating_projection = nn.Sequential(
             nn.Conv2d(gating_channels, inter_channels, 1, bias=False),
             nn.GroupNorm(groups, inter_channels),
@@ -2173,8 +2173,8 @@ class AttentionMaskTrainingDataset(Dataset):
 
     def __getitem__(self, index):
         row = self.rows[index]
-        image = load_attention_segmentation_image(row)
-        mask_path, source = _resolved_training_mask(row)
+        image = AttentionDataManager.load_attention_segmentation_image(row)
+        mask_path, source = AttentionTrainingManager._resolved_training_mask(row)
         if mask_path is None:
             raise RuntimeError(
                 f"No manual or valid pseudo mask for {row['image_token']}."
@@ -2253,7 +2253,7 @@ class AttentionInferenceDataset(Dataset):
         if image is None:
             raise RuntimeError(f"Could not decode MRI image: {image_path}")
         decoded_hash = hashlib.sha256(np.ascontiguousarray(image).tobytes()).hexdigest()
-        monai_canvas, raw_224, content_224 = _load_attention_canvases(image_path)
+        monai_canvas, raw_224, content_224 = AttentionDataManager._load_attention_canvases(image_path)
         raw_3 = np.stack([raw_224] * 3, axis=0).astype(np.float32)
         return (
             torch.from_numpy(monai_canvas).unsqueeze(0),
@@ -2264,7 +2264,7 @@ class AttentionInferenceDataset(Dataset):
             str(series_id),
             int(index),
             decoded_hash,
-            attention_image_token(image_path, patient_id, series_id),
+            AttentionDataManager.attention_image_token(image_path, patient_id, series_id),
         )
 
 
@@ -2602,7 +2602,7 @@ class BaseAttentionMaskEditor:
 
     def load_current(self):
         row = self.rows[self.index]
-        image = load_attention_segmentation_image(row)
+        image = AttentionDataManager.load_attention_segmentation_image(row)
         automatic_path = self._automatic_mask_path(row)
         if not automatic_path.is_file():
             raise FileNotFoundError(
@@ -3043,7 +3043,7 @@ class BaseAttentionMaskEditor:
     def save(self):
         row = self.rows[self.index]
         path = Path(row["manual_mask_path"])
-        _atomic_cv2_write(
+        AttentionDataManager._atomic_cv2_write(
             path,
             self.mask.astype(np.uint8) * 255,
             required=True,
@@ -3055,7 +3055,7 @@ class BaseAttentionMaskEditor:
         overlay[..., 0] = np.maximum(overlay[..., 0], self.mask * 0.90)
         overlay[..., 1] *= (1.0 - 0.45 * self.mask)
         overlay[..., 2] *= (1.0 - 0.45 * self.mask)
-        _atomic_cv2_write(
+        AttentionDataManager._atomic_cv2_write(
             overlay_path,
             cv2.cvtColor(
                 np.clip(np.round(overlay * 255.0), 0, 255).astype(np.uint8),
@@ -3065,7 +3065,7 @@ class BaseAttentionMaskEditor:
             purpose="optional manual-mask review overlay",
         )
         row["manual_mask_exists"] = 1
-        write_attention_manifest(self.rows, self.workspace.manifest_csv)
+        AttentionDataManager.write_attention_manifest(self.rows, self.workspace.manifest_csv)
         print(f"[ATTENTION][EDITOR] Saved manual mask: {path}", flush=True)
 
     def reset(self):
@@ -3209,7 +3209,7 @@ class AttentionMaskEditor(BaseAttentionMaskEditor):
 
     def load_current(self):
         row = self.rows[self.index]
-        image = load_attention_segmentation_image(row)
+        image = AttentionDataManager.load_attention_segmentation_image(row)
         automatic_path = self._automatic_mask_path(row)
         automatic = cv2.imread(str(automatic_path), cv2.IMREAD_GRAYSCALE)
         if automatic is None:
@@ -3260,7 +3260,7 @@ class AttentionMaskEditor(BaseAttentionMaskEditor):
         )
 
     def _log(self, action, mask=None):
-        _review_append_review_event(
+        MaskReviewManager._review_append_review_event(
             self.workspace,
             self.rows[self.index],
             self.base_source,
@@ -3274,7 +3274,7 @@ class AttentionMaskEditor(BaseAttentionMaskEditor):
     def save(self):
         row = self.rows[self.index]
         path = Path(row["manual_mask_path"])
-        _atomic_cv2_write(
+        AttentionDataManager._atomic_cv2_write(
             path,
             self.mask.astype(np.uint8) * 255,
             required=True,
@@ -3288,7 +3288,7 @@ class AttentionMaskEditor(BaseAttentionMaskEditor):
         overlay[..., 0] = np.maximum(overlay[..., 0], self.mask * 0.90)
         overlay[..., 1] *= 1.0 - 0.45 * self.mask
         overlay[..., 2] *= 1.0 - 0.45 * self.mask
-        _atomic_cv2_write(
+        AttentionDataManager._atomic_cv2_write(
             overlay_path,
             cv2.cvtColor(
                 np.clip(np.round(overlay * 255.0), 0, 255).astype(np.uint8),
@@ -3417,7 +3417,7 @@ class RuntimeManager:
             requested = os.environ.get(
                 "CAD_RUNTIME_DEVICE", SETTINGS_RUNTIME.RUNTIME_DEVICE_POLICY
             )
-        policy, resolved = _resolve_requested_runtime_device(requested)
+        policy, resolved = RuntimeManager._resolve_requested_runtime_device(requested)
 
         if resolved == "cuda" and not torch.cuda.is_available():
             message = (
@@ -3459,7 +3459,7 @@ class RuntimeManager:
     def refresh_runtime_device(context="runtime"):
         """Refresh the current policy against the live Kaggle runtime."""
 
-        return set_runtime_device(
+        return RuntimeManager.set_runtime_device(
             requested=os.environ.get(
                 "CAD_RUNTIME_DEVICE", SETTINGS_RUNTIME.RUNTIME_DEVICE_POLICY
             ),
@@ -3562,19 +3562,19 @@ class RuntimeManager:
         )
         print("=" * 78, flush=True)
 
-        _synchronize_timing_device()
+        RuntimeManager._synchronize_timing_device()
         return time.perf_counter()
 
     @staticmethod
     def _print_stage_complete(stage_number, title, started_at, details=None):
         """Print measured stage duration and return it in seconds."""
 
-        _synchronize_timing_device()
+        RuntimeManager._synchronize_timing_device()
         elapsed = time.perf_counter() - started_at
 
         print(
             f"[PIPELINE {stage_number:02d}/{SETTINGS_REPORTING.PIPELINE_STAGE_COUNT:02d}] "
-            f"COMPLETED: {title} in {_format_elapsed_time(elapsed)}",
+            f"COMPLETED: {title} in {RuntimeManager._format_elapsed_time(elapsed)}",
             flush=True,
         )
 
@@ -3604,14 +3604,14 @@ class RuntimeManager:
 
         for stage_key, duration in stage_durations.items():
             print(
-                f"  {stage_key:<52} {_format_elapsed_time(duration):>20}",
+                f"  {stage_key:<52} {RuntimeManager._format_elapsed_time(duration):>20}",
                 flush=True,
             )
 
         print("-" * 78, flush=True)
         print(
             f"  {'TOTAL PIPELINE RUNTIME':<52} "
-            f"{_format_elapsed_time(total_elapsed):>20}",
+            f"{RuntimeManager._format_elapsed_time(total_elapsed):>20}",
             flush=True,
         )
         print("-" * 78, flush=True)
@@ -3628,7 +3628,7 @@ class RuntimeManager:
             sys.stdout = TeeStream(original_stdout, log_file)
             sys.stderr = TeeStream(original_stderr, log_file)
             try:
-                main()
+                PipelineRunner.main()
             except Exception:
                 print("\n[SUITE] FATAL ERROR", flush=True)
                 traceback.print_exc(file=sys.stdout)
@@ -3670,7 +3670,7 @@ class ConfigurationManager:
     def validate_configuration():
         """Fail before data loading when the final protocol is inconsistent."""
 
-        experiments = get_enabled_experiments()
+        experiments = ConfigurationManager.get_enabled_experiments()
         ids = [experiment.experiment_id for experiment in experiments]
         expected_ids = {
             SETTINGS_EXPERIMENTS.REFERENCE_EXPERIMENT_ID,
@@ -3794,7 +3794,7 @@ class ConfigurationManager:
         if SETTINGS_RUNTIME.USE_CUDA_AMP:
             raise ValueError("Deterministic final runs require USE_CUDA_AMP=False.")
 
-        run_exact_support_transform_contract_self_test()
+        FeatureBankManager.run_exact_support_transform_contract_self_test()
 
     @staticmethod
     def collect_suite_metadata(
@@ -3814,10 +3814,10 @@ class ConfigurationManager:
     ):
         """Collect compact reproducibility, cohort, audit and completion metadata."""
 
-        patient_ids, patient_labels = build_patient_label_table(
+        patient_ids, patient_labels = DuplicateAuditManager.build_patient_label_table(
             [sample[1] for sample in samples], [sample[2] for sample in samples]
         )
-        bundle_root = locate_monai_bundle_root()
+        bundle_root = MonaiSegmenter.locate_monai_bundle_root()
         model_path = bundle_root / "models" / "model.ts"
         return {
             "pipeline_schema": SETTINGS_RUNTIME.PIPELINE_SCHEMA_ID,
@@ -3833,7 +3833,7 @@ class ConfigurationManager:
             "feature_cache_status": cache_status,
             "reference_experiment_id": SETTINGS_EXPERIMENTS.REFERENCE_EXPERIMENT_ID,
             "primary_candidate_experiment_id": SETTINGS_EXPERIMENTS.PRIMARY_CANDIDATE_EXPERIMENT_ID,
-            "enabled_experiment_ids": [e.experiment_id for e in get_enabled_experiments()],
+            "enabled_experiment_ids": [e.experiment_id for e in ConfigurationManager.get_enabled_experiments()],
             "validation_runtime_profile": SETTINGS_VALIDATION.VALIDATION_RUNTIME_PROFILE,
             "device": DEVICE,
             "python_version": platform.python_version(),
@@ -3844,7 +3844,7 @@ class ConfigurationManager:
             "monai_bundle": SETTINGS_MONAI.MONAI_BUNDLE_NAME,
             "monai_bundle_version": SETTINGS_MONAI.MONAI_BUNDLE_VERSION,
             "monai_runtime_source": MONAI_RUNTIME_SOURCE,
-            "monai_model_ts_sha256": sha256_file(model_path) if model_path.is_file() else None,
+            "monai_model_ts_sha256": MonaiSegmenter.sha256_file(model_path) if model_path.is_file() else None,
             "exact_duplicate_audit": exact_summary,
             "perceptual_duplicate_audit": phash_summary,
             "monai_gate_comparison": standardized_monai_gate_comparison,
@@ -3953,15 +3953,15 @@ class ConfigurationManager:
         hard[0, 0, 80:130, 85:135] = 1.0
         valid = torch.tensor([True, False])
         content = torch.ones(2, 1, SETTINGS_PREPROCESSING.IMG_SIZE, SETTINGS_PREPROCESSING.IMG_SIZE)
-        support = create_attention_exact_support_mask(hard, valid, content)
+        support = AttentionTrainingManager.create_attention_exact_support_mask(hard, valid, content)
         if support.shape != hard.shape or not torch.any(support[1] > 0.5):
             raise RuntimeError("Attention support/fallback self-test failed.")
         raw = torch.linspace(0.0, 1.0, SETTINGS_PREPROCESSING.IMG_SIZE * SETTINGS_PREPROCESSING.IMG_SIZE).reshape(1, 1, SETTINGS_PREPROCESSING.IMG_SIZE, SETTINGS_PREPROCESSING.IMG_SIZE)
         raw = raw.repeat(2, 3, 1, 1)
-        au1 = _robust_scale_visible_regions(raw, support)
+        au1 = FeatureBankManager._robust_scale_visible_regions(raw, support)
         hashes = [hashlib.sha256(f"attention-test-{i}".encode()).hexdigest() for i in range(2)]
-        shuffled = create_attention_support_shuffled_images(au1, support, hashes)
-        complement = _robust_scale_visible_regions(raw, 1.0 - support)
+        shuffled = AttentionTrainingManager.create_attention_support_shuffled_images(au1, support, hashes)
+        complement = FeatureBankManager._robust_scale_visible_regions(raw, 1.0 - support)
         for index in range(2):
             mask = support[index, 0].reshape(-1) > 0.5
             original_values = np.sort(au1[index, 0].reshape(-1)[mask].numpy())
@@ -4074,7 +4074,7 @@ class ImagePreprocessor:
         while (
             top_crop < maximum_vertical_crop
             and height - (top_crop + 1) >= minimum_height
-            and _is_dark_uniform_edge_line(image[top_crop, :])
+            and ImagePreprocessor._is_dark_uniform_edge_line(image[top_crop, :])
         ):
             top_crop += 1
 
@@ -4082,7 +4082,7 @@ class ImagePreprocessor:
         while (
             bottom_crop < maximum_vertical_crop
             and height - top_crop - (bottom_crop + 1) >= minimum_height
-            and _is_dark_uniform_edge_line(image[height - 1 - bottom_crop, :])
+            and ImagePreprocessor._is_dark_uniform_edge_line(image[height - 1 - bottom_crop, :])
         ):
             bottom_crop += 1
 
@@ -4090,7 +4090,7 @@ class ImagePreprocessor:
         while (
             left_crop < maximum_horizontal_crop
             and width - (left_crop + 1) >= minimum_width
-            and _is_dark_uniform_edge_line(image[:, left_crop])
+            and ImagePreprocessor._is_dark_uniform_edge_line(image[:, left_crop])
         ):
             left_crop += 1
 
@@ -4098,7 +4098,7 @@ class ImagePreprocessor:
         while (
             right_crop < maximum_horizontal_crop
             and width - left_crop - (right_crop + 1) >= minimum_width
-            and _is_dark_uniform_edge_line(image[:, width - 1 - right_crop])
+            and ImagePreprocessor._is_dark_uniform_edge_line(image[:, width - 1 - right_crop])
         ):
             right_crop += 1
 
@@ -4230,7 +4230,7 @@ class ImagePreprocessor:
 
         height, width = image.shape
         resized_height, resized_width, top, left, scale = (
-            _fixed_content_canvas_geometry(height, width)
+            ImagePreprocessor._fixed_content_canvas_geometry(height, width)
         )
         if resized_height != height or resized_width != width:
             interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
@@ -4268,7 +4268,7 @@ class ImagePreprocessor:
         """
 
         resized_height, resized_width, top, left, _ = (
-            _fixed_content_canvas_geometry(height, width)
+            ImagePreprocessor._fixed_content_canvas_geometry(height, width)
         )
         canvas = np.ones(
             (SETTINGS_MONAI.MONAI_INPUT_SIZE, SETTINGS_MONAI.MONAI_INPUT_SIZE),
@@ -4322,23 +4322,23 @@ class ImagePreprocessor:
             )
 
         height, width = image.shape
-        top, bottom, left, right = detect_label_blind_dark_padding_bounds(image)
+        top, bottom, left, right = ImagePreprocessor.detect_label_blind_dark_padding_bounds(image)
         cropped = image[top:bottom, left:right]
         if cropped.size == 0:
             raise RuntimeError("Label-blind standardization produced an empty crop.")
 
-        robust_scaled, lower, upper = robust_scale_intensity_0_1(cropped)
-        monai_scaled = scale_intensity_0_1(cropped)
+        robust_scaled, lower, upper = ImagePreprocessor.robust_scale_intensity_0_1(cropped)
+        monai_scaled = ImagePreprocessor.scale_intensity_0_1(cropped)
         raw_scaled = cropped.astype(np.float32) / 255.0
 
         robust_canvas, resized_height, resized_width = (
-            resize_to_fixed_content_canvas(robust_scaled)
+            ImagePreprocessor.resize_to_fixed_content_canvas(robust_scaled)
         )
         monai_canvas, monai_height, monai_width = (
-            resize_to_fixed_content_canvas(monai_scaled)
+            ImagePreprocessor.resize_to_fixed_content_canvas(monai_scaled)
         )
         raw_canvas, raw_height, raw_width = (
-            resize_to_fixed_content_canvas(raw_scaled)
+            ImagePreprocessor.resize_to_fixed_content_canvas(raw_scaled)
         )
         if (
             (resized_height, resized_width) != (monai_height, monai_width)
@@ -4350,7 +4350,7 @@ class ImagePreprocessor:
             )
 
         padding_canvas, padding_height, padding_width = (
-            build_fixed_content_padding_canvas(*cropped.shape)
+            ImagePreprocessor.build_fixed_content_padding_canvas(*cropped.shape)
         )
         if (resized_height, resized_width) != (padding_height, padding_width):
             raise RuntimeError(
@@ -4702,7 +4702,7 @@ class DatasetManager:
                 f"[DATA] Finished {class_name}: "
                 f"patients_added={len(discovered_patients) - class_start_patients}, "
                 f"images_added={len(samples) - class_start_images}, "
-                f"elapsed={_format_elapsed_time(class_elapsed)}",
+                f"elapsed={RuntimeManager._format_elapsed_time(class_elapsed)}",
                 flush=True,
             )
 
@@ -4754,7 +4754,7 @@ class DatasetManager:
         print(f"  Series proxies: {len(set(sample[3] for sample in samples))}")
         print(
             "[DATA] Dataset discovery completed in "
-            f"{_format_elapsed_time(time.perf_counter() - discovery_started_at)}",
+            f"{RuntimeManager._format_elapsed_time(time.perf_counter() - discovery_started_at)}",
             flush=True,
         )
 
@@ -4956,7 +4956,7 @@ class MonaiSegmenter:
 
         # Calculate the digest immediately before use. A cached filename alone
         # is not sufficient evidence that the intended bytes are present.
-        actual_sha256 = sha256_file(path)
+        actual_sha256 = MonaiSegmenter.sha256_file(path)
 
         if actual_sha256.lower() != expected_sha256.lower():
             raise RuntimeError(
@@ -4981,7 +4981,7 @@ class MonaiSegmenter:
         """
 
         ensure_started_at = time.perf_counter()
-        _print_detail(
+        RuntimeManager._print_detail(
             "Checking whether the pinned MONAI bundle files are already present."
         )
 
@@ -4999,8 +4999,8 @@ class MonaiSegmenter:
 
         # Resolve a local candidate and identify exactly which requested files
         # are absent before deciding whether network access is necessary.
-        bundle_root = locate_monai_bundle_root()
-        _print_detail(f"MONAI bundle root resolved to: {bundle_root}")
+        bundle_root = MonaiSegmenter.locate_monai_bundle_root()
+        RuntimeManager._print_detail(f"MONAI bundle root resolved to: {bundle_root}")
         missing = [
             relative_path
             for relative_path in required_relative_paths
@@ -5008,11 +5008,11 @@ class MonaiSegmenter:
         ]
 
         if not missing:
-            validate_monai_bundle_metadata(bundle_root)
+            MonaiSegmenter.validate_monai_bundle_metadata(bundle_root)
             elapsed = time.perf_counter() - ensure_started_at
             print(
                 f"[MODEL][MONAI] Required pinned files are already cached at "
-                f"{bundle_root} (check completed in {_format_elapsed_time(elapsed)}).",
+                f"{bundle_root} (check completed in {RuntimeManager._format_elapsed_time(elapsed)}).",
                 flush=True,
             )
             return bundle_root
@@ -5063,7 +5063,7 @@ class MonaiSegmenter:
 
         print(
             "[MODEL][MONAI] Download call completed in "
-            f"{_format_elapsed_time(time.perf_counter() - download_started_at)}.",
+            f"{RuntimeManager._format_elapsed_time(time.perf_counter() - download_started_at)}.",
             flush=True,
         )
 
@@ -5080,11 +5080,11 @@ class MonaiSegmenter:
                 f"remain missing under {bundle_root}:\n  - {formatted}"
             )
 
-        validate_monai_bundle_metadata(bundle_root)
+        MonaiSegmenter.validate_monai_bundle_metadata(bundle_root)
         elapsed = time.perf_counter() - ensure_started_at
         print(
             f"[MODEL][MONAI] Pinned files are ready and cached at {bundle_root}. "
-            f"Total preparation time: {_format_elapsed_time(elapsed)}",
+            f"Total preparation time: {RuntimeManager._format_elapsed_time(elapsed)}",
             flush=True,
         )
         return bundle_root
@@ -5103,7 +5103,7 @@ class MonaiSegmenter:
         global MONAI_RUNTIME_SOURCE, MONAI_RUNTIME_ARTIFACT_PATH, DEVICE
 
         load_started_at = time.perf_counter()
-        primary_device = refresh_runtime_device(
+        primary_device = RuntimeManager.refresh_runtime_device(
             f"loading {source_description}"
         )
         attempt_devices = [primary_device]
@@ -5153,7 +5153,7 @@ class MonaiSegmenter:
                     dtype=torch.float32,
                 )
 
-                _print_detail(
+                RuntimeManager._print_detail(
                     "Running MONAI zero-input shape/finite-value validation on "
                     f"{runtime_device}."
                 )
@@ -5194,7 +5194,7 @@ class MonaiSegmenter:
                 elapsed = time.perf_counter() - load_started_at
                 print(
                     f"[MODEL][MONAI] Loaded and validated {source_description} on "
-                    f"{runtime_device} in {_format_elapsed_time(elapsed)}; "
+                    f"{runtime_device} in {RuntimeManager._format_elapsed_time(elapsed)}; "
                     f"output_shape={tuple(example_output.shape)}.",
                     flush=True,
                 )
@@ -5302,7 +5302,7 @@ class MonaiSegmenter:
         strict weight loading and local TorchScript export.
         """
 
-        refresh_runtime_device("building MONAI segmenter")
+        RuntimeManager.refresh_runtime_device("building MONAI segmenter")
 
         build_started_at = time.perf_counter()
         print(
@@ -5324,7 +5324,7 @@ class MonaiSegmenter:
         # =========================================================
 
         if not SETTINGS_MONAI.FORCE_REBUILD_MONAI_TORCHSCRIPT:
-            bundle_root = ensure_monai_bundle(
+            bundle_root = MonaiSegmenter.ensure_monai_bundle(
                 (
                     "models/model.ts",
                     "configs/metadata.json",
@@ -5332,21 +5332,21 @@ class MonaiSegmenter:
             )
             official_torchscript_path = bundle_root / "models" / "model.ts"
 
-            verify_monai_artifact_sha256(
+            MonaiSegmenter.verify_monai_artifact_sha256(
                 official_torchscript_path,
                 SETTINGS_MONAI.MONAI_OFFICIAL_TORCHSCRIPT_SHA256,
                 "Official MONAI models/model.ts",
             )
 
             try:
-                network = load_and_validate_torchscript_segmenter(
+                network = MonaiSegmenter.load_and_validate_torchscript_segmenter(
                     official_torchscript_path,
                     "official pinned MONAI TorchScript segmenter",
                 )
                 print(
                     "[MODEL][MONAI] Segmenter preparation completed through the "
                     f"preferred official path in "
-                    f"{_format_elapsed_time(time.perf_counter() - build_started_at)}.",
+                    f"{RuntimeManager._format_elapsed_time(time.perf_counter() - build_started_at)}.",
                     flush=True,
                 )
                 return network
@@ -5368,14 +5368,14 @@ class MonaiSegmenter:
             and not SETTINGS_MONAI.FORCE_REBUILD_MONAI_TORCHSCRIPT
         ):
             try:
-                network = load_and_validate_torchscript_segmenter(
+                network = MonaiSegmenter.load_and_validate_torchscript_segmenter(
                     SETTINGS_MONAI.MONAI_TORCHSCRIPT_PATH,
                     "locally reconstructed MONAI TorchScript cache",
                 )
                 print(
                     "[MODEL][MONAI] Segmenter preparation completed through the "
                     f"local fallback cache in "
-                    f"{_format_elapsed_time(time.perf_counter() - build_started_at)}.",
+                    f"{RuntimeManager._format_elapsed_time(time.perf_counter() - build_started_at)}.",
                     flush=True,
                 )
                 return network
@@ -5390,7 +5390,7 @@ class MonaiSegmenter:
         # EXCEPTIONAL FALLBACK: model.pt + LAZY MONAI IMPORT
         # =========================================================
 
-        bundle_root = ensure_monai_bundle(
+        bundle_root = MonaiSegmenter.ensure_monai_bundle(
             (
                 "models/model.pt",
                 "configs/train.json",
@@ -5399,12 +5399,12 @@ class MonaiSegmenter:
         )
         model_path = bundle_root / "models" / "model.pt"
 
-        verify_monai_artifact_sha256(
+        MonaiSegmenter.verify_monai_artifact_sha256(
             model_path,
             SETTINGS_MONAI.MONAI_MODEL_SHA256,
             "Official MONAI models/model.pt",
         )
-        validate_monai_train_config(bundle_root)
+        MonaiSegmenter.validate_monai_train_config(bundle_root)
 
         print(
             "Reconstructing the pinned MONAI UNet from model.pt. This exceptional "
@@ -5442,7 +5442,7 @@ class MonaiSegmenter:
 
         print(
             "[MODEL][MONAI] MONAI import completed in "
-            f"{_format_elapsed_time(time.perf_counter() - monai_import_started_at)}.",
+            f"{RuntimeManager._format_elapsed_time(time.perf_counter() - monai_import_started_at)}.",
             flush=True,
         )
 
@@ -5456,11 +5456,11 @@ class MonaiSegmenter:
         )
 
         checkpoint_started_at = time.perf_counter()
-        _print_detail(f"Loading MONAI fallback state dictionary: {model_path}")
-        state_dict = load_checkpoint_state_dict(model_path)
-        _print_detail(
+        RuntimeManager._print_detail(f"Loading MONAI fallback state dictionary: {model_path}")
+        state_dict = MonaiSegmenter.load_checkpoint_state_dict(model_path)
+        RuntimeManager._print_detail(
             "MONAI fallback checkpoint loaded in "
-            f"{_format_elapsed_time(time.perf_counter() - checkpoint_started_at)}."
+            f"{RuntimeManager._format_elapsed_time(time.perf_counter() - checkpoint_started_at)}."
         )
 
         # strict=True fails on missing/unexpected keys instead of silently running a
@@ -5501,7 +5501,7 @@ class MonaiSegmenter:
 
         print(
             "[MODEL][MONAI] Trace creation and first validation inference completed "
-            f"in {_format_elapsed_time(time.perf_counter() - trace_started_at)}.",
+            f"in {RuntimeManager._format_elapsed_time(time.perf_counter() - trace_started_at)}.",
             flush=True,
         )
 
@@ -5548,13 +5548,13 @@ class MonaiSegmenter:
             f"{SETTINGS_MONAI.MONAI_TORCHSCRIPT_PATH}"
         )
 
-        network = load_and_validate_torchscript_segmenter(
+        network = MonaiSegmenter.load_and_validate_torchscript_segmenter(
             SETTINGS_MONAI.MONAI_TORCHSCRIPT_PATH,
             "newly reconstructed MONAI TorchScript cache",
         )
         print(
             "[MODEL][MONAI] Exceptional fallback preparation completed in "
-            f"{_format_elapsed_time(time.perf_counter() - build_started_at)}.",
+            f"{RuntimeManager._format_elapsed_time(time.perf_counter() - build_started_at)}.",
             flush=True,
         )
         return network
@@ -5840,7 +5840,7 @@ class FeatureBankManager:
         configuration = {
             "schema": SETTINGS_FEATURE_BANK.FEATURE_CACHE_SCHEMA,
             "dataset_path": str(Path(dataset_path).resolve()),
-            "required_modes": list(required_efficientnet_feature_modes(get_enabled_experiments())),
+            "required_modes": list(FeatureBankManager.required_efficientnet_feature_modes(ConfigurationManager.get_enabled_experiments())),
             "img_size": SETTINGS_PREPROCESSING.IMG_SIZE,
             "monai_input_size": SETTINGS_MONAI.MONAI_INPUT_SIZE,
             "standardized_content_long_side": SETTINGS_PREPROCESSING.STANDARDIZED_CONTENT_LONG_SIDE,
@@ -5857,7 +5857,7 @@ class FeatureBankManager:
             "shuffle_schema": SETTINGS_PREPROCESSING.SUPPORT_INTENSITY_SHUFFLE_SCHEMA,
             "monai_bundle": [SETTINGS_MONAI.MONAI_BUNDLE_NAME, SETTINGS_MONAI.MONAI_BUNDLE_VERSION, SETTINGS_MONAI.MONAI_HF_REVISION],
             "efficientnet_weights": SETTINGS_FEATURE_BANK.EFFICIENTNET_WEIGHTS_NAME,
-            "device_tag": resolved_feature_cache_device_tag(),
+            "device_tag": RuntimeManager.resolved_feature_cache_device_tag(),
             "use_cuda_amp": SETTINGS_RUNTIME.USE_CUDA_AMP,
         }
         hasher.update(json.dumps(configuration, sort_keys=True).encode("utf-8"))
@@ -5882,7 +5882,7 @@ class FeatureBankManager:
         digest = hasher.hexdigest()
         print(
             f"[FEATURE BANK] Fingerprint completed in "
-            f"{_format_elapsed_time(time.perf_counter() - started)}: {digest[:16]}...",
+            f"{RuntimeManager._format_elapsed_time(time.perf_counter() - started)}: {digest[:16]}...",
             flush=True,
         )
         return digest
@@ -5916,13 +5916,13 @@ class FeatureBankManager:
         """Load a complete matching feature bank through memory maps."""
 
         metadata_path = cache_dir / "metadata.json"
-        shared_paths = _feature_bank_shared_paths(cache_dir)
+        shared_paths = FeatureBankManager._feature_bank_shared_paths(cache_dir)
 
         if not metadata_path.is_file():
             return None
         if not all(path.is_file() for path in shared_paths.values()):
             return None
-        if not all(_feature_mode_path(cache_dir, mode).is_file() for mode in required_modes):
+        if not all(FeatureBankManager._feature_mode_path(cache_dir, mode).is_file() for mode in required_modes):
             return None
 
         try:
@@ -5956,7 +5956,7 @@ class FeatureBankManager:
             "metadata": metadata,
             "features": {
                 mode: np.load(
-                    _feature_mode_path(cache_dir, mode),
+                    FeatureBankManager._feature_mode_path(cache_dir, mode),
                     mmap_mode="r",
                     allow_pickle=False,
                 )
@@ -5976,7 +5976,7 @@ class FeatureBankManager:
 
         print(
             "[FEATURE BANK] Cache hit loaded in "
-            f"{_format_elapsed_time(time.perf_counter() - started_at)}; "
+            f"{RuntimeManager._format_elapsed_time(time.perf_counter() - started_at)}; "
             f"slices={n_slices}, modes={list(required_modes)}.",
             flush=True,
         )
@@ -6016,13 +6016,13 @@ class FeatureBankManager:
         retains every slice and makes fallback content deterministic and label-blind.
         """
 
-        strict_roi = apply_confidence_gated_soft_roi(
+        strict_roi = MonaiSegmenter.apply_confidence_gated_soft_roi(
             images,
             roi_probability,
             valid_mask,
             background_weight=0.0,
         )
-        fixed_center = create_fixed_fraction_center_crop_images(
+        fixed_center = FeatureBankManager.create_fixed_fraction_center_crop_images(
             images,
             fallback_fraction,
         )
@@ -6191,7 +6191,7 @@ class FeatureBankManager:
         )
 
         batch_size, _, height, width = hard_mask.shape
-        fallback = _fixed_central_square_mask(
+        fallback = FeatureBankManager._fixed_central_square_mask(
             batch_size,
             height,
             width,
@@ -6219,12 +6219,12 @@ class FeatureBankManager:
     ):
         """Create A17 from the exact binary support without soft confidence."""
 
-        visible = create_a17_exact_support_mask(
+        visible = FeatureBankManager.create_a17_exact_support_mask(
             hard_mask,
             valid_mask,
             content_mask,
         )
-        return _robust_scale_visible_regions(raw_images, visible)
+        return FeatureBankManager._robust_scale_visible_regions(raw_images, visible)
 
     @staticmethod
     def create_a17_exact_support_mask_only_images(
@@ -6234,7 +6234,7 @@ class FeatureBankManager:
     ):
         """Create C31: the exact A17 support with every MRI intensity removed."""
 
-        support = create_a17_exact_support_mask(
+        support = FeatureBankManager.create_a17_exact_support_mask(
             hard_mask,
             valid_mask,
             content_mask,
@@ -6306,12 +6306,12 @@ class FeatureBankManager:
                 "decoded_pixel_hashes length must match the image batch size."
             )
 
-        support = create_a17_exact_support_mask(
+        support = FeatureBankManager.create_a17_exact_support_mask(
             hard_mask,
             valid_mask,
             content_mask,
         )
-        scaled = _robust_scale_visible_regions(raw_images, support)
+        scaled = FeatureBankManager._robust_scale_visible_regions(raw_images, support)
         output_gray = torch.zeros_like(scaled[:, 0:1])
 
         for index, decoded_hash in enumerate(decoded_pixel_hashes):
@@ -6321,7 +6321,7 @@ class FeatureBankManager:
                 continue
 
             source_values = scaled[index, 0].reshape(-1)[flat_mask]
-            multiplier, offset = _affine_permutation_parameters(
+            multiplier, offset = FeatureBankManager._affine_permutation_parameters(
                 decoded_hash,
                 n_visible,
             )
@@ -6346,7 +6346,7 @@ class FeatureBankManager:
     ):
         """Create C33 from the exact non-padding complement of the A17 support."""
 
-        support = create_a17_exact_support_mask(
+        support = FeatureBankManager.create_a17_exact_support_mask(
             hard_mask,
             valid_mask,
             content_mask,
@@ -6355,7 +6355,7 @@ class FeatureBankManager:
             (content_mask > 0.5).to(raw_images.dtype)
             - (support > 0.5).to(raw_images.dtype)
         ).clamp(0.0, 1.0)
-        return _robust_scale_visible_regions(raw_images, visible)
+        return FeatureBankManager._robust_scale_visible_regions(raw_images, visible)
 
     @staticmethod
     def run_exact_support_transform_contract_self_test():
@@ -6386,22 +6386,22 @@ class FeatureBankManager:
         content[:, :, :, -2:] = 0.0
         decoded_hashes = ("a" * 64, "b" * 64)
 
-        support = create_a17_exact_support_mask(hard, valid, content)
-        a17 = create_hard_support_region_normalized_images(
+        support = FeatureBankManager.create_a17_exact_support_mask(hard, valid, content)
+        a17 = FeatureBankManager.create_hard_support_region_normalized_images(
             raw,
             hard,
             valid,
             content,
         )
-        c31 = create_a17_exact_support_mask_only_images(hard, valid, content)
-        c32 = create_a17_support_intensity_affine_shuffled_images(
+        c31 = FeatureBankManager.create_a17_exact_support_mask_only_images(hard, valid, content)
+        c32 = FeatureBankManager.create_a17_support_intensity_affine_shuffled_images(
             raw,
             hard,
             valid,
             content,
             decoded_hashes,
         )
-        c33 = create_a17_exact_support_complement_region_normalized_images(
+        c33 = FeatureBankManager.create_a17_exact_support_complement_region_normalized_images(
             raw,
             hard,
             valid,
@@ -6434,7 +6434,7 @@ class FeatureBankManager:
                     "self-test failed: C32 spatial assignment was unchanged."
                 )
 
-        c32_repeat = create_a17_support_intensity_affine_shuffled_images(
+        c32_repeat = FeatureBankManager.create_a17_support_intensity_affine_shuffled_images(
             raw,
             hard,
             valid,
@@ -6448,7 +6448,7 @@ class FeatureBankManager:
         changed_outside[(1.0 - support).repeat(1, 3, 1, 1) > 0.5] = 0.987
         if not torch.equal(
             a17,
-            create_hard_support_region_normalized_images(
+            FeatureBankManager.create_hard_support_region_normalized_images(
                 changed_outside,
                 hard,
                 valid,
@@ -6463,7 +6463,7 @@ class FeatureBankManager:
         changed_inside[support.repeat(1, 3, 1, 1) > 0.5] = 0.123
         if not torch.equal(
             c33,
-            create_a17_exact_support_complement_region_normalized_images(
+            FeatureBankManager.create_a17_exact_support_complement_region_normalized_images(
                 changed_inside,
                 hard,
                 valid,
@@ -6488,7 +6488,7 @@ class FeatureBankManager:
         # Check that the affine mapping is a genuine bijection for representative
         # small and realistic support sizes rather than an accidental identity map.
         for n_values in (2, 3, 17, 64, 997, 10_000):
-            multiplier, offset = _affine_permutation_parameters(
+            multiplier, offset = FeatureBankManager._affine_permutation_parameters(
                 "self-test",
                 n_values,
             )
@@ -6508,7 +6508,7 @@ class FeatureBankManager:
     def _fixed_central_square_mask(batch_size, height, width, fraction, device, dtype):
         """Create one MONAI-independent central square mask for an entire batch."""
 
-        top, bottom, left, right = _fixed_square_bounds(
+        top, bottom, left, right = FeatureBankManager._fixed_square_bounds(
             height,
             width,
             (height - 1) / 2.0,
@@ -6524,7 +6524,7 @@ class FeatureBankManager:
         """Retain only a fixed MONAI-independent periphery with local scaling."""
 
         batch_size, _, height, width = raw_images.shape
-        exclusion = _fixed_central_square_mask(
+        exclusion = FeatureBankManager._fixed_central_square_mask(
             batch_size,
             height,
             width,
@@ -6533,7 +6533,7 @@ class FeatureBankManager:
             raw_images.dtype,
         )
         visible = (1.0 - exclusion) * content_mask
-        return _robust_scale_visible_regions(raw_images, visible)
+        return FeatureBankManager._robust_scale_visible_regions(raw_images, visible)
 
     @staticmethod
     def extract_feature_bank(
@@ -6552,7 +6552,7 @@ class FeatureBankManager:
         memory maps; metadata.json is the final cache-completion marker.
         """
 
-        allowed_modes = set(required_efficientnet_feature_modes(SETTINGS_EXPERIMENTS.EXPERIMENT_REGISTRY))
+        allowed_modes = set(FeatureBankManager.required_efficientnet_feature_modes(SETTINGS_EXPERIMENTS.EXPERIMENT_REGISTRY))
         unknown = set(required_modes) - allowed_modes
         if not required_modes or unknown:
             raise ValueError(f"Invalid feature modes: {sorted(unknown)}")
@@ -6570,7 +6570,7 @@ class FeatureBankManager:
 
         feature_maps = {
             mode: np.lib.format.open_memmap(
-                _feature_mode_path(cache_dir, mode),
+                FeatureBankManager._feature_mode_path(cache_dir, mode),
                 mode="w+",
                 dtype=np.float32,
                 shape=(n_slices, SETTINGS_FEATURE_BANK.EFFICIENTNET_FEATURE_DIM),
@@ -6651,7 +6651,7 @@ class FeatureBankManager:
                         area_ratio,
                         peak_probability,
                         mean_foreground_probability,
-                    ) = predict_monai_heart_masks(
+                    ) = MonaiSegmenter.predict_monai_heart_masks(
                         standardized_monai_images,
                         classifier_size=standardized_images.shape[-2:],
                         monai_segmenter=monai_segmenter,
@@ -6661,7 +6661,7 @@ class FeatureBankManager:
                 variants = {}
                 if "standardized_roi_zero_bg_center_fallback" in required_modes:
                     variants["standardized_roi_zero_bg_center_fallback"] = (
-                        apply_zero_background_roi_with_fixed_center_fallback(
+                        FeatureBankManager.apply_zero_background_roi_with_fixed_center_fallback(
                             standardized_images,
                             roi_probability,
                             valid_mask,
@@ -6670,25 +6670,25 @@ class FeatureBankManager:
                     )
                 if "standardized_hard_support_region_norm" in required_modes:
                     variants["standardized_hard_support_region_norm"] = (
-                        create_hard_support_region_normalized_images(
+                        FeatureBankManager.create_hard_support_region_normalized_images(
                             standardized_raw_images, hard_mask, valid_mask, content_mask
                         )
                     )
                 if "standardized_fixed_periphery_region_norm" in required_modes:
                     variants["standardized_fixed_periphery_region_norm"] = (
-                        create_fixed_periphery_region_normalized_images(
+                        FeatureBankManager.create_fixed_periphery_region_normalized_images(
                             standardized_raw_images, content_mask
                         )
                     )
                 if "standardized_a17_exact_support_mask_only" in required_modes:
                     variants["standardized_a17_exact_support_mask_only"] = (
-                        create_a17_exact_support_mask_only_images(
+                        FeatureBankManager.create_a17_exact_support_mask_only_images(
                             hard_mask, valid_mask, content_mask
                         )
                     )
                 if "standardized_a17_support_intensity_affine_shuffled" in required_modes:
                     variants["standardized_a17_support_intensity_affine_shuffled"] = (
-                        create_a17_support_intensity_affine_shuffled_images(
+                        FeatureBankManager.create_a17_support_intensity_affine_shuffled_images(
                             standardized_raw_images,
                             hard_mask,
                             valid_mask,
@@ -6698,7 +6698,7 @@ class FeatureBankManager:
                     )
                 if "standardized_a17_exact_support_complement_region_norm" in required_modes:
                     variants["standardized_a17_exact_support_complement_region_norm"] = (
-                        create_a17_exact_support_complement_region_normalized_images(
+                        FeatureBankManager.create_a17_exact_support_complement_region_normalized_images(
                             standardized_raw_images, hard_mask, valid_mask, content_mask
                         )
                     )
@@ -6711,7 +6711,7 @@ class FeatureBankManager:
                         device_type="cuda", dtype=torch.float16, enabled=autocast_enabled
                     ):
                         encoded = feature_extractor(
-                            normalize_for_efficientnet(concatenated)
+                            MonaiSegmenter.normalize_for_efficientnet(concatenated)
                         ).float()
                     expected_rows = len(indices) * len(chunk_modes)
                     if encoded.shape != (expected_rows, SETTINGS_FEATURE_BANK.EFFICIENTNET_FEATURE_DIM):
@@ -6741,15 +6741,15 @@ class FeatureBankManager:
 
                 processed += len(indices)
                 if batch_index == 1 or batch_index % progress_interval == 0 or batch_index == total_batches:
-                    _synchronize_timing_device()
+                    RuntimeManager._synchronize_timing_device()
                     elapsed = time.perf_counter() - started
                     rate = processed / max(elapsed, 1e-8)
                     eta = (n_slices - processed) / max(rate, 1e-8)
                     print(
                         f"[FEATURE BANK] {processed}/{n_slices} "
                         f"({100.0 * processed / n_slices:.1f}%) | "
-                        f"rate={rate:.2f} slices/s | ETA={_format_elapsed_time(eta)} | "
-                        f"batch={_format_elapsed_time(time.perf_counter() - batch_started)}",
+                        f"rate={rate:.2f} slices/s | ETA={RuntimeManager._format_elapsed_time(eta)} | "
+                        f"batch={RuntimeManager._format_elapsed_time(time.perf_counter() - batch_started)}",
                         flush=True,
                     )
 
@@ -6777,7 +6777,7 @@ class FeatureBankManager:
             "standardized_mean_foreground_probabilities": foreground_probability_array,
         }
         for name, array in shared_arrays.items():
-            np.save(_feature_bank_shared_paths(cache_dir)[name], np.asarray(array), allow_pickle=False)
+            np.save(FeatureBankManager._feature_bank_shared_paths(cache_dir)[name], np.asarray(array), allow_pickle=False)
 
         metadata = {
             "fingerprint": fingerprint,
@@ -6793,13 +6793,13 @@ class FeatureBankManager:
         (cache_dir / "metadata.json").write_text(
             json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8"
         )
-        _synchronize_timing_device()
+        RuntimeManager._synchronize_timing_device()
         print(
             "[FEATURE BANK] Extraction and cache write completed in "
-            f"{_format_elapsed_time(time.perf_counter() - started)}.",
+            f"{RuntimeManager._format_elapsed_time(time.perf_counter() - started)}.",
             flush=True,
         )
-        loaded = load_feature_bank(cache_dir, fingerprint, required_modes)
+        loaded = FeatureBankManager.load_feature_bank(cache_dir, fingerprint, required_modes)
         if loaded is None:
             raise RuntimeError("Freshly written feature bank could not be reloaded.")
         return loaded
@@ -6809,7 +6809,7 @@ class FeatureBankManager:
         """Load a matching bank or perform one fresh multi-view extraction."""
 
         if SETTINGS_FEATURE_BANK.USE_FEATURE_CACHE and not SETTINGS_FEATURE_BANK.FORCE_REBUILD_FEATURE_CACHE:
-            bank = load_feature_bank(cache_dir, fingerprint, required_modes)
+            bank = FeatureBankManager.load_feature_bank(cache_dir, fingerprint, required_modes)
             if bank is not None:
                 return bank, "HIT"
 
@@ -6841,7 +6841,7 @@ class FeatureBankManager:
         need_monai = any(
             mode in monai_dependent_modes for mode in required_modes
         )
-        monai_segmenter = build_monai_segmenter() if need_monai else None
+        monai_segmenter = MonaiSegmenter.build_monai_segmenter() if need_monai else None
 
         feature_extractor = FeatureExtractor().to(DEVICE)
         feature_extractor.eval()
@@ -6852,7 +6852,7 @@ class FeatureBankManager:
             if SETTINGS_FEATURE_BANK.USE_FEATURE_CACHE
             else SETTINGS_PATHS.OUTPUT_DIR / "_runtime_feature_bank"
         )
-        bank = extract_feature_bank(
+        bank = FeatureBankManager.extract_feature_bank(
             dataset=dataset,
             monai_segmenter=monai_segmenter,
             feature_extractor=feature_extractor,
@@ -7073,8 +7073,8 @@ class DuplicateAuditManager:
             title_b = (
                 f"B: {row['patient_id_b']} | pHash={row['example_phash_b']}"
             )
-            tile_a = _prepare_phash_review_tile(row["example_image_a"], title_a)
-            tile_b = _prepare_phash_review_tile(row["example_image_b"], title_b)
+            tile_a = DuplicateAuditManager._prepare_phash_review_tile(row["example_image_a"], title_a)
+            tile_b = DuplicateAuditManager._prepare_phash_review_tile(row["example_image_b"], title_b)
             panel = np.concatenate([tile_a, tile_b], axis=1)
             footer = np.zeros((70, panel.shape[1], 3), dtype=np.uint8)
             footer_text = (
@@ -7283,8 +7283,8 @@ class DuplicateAuditManager:
                     "[PERCEPTUAL DUPLICATES] "
                     f"{hash_index}/{len(unique_hashes)} hashes "
                     f"({100.0 * hash_index / max(len(unique_hashes), 1):.0f}%) | "
-                    f"elapsed={_format_elapsed_time(elapsed)} | "
-                    f"ETA={_format_elapsed_time(eta)}",
+                    f"elapsed={RuntimeManager._format_elapsed_time(elapsed)} | "
+                    f"ETA={RuntimeManager._format_elapsed_time(eta)}",
                     flush=True,
                 )
 
@@ -7299,7 +7299,7 @@ class DuplicateAuditManager:
         )
 
         review_panel_directory = output_path.parent / "phash_review_panels"
-        write_phash_review_panels(rows, review_panel_directory)
+        DuplicateAuditManager.write_phash_review_panels(rows, review_panel_directory)
 
         fieldnames = [
             "patient_id_a",
@@ -7522,8 +7522,8 @@ class DuplicateAuditManager:
     ):
         """Build the single authoritative outer-fold assignment for every experiment."""
 
-        ordered_ids, ordered_labels = build_patient_label_table(labels, patient_ids)
-        patient_to_component = build_duplicate_component_map(
+        ordered_ids, ordered_labels = DuplicateAuditManager.build_patient_label_table(labels, patient_ids)
+        patient_to_component = DuplicateAuditManager.build_duplicate_component_map(
             ordered_ids,
             exact_edges,
             phash_edges,
@@ -7532,7 +7532,7 @@ class DuplicateAuditManager:
             [patient_to_component[patient_id] for patient_id in ordered_ids]
         )
 
-        folds = assign_stratified_patient_folds(
+        folds = DuplicateAuditManager.assign_stratified_patient_folds(
             ordered_ids,
             ordered_labels,
             group_ids,
@@ -7667,7 +7667,7 @@ class PatientDataManager:
         )
         provenance = provenance[:, selected_feature_indices]
 
-        mapping = _patient_indices(patient_ids)
+        mapping = DuplicateAuditManager._patient_indices(patient_ids)
         ordered_patients = np.asarray(sorted(mapping))
         patient_labels = []
         rows = []
@@ -7737,7 +7737,7 @@ class PatientDataManager:
         patient_ids = np.asarray(bank["patient_ids"])
         values = np.asarray(bank["standardization_features"], dtype=np.float32)
 
-        mapping = _patient_indices(patient_ids)
+        mapping = DuplicateAuditManager._patient_indices(patient_ids)
         ordered_patients = np.asarray(sorted(mapping))
         patient_labels = []
         rows = []
@@ -7799,7 +7799,7 @@ class PatientDataManager:
             dtype=np.float32,
         )
 
-        mapping = _patient_indices(patient_ids)
+        mapping = DuplicateAuditManager._patient_indices(patient_ids)
         ordered_patients = np.asarray(sorted(mapping))
         patient_labels = []
         rows = []
@@ -7873,7 +7873,7 @@ class PatientDataManager:
 
         output_dir.mkdir(parents=True, exist_ok=True)
         X_qc, y_qc, patient_ids, feature_names = (
-            aggregate_patient_standardized_monai_qc_features(bank)
+            PatientDataManager.aggregate_patient_standardized_monai_qc_features(bank)
         )
 
         rows = []
@@ -7893,7 +7893,7 @@ class PatientDataManager:
         normal_mean = float(np.mean(gate_rates[y_qc == 0]))
         sick_mean = float(np.mean(gate_rates[y_qc == 1]))
         difference = sick_mean - normal_mean
-        ci_lower, ci_upper = bootstrap_difference_in_means(
+        ci_lower, ci_upper = PatientDataManager.bootstrap_difference_in_means(
             gate_rates,
             y_qc,
             SETTINGS_VALIDATION.BOOTSTRAP_REPLICATES,
@@ -8093,7 +8093,7 @@ class PatientDataManager:
         labels = labels[mask]
         patient_ids = patient_ids[mask]
         series_ids = series_ids[mask]
-        X, y, patients = aggregate_patient_embeddings(
+        X, y, patients = PatientDataManager.aggregate_patient_embeddings(
             features,
             labels,
             patient_ids,
@@ -8141,7 +8141,7 @@ class ModelingManager:
         """Fit patient-row preprocessing and classifier with balanced labels."""
 
         y_train = np.asarray(y_train, dtype=np.int64)
-        patient_weights = compute_balanced_patient_weights(y_train)
+        patient_weights = PatientDataManager.compute_balanced_patient_weights(y_train)
         model.fit(
             X_train,
             y_train,
@@ -8176,9 +8176,9 @@ class ModelingManager:
         valid_mask = np.isin(patient_ids, list(valid_patients))
         if not np.any(train_mask) or not np.any(valid_mask):
             raise RuntimeError("A patient-level fold side is empty.")
-        model = build_patient_classifier(experiment, c_value)
-        fit_patient_classifier(model, prepared["X"][train_mask], prepared["y"][train_mask])
-        scores = patient_model_raw_scores(model, experiment, prepared["X"][valid_mask])
+        model = ModelingManager.build_patient_classifier(experiment, c_value)
+        ModelingManager.fit_patient_classifier(model, prepared["X"][train_mask], prepared["y"][train_mask])
+        scores = ModelingManager.patient_model_raw_scores(model, experiment, prepared["X"][valid_mask])
         return scores, np.asarray(prepared["y"][valid_mask], dtype=np.int64), patient_ids[valid_mask]
 
     @staticmethod
@@ -8204,7 +8204,7 @@ class ModelingManager:
         last_error = None
         for n_splits in range(maximum_splits, 1, -1):
             try:
-                folds = assign_stratified_patient_folds(
+                folds = DuplicateAuditManager.assign_stratified_patient_folds(
                     train_patient_ids,
                     train_labels,
                     groups,
@@ -8232,7 +8232,7 @@ class ModelingManager:
     ):
         """Generate training-only patient OOF scores for C/threshold selection."""
 
-        inner_folds, actual_inner_splits = create_inner_fold_assignment(
+        inner_folds, actual_inner_splits = ModelingManager.create_inner_fold_assignment(
             outer_train_patient_ids,
             outer_train_labels,
             patient_to_group,
@@ -8245,7 +8245,7 @@ class ModelingManager:
             inner_train_patients = outer_train_patient_ids[inner_folds != inner_fold]
             inner_valid_patients = outer_train_patient_ids[inner_folds == inner_fold]
 
-            scores, labels, patients = fit_predict_raw_for_patient_sets(
+            scores, labels, patients = ModelingManager.fit_predict_raw_for_patient_sets(
                 experiment=experiment,
                 prepared=prepared,
                 train_patients=inner_train_patients,
@@ -8334,8 +8334,8 @@ class ModelingManager:
         """Select C and threshold exclusively from the outer-training cohort."""
 
         candidate_results = []
-        for c_value in experiment_candidate_c_values(experiment):
-            patients, labels, raw_scores, inner_splits = collect_inner_oof_raw_scores(
+        for c_value in ModelingManager.experiment_candidate_c_values(experiment):
+            patients, labels, raw_scores, inner_splits = ModelingManager.collect_inner_oof_raw_scores(
                 experiment=experiment,
                 prepared=prepared,
                 outer_train_patient_ids=outer_train_patient_ids,
@@ -8381,7 +8381,7 @@ class ModelingManager:
         calibrator = None
         inner_probabilities = np.clip(selected["raw_scores"], 0.0, 1.0)
 
-        threshold = select_decision_threshold(
+        threshold = ModelingManager.select_decision_threshold(
             selected["labels"],
             inner_probabilities,
         )
@@ -8428,14 +8428,14 @@ class ModelingManager:
             labels=[0, 1],
         ).ravel()
 
-        sensitivity = _safe_divide(tp, tp + fn)
-        specificity = _safe_divide(tn, tn + fp)
-        ppv = _safe_divide(tp, tp + fp)
-        npv = _safe_divide(tn, tn + fn)
+        sensitivity = ModelingManager._safe_divide(tp, tp + fn)
+        specificity = ModelingManager._safe_divide(tn, tn + fp)
+        ppv = ModelingManager._safe_divide(tp, tp + fp)
+        npv = ModelingManager._safe_divide(tn, tn + fn)
         # Compute F1 directly from the confusion-matrix counts. This avoids a
         # 0/0 intermediate when both precision and sensitivity are zero and follows
         # the standard binary definition 2*TP / (2*TP + FP + FN).
-        f1 = _safe_divide(2.0 * tp, 2.0 * tp + fp + fn)
+        f1 = ModelingManager._safe_divide(2.0 * tp, 2.0 * tp + fp + fn)
 
         return {
             "auc": float(roc_auc_score(labels, probabilities)),
@@ -8494,7 +8494,7 @@ class ModelingManager:
             sampled0 = rng.choice(class0, size=len(class0), replace=True)
             sampled1 = rng.choice(class1, size=len(class1), replace=True)
             sampled = np.concatenate([sampled0, sampled1])
-            metrics = compute_binary_patient_metrics(
+            metrics = ModelingManager.compute_binary_patient_metrics(
                 labels[sampled],
                 probabilities[sampled],
                 predictions[sampled],
@@ -8625,7 +8625,7 @@ class ModelingManager:
                 flush=True,
             )
 
-            selection = select_c_and_training_threshold(
+            selection = ModelingManager.select_c_and_training_threshold(
                 experiment=experiment,
                 prepared=prepared,
                 outer_train_patient_ids=train_patients,
@@ -8644,7 +8644,7 @@ class ModelingManager:
             )
 
             raw_scores, valid_labels, evaluated_patients = (
-                fit_predict_raw_for_patient_sets(
+                ModelingManager.fit_predict_raw_for_patient_sets(
                     experiment=experiment,
                     prepared=prepared,
                     train_patients=train_patients,
@@ -8683,7 +8683,7 @@ class ModelingManager:
             predictions = (
                 probabilities >= float(selection["threshold"])
             ).astype(np.int64)
-            fold_metric_values = compute_binary_patient_metrics(
+            fold_metric_values = ModelingManager.compute_binary_patient_metrics(
                 valid_labels,
                 probabilities,
                 predictions,
@@ -8750,7 +8750,7 @@ class ModelingManager:
             fold_rows.append(fold_row)
             print(
                 f"[OUTER {outer_fold}] held-out AUC={fold_auc:.4f}; "
-                f"runtime={_format_elapsed_time(fold_row['runtime_seconds'])}",
+                f"runtime={RuntimeManager._format_elapsed_time(fold_row['runtime_seconds'])}",
                 flush=True,
             )
 
@@ -8784,12 +8784,12 @@ class ModelingManager:
             dtype=np.float64,
         )
 
-        metrics = compute_binary_patient_metrics(
+        metrics = ModelingManager.compute_binary_patient_metrics(
             labels,
             probabilities,
             predictions,
         )
-        intervals = bootstrap_patient_metric_intervals(
+        intervals = ModelingManager.bootstrap_patient_metric_intervals(
             labels,
             probabilities,
             predictions,
@@ -8891,7 +8891,7 @@ class ModelingManager:
             f"Sensitivity={metrics['sensitivity']:.4f} | "
             f"Specificity={metrics['specificity']:.4f} | "
             f"F1={metrics['f1']:.4f} | "
-            f"runtime={_format_elapsed_time(runtime_seconds)}",
+            f"runtime={RuntimeManager._format_elapsed_time(runtime_seconds)}",
             flush=True,
         )
 
@@ -8941,7 +8941,7 @@ class ModelingManager:
         group_ids = np.asarray(
             [patient_to_group[str(patient_id)] for patient_id in patient_ids]
         )
-        fold_numbers = assign_stratified_patient_folds(
+        fold_numbers = DuplicateAuditManager.assign_stratified_patient_folds(
             patient_ids,
             patient_labels,
             group_ids,
@@ -9028,7 +9028,7 @@ class ModelingManager:
                 dtype=np.int64,
             )
 
-            selection = select_c_and_training_threshold(
+            selection = ModelingManager.select_c_and_training_threshold(
                 experiment=experiment,
                 prepared=prepared,
                 outer_train_patient_ids=train_patients,
@@ -9038,7 +9038,7 @@ class ModelingManager:
                 verbose=verbose,
             )
             raw_scores, valid_labels, evaluated_patients = (
-                fit_predict_raw_for_patient_sets(
+                ModelingManager.fit_predict_raw_for_patient_sets(
                     experiment=experiment,
                     prepared=prepared,
                     train_patients=train_patients,
@@ -9313,7 +9313,7 @@ class ModelingManager:
             candidate_selections = []
             for order_index, candidate_id in enumerate(candidate_ids):
                 experiment = experiments_by_id[candidate_id]
-                selection = select_c_and_training_threshold(
+                selection = ModelingManager.select_c_and_training_threshold(
                     experiment=experiment,
                     prepared=prepared_by_id[candidate_id],
                     outer_train_patient_ids=train_patients,
@@ -9366,7 +9366,7 @@ class ModelingManager:
                 )
 
             raw_scores, valid_labels, evaluated_patients = (
-                fit_predict_raw_for_patient_sets(
+                ModelingManager.fit_predict_raw_for_patient_sets(
                     experiment=chosen_experiment,
                     prepared=prepared_by_id[chosen_id],
                     train_patients=train_patients,
@@ -9439,7 +9439,7 @@ class ModelingManager:
         # 0.5 labels below are used only because the shared bootstrap helper also
         # computes threshold-dependent metrics; only its discrimination intervals
         # are retained for this candidate-family summary.
-        discrimination_intervals = bootstrap_patient_metric_intervals(
+        discrimination_intervals = ModelingManager.bootstrap_patient_metric_intervals(
             labels,
             scores,
             (scores >= 0.5).astype(np.int64),
@@ -9558,7 +9558,7 @@ class ModelingManager:
 
         for repeat_index in range(SETTINGS_VALIDATION.REPEATED_NESTED_CV_REPEATS):
             seed = SETTINGS_VALIDATION.REPEATED_NESTED_CV_RANDOM_STATE + repeat_index
-            fold_rows = _build_fold_manifest_rows_for_seed(
+            fold_rows = ModelingManager._build_fold_manifest_rows_for_seed(
                 patient_ids,
                 patient_labels,
                 patient_to_group,
@@ -9570,7 +9570,7 @@ class ModelingManager:
                 scores,
                 folds,
                 selected_cs,
-            ) = run_nested_cv_auc_only(
+            ) = ModelingManager.run_nested_cv_auc_only(
                 experiment,
                 prepared,
                 fold_rows,
@@ -10037,13 +10037,13 @@ class ModelingManager:
             # analysis. This yields a cleaner Monte-Carlo randomization test than
             # adding a second source of split randomness to every null replicate.
             fold_seed = SETTINGS_VALIDATION.CV_RANDOM_STATE
-            fold_rows = _build_fold_manifest_rows_for_seed(
+            fold_rows = ModelingManager._build_fold_manifest_rows_for_seed(
                 patient_ids,
                 permuted_labels,
                 patient_to_group,
                 fold_seed,
             )
-            _, labels, scores, _, _ = run_nested_cv_auc_only(
+            _, labels, scores, _, _ = ModelingManager.run_nested_cv_auc_only(
                 experiment,
                 permuted_prepared,
                 fold_rows,
@@ -10227,7 +10227,7 @@ class ModelingManager:
             # randomized; candidate representations, hyperparameter procedure and
             # algorithmic split seed remain fixed.
             fold_seed = SETTINGS_VALIDATION.CV_RANDOM_STATE
-            fold_rows = _build_fold_manifest_rows_for_seed(
+            fold_rows = ModelingManager._build_fold_manifest_rows_for_seed(
                 patient_ids,
                 permuted_labels,
                 patient_to_group,
@@ -10240,7 +10240,7 @@ class ModelingManager:
                 prepared["patient_ids"] = patient_ids
                 prepared["X"] = aligned_X[candidate_id]
                 prepared["y"] = permuted_labels
-                _, labels, scores, _, _ = run_nested_cv_auc_only(
+                _, labels, scores, _, _ = ModelingManager.run_nested_cv_auc_only(
                     experiments_by_id[candidate_id],
                     prepared,
                     fold_rows,
@@ -10468,7 +10468,7 @@ class ModelingManager:
                     "baseline."
                 )
 
-            comparison = paired_auc_difference_interval(
+            comparison = ModelingManager.paired_auc_difference_interval(
                 baseline_labels,
                 baseline_scores,
                 scores,
@@ -10549,7 +10549,7 @@ class ModelingManager:
 
             reference_scores = reference["probabilities"][reference_order]
             comparison_scores = comparison["probabilities"][comparison_order]
-            interval = paired_auc_difference_interval(
+            interval = ModelingManager.paired_auc_difference_interval(
                 reference_labels,
                 reference_scores,
                 comparison_scores,
@@ -10713,7 +10713,7 @@ class ModelingManager:
         comparison_dir.mkdir(parents=True, exist_ok=True)
         comparison_lookup = {row["comparison_experiment_id"]: row for row in paired_rows}
         summary_rows = [
-            result_summary_row(result, comparison_lookup)
+            ModelingManager.result_summary_row(result, comparison_lookup)
             for result in results if result.get("status") == "OK"
         ]
         summary_rows.sort(key=lambda row: (-row["auc"], row["experiment_id"]))
@@ -10852,10 +10852,10 @@ class PipelineRunner:
     def main():
         """Run every enabled experiment and compare the patient-level results."""
 
-        refresh_runtime_device("main pipeline")
+        RuntimeManager.refresh_runtime_device("main pipeline")
         pipeline_started_at = time.perf_counter()
         stage_durations = {}
-        experiments = get_enabled_experiments()
+        experiments = ConfigurationManager.get_enabled_experiments()
 
         print("\n" + "#" * 100, flush=True)
         print("CAD CARDIAC MRI — PATIENT-LEVEL RESEARCH PIPELINE", flush=True)
@@ -10900,13 +10900,13 @@ class PipelineRunner:
         # training-only threshold policy, duplicate-audit settings, negative-control
         # definitions, and the requested feature-bank modes. Failing here prevents a
         # malformed configuration from producing partially valid-looking outputs.
-        stage_started = _print_stage_start(
+        stage_started = RuntimeManager._print_stage_start(
             1,
             "Validate suite configuration",
             "Fast; no image scanning or model loading.",
         )
-        validate_configuration()
-        stage_durations["01 Configuration validation"] = _print_stage_complete(
+        ConfigurationManager.validate_configuration()
+        stage_durations["01 Configuration validation"] = RuntimeManager._print_stage_complete(
             1,
             "Validate suite configuration",
             stage_started,
@@ -10923,7 +10923,7 @@ class PipelineRunner:
         # setting. Only run-specific subdirectories are removed on an intentional
         # rerun; the shared frozen-feature cache remains outside OUTPUT_DIR and is
         # reused only when its complete fingerprint matches.
-        stage_started = _print_stage_start(
+        stage_started = RuntimeManager._print_stage_start(
             2,
             "Create output structure and save predeclared configuration",
             "Fast filesystem and JSON operations.",
@@ -10944,11 +10944,11 @@ class PipelineRunner:
             if directory.exists():
                 shutil.rmtree(directory)
             directory.mkdir(parents=True, exist_ok=True)
-        write_suite_configuration(
+        ConfigurationManager.write_suite_configuration(
             SETTINGS_PATHS.OUTPUT_DIR / "suite_configuration.json",
             experiments,
         )
-        stage_durations["02 Output structure"] = _print_stage_complete(
+        stage_durations["02 Output structure"] = RuntimeManager._print_stage_complete(
             2,
             "Create output structure and save predeclared configuration",
             stage_started,
@@ -10964,13 +10964,13 @@ class PipelineRunner:
         # assigns every image to one patient-scoped immediate-child-folder proxy,
         # and returns one deterministic metadata row per image. No label is supplied
         # to MONAI or EfficientNet, and no JPEG is decoded in this stage.
-        stage_started = _print_stage_start(
+        stage_started = RuntimeManager._print_stage_start(
             3,
             "Discover Directory_* patients and image rows",
             "Depends on filesystem and folder count; no pixel decoding yet.",
         )
-        samples = load_samples(SETTINGS_PATHS.DATASET_PATH)
-        stage_durations["03 Dataset discovery"] = _print_stage_complete(
+        samples = DatasetManager.load_samples(SETTINGS_PATHS.DATASET_PATH)
+        stage_durations["03 Dataset discovery"] = RuntimeManager._print_stage_complete(
             3,
             "Discover Directory_* patients and image rows",
             stage_started,
@@ -10985,22 +10985,22 @@ class PipelineRunner:
         # representations required by the active candidate/control panel. Frozen
         # EfficientNet embeddings are cached and reused by every CPU evaluation.
         # The fingerprint includes dataset metadata and all feature-affecting settings.
-        stage_started = _print_stage_start(
+        stage_started = RuntimeManager._print_stage_start(
             4,
             "Load or build the shared multi-view feature bank",
             "Potentially the longest stage on a cache miss; all required image "
             "variants are encoded and cached.",
         )
-        required_modes = required_efficientnet_feature_modes(experiments)
-        fingerprint = feature_bank_fingerprint(samples, SETTINGS_PATHS.DATASET_PATH)
+        required_modes = FeatureBankManager.required_efficientnet_feature_modes(experiments)
+        fingerprint = FeatureBankManager.feature_bank_fingerprint(samples, SETTINGS_PATHS.DATASET_PATH)
         cache_dir = SETTINGS_PATHS.FEATURE_CACHE_ROOT / fingerprint[:16]
-        bank, cache_status = load_or_extract_feature_bank(
+        bank, cache_status = FeatureBankManager.load_or_extract_feature_bank(
             samples,
             required_modes,
             fingerprint,
             cache_dir,
         )
-        stage_durations["04 Shared feature bank"] = _print_stage_complete(
+        stage_durations["04 Shared feature bank"] = RuntimeManager._print_stage_complete(
             4,
             "Load or build the shared multi-view feature bank",
             stage_started,
@@ -11019,13 +11019,13 @@ class PipelineRunner:
         # the final fold manifest is created because cross-patient visual duplicates
         # can leak content even when Directory_* identities themselves never cross
         # train/validation boundaries.
-        stage_started = _print_stage_start(
+        stage_started = RuntimeManager._print_stage_start(
             5,
             "Audit exact and perceptual cross-patient duplicates",
             "Hash grouping and pHash candidate search; no neural-network inference.",
         )
         if SETTINGS_AUDIT.AUDIT_EXACT_DECODED_PIXEL_DUPLICATES:
-            exact_summary, exact_edges = audit_exact_decoded_pixel_duplicates(
+            exact_summary, exact_edges = DuplicateAuditManager.audit_exact_decoded_pixel_duplicates(
                 SETTINGS_PATHS.OUTPUT_DIR / "audits" / "exact_decoded_pixel_duplicate_groups.csv",
                 samples,
                 bank["decoded_pixel_hashes"],
@@ -11035,7 +11035,7 @@ class PipelineRunner:
             exact_edges = set()
 
         if SETTINGS_AUDIT.AUDIT_PERCEPTUAL_NEAR_DUPLICATES:
-            phash_summary, phash_edges = audit_perceptual_near_duplicate_candidates(
+            phash_summary, phash_edges = DuplicateAuditManager.audit_perceptual_near_duplicate_candidates(
                 SETTINGS_PATHS.OUTPUT_DIR
                 / "audits"
                 / "perceptual_near_duplicate_patient_pairs.csv",
@@ -11047,7 +11047,7 @@ class PipelineRunner:
             phash_summary = {"enabled": False}
             phash_edges = set()
 
-        stage_durations["05 Duplicate audits"] = _print_stage_complete(
+        stage_durations["05 Duplicate audits"] = RuntimeManager._print_stage_complete(
             5,
             "Audit exact and perceptual cross-patient duplicates",
             stage_started,
@@ -11065,28 +11065,28 @@ class PipelineRunner:
         # path, series proxy, image geometry, hashes, and MONAI diagnostics. This
         # explicit manifest is safer than allowing every experiment to call a random
         # splitter independently and enables paired patient-level comparisons.
-        stage_started = _print_stage_start(
+        stage_started = RuntimeManager._print_stage_start(
             6,
             "Create one duplicate-aware outer-fold and cohort manifest",
             "Fast patient-level grouping plus one large CSV write.",
         )
-        fold_manifest_rows = build_patient_fold_manifest(
+        fold_manifest_rows = DuplicateAuditManager.build_patient_fold_manifest(
             bank["labels"],
             bank["patient_ids"],
             exact_edges,
             phash_edges,
         )
-        write_patient_fold_manifest(
+        DuplicateAuditManager.write_patient_fold_manifest(
             SETTINGS_PATHS.OUTPUT_DIR / "manifests" / "patient_fold_manifest.csv",
             fold_manifest_rows,
         )
-        write_cohort_manifest(
+        DuplicateAuditManager.write_cohort_manifest(
             SETTINGS_PATHS.OUTPUT_DIR / "manifests" / "cohort_manifest.csv",
             samples,
             bank,
             fold_manifest_rows,
         )
-        stage_durations["06 Manifests"] = _print_stage_complete(
+        stage_durations["06 Manifests"] = RuntimeManager._print_stage_complete(
             6,
             "Create one duplicate-aware outer-fold and cohort manifest",
             stage_started,
@@ -11099,47 +11099,47 @@ class PipelineRunner:
         # These descriptive tables audit whether geometry, file size, padding,
         # intensity scaling or MONAI gate behavior differ between classes. They are
         # not classifier experiments and never influence model selection.
-        stage_started = _print_stage_start(
+        stage_started = RuntimeManager._print_stage_start(
             7,
             "Build and save provenance, standardization and MONAI-QC audits",
             "Patient-level aggregation and descriptive audit files.",
         )
-        provenance_set = aggregate_patient_provenance_features(bank)
-        standardization_set = aggregate_patient_standardization_features(bank)
+        provenance_set = PatientDataManager.aggregate_patient_provenance_features(bank)
+        standardization_set = PatientDataManager.aggregate_patient_standardization_features(bank)
         (
             standardized_monai_gate_comparison,
             standardized_monai_qc_set,
-        ) = write_standardized_monai_qc_outputs(
+        ) = PatientDataManager.write_standardized_monai_qc_outputs(
             SETTINGS_PATHS.OUTPUT_DIR / "audits",
             bank,
         )
-        write_patient_tabular_features(
+        PatientDataManager.write_patient_tabular_features(
             SETTINGS_PATHS.OUTPUT_DIR / "audits" / "patient_provenance_features.csv",
             *provenance_set,
         )
-        write_patient_tabular_features(
+        PatientDataManager.write_patient_tabular_features(
             SETTINGS_PATHS.OUTPUT_DIR / "audits" / "patient_standardization_features.csv",
             *standardization_set,
         )
-        write_tabular_class_summary(
+        ReportingManager.write_tabular_class_summary(
             SETTINGS_PATHS.OUTPUT_DIR / "audits" / "provenance_class_summary.csv",
             provenance_set[0],
             provenance_set[1],
             provenance_set[3],
         )
-        write_tabular_class_summary(
+        ReportingManager.write_tabular_class_summary(
             SETTINGS_PATHS.OUTPUT_DIR / "audits" / "standardization_class_summary.csv",
             standardization_set[0],
             standardization_set[1],
             standardization_set[3],
         )
-        write_tabular_class_summary(
+        ReportingManager.write_tabular_class_summary(
             SETTINGS_PATHS.OUTPUT_DIR / "audits" / "standardized_monai_qc_class_summary.csv",
             standardized_monai_qc_set[0],
             standardized_monai_qc_set[1],
             standardized_monai_qc_set[3],
         )
-        stage_durations["07 QC/provenance controls"] = _print_stage_complete(
+        stage_durations["07 QC/provenance controls"] = RuntimeManager._print_stage_complete(
             7,
             "Build and save provenance, standardization and MONAI-QC audits",
             stage_started,
@@ -11156,7 +11156,7 @@ class PipelineRunner:
         #
         # One experiment failure is written to its own failure.json and does not
         # erase successful results unless FAIL_SUITE_IF_ANY_EXPERIMENT_FAILS=True.
-        stage_started = _print_stage_start(
+        stage_started = RuntimeManager._print_stage_start(
             8,
             "Run every enabled experiment on the shared folds",
             "Fold-local PCA and Logistic Regression fits on patient embeddings.",
@@ -11172,22 +11172,22 @@ class PipelineRunner:
                 flush=True,
             )
             experiment_output = SETTINGS_PATHS.OUTPUT_DIR / "experiments" / experiment.experiment_id
-            preparation_key = experiment_preparation_cache_key(experiment)
+            preparation_key = PatientDataManager.experiment_preparation_cache_key(experiment)
 
             try:
                 if preparation_key not in prepared_cache:
                     preparation_started = time.perf_counter()
-                    prepared_cache[preparation_key] = prepare_experiment_data(
+                    prepared_cache[preparation_key] = PatientDataManager.prepare_experiment_data(
                         experiment,
                         bank,
                     )
                     print(
                         f"[SUITE] Prepared data representation {preparation_key} in "
-                        f"{_format_elapsed_time(time.perf_counter() - preparation_started)}.",
+                        f"{RuntimeManager._format_elapsed_time(time.perf_counter() - preparation_started)}.",
                         flush=True,
                     )
 
-                result = run_one_experiment(
+                result = ModelingManager.run_one_experiment(
                     experiment=experiment,
                     prepared=prepared_cache[preparation_key],
                     fold_manifest_rows=fold_manifest_rows,
@@ -11219,7 +11219,7 @@ class PipelineRunner:
                 if SETTINGS_AUDIT.FAIL_SUITE_IF_ANY_EXPERIMENT_FAILS:
                     raise
 
-        stage_durations["08 Experiment execution"] = _print_stage_complete(
+        stage_durations["08 Experiment execution"] = RuntimeManager._print_stage_complete(
             8,
             "Run every enabled experiment on the shared folds",
             stage_started,
@@ -11236,13 +11236,13 @@ class PipelineRunner:
         # then consolidates experiment summaries, all OOF patient predictions,
         # paired comparisons, and failures into CSV/JSON files for later tables,
         # plots, and manuscript/poster preparation.
-        stage_started = _print_stage_start(
+        stage_started = RuntimeManager._print_stage_start(
             9,
             "Calculate paired comparisons and write master result files",
             "Patient-level bootstrap comparisons and CSV/JSON consolidation.",
         )
-        paired_rows = compare_experiments_to_baseline(successful_results)
-        primary_ablation_rows = compare_predeclared_ablation_pairs(
+        paired_rows = ModelingManager.compare_experiments_to_baseline(successful_results)
+        primary_ablation_rows = ModelingManager.compare_predeclared_ablation_pairs(
             successful_results
         )
 
@@ -11256,7 +11256,7 @@ class PipelineRunner:
         }
         exact_support_contract_prepared = {
             experiment_id: prepared_cache[
-                experiment_preparation_cache_key(
+                PatientDataManager.experiment_preparation_cache_key(
                     experiments_by_id[experiment_id]
                 )
             ]
@@ -11269,7 +11269,7 @@ class PipelineRunner:
             )
             if experiment_id in successful_by_id
         }
-        exact_support_row_contract_summary = audit_exact_support_prepared_row_contract(
+        exact_support_row_contract_summary = ModelingManager.audit_exact_support_prepared_row_contract(
             exact_support_contract_prepared,
             SETTINGS_PATHS.OUTPUT_DIR / "audits" / "exact_support_row_contract.json",
         )
@@ -11300,7 +11300,7 @@ class PipelineRunner:
                 try:
                     candidate_prepared_by_id = {
                         experiment_id: prepared_cache[
-                            experiment_preparation_cache_key(
+                            PatientDataManager.experiment_preparation_cache_key(
                                 experiments_by_id[experiment_id]
                             )
                         ]
@@ -11309,7 +11309,7 @@ class PipelineRunner:
                         )
                     }
                     candidate_family_selection_summary = (
-                        run_model_family_nested_selection(
+                        ModelingManager.run_model_family_nested_selection(
                             experiments_by_id=experiments_by_id,
                             prepared_by_id=candidate_prepared_by_id,
                             fold_manifest_rows=fold_manifest_rows,
@@ -11349,7 +11349,7 @@ class PipelineRunner:
             encoding="utf-8",
         )
 
-        summary_rows = write_master_outputs(
+        summary_rows = ModelingManager.write_master_outputs(
             successful_results,
             failed_results,
             paired_rows,
@@ -11358,7 +11358,7 @@ class PipelineRunner:
             exact_support_row_contract_summary,
             SETTINGS_PATHS.OUTPUT_DIR / "comparison",
         )
-        stage_durations["09 Master comparisons"] = _print_stage_complete(
+        stage_durations["09 Master comparisons"] = RuntimeManager._print_stage_complete(
             9,
             "Calculate paired comparisons and write master result files",
             stage_started,
@@ -11378,7 +11378,7 @@ class PipelineRunner:
         # path not only for the baseline, but also for the main simple-localization
         # candidate, strict ROI candidate, and key padding/border/exterior controls.
         # No split is selected according to AUC and no neural inference is repeated.
-        stage_started = _print_stage_start(
+        stage_started = RuntimeManager._print_stage_start(
             10,
             "Run repeated nested-CV split-stability analyses",
             "Several patient-level reruns for selected models and controls; frozen features are reused.",
@@ -11400,7 +11400,7 @@ class PipelineRunner:
             for stability_experiment_id in SETTINGS_VALIDATION.STABILITY_EXPERIMENT_IDS:
                 experiment = experiments_by_id[stability_experiment_id]
                 result = successful_by_id.get(stability_experiment_id)
-                preparation_key = experiment_preparation_cache_key(experiment)
+                preparation_key = PatientDataManager.experiment_preparation_cache_key(experiment)
 
                 if result is None:
                     summary = {
@@ -11419,7 +11419,7 @@ class PipelineRunner:
                         flush=True,
                     )
                 else:
-                    summary = run_repeated_nested_cv_stability(
+                    summary = ModelingManager.run_repeated_nested_cv_stability(
                         experiment=experiment,
                         prepared=prepared_cache[preparation_key],
                         base_fold_manifest_rows=fold_manifest_rows,
@@ -11427,11 +11427,11 @@ class PipelineRunner:
                     )
                 stability_summaries[stability_experiment_id] = summary
 
-            stability_paired_summary = compare_repeated_nested_cv_pairs(
+            stability_paired_summary = ModelingManager.compare_repeated_nested_cv_pairs(
                 stability_root,
                 SETTINGS_VALIDATION.REPEATED_STABILITY_COMPARISONS,
             )
-            stability_ranking_rows = write_repeated_stability_ranking(
+            stability_ranking_rows = ModelingManager.write_repeated_stability_ranking(
                 stability_summaries,
                 stability_root / "repeated_nested_cv_ranking.csv",
             )
@@ -11456,7 +11456,7 @@ class PipelineRunner:
                 ),
             }
         else:
-            stability_ranking_rows = write_repeated_stability_ranking(
+            stability_ranking_rows = ModelingManager.write_repeated_stability_ranking(
                 {},
                 stability_root / "repeated_nested_cv_ranking.csv",
             )
@@ -11479,7 +11479,7 @@ class PipelineRunner:
             summary.get("status") == "OK"
             for summary in stability_summaries.values()
         )
-        stage_durations["10 Repeated nested CV"] = _print_stage_complete(
+        stage_durations["10 Repeated nested CV"] = RuntimeManager._print_stage_complete(
             10,
             "Run repeated nested-CV split-stability analyses",
             stage_started,
@@ -11495,7 +11495,7 @@ class PipelineRunner:
         # near 0.5 supports the absence of an obvious implementation-level label
         # leak; it does not resolve dataset provenance confounding or replace an
         # independent hospital cohort.
-        stage_started = _print_stage_start(
+        stage_started = RuntimeManager._print_stage_start(
             11,
             "Run patient-label permutation sanity test",
             "Many lightweight patient-level fits; no neural-network inference.",
@@ -11541,13 +11541,13 @@ class PipelineRunner:
                         flush=True,
                     )
                 else:
-                    preparation_key = experiment_preparation_cache_key(
+                    preparation_key = PatientDataManager.experiment_preparation_cache_key(
                         permutation_experiment
                     )
                     observed_auc = float(
                         permutation_result["summary"]["metrics"]["auc"]
                     )
-                    summary = run_patient_label_permutation_test(
+                    summary = ModelingManager.run_patient_label_permutation_test(
                         experiment=permutation_experiment,
                         prepared=prepared_cache[preparation_key],
                         base_fold_manifest_rows=fold_manifest_rows,
@@ -11603,7 +11603,7 @@ class PipelineRunner:
                 try:
                     selection_prepared_by_id = {
                         experiment_id: prepared_cache[
-                            experiment_preparation_cache_key(
+                            PatientDataManager.experiment_preparation_cache_key(
                                 experiments_by_id[experiment_id]
                             )
                         ]
@@ -11621,7 +11621,7 @@ class PipelineRunner:
                         )
                     }
                     selection_adjusted_summary = (
-                        run_selection_adjusted_candidate_family_permutation_test(
+                        ModelingManager.run_selection_adjusted_candidate_family_permutation_test(
                             experiments_by_id=experiments_by_id,
                             prepared_by_id=selection_prepared_by_id,
                             base_fold_manifest_rows=fold_manifest_rows,
@@ -11669,7 +11669,7 @@ class PipelineRunner:
             encoding="utf-8",
         )
 
-        stage_durations["11 Label permutation"] = _print_stage_complete(
+        stage_durations["11 Label permutation"] = RuntimeManager._print_stage_complete(
             11,
             "Run patient-label permutation sanity test",
             stage_started,
@@ -11684,17 +11684,17 @@ class PipelineRunner:
         # feature-bank identity, patient counts, audit summaries, successful and
         # failed experiments, and total runtime. All ordinary print() output and
         # tracebacks are simultaneously preserved in console_output.log.
-        stage_started = _print_stage_start(
+        stage_started = RuntimeManager._print_stage_start(
             12,
             "Print final comparison and save suite metadata",
             "Console table, warnings, metadata JSON and timing summary.",
         )
-        print_repeated_stability_ranking(stability_ranking_rows)
-        print_final_comparison(summary_rows, failed_results)
-        print_primary_ablation_comparisons(primary_ablation_rows)
+        ModelingManager.print_repeated_stability_ranking(stability_ranking_rows)
+        ModelingManager.print_final_comparison(summary_rows, failed_results)
+        ModelingManager.print_primary_ablation_comparisons(primary_ablation_rows)
 
         total_runtime = time.perf_counter() - pipeline_started_at
-        metadata = collect_suite_metadata(
+        metadata = ConfigurationManager.collect_suite_metadata(
             samples=samples,
             fingerprint=fingerprint,
             cache_status=cache_status,
@@ -11716,7 +11716,7 @@ class PipelineRunner:
             encoding="utf-8",
         )
 
-        stage_durations["12 Final reporting"] = _print_stage_complete(
+        stage_durations["12 Final reporting"] = RuntimeManager._print_stage_complete(
             12,
             "Print final comparison and save suite metadata",
             stage_started,
@@ -11724,13 +11724,13 @@ class PipelineRunner:
         )
 
         total_runtime = time.perf_counter() - pipeline_started_at
-        _print_timing_summary(stage_durations, total_runtime)
+        RuntimeManager._print_timing_summary(stage_durations, total_runtime)
         print(f"\n[SUITE] Outputs saved under: {SETTINGS_PATHS.OUTPUT_DIR}", flush=True)
         print(f"[SUITE] Console log: {SETTINGS_PATHS.CONSOLE_LOG_PATH}", flush=True)
         print(
             f"[SUITE] Completed with {len(successful_results)} successful and "
             f"{len(failed_results)} failed experiments in "
-            f"{_format_elapsed_time(total_runtime)}.",
+            f"{RuntimeManager._format_elapsed_time(total_runtime)}.",
             flush=True,
         )
         print("Done!", flush=True)
@@ -11744,15 +11744,15 @@ class PipelineRunner:
         ``monai-cpu-from-cache`` after the Kaggle accelerator is disabled.
         """
 
-        refresh_runtime_device("build MONAI/EfficientNet feature cache")
-        validate_configuration()
-        experiments = get_enabled_experiments()
+        RuntimeManager.refresh_runtime_device("build MONAI/EfficientNet feature cache")
+        ConfigurationManager.validate_configuration()
+        experiments = ConfigurationManager.get_enabled_experiments()
         dataset_path = Path(dataset_path or SETTINGS_PATHS.DATASET_PATH)
-        samples = load_samples(dataset_path)
-        required_modes = required_efficientnet_feature_modes(experiments)
-        fingerprint = feature_bank_fingerprint(samples, dataset_path)
+        samples = DatasetManager.load_samples(dataset_path)
+        required_modes = FeatureBankManager.required_efficientnet_feature_modes(experiments)
+        fingerprint = FeatureBankManager.feature_bank_fingerprint(samples, dataset_path)
         cache_dir = SETTINGS_PATHS.FEATURE_CACHE_ROOT / fingerprint[:16]
-        bank, cache_status = load_or_extract_feature_bank(
+        bank, cache_status = FeatureBankManager.load_or_extract_feature_bank(
             samples,
             required_modes,
             fingerprint,
@@ -11764,7 +11764,7 @@ class PipelineRunner:
             "cache_dir": str(bank["cache_dir"]),
             "fingerprint": fingerprint,
             "device": DEVICE,
-            "feature_cache_device_tag": resolved_feature_cache_device_tag(),
+            "feature_cache_device_tag": RuntimeManager.resolved_feature_cache_device_tag(),
             "n_images": len(samples),
             "modes": list(required_modes),
         }
@@ -11782,7 +11782,7 @@ class PipelineRunner:
         checkpoint_map = {}
         missing = []
         for fold in range(SETTINGS_ATTENTION.ATTENTION_SEGMENTATION_FOLDS):
-            path = _checkpoint_path(workspace, fold)
+            path = AttentionTrainingManager._checkpoint_path(workspace, fold)
             if path.is_file():
                 checkpoint_map[fold] = path
             else:
@@ -11807,7 +11807,7 @@ class PipelineRunner:
                 "Attention patient feature bank is missing. Run "
                 "build-attention-feature-cache in a GPU session first."
             )
-        checkpoint_fingerprint = _attention_feature_fingerprint(
+        checkpoint_fingerprint = AttentionEvaluationManager._attention_feature_fingerprint(
             samples, checkpoint_map
         )
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -11965,7 +11965,7 @@ class AttentionDataManager:
     def attention_image_token(image_path, patient_id, series_id):
         """Create a stable filename token without exposing Normal/Sick labels."""
 
-        relative = _directory_scoped_relative_token(image_path)
+        relative = AttentionDataManager._directory_scoped_relative_token(image_path)
         digest = hashlib.sha256(relative.encode("utf-8")).hexdigest()[:20]
         safe_series = (
             str(series_id)
@@ -12036,7 +12036,7 @@ class AttentionDataManager:
                 pass
             raise RuntimeError(
                 f"Could not write Attention mask manifest atomically: {path}. "
-                f"{type(error).__name__}: {error}. {_storage_description(path)}"
+                f"{type(error).__name__}: {error}. {AttentionDataManager._storage_description(path)}"
             ) from error
 
     @staticmethod
@@ -12067,7 +12067,7 @@ class AttentionDataManager:
             raw_canvas,
             padding_canvas,
             _features,
-        ) = build_label_blind_standardized_image(image)
+        ) = ImagePreprocessor.build_label_blind_standardized_image(image)
         raw_224 = cv2.resize(
             raw_canvas.astype(np.float32),
             (SETTINGS_PREPROCESSING.IMG_SIZE, SETTINGS_PREPROCESSING.IMG_SIZE),
@@ -12115,12 +12115,12 @@ class AttentionDataManager:
 
         path = Path(path)
         try:
-            usage = shutil.disk_usage(_existing_parent(path))
+            usage = shutil.disk_usage(AttentionDataManager._existing_parent(path))
             return (
-                f"filesystem={_existing_parent(path)}, "
-                f"free={_format_storage_bytes(usage.free)}, "
-                f"used={_format_storage_bytes(usage.used)}, "
-                f"total={_format_storage_bytes(usage.total)}"
+                f"filesystem={AttentionDataManager._existing_parent(path)}, "
+                f"free={AttentionDataManager._format_storage_bytes(usage.free)}, "
+                f"used={AttentionDataManager._format_storage_bytes(usage.used)}, "
+                f"total={AttentionDataManager._format_storage_bytes(usage.total)}"
             )
         except OSError as error:
             return f"storage query failed: {type(error).__name__}: {error}"
@@ -12141,13 +12141,13 @@ class AttentionDataManager:
 
         print(
             "[ATTENTION][STORAGE] Persistent workspace: "
-            f"{workspace.root} | {_storage_description(workspace.root)}",
+            f"{workspace.root} | {AttentionDataManager._storage_description(workspace.root)}",
             flush=True,
         )
         print(
             "[ATTENTION][STORAGE] Transient cache root: "
             f"{workspace.transient_root} | "
-            f"{_storage_description(workspace.transient_root)}",
+            f"{AttentionDataManager._storage_description(workspace.transient_root)}",
             flush=True,
         )
         print(
@@ -12158,7 +12158,7 @@ class AttentionDataManager:
         )
         try:
             persistent_free = shutil.disk_usage(
-                _existing_parent(workspace.root)
+                AttentionDataManager._existing_parent(workspace.root)
             ).free
             warning_threshold = (
                 int(SETTINGS_ATTENTION.ATTENTION_PERSISTENT_FREE_SPACE_WARNING_MB) * 1024 * 1024
@@ -12217,14 +12217,14 @@ class AttentionDataManager:
             payload = encoded.tobytes()
 
             if not required and optional_reserve_mb > 0:
-                free = shutil.disk_usage(_existing_parent(path)).free
+                free = shutil.disk_usage(AttentionDataManager._existing_parent(path)).free
                 reserve = int(optional_reserve_mb) * 1024 * 1024
                 if free < len(payload) + reserve:
                     raise OSError(
                         28,
                         "optional cache skipped to preserve required-output space; "
-                        f"free={_format_storage_bytes(free)}, "
-                        f"reserve={_format_storage_bytes(reserve)}",
+                        f"free={AttentionDataManager._format_storage_bytes(free)}, "
+                        f"reserve={AttentionDataManager._format_storage_bytes(reserve)}",
                     )
 
             temporary = path.with_name(
@@ -12251,7 +12251,7 @@ class AttentionDataManager:
             details = (
                 f"Could not save {purpose}: {path}. "
                 f"{type(error).__name__}: {error}. "
-                f"{_storage_description(path)}"
+                f"{AttentionDataManager._storage_description(path)}"
             )
             if required:
                 raise RuntimeError(
@@ -12259,7 +12259,7 @@ class AttentionDataManager:
                     + " Free space in /kaggle/working or set "
                     + "CAD_ATTENTION_UNET_WORK_ROOT to a writable location."
                 ) from error
-            _attention_warn_once(
+            AttentionDataManager._attention_warn_once(
                 "optional-image-cache-write-disabled",
                 "[ATTENTION][CACHE][WARNING] "
                 + details
@@ -12319,7 +12319,7 @@ class AttentionDataManager:
         if count:
             print(
                 f"[ATTENTION][CACHE] Released {count} RAM-cached images "
-                f"({_format_storage_bytes(released)}).",
+                f"({AttentionDataManager._format_storage_bytes(released)}).",
                 flush=True,
             )
 
@@ -12340,7 +12340,7 @@ class AttentionDataManager:
         global _ATTENTION_OPTIONAL_DISK_CACHE_DISABLED_REASON
 
         token = str(row.get("image_token", row.get("image_path", "")))
-        cached = _attention_ram_cache_get(token)
+        cached = AttentionDataManager._attention_ram_cache_get(token)
         if cached is not None:
             return cached
 
@@ -12352,32 +12352,32 @@ class AttentionDataManager:
                 and disk_image.shape == (SETTINGS_ATTENTION.ATTENTION_INPUT_SIZE, SETTINGS_ATTENTION.ATTENTION_INPUT_SIZE)
             ):
                 disk_image = np.ascontiguousarray(disk_image, dtype=np.uint8)
-                _attention_ram_cache_put(token, disk_image)
+                AttentionDataManager._attention_ram_cache_put(token, disk_image)
                 return disk_image
             try:
                 path.unlink(missing_ok=True)
             except OSError:
                 pass
-            _attention_warn_once(
+            AttentionDataManager._attention_warn_once(
                 "corrupt-standardized-image-cache",
                 "[ATTENTION][CACHE][WARNING] A corrupt/incomplete standardized "
                 "training-image cache file was found and ignored. It will be "
                 "regenerated from the source JPEG.",
             )
 
-        monai_canvas, _raw_224, _content_224 = _load_attention_canvases(
+        monai_canvas, _raw_224, _content_224 = AttentionDataManager._load_attention_canvases(
             row["image_path"]
         )
         encoded = np.clip(
             np.round(monai_canvas * 255.0), 0, 255
         ).astype(np.uint8)
-        _attention_ram_cache_put(token, encoded)
+        AttentionDataManager._attention_ram_cache_put(token, encoded)
 
         if (
             SETTINGS_ATTENTION.ATTENTION_CACHE_TRAINING_IMAGES
             and _ATTENTION_OPTIONAL_DISK_CACHE_DISABLED_REASON is None
         ):
-            written = _atomic_cv2_write(
+            written = AttentionDataManager._atomic_cv2_write(
                 path,
                 encoded,
                 required=False,
@@ -12425,12 +12425,12 @@ class AttentionDataManager:
     def generate_attention_pseudo_masks(samples, workspace, monai_segmenter=None):
         """Generate label-blind MONAI pseudo masks for the training/review subset."""
 
-        rows = select_attention_training_rows(samples, workspace)
-        report_attention_storage(workspace)
+        rows = MaskReviewManager.select_attention_training_rows(samples, workspace)
+        AttentionDataManager.report_attention_storage(workspace)
         missing_indices = [
             index
             for index, row in enumerate(rows)
-            if not _attention_mask_file_is_readable(row["automatic_mask_path"])
+            if not AttentionDataManager._attention_mask_file_is_readable(row["automatic_mask_path"])
             or row.get("monai_valid", "") == ""
         ]
         if not missing_indices:
@@ -12441,7 +12441,7 @@ class AttentionDataManager:
             return rows
 
         if monai_segmenter is None:
-            monai_segmenter = build_monai_segmenter()
+            monai_segmenter = MonaiSegmenter.build_monai_segmenter()
         monai_segmenter = monai_segmenter.to(DEVICE).eval()
 
         subset_rows = [rows[index] for index in missing_indices]
@@ -12494,11 +12494,11 @@ class AttentionDataManager:
                         subset_index = int(subset_index_tensor)
                         original_index = missing_indices[subset_index]
                         row = rows[original_index]
-                        mask = _largest_connected_component(
+                        mask = AttentionDataManager._largest_connected_component(
                             hard[batch_position, 0].detach().cpu().numpy() > 0.5
                         )
                         output_path = Path(row["automatic_mask_path"])
-                        _atomic_cv2_write(
+                        AttentionDataManager._atomic_cv2_write(
                             output_path,
                             mask.astype(np.uint8) * 255,
                             required=True,
@@ -12519,7 +12519,7 @@ class AttentionDataManager:
                         % SETTINGS_ATTENTION.ATTENTION_MANIFEST_CHECKPOINT_EVERY_BATCHES
                         == 0
                     ):
-                        write_attention_manifest(rows, workspace.manifest_csv)
+                        AttentionDataManager.write_attention_manifest(rows, workspace.manifest_csv)
                         print(
                             "[ATTENTION][MASKS] Manifest checkpoint saved after "
                             f"{batch_number}/{len(loader)} batches.",
@@ -12529,7 +12529,7 @@ class AttentionDataManager:
             # Preserve all successfully written mask metadata before propagating the
             # failure. A subsequent launch then resumes from the remaining rows.
             try:
-                write_attention_manifest(rows, workspace.manifest_csv)
+                AttentionDataManager.write_attention_manifest(rows, workspace.manifest_csv)
                 print(
                     "[ATTENTION][MASKS] Progress manifest saved after failure at "
                     f"batch {completed_batches}/{len(loader)}.",
@@ -12544,7 +12544,7 @@ class AttentionDataManager:
                 )
             raise
 
-        write_attention_manifest(rows, workspace.manifest_csv)
+        AttentionDataManager.write_attention_manifest(rows, workspace.manifest_csv)
         valid_count = sum(int(str(row["monai_valid"])) for row in rows)
         print(
             f"[ATTENTION][MASKS] Pseudo-mask generation completed: "
@@ -12575,7 +12575,7 @@ class AttentionTrainingManager:
     @staticmethod
     def attention_segmentation_loss(logits, targets):
         bce = F.binary_cross_entropy_with_logits(logits.float(), targets.float())
-        dice_loss = 1.0 - soft_dice_coefficient_from_logits(logits, targets)
+        dice_loss = 1.0 - AttentionTrainingManager.soft_dice_coefficient_from_logits(logits, targets)
         return SETTINGS_ATTENTION.ATTENTION_BCE_WEIGHT * bce + SETTINGS_ATTENTION.ATTENTION_DICE_WEIGHT * dice_loss
 
     @staticmethod
@@ -12611,7 +12611,7 @@ class AttentionTrainingManager:
         }
         hasher.update(json.dumps(settings, sort_keys=True).encode("utf-8"))
         for row in sorted(rows, key=lambda x: x["image_token"]):
-            mask_path, source = _resolved_training_mask(row)
+            mask_path, source = AttentionTrainingManager._resolved_training_mask(row)
             if mask_path is None:
                 continue
             hasher.update(row["image_token"].encode("utf-8"))
@@ -12658,7 +12658,7 @@ class AttentionTrainingManager:
                 raise FileNotFoundError(
                     f"External Attention U-Net checkpoint not found: {external_path}"
                 )
-            state_dict, metadata = _load_attention_state_dict(external_path)
+            state_dict, metadata = AttentionTrainingManager._load_attention_state_dict(external_path)
             model = AttentionUNet()
             model.load_state_dict(state_dict, strict=True)
             summary = {
@@ -12679,7 +12679,7 @@ class AttentionTrainingManager:
         eligible_rows = []
         source_counts = defaultdict(int)
         for row in rows:
-            mask_path, source = _resolved_training_mask(row)
+            mask_path, source = AttentionTrainingManager._resolved_training_mask(row)
             if mask_path is not None:
                 eligible_rows.append(row)
                 source_counts[source] += 1
@@ -12697,7 +12697,7 @@ class AttentionTrainingManager:
                 if int(row["segmentation_fold"]) != target_fold
             ]
             candidate_patients = sorted({row["patient_id"] for row in candidate_rows})
-            validation_patients = _select_internal_validation_patients(
+            validation_patients = AttentionTrainingManager._select_internal_validation_patients(
                 candidate_patients, target_fold
             )
             train_rows = [
@@ -12711,11 +12711,11 @@ class AttentionTrainingManager:
                     f"Fold {target_fold}: insufficient train/validation mask rows."
                 )
 
-            fingerprint = _attention_training_fingerprint(candidate_rows, target_fold)
-            checkpoint_path = _checkpoint_path(workspace, target_fold)
+            fingerprint = AttentionTrainingManager._attention_training_fingerprint(candidate_rows, target_fold)
+            checkpoint_path = AttentionTrainingManager._checkpoint_path(workspace, target_fold)
             if checkpoint_path.is_file():
                 try:
-                    _state, metadata = _load_attention_state_dict(
+                    _state, metadata = AttentionTrainingManager._load_attention_state_dict(
                         checkpoint_path, expected_fingerprint=fingerprint
                     )
                     print(
@@ -12798,7 +12798,7 @@ class AttentionTrainingManager:
                         enabled=amp_enabled,
                     ):
                         logits = model(images)
-                        loss = attention_segmentation_loss(logits, masks)
+                        loss = AttentionTrainingManager.attention_segmentation_loss(logits, masks)
                     scaler.scale(loss).backward()
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
@@ -12815,11 +12815,11 @@ class AttentionTrainingManager:
                         masks = masks.to(DEVICE, non_blocking=True)
                         logits = model(images)
                         validation_losses.append(
-                            float(attention_segmentation_loss(logits, masks).cpu().item())
+                            float(AttentionTrainingManager.attention_segmentation_loss(logits, masks).cpu().item())
                         )
                         validation_dice_values.append(
                             float(
-                                soft_dice_coefficient_from_logits(logits, masks)
+                                AttentionTrainingManager.soft_dice_coefficient_from_logits(logits, masks)
                                 .cpu()
                                 .item()
                             )
@@ -12924,7 +12924,7 @@ class AttentionTrainingManager:
         output = []
         for index in range(probability_256.shape[0]):
             mask = probability_256[index, 0].detach().cpu().numpy()
-            component = _largest_connected_component(mask >= SETTINGS_ATTENTION.ATTENTION_MASK_THRESHOLD)
+            component = AttentionDataManager._largest_connected_component(mask >= SETTINGS_ATTENTION.ATTENTION_MASK_THRESHOLD)
             output.append(torch.from_numpy(component.astype(np.float32)))
         return torch.stack(output, dim=0).unsqueeze(1).to(probability_256.device)
 
@@ -12944,7 +12944,7 @@ class AttentionTrainingManager:
             if bool(valid_mask[index].item()) and bool(torch.any(dilated[index] > 0.5)):
                 support[index] = dilated[index]
             else:
-                top, bottom, left, right = _fixed_square_bounds(
+                top, bottom, left, right = FeatureBankManager._fixed_square_bounds(
                     height,
                     width,
                     (height - 1) / 2.0,
@@ -12965,7 +12965,7 @@ class AttentionTrainingManager:
             if n_visible == 0:
                 continue
             values = au1_images[index, 0].reshape(-1)[flat_mask]
-            multiplier, offset = _affine_permutation_parameters(decoded_hash, n_visible)
+            multiplier, offset = FeatureBankManager._affine_permutation_parameters(decoded_hash, n_visible)
             positions = torch.arange(n_visible, device=values.device, dtype=torch.long)
             shuffled = values[(multiplier * positions + offset) % n_visible]
             for channel in range(3):
@@ -12996,7 +12996,7 @@ class AttentionEvaluationManager:
             hasher.update(hashlib.sha256(path.read_bytes()).digest())
         for image_path, _label, patient_id, series_id in samples:
             stat = Path(image_path).stat()
-            hasher.update(_directory_scoped_relative_token(image_path).encode("utf-8"))
+            hasher.update(AttentionDataManager._directory_scoped_relative_token(image_path).encode("utf-8"))
             hasher.update(str(patient_id).encode("utf-8"))
             hasher.update(str(series_id).encode("utf-8"))
             hasher.update(str(stat.st_size).encode("utf-8"))
@@ -13014,7 +13014,7 @@ class AttentionEvaluationManager:
 
     @staticmethod
     def _load_attention_model(checkpoint_path):
-        state_dict, metadata = _load_attention_state_dict(checkpoint_path)
+        state_dict, metadata = AttentionTrainingManager._load_attention_state_dict(checkpoint_path)
         model_config = metadata.get("model_config", {}) if isinstance(metadata, dict) else {}
         model = AttentionUNet(
             base_channels=int(model_config.get("base_channels", SETTINGS_ATTENTION.ATTENTION_BASE_CHANNELS))
@@ -13030,7 +13030,7 @@ class AttentionEvaluationManager:
         output_dir.mkdir(parents=True, exist_ok=True)
         npz_path = output_dir / "attention_unet_patient_feature_bank.npz"
         metadata_path = output_dir / "attention_unet_feature_bank_metadata.json"
-        fingerprint = _attention_feature_fingerprint(samples, checkpoint_map)
+        fingerprint = AttentionEvaluationManager._attention_feature_fingerprint(samples, checkpoint_map)
         if npz_path.is_file() and metadata_path.is_file():
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             if metadata.get("fingerprint") == fingerprint:
@@ -13050,8 +13050,8 @@ class AttentionEvaluationManager:
                     "metadata": metadata,
                 }
 
-        patient_to_fold = build_attention_patient_folds(samples)
-        review_rows = read_attention_manifest(workspace)
+        patient_to_fold = AttentionDataManager.build_attention_patient_folds(samples)
+        review_rows = AttentionDataManager.read_attention_manifest(workspace)
         review_by_token = {row["image_token"]: row for row in review_rows}
         review_tokens = set(review_by_token)
         pool = _StreamingHierarchicalAttentionPool(SETTINGS_ATTENTION.ATTENTION_FEATURE_MODES)
@@ -13069,7 +13069,7 @@ class AttentionEvaluationManager:
             ]
             if not fold_samples:
                 continue
-            model, checkpoint_metadata = _load_attention_model(
+            model, checkpoint_metadata = AttentionEvaluationManager._load_attention_model(
                 checkpoint_map[target_fold]
             )
             loader = DataLoader(
@@ -13103,7 +13103,7 @@ class AttentionEvaluationManager:
                     content_masks = content_masks.to(DEVICE, non_blocking=True)
                     logits = model(attention_inputs)
                     probability_256 = torch.sigmoid(logits.float())
-                    hard_256 = _attention_binary_masks(probability_256)
+                    hard_256 = AttentionTrainingManager._attention_binary_masks(probability_256)
                     area_ratio = hard_256.mean(dim=(1, 2, 3))
                     peak_probability = probability_256.amax(dim=(1, 2, 3))
                     valid_mask = (
@@ -13116,18 +13116,18 @@ class AttentionEvaluationManager:
                         size=(SETTINGS_PREPROCESSING.IMG_SIZE, SETTINGS_PREPROCESSING.IMG_SIZE),
                         mode="nearest",
                     )
-                    support = create_attention_exact_support_mask(
+                    support = AttentionTrainingManager.create_attention_exact_support_mask(
                         hard_224, valid_mask, content_masks
                     )
-                    au1 = _robust_scale_visible_regions(raw_images, support)
+                    au1 = FeatureBankManager._robust_scale_visible_regions(raw_images, support)
                     au3 = support.repeat(1, 3, 1, 1)
-                    au4 = create_attention_support_shuffled_images(
+                    au4 = AttentionTrainingManager.create_attention_support_shuffled_images(
                         au1, support, list(decoded_hashes)
                     )
                     complement = (
                         (content_masks > 0.5) & (support <= 0.5)
                     ).float()
-                    au5 = _robust_scale_visible_regions(raw_images, complement)
+                    au5 = FeatureBankManager._robust_scale_visible_regions(raw_images, complement)
                     variants = {
                         SETTINGS_ATTENTION.ATTENTION_FEATURE_MODES[0]: au1,
                         SETTINGS_ATTENTION.ATTENTION_FEATURE_MODES[1]: au1,
@@ -13141,7 +13141,7 @@ class AttentionEvaluationManager:
                     for start in range(0, len(mode_list), SETTINGS_FEATURE_BANK.FEATURE_MODES_PER_ENCODER_CALL):
                         chunk_modes = mode_list[start:start + SETTINGS_FEATURE_BANK.FEATURE_MODES_PER_ENCODER_CALL]
                         normalized = torch.cat(
-                            [normalize_for_efficientnet(variants[mode]) for mode in chunk_modes],
+                            [MonaiSegmenter.normalize_for_efficientnet(variants[mode]) for mode in chunk_modes],
                             dim=0,
                         )
                         encoded = encoder(normalized).float().cpu().numpy()
@@ -13173,7 +13173,7 @@ class AttentionEvaluationManager:
                         predicted_path = workspace.predicted_masks / f"{token}.png"
                         prediction_written = False
                         if save_prediction and predicted_mask_writes_enabled:
-                            prediction_written = _atomic_cv2_write(
+                            prediction_written = AttentionDataManager._atomic_cv2_write(
                                 predicted_path,
                                 hard_cpu[index].astype(np.uint8) * 255,
                                 required=False,
@@ -13197,12 +13197,12 @@ class AttentionEvaluationManager:
                                 target = cv2.imread(str(automatic_path), cv2.IMREAD_GRAYSCALE)
                                 if target is not None:
                                     target = cv2.resize(target, (256, 256), interpolation=cv2.INTER_NEAREST) > 127
-                                    dice_monai = _dice_binary(hard_cpu[index], target)
+                                    dice_monai = AttentionEvaluationManager._dice_binary(hard_cpu[index], target)
                             if manual_path.is_file():
                                 target = cv2.imread(str(manual_path), cv2.IMREAD_GRAYSCALE)
                                 if target is not None:
                                     target = cv2.resize(target, (256, 256), interpolation=cv2.INTER_NEAREST) > 127
-                                    dice_manual = _dice_binary(hard_cpu[index], target)
+                                    dice_manual = AttentionEvaluationManager._dice_binary(hard_cpu[index], target)
                         slice_qc_rows.append(
                             {
                                 "sample_index": int(sample_indices[index]),
@@ -13378,7 +13378,7 @@ class AttentionEvaluationManager:
         patients = np.asarray(sorted(patient_to_label))
         labels = np.asarray([patient_to_label[p] for p in patients], dtype=np.int64)
         groups = patients.copy()
-        folds = assign_stratified_patient_folds(
+        folds = DuplicateAuditManager.assign_stratified_patient_folds(
             patients, labels, groups, SETTINGS_VALIDATION.N_SPLITS, SETTINGS_VALIDATION.CV_RANDOM_STATE
         )
         rows = [
@@ -13464,7 +13464,7 @@ class AttentionEvaluationManager:
             flush=True,
         )
 
-        fold_rows, fold_path = _load_or_create_classification_fold_manifest(
+        fold_rows, fold_path = AttentionEvaluationManager._load_or_create_classification_fold_manifest(
             samples, workspace
         )
         evaluation_root = workspace.comparison_output / "evaluation"
@@ -13473,7 +13473,7 @@ class AttentionEvaluationManager:
         stability = {}
         prepared_by_id = {}
 
-        with _temporary_attention_analysis_settings():
+        with AttentionEvaluationManager._temporary_attention_analysis_settings():
             for experiment in SETTINGS_ATTENTION.ATTENTION_EXPERIMENTS:
                 X = bank["features"][experiment.feature_mode]
                 prepared = {
@@ -13493,7 +13493,7 @@ class AttentionEvaluationManager:
                     ),
                 }
                 prepared_by_id[experiment.experiment_id] = prepared
-                result = run_one_experiment(
+                result = ModelingManager.run_one_experiment(
                     experiment,
                     prepared,
                     fold_rows,
@@ -13502,7 +13502,7 @@ class AttentionEvaluationManager:
                 results[experiment.experiment_id] = result
                 if SETTINGS_ATTENTION.ATTENTION_RUN_REPEATED_CV_STABILITY:
                     stability[experiment.experiment_id] = (
-                        run_repeated_nested_cv_stability(
+                        ModelingManager.run_repeated_nested_cv_stability(
                             experiment,
                             prepared,
                             fold_rows,
@@ -13523,7 +13523,7 @@ class AttentionEvaluationManager:
             au1_id = SETTINGS_ATTENTION.ATTENTION_EXPERIMENTS[0].experiment_id
             au1_result = results[au1_id]
             if SETTINGS_ATTENTION.ATTENTION_RUN_PERMUTATION_TEST:
-                permutation = run_patient_label_permutation_test(
+                permutation = ModelingManager.run_patient_label_permutation_test(
                     SETTINGS_ATTENTION.ATTENTION_EXPERIMENTS[0],
                     prepared_by_id[au1_id],
                     fold_rows,
@@ -13552,7 +13552,7 @@ class AttentionEvaluationManager:
                 raise RuntimeError(
                     f"Patient mismatch in AU1 versus {experiment.experiment_id}."
                 )
-            pairwise[experiment.experiment_id] = paired_auc_difference_interval(
+            pairwise[experiment.experiment_id] = ModelingManager.paired_auc_difference_interval(
                 au1["labels"][au1_order],
                 comparison["probabilities"][comparison_order],
                 au1["probabilities"][au1_order],
@@ -13561,15 +13561,15 @@ class AttentionEvaluationManager:
             )
 
         monai_comparison = {"status": "UNAVAILABLE"}
-        monai_path = _find_monai_candidate_predictions()
+        monai_path = AttentionEvaluationManager._find_monai_candidate_predictions()
         if monai_path is not None:
-            monai_patients, monai_labels, monai_scores = _read_oof_prediction_csv(monai_path)
+            monai_patients, monai_labels, monai_scores = AttentionEvaluationManager._read_oof_prediction_csv(monai_path)
             order = np.argsort(au1["patient_ids"].astype(str))
             au1_patients = au1["patient_ids"][order].astype(str)
             au1_labels = au1["labels"][order]
             au1_scores = au1["probabilities"][order]
             if np.array_equal(monai_patients, au1_patients) and np.array_equal(monai_labels, au1_labels):
-                comparison = paired_auc_difference_interval(
+                comparison = ModelingManager.paired_auc_difference_interval(
                     au1_labels,
                     monai_scores,
                     au1_scores,
@@ -13720,11 +13720,11 @@ class MaskReviewManager:
         Existing MONAI/Attention QC values and manual-mask state are preserved.
         """
 
-        path = attention_full_review_manifest_path(workspace)
-        existing = {} if refresh else _review_read_csv_by_token(path)
+        path = MaskReviewManager.attention_full_review_manifest_path(workspace)
+        existing = {} if refresh else MaskReviewManager._review_read_csv_by_token(path)
 
         # Merge QC already known from the compact training manifest.
-        compact = _review_read_csv_by_token(workspace.manifest_csv)
+        compact = MaskReviewManager._review_read_csv_by_token(workspace.manifest_csv)
         for token, row in compact.items():
             existing.setdefault(token, {}).update(
                 {
@@ -13762,10 +13762,10 @@ class MaskReviewManager:
                         }
                     )
 
-        patient_to_fold = build_attention_patient_folds(samples)
+        patient_to_fold = AttentionDataManager.build_attention_patient_folds(samples)
         rows = []
         for image_path, _label, patient_id, series_id in samples:
-            token = attention_image_token(image_path, patient_id, series_id)
+            token = AttentionDataManager.attention_image_token(image_path, patient_id, series_id)
             old = existing.get(token, {})
             manual_path = Path(workspace.manual_masks) / f"{token}.png"
             rows.append(
@@ -13816,7 +13816,7 @@ class MaskReviewManager:
         )
         for index, row in enumerate(rows):
             row["review_index"] = int(index)
-        _review_atomic_csv(rows, path, SETTINGS_REVIEW.ATTENTION_REVIEW_MANIFEST_FIELDS)
+        MaskReviewManager._review_atomic_csv(rows, path, SETTINGS_REVIEW.ATTENTION_REVIEW_MANIFEST_FIELDS)
         print(
             f"[ATTENTION][REVIEW] Full manifest: {len(rows)} images -> {path}",
             flush=True,
@@ -13825,7 +13825,7 @@ class MaskReviewManager:
 
     @staticmethod
     def read_attention_full_review_manifest(workspace):
-        path = attention_full_review_manifest_path(workspace)
+        path = MaskReviewManager.attention_full_review_manifest_path(workspace)
         if not path.is_file():
             raise FileNotFoundError(
                 f"Full Attention review manifest not found: {path}"
@@ -13853,7 +13853,7 @@ class MaskReviewManager:
     ):
         """Append one persistent review action without rewriting 63k CSV rows."""
 
-        path = attention_review_history_path(workspace)
+        path = MaskReviewManager.attention_review_history_path(workspace)
         path.parent.mkdir(parents=True, exist_ok=True)
         write_header = not path.is_file() or path.stat().st_size == 0
         area = ""
@@ -13887,7 +13887,7 @@ class MaskReviewManager:
 
     @staticmethod
     def _review_reviewed_tokens(workspace, source=None, review_round=None):
-        path = attention_review_history_path(workspace)
+        path = MaskReviewManager.attention_review_history_path(workspace)
         if not path.is_file():
             return set()
         tokens = set()
@@ -13895,7 +13895,7 @@ class MaskReviewManager:
             for row in csv.DictReader(file):
                 if source is not None and row.get("review_source") != source:
                     continue
-                if review_round is not None and _review_to_int(
+                if review_round is not None and MaskReviewManager._review_to_int(
                     row.get("review_round"), -1
                 ) != int(review_round):
                     continue
@@ -13920,17 +13920,17 @@ class MaskReviewManager:
             token = row["image_token"]
             hashed = hashlib.sha256(f"{seed}|{token}".encode()).hexdigest()
             if source == "attention":
-                valid = _review_to_int(row.get("attention_valid"), -1)
-                dice = _review_to_float(row.get("dice_attention_vs_monai"), 1.0)
-                peak = _review_to_float(
+                valid = MaskReviewManager._review_to_int(row.get("attention_valid"), -1)
+                dice = MaskReviewManager._review_to_float(row.get("dice_attention_vs_monai"), 1.0)
+                peak = MaskReviewManager._review_to_float(
                     row.get("attention_peak_probability"), 1.0
                 )
-                area = _review_to_float(row.get("attention_area_ratio"), 0.15)
+                area = MaskReviewManager._review_to_float(row.get("attention_area_ratio"), 0.15)
             else:
-                valid = _review_to_int(row.get("monai_valid"), -1)
+                valid = MaskReviewManager._review_to_int(row.get("monai_valid"), -1)
                 dice = 1.0
-                peak = _review_to_float(row.get("monai_peak_probability"), 1.0)
-                area = _review_to_float(row.get("monai_area_ratio"), 0.15)
+                peak = MaskReviewManager._review_to_float(row.get("monai_peak_probability"), 1.0)
+                area = MaskReviewManager._review_to_float(row.get("monai_area_ratio"), 0.15)
             # invalid / low agreement / low confidence / extreme-area rows first.
             return (
                 1 if bool(row.get("_reviewed_current_round", False)) else 0,
@@ -14001,8 +14001,8 @@ class MaskReviewManager:
             )
 
         rows = [dict(row) for row in rows]
-        reviewed = _review_reviewed_tokens(workspace, source=source)
-        current_round_reviewed = _review_reviewed_tokens(
+        reviewed = MaskReviewManager._review_reviewed_tokens(workspace, source=source)
+        current_round_reviewed = MaskReviewManager._review_reviewed_tokens(
             workspace, source=source, review_round=review_round
         )
 
@@ -14018,7 +14018,7 @@ class MaskReviewManager:
             ]
         elif scope == "invalid":
             field = "attention_valid" if source == "attention" else "monai_valid"
-            rows = [row for row in rows if _review_to_int(row.get(field), -1) == 0]
+            rows = [row for row in rows if MaskReviewManager._review_to_int(row.get(field), -1) == 0]
         elif scope == "disagreement":
             if source != "attention":
                 raise ValueError("disagreement scope is available for Attention only.")
@@ -14026,12 +14026,12 @@ class MaskReviewManager:
                 row
                 for row in rows
                 if np.isfinite(
-                    _review_to_float(row.get("dice_attention_vs_monai"))
+                    MaskReviewManager._review_to_float(row.get("dice_attention_vs_monai"))
                 )
             ]
             rows.sort(
                 key=lambda row: (
-                    _review_to_float(row.get("dice_attention_vs_monai"), 1.0),
+                    MaskReviewManager._review_to_float(row.get("dice_attention_vs_monai"), 1.0),
                     row["patient_id"],
                     row["series_id"],
                     row["image_token"],
@@ -14045,7 +14045,7 @@ class MaskReviewManager:
                 row["_reviewed_current_round"] = (
                     row["image_token"] in current_round_reviewed
                 )
-            rows = _review_round_robin_diverse(
+            rows = MaskReviewManager._review_round_robin_diverse(
                 rows, int(limit), source, int(seed)
             )
         elif int(limit) > 0:
@@ -14079,7 +14079,7 @@ class MaskReviewManager:
     ):
         """Generate/reuse MONAI masks for any full-cohort review rows."""
 
-        full_rows = build_attention_full_review_manifest(samples, workspace)
+        full_rows = MaskReviewManager.build_attention_full_review_manifest(samples, workspace)
         full_by_token = {row["image_token"]: row for row in full_rows}
         target_rows = (
             full_rows
@@ -14090,7 +14090,7 @@ class MaskReviewManager:
             row
             for row in target_rows
             if force
-            or not _attention_mask_file_is_readable(row["automatic_mask_path"])
+            or not AttentionDataManager._attention_mask_file_is_readable(row["automatic_mask_path"])
             or str(row.get("monai_valid", "")).strip() == ""
         ]
         if not missing:
@@ -14100,9 +14100,9 @@ class MaskReviewManager:
             )
             return target_rows
 
-        report_attention_storage(workspace)
-        model = build_monai_segmenter().to(DEVICE).eval()
-        loader = _review_manifest_image_loader(missing)
+        AttentionDataManager.report_attention_storage(workspace)
+        model = MonaiSegmenter.build_monai_segmenter().to(DEVICE).eval()
+        loader = MaskReviewManager._review_manifest_image_loader(missing)
         print(
             f"[ATTENTION][MONAI REVIEW] Generating {len(missing)} masks "
             f"for a {len(target_rows)}-row review queue.",
@@ -14134,10 +14134,10 @@ class MaskReviewManager:
                 )
                 for batch_position, local_index_tensor in enumerate(local_indices):
                     row = missing[int(local_index_tensor)]
-                    mask = _largest_connected_component(
+                    mask = AttentionDataManager._largest_connected_component(
                         hard[batch_position, 0].detach().cpu().numpy() > 0.5
                     )
-                    _atomic_cv2_write(
+                    AttentionDataManager._atomic_cv2_write(
                         Path(row["automatic_mask_path"]),
                         mask.astype(np.uint8) * 255,
                         required=True,
@@ -14150,14 +14150,14 @@ class MaskReviewManager:
                     )
                     completed += 1
                 if batch_number % 50 == 0:
-                    _review_atomic_csv(
+                    MaskReviewManager._review_atomic_csv(
                         full_rows,
-                        attention_full_review_manifest_path(workspace),
+                        MaskReviewManager.attention_full_review_manifest_path(workspace),
                         SETTINGS_REVIEW.ATTENTION_REVIEW_MANIFEST_FIELDS,
                     )
-        _review_atomic_csv(
+        MaskReviewManager._review_atomic_csv(
             full_rows,
-            attention_full_review_manifest_path(workspace),
+            MaskReviewManager.attention_full_review_manifest_path(workspace),
             SETTINGS_REVIEW.ATTENTION_REVIEW_MANIFEST_FIELDS,
         )
         del model
@@ -14189,15 +14189,15 @@ class MaskReviewManager:
     ):
         """Generate/reuse cross-fitted Attention masks for review, without EfficientNet."""
 
-        full_rows = build_attention_full_review_manifest(samples, workspace)
+        full_rows = MaskReviewManager.build_attention_full_review_manifest(samples, workspace)
         full_by_token = {row["image_token"]: row for row in full_rows}
         target_rows = (
             full_rows
             if rows is None
             else [full_by_token[row["image_token"]] for row in rows]
         )
-        fingerprint = _review_checkpoint_fingerprint(checkpoint_map)
-        metadata_path = attention_prediction_generation_path(workspace)
+        fingerprint = MaskReviewManager._review_checkpoint_fingerprint(checkpoint_map)
+        metadata_path = MaskReviewManager.attention_prediction_generation_path(workspace)
         previous_fingerprint = ""
         if metadata_path.is_file():
             try:
@@ -14213,7 +14213,7 @@ class MaskReviewManager:
             row
             for row in target_rows
             if force
-            or not _attention_mask_file_is_readable(
+            or not AttentionDataManager._attention_mask_file_is_readable(
                 row["predicted_attention_mask_path"]
             )
             or row.get("attention_checkpoint_fingerprint", "") != fingerprint
@@ -14246,7 +14246,7 @@ class MaskReviewManager:
                 )
                 for row in fold_rows
             ]
-            model, _metadata = _load_attention_model(checkpoint_map[target_fold])
+            model, _metadata = AttentionEvaluationManager._load_attention_model(checkpoint_map[target_fold])
             loader = DataLoader(
                 AttentionInferenceDataset(fold_samples),
                 batch_size=SETTINGS_ATTENTION.ATTENTION_INFERENCE_BATCH_SIZE,
@@ -14262,7 +14262,7 @@ class MaskReviewManager:
                     attention_inputs = batch[0].to(DEVICE, non_blocking=True)
                     image_tokens = list(batch[8])
                     probability = torch.sigmoid(model(attention_inputs).float())
-                    hard = _attention_binary_masks(probability)
+                    hard = AttentionTrainingManager._attention_binary_masks(probability)
                     area = hard.mean(dim=(1, 2, 3))
                     peak = probability.amax(dim=(1, 2, 3))
                     valid = (
@@ -14273,7 +14273,7 @@ class MaskReviewManager:
                     hard_np = hard[:, 0].cpu().numpy() > 0.5
                     for position, token in enumerate(image_tokens):
                         row = full_by_token[str(token)]
-                        _atomic_cv2_write(
+                        AttentionDataManager._atomic_cv2_write(
                             Path(row["predicted_attention_mask_path"]),
                             hard_np[position].astype(np.uint8) * 255,
                             required=True,
@@ -14296,23 +14296,23 @@ class MaskReviewManager:
                                     (SETTINGS_ATTENTION.ATTENTION_INPUT_SIZE, SETTINGS_ATTENTION.ATTENTION_INPUT_SIZE),
                                     interpolation=cv2.INTER_NEAREST,
                                 ) > 127
-                                row["dice_attention_vs_monai"] = _dice_binary(
+                                row["dice_attention_vs_monai"] = AttentionEvaluationManager._dice_binary(
                                     hard_np[position], monai
                                 )
                         generated += 1
                     if batch_number % 50 == 0:
-                        _review_atomic_csv(
+                        MaskReviewManager._review_atomic_csv(
                             full_rows,
-                            attention_full_review_manifest_path(workspace),
+                            MaskReviewManager.attention_full_review_manifest_path(workspace),
                             SETTINGS_REVIEW.ATTENTION_REVIEW_MANIFEST_FIELDS,
                         )
             del model
             if DEVICE == "cuda":
                 torch.cuda.empty_cache()
 
-        _review_atomic_csv(
+        MaskReviewManager._review_atomic_csv(
             full_rows,
-            attention_full_review_manifest_path(workspace),
+            MaskReviewManager.attention_full_review_manifest_path(workspace),
             SETTINGS_REVIEW.ATTENTION_REVIEW_MANIFEST_FIELDS,
         )
         metadata_path.write_text(
@@ -14348,14 +14348,14 @@ class MaskReviewManager:
         are never discarded merely because their image was outside that subset.
         """
 
-        existing = _review_read_csv_by_token(workspace.manifest_csv)
-        review_existing = _review_read_csv_by_token(
-            attention_full_review_manifest_path(workspace)
+        existing = MaskReviewManager._review_read_csv_by_token(workspace.manifest_csv)
+        review_existing = MaskReviewManager._review_read_csv_by_token(
+            MaskReviewManager.attention_full_review_manifest_path(workspace)
         )
         all_rows = {}
         by_series = _review_defaultdict(list)
         for image_path, _label, patient_id, series_id in samples:
-            token = attention_image_token(image_path, patient_id, series_id)
+            token = AttentionDataManager.attention_image_token(image_path, patient_id, series_id)
             row = {
                 "image_token": token,
                 "image_path": str(image_path),
@@ -14371,7 +14371,7 @@ class MaskReviewManager:
                 by_series[series_id], key=lambda row: row["image_token"]
             )
             series_selected.extend(
-                _evenly_spaced_subset(
+                AttentionDataManager._evenly_spaced_subset(
                     ordered, SETTINGS_ATTENTION.ATTENTION_MAX_TRAIN_SLICES_PER_SERIES
                 )
             )
@@ -14383,7 +14383,7 @@ class MaskReviewManager:
             ordered = sorted(
                 by_patient[patient_id], key=lambda row: row["image_token"]
             )
-            for row in _evenly_spaced_subset(
+            for row in AttentionDataManager._evenly_spaced_subset(
                 ordered, SETTINGS_ATTENTION.ATTENTION_MAX_TRAIN_SLICES_PER_PATIENT
             ):
                 selected[row["image_token"]] = row
@@ -14396,7 +14396,7 @@ class MaskReviewManager:
                 selected[token] = all_rows[token]
                 manual_added += 1
 
-        patient_to_fold = build_attention_patient_folds(samples)
+        patient_to_fold = AttentionDataManager.build_attention_patient_folds(samples)
         manifest_rows = []
         for index, row in enumerate(
             sorted(selected.values(), key=lambda x: x["image_token"])
@@ -14430,7 +14430,7 @@ class MaskReviewManager:
                     "manual_mask_exists": int(manual_path.is_file()),
                 }
             )
-        write_attention_manifest(manifest_rows, workspace.manifest_csv)
+        AttentionDataManager.write_attention_manifest(manifest_rows, workspace.manifest_csv)
         print(
             f"[ATTENTION][TRAIN MANIFEST] automatic subset={base_count}; "
             f"manual rows added outside subset={manual_added}; "
@@ -14450,7 +14450,7 @@ class MaskReviewManager:
         review_scope="all",
     ):
         if rows is None:
-            rows = read_attention_full_review_manifest(workspace)
+            rows = MaskReviewManager.read_attention_full_review_manifest(workspace)
         editor = AttentionMaskEditor(
             rows,
             workspace,
@@ -14545,23 +14545,23 @@ class PipelineApplication:
     def run_attention_pipeline(samples, workspace, action):
         """Execute one neural or cached Attention/segmentation stage."""
 
-        validate_attention_extension()
+        ConfigurationManager.validate_attention_extension()
 
         if action == "evaluate-attention-cpu":
-            checkpoint_map = existing_attention_checkpoint_map(workspace)
-            bank = load_existing_attention_feature_bank(
+            checkpoint_map = PipelineRunner.existing_attention_checkpoint_map(workspace)
+            bank = PipelineRunner.load_existing_attention_feature_bank(
                 samples, workspace, checkpoint_map
             )
-            return evaluate_attention_feature_bank(samples, workspace, bank)
+            return AttentionEvaluationManager.evaluate_attention_feature_bank(samples, workspace, bank)
 
         if action == "generate-all-monai-masks":
-            rows = generate_monai_review_masks(
+            rows = MaskReviewManager.generate_monai_review_masks(
                 samples, workspace, rows=None, force=False
             )
             return {
                 "status": "ALL_MONAI_REVIEW_MASKS_READY",
                 "n_rows": len(rows),
-                "manifest": str(attention_full_review_manifest_path(workspace)),
+                "manifest": str(MaskReviewManager.attention_full_review_manifest_path(workspace)),
             }
 
         if action not in {
@@ -14570,26 +14570,26 @@ class PipelineApplication:
         }:
             raise ValueError(f"Unsupported Attention stage: {action!r}.")
 
-        training_rows = generate_attention_pseudo_masks(samples, workspace)
-        checkpoint_map = train_attention_unet_crossfit(training_rows, workspace)
+        training_rows = AttentionDataManager.generate_attention_pseudo_masks(samples, workspace)
+        checkpoint_map = AttentionTrainingManager.train_attention_unet_crossfit(training_rows, workspace)
 
         if action == "retrain-regenerate-attention":
-            rows = generate_attention_review_masks(
+            rows = MaskReviewManager.generate_attention_review_masks(
                 samples,
                 workspace,
                 checkpoint_map,
                 rows=None,
                 force=True,
             )
-            clear_attention_image_ram_cache()
+            AttentionDataManager.clear_attention_image_ram_cache()
             return {
                 "status": "ALL_ATTENTION_REVIEW_MASKS_READY",
                 "n_rows": len(rows),
-                "manifest": str(attention_full_review_manifest_path(workspace)),
+                "manifest": str(MaskReviewManager.attention_full_review_manifest_path(workspace)),
             }
 
-        clear_attention_image_ram_cache()
-        bank = extract_attention_patient_feature_bank(
+        AttentionDataManager.clear_attention_image_ram_cache()
+        bank = AttentionEvaluationManager.extract_attention_patient_feature_bank(
             samples, workspace, checkpoint_map
         )
         return {
@@ -14603,48 +14603,48 @@ class PipelineApplication:
     def run_cad_pipeline(argv=None):
         """Dispatch one explicit CPU/GPU pipeline stage."""
 
-        args = _parse_attention_arguments(argv)
+        args = PipelineApplication._parse_attention_arguments(argv)
         action = args.attention_action
 
         requested_device = args.runtime_device
         if action in SETTINGS_REVIEW.CPU_CACHE_ONLY_ACTIONS and requested_device == "auto":
             requested_device = "cpu"
-        set_runtime_device(
+        RuntimeManager.set_runtime_device(
             requested=requested_device,
             context=f"pipeline action {action}",
             strict_cuda=(requested_device == "cuda"),
         )
-        set_feature_cache_device_tag(args.feature_cache_device_tag)
+        RuntimeManager.set_feature_cache_device_tag(args.feature_cache_device_tag)
 
         if action == "build-monai-feature-cache":
             try:
-                return build_monai_feature_cache_only(args.attention_dataset_path)
+                return PipelineRunner.build_monai_feature_cache_only(args.attention_dataset_path)
             finally:
                 if not args.keep_gpu_memory:
-                    release_gpu_resources(action)
+                    RuntimeManager.release_gpu_resources(action)
 
         if action == "monai-cpu-from-cache":
             previous_cache_requirement = SETTINGS_FEATURE_BANK.REQUIRE_EXISTING_FEATURE_CACHE
             SETTINGS_FEATURE_BANK.REQUIRE_EXISTING_FEATURE_CACHE = True
             try:
-                run_with_console_logging()
+                RuntimeManager.run_with_console_logging()
                 return {
                     "status": "MONAI_CPU_EVALUATION_COMPLETED",
                     "device": DEVICE,
-                    "feature_cache_device_tag": resolved_feature_cache_device_tag(),
+                    "feature_cache_device_tag": RuntimeManager.resolved_feature_cache_device_tag(),
                 }
             finally:
                 SETTINGS_FEATURE_BANK.REQUIRE_EXISTING_FEATURE_CACHE = previous_cache_requirement
                 if not args.keep_gpu_memory:
-                    release_gpu_resources(action)
+                    RuntimeManager.release_gpu_resources(action)
 
-        workspace = build_attention_workspace(args.attention_work_root)
-        samples = load_samples(Path(args.attention_dataset_path))
+        workspace = AttentionDataManager.build_attention_workspace(args.attention_work_root)
+        samples = DatasetManager.load_samples(Path(args.attention_dataset_path))
 
         if action == "edit-existing-masks":
-            validate_attention_extension()
-            rows = build_attention_full_review_manifest(samples, workspace)
-            queue = select_attention_review_rows(
+            ConfigurationManager.validate_attention_extension()
+            rows = MaskReviewManager.build_attention_full_review_manifest(samples, workspace)
+            queue = MaskReviewManager.select_attention_review_rows(
                 rows,
                 workspace,
                 source=args.attention_editor_base,
@@ -14655,7 +14655,7 @@ class PipelineApplication:
             )
             queue = [
                 row for row in queue
-                if _review_mask_exists(row, args.attention_editor_base)
+                if PipelineRunner._review_mask_exists(row, args.attention_editor_base)
             ]
             if not queue:
                 raise RuntimeError(
@@ -14669,7 +14669,7 @@ class PipelineApplication:
                 f"round={args.attention_review_round}. Class labels are hidden.",
                 flush=True,
             )
-            return open_attention_mask_editor(
+            return MaskReviewManager.open_attention_mask_editor(
                 workspace,
                 start_index=args.attention_editor_index,
                 brush_radius=args.attention_brush_radius,
@@ -14698,11 +14698,11 @@ class PipelineApplication:
                 print(f"[PIPELINE] runtime_device={DEVICE}", flush=True)
                 print(
                     "[PIPELINE] feature_cache_device_tag="
-                    f"{resolved_feature_cache_device_tag()}",
+                    f"{RuntimeManager.resolved_feature_cache_device_tag()}",
                     flush=True,
                 )
                 print(f"[PIPELINE] workspace={workspace.root}", flush=True)
-                summary = run_attention_pipeline(samples, workspace, action)
+                summary = PipelineApplication.run_attention_pipeline(samples, workspace, action)
                 print(
                     "[PIPELINE] Completed with status="
                     f"{summary.get('status', 'OK')}",
@@ -14715,214 +14715,12 @@ class PipelineApplication:
                 raise
             finally:
                 if not args.keep_gpu_memory:
-                    release_gpu_resources(action)
+                    RuntimeManager.release_gpu_resources(action)
                 sys.stdout.flush()
                 sys.stderr.flush()
                 sys.stdout = original_stdout
                 sys.stderr = original_stderr
 
-
-# endregion
-
-# region BACKWARD-COMPATIBLE MODULE API
-# Existing internal calls and notebooks continue to use these names.
-_resolve_requested_runtime_device = RuntimeManager._resolve_requested_runtime_device
-set_runtime_device = RuntimeManager.set_runtime_device
-refresh_runtime_device = RuntimeManager.refresh_runtime_device
-release_gpu_resources = RuntimeManager.release_gpu_resources
-set_feature_cache_device_tag = RuntimeManager.set_feature_cache_device_tag
-resolved_feature_cache_device_tag = RuntimeManager.resolved_feature_cache_device_tag
-_synchronize_timing_device = RuntimeManager._synchronize_timing_device
-_format_elapsed_time = RuntimeManager._format_elapsed_time
-_print_stage_start = RuntimeManager._print_stage_start
-_print_stage_complete = RuntimeManager._print_stage_complete
-_print_detail = RuntimeManager._print_detail
-_print_timing_summary = RuntimeManager._print_timing_summary
-run_with_console_logging = RuntimeManager.run_with_console_logging
-
-get_enabled_experiments = ConfigurationManager.get_enabled_experiments
-validate_configuration = ConfigurationManager.validate_configuration
-collect_suite_metadata = ConfigurationManager.collect_suite_metadata
-write_suite_configuration = ConfigurationManager.write_suite_configuration
-validate_attention_extension = ConfigurationManager.validate_attention_extension
-
-scale_intensity_0_1 = ImagePreprocessor.scale_intensity_0_1
-_is_dark_uniform_edge_line = ImagePreprocessor._is_dark_uniform_edge_line
-detect_label_blind_dark_padding_bounds = ImagePreprocessor.detect_label_blind_dark_padding_bounds
-robust_scale_intensity_0_1 = ImagePreprocessor.robust_scale_intensity_0_1
-_fixed_content_canvas_geometry = ImagePreprocessor._fixed_content_canvas_geometry
-resize_to_fixed_content_canvas = ImagePreprocessor.resize_to_fixed_content_canvas
-build_fixed_content_padding_canvas = ImagePreprocessor.build_fixed_content_padding_canvas
-build_label_blind_standardized_image = ImagePreprocessor.build_label_blind_standardized_image
-compute_dct_perceptual_hash = ImagePreprocessor.compute_dct_perceptual_hash
-compute_image_provenance_features = ImagePreprocessor.compute_image_provenance_features
-
-load_samples = DatasetManager.load_samples
-
-sha256_file = MonaiSegmenter.sha256_file
-locate_monai_bundle_root = MonaiSegmenter.locate_monai_bundle_root
-validate_monai_bundle_metadata = MonaiSegmenter.validate_monai_bundle_metadata
-validate_monai_train_config = MonaiSegmenter.validate_monai_train_config
-verify_monai_artifact_sha256 = MonaiSegmenter.verify_monai_artifact_sha256
-ensure_monai_bundle = MonaiSegmenter.ensure_monai_bundle
-load_and_validate_torchscript_segmenter = MonaiSegmenter.load_and_validate_torchscript_segmenter
-load_checkpoint_state_dict = MonaiSegmenter.load_checkpoint_state_dict
-build_monai_segmenter = MonaiSegmenter.build_monai_segmenter
-predict_monai_heart_masks = MonaiSegmenter.predict_monai_heart_masks
-apply_confidence_gated_soft_roi = MonaiSegmenter.apply_confidence_gated_soft_roi
-normalize_for_efficientnet = MonaiSegmenter.normalize_for_efficientnet
-
-required_efficientnet_feature_modes = FeatureBankManager.required_efficientnet_feature_modes
-feature_bank_fingerprint = FeatureBankManager.feature_bank_fingerprint
-_feature_bank_shared_paths = FeatureBankManager._feature_bank_shared_paths
-_feature_mode_path = FeatureBankManager._feature_mode_path
-load_feature_bank = FeatureBankManager.load_feature_bank
-create_fixed_fraction_center_crop_images = FeatureBankManager.create_fixed_fraction_center_crop_images
-apply_zero_background_roi_with_fixed_center_fallback = FeatureBankManager.apply_zero_background_roi_with_fixed_center_fallback
-_fixed_square_bounds = FeatureBankManager._fixed_square_bounds
-_robust_scale_visible_regions = FeatureBankManager._robust_scale_visible_regions
-create_a17_exact_support_mask = FeatureBankManager.create_a17_exact_support_mask
-create_hard_support_region_normalized_images = FeatureBankManager.create_hard_support_region_normalized_images
-create_a17_exact_support_mask_only_images = FeatureBankManager.create_a17_exact_support_mask_only_images
-_affine_permutation_parameters = FeatureBankManager._affine_permutation_parameters
-create_a17_support_intensity_affine_shuffled_images = FeatureBankManager.create_a17_support_intensity_affine_shuffled_images
-create_a17_exact_support_complement_region_normalized_images = FeatureBankManager.create_a17_exact_support_complement_region_normalized_images
-run_exact_support_transform_contract_self_test = FeatureBankManager.run_exact_support_transform_contract_self_test
-_fixed_central_square_mask = FeatureBankManager._fixed_central_square_mask
-create_fixed_periphery_region_normalized_images = FeatureBankManager.create_fixed_periphery_region_normalized_images
-extract_feature_bank = FeatureBankManager.extract_feature_bank
-load_or_extract_feature_bank = FeatureBankManager.load_or_extract_feature_bank
-
-audit_exact_decoded_pixel_duplicates = DuplicateAuditManager.audit_exact_decoded_pixel_duplicates
-_prepare_phash_review_tile = DuplicateAuditManager._prepare_phash_review_tile
-write_phash_review_panels = DuplicateAuditManager.write_phash_review_panels
-audit_perceptual_near_duplicate_candidates = DuplicateAuditManager.audit_perceptual_near_duplicate_candidates
-build_patient_label_table = DuplicateAuditManager.build_patient_label_table
-build_duplicate_component_map = DuplicateAuditManager.build_duplicate_component_map
-assign_stratified_patient_folds = DuplicateAuditManager.assign_stratified_patient_folds
-build_patient_fold_manifest = DuplicateAuditManager.build_patient_fold_manifest
-write_patient_fold_manifest = DuplicateAuditManager.write_patient_fold_manifest
-write_cohort_manifest = DuplicateAuditManager.write_cohort_manifest
-_patient_indices = DuplicateAuditManager._patient_indices
-
-aggregate_patient_provenance_features = PatientDataManager.aggregate_patient_provenance_features
-aggregate_patient_standardization_features = PatientDataManager.aggregate_patient_standardization_features
-aggregate_patient_standardized_monai_qc_features = PatientDataManager.aggregate_patient_standardized_monai_qc_features
-bootstrap_difference_in_means = PatientDataManager.bootstrap_difference_in_means
-write_standardized_monai_qc_outputs = PatientDataManager.write_standardized_monai_qc_outputs
-write_patient_tabular_features = PatientDataManager.write_patient_tabular_features
-aggregate_patient_embeddings = PatientDataManager.aggregate_patient_embeddings
-compute_balanced_patient_weights = PatientDataManager.compute_balanced_patient_weights
-experiment_preparation_cache_key = PatientDataManager.experiment_preparation_cache_key
-prepare_experiment_data = PatientDataManager.prepare_experiment_data
-
-build_patient_classifier = ModelingManager.build_patient_classifier
-fit_patient_classifier = ModelingManager.fit_patient_classifier
-patient_model_raw_scores = ModelingManager.patient_model_raw_scores
-fit_predict_raw_for_patient_sets = ModelingManager.fit_predict_raw_for_patient_sets
-create_inner_fold_assignment = ModelingManager.create_inner_fold_assignment
-collect_inner_oof_raw_scores = ModelingManager.collect_inner_oof_raw_scores
-select_decision_threshold = ModelingManager.select_decision_threshold
-experiment_candidate_c_values = ModelingManager.experiment_candidate_c_values
-select_c_and_training_threshold = ModelingManager.select_c_and_training_threshold
-_safe_divide = ModelingManager._safe_divide
-compute_binary_patient_metrics = ModelingManager.compute_binary_patient_metrics
-bootstrap_patient_metric_intervals = ModelingManager.bootstrap_patient_metric_intervals
-run_one_experiment = ModelingManager.run_one_experiment
-_build_fold_manifest_rows_for_seed = ModelingManager._build_fold_manifest_rows_for_seed
-run_nested_cv_auc_only = ModelingManager.run_nested_cv_auc_only
-audit_exact_support_prepared_row_contract = ModelingManager.audit_exact_support_prepared_row_contract
-run_model_family_nested_selection = ModelingManager.run_model_family_nested_selection
-run_repeated_nested_cv_stability = ModelingManager.run_repeated_nested_cv_stability
-write_repeated_stability_ranking = ModelingManager.write_repeated_stability_ranking
-print_repeated_stability_ranking = ModelingManager.print_repeated_stability_ranking
-compare_repeated_nested_cv_pairs = ModelingManager.compare_repeated_nested_cv_pairs
-run_patient_label_permutation_test = ModelingManager.run_patient_label_permutation_test
-run_selection_adjusted_candidate_family_permutation_test = ModelingManager.run_selection_adjusted_candidate_family_permutation_test
-paired_auc_difference_interval = ModelingManager.paired_auc_difference_interval
-compare_experiments_to_baseline = ModelingManager.compare_experiments_to_baseline
-compare_predeclared_ablation_pairs = ModelingManager.compare_predeclared_ablation_pairs
-print_primary_ablation_comparisons = ModelingManager.print_primary_ablation_comparisons
-result_summary_row = ModelingManager.result_summary_row
-write_master_outputs = ModelingManager.write_master_outputs
-print_final_comparison = ModelingManager.print_final_comparison
-
-write_tabular_class_summary = ReportingManager.write_tabular_class_summary
-
-main = PipelineRunner.main
-build_monai_feature_cache_only = PipelineRunner.build_monai_feature_cache_only
-existing_attention_checkpoint_map = PipelineRunner.existing_attention_checkpoint_map
-load_existing_attention_feature_bank = PipelineRunner.load_existing_attention_feature_bank
-_review_mask_exists = PipelineRunner._review_mask_exists
-
-build_attention_workspace = AttentionDataManager.build_attention_workspace
-_directory_scoped_relative_token = AttentionDataManager._directory_scoped_relative_token
-attention_image_token = AttentionDataManager.attention_image_token
-_evenly_spaced_subset = AttentionDataManager._evenly_spaced_subset
-build_attention_patient_folds = AttentionDataManager.build_attention_patient_folds
-write_attention_manifest = AttentionDataManager.write_attention_manifest
-read_attention_manifest = AttentionDataManager.read_attention_manifest
-_load_attention_canvases = AttentionDataManager._load_attention_canvases
-_format_storage_bytes = AttentionDataManager._format_storage_bytes
-_existing_parent = AttentionDataManager._existing_parent
-_storage_description = AttentionDataManager._storage_description
-_attention_warn_once = AttentionDataManager._attention_warn_once
-report_attention_storage = AttentionDataManager.report_attention_storage
-_atomic_cv2_write = AttentionDataManager._atomic_cv2_write
-_attention_ram_cache_get = AttentionDataManager._attention_ram_cache_get
-_attention_ram_cache_put = AttentionDataManager._attention_ram_cache_put
-clear_attention_image_ram_cache = AttentionDataManager.clear_attention_image_ram_cache
-load_attention_segmentation_image = AttentionDataManager.load_attention_segmentation_image
-_largest_connected_component = AttentionDataManager._largest_connected_component
-_attention_mask_file_is_readable = AttentionDataManager._attention_mask_file_is_readable
-generate_attention_pseudo_masks = AttentionDataManager.generate_attention_pseudo_masks
-
-_group_count = AttentionTrainingManager._group_count
-soft_dice_coefficient_from_logits = AttentionTrainingManager.soft_dice_coefficient_from_logits
-attention_segmentation_loss = AttentionTrainingManager.attention_segmentation_loss
-_resolved_training_mask = AttentionTrainingManager._resolved_training_mask
-_attention_training_fingerprint = AttentionTrainingManager._attention_training_fingerprint
-_checkpoint_path = AttentionTrainingManager._checkpoint_path
-_load_attention_state_dict = AttentionTrainingManager._load_attention_state_dict
-_select_internal_validation_patients = AttentionTrainingManager._select_internal_validation_patients
-train_attention_unet_crossfit = AttentionTrainingManager.train_attention_unet_crossfit
-_attention_binary_masks = AttentionTrainingManager._attention_binary_masks
-create_attention_exact_support_mask = AttentionTrainingManager.create_attention_exact_support_mask
-create_attention_support_shuffled_images = AttentionTrainingManager.create_attention_support_shuffled_images
-
-_attention_feature_fingerprint = AttentionEvaluationManager._attention_feature_fingerprint
-_dice_binary = AttentionEvaluationManager._dice_binary
-_load_attention_model = AttentionEvaluationManager._load_attention_model
-extract_attention_patient_feature_bank = AttentionEvaluationManager.extract_attention_patient_feature_bank
-_load_or_create_classification_fold_manifest = AttentionEvaluationManager._load_or_create_classification_fold_manifest
-_temporary_attention_analysis_settings = AttentionEvaluationManager._temporary_attention_analysis_settings
-_read_oof_prediction_csv = AttentionEvaluationManager._read_oof_prediction_csv
-_find_monai_candidate_predictions = AttentionEvaluationManager._find_monai_candidate_predictions
-evaluate_attention_feature_bank = AttentionEvaluationManager.evaluate_attention_feature_bank
-
-attention_full_review_manifest_path = MaskReviewManager.attention_full_review_manifest_path
-attention_review_history_path = MaskReviewManager.attention_review_history_path
-attention_prediction_generation_path = MaskReviewManager.attention_prediction_generation_path
-_review_atomic_csv = MaskReviewManager._review_atomic_csv
-_review_read_csv_by_token = MaskReviewManager._review_read_csv_by_token
-_review_to_float = MaskReviewManager._review_to_float
-_review_to_int = MaskReviewManager._review_to_int
-build_attention_full_review_manifest = MaskReviewManager.build_attention_full_review_manifest
-read_attention_full_review_manifest = MaskReviewManager.read_attention_full_review_manifest
-_review_append_review_event = MaskReviewManager._review_append_review_event
-_review_reviewed_tokens = MaskReviewManager._review_reviewed_tokens
-_review_round_robin_diverse = MaskReviewManager._review_round_robin_diverse
-select_attention_review_rows = MaskReviewManager.select_attention_review_rows
-_review_manifest_image_loader = MaskReviewManager._review_manifest_image_loader
-generate_monai_review_masks = MaskReviewManager.generate_monai_review_masks
-_review_checkpoint_fingerprint = MaskReviewManager._review_checkpoint_fingerprint
-generate_attention_review_masks = MaskReviewManager.generate_attention_review_masks
-select_attention_training_rows = MaskReviewManager.select_attention_training_rows
-open_attention_mask_editor = MaskReviewManager.open_attention_mask_editor
-
-_parse_attention_arguments = PipelineApplication._parse_attention_arguments
-run_attention_pipeline = PipelineApplication.run_attention_pipeline
-run_cad_pipeline = PipelineApplication.run_cad_pipeline
 
 # endregion
 
@@ -14978,9 +14776,9 @@ print(
 
 
 
-# region OPTIONAL COMPATIBILITY ALIASES
-# New code should use SETTINGS_<DOMAIN>.<NAME>. These aliases are read-only
-# snapshots retained for older notebooks and can be removed after migration.
+# region OPTIONAL SETTING SNAPSHOTS
+# Operational methods are class-qualified throughout the pipeline. Only a
+# small set of read-only setting snapshots remains for notebook migration.
 ATTENTION_INPUT_SIZE = SETTINGS_ATTENTION.ATTENTION_INPUT_SIZE
 ATTENTION_SEGMENTATION_FOLDS = SETTINGS_ATTENTION.ATTENTION_SEGMENTATION_FOLDS
 ATTENTION_BASE_CHANNELS = SETTINGS_ATTENTION.ATTENTION_BASE_CHANNELS
