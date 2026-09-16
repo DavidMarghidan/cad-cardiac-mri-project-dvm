@@ -1083,6 +1083,7 @@ class SETTINGS_REVIEW:
         "monai-cpu-from-cache",
         "edit-existing-masks",
         "retrain-regenerate-attention",
+        "retrain-regenerate-attention-manual-only",
         "build-attention-feature-cache",
         "evaluate-attention-cpu",
     )
@@ -11789,8 +11790,10 @@ class PipelineRunner:
                 missing.append(str(path))
         if missing:
             raise FileNotFoundError(
-                "Missing Attention U-Net checkpoints. Run train-attention or "
-                "retrain-regenerate-attention in a GPU session first:\n  "
+                "Missing Attention U-Net checkpoints. Run "
+                "retrain-regenerate-attention-manual-only in a GPU session "
+                "first (or use retrain-regenerate-attention for mixed manual + "
+                "MONAI pseudo supervision):\n  "
                 + "\n  ".join(missing)
             )
         return checkpoint_map
@@ -12577,6 +12580,254 @@ class AttentionTrainingManager:
         bce = F.binary_cross_entropy_with_logits(logits.float(), targets.float())
         dice_loss = 1.0 - AttentionTrainingManager.soft_dice_coefficient_from_logits(logits, targets)
         return SETTINGS_ATTENTION.ATTENTION_BCE_WEIGHT * bce + SETTINGS_ATTENTION.ATTENTION_DICE_WEIGHT * dice_loss
+
+    @staticmethod
+    def build_manual_only_training_rows(
+        samples,
+        workspace,
+        minimum_masks=1000,
+        minimum_area_ratio=0.0005,
+        maximum_area_ratio=0.98,
+    ):
+        """Build a training cohort containing only readable manual masks.
+
+        No MONAI pseudo-mask is generated or accepted here. The method scans the
+        full label-blind review manifest, maps every ``manual_masks/*.png`` file
+        back to its source image, excludes unreadable/empty/nearly-full masks,
+        and writes an auditable manual-only manifest before training.
+        """
+
+        full_rows = MaskReviewManager.build_attention_full_review_manifest(
+            samples, workspace
+        )
+        rows_by_token = {row["image_token"]: row for row in full_rows}
+        manual_files = {
+            path.stem: path
+            for path in Path(workspace.manual_masks).glob("*.png")
+            if path.is_file()
+        }
+
+        manual_rows = []
+        audit_rows = []
+        patient_counts = defaultdict(int)
+        fold_counts = defaultdict(int)
+
+        for token, manual_path in sorted(manual_files.items()):
+            row = rows_by_token.get(token)
+            if row is None:
+                audit_rows.append(
+                    {
+                        "image_token": token,
+                        "patient_id": "",
+                        "series_id": "",
+                        "manual_mask_path": str(manual_path),
+                        "status": "REJECTED",
+                        "area_ratio": "",
+                        "reason": "manual mask token is absent from the current dataset",
+                    }
+                )
+                continue
+
+            mask = cv2.imread(str(manual_path), cv2.IMREAD_GRAYSCALE)
+            if mask is None:
+                audit_rows.append(
+                    {
+                        "image_token": token,
+                        "patient_id": row["patient_id"],
+                        "series_id": row["series_id"],
+                        "manual_mask_path": str(manual_path),
+                        "status": "REJECTED",
+                        "area_ratio": "",
+                        "reason": "mask is unreadable",
+                    }
+                )
+                continue
+
+            resized = cv2.resize(
+                mask,
+                (
+                    SETTINGS_ATTENTION.ATTENTION_INPUT_SIZE,
+                    SETTINGS_ATTENTION.ATTENTION_INPUT_SIZE,
+                ),
+                interpolation=cv2.INTER_NEAREST,
+            )
+            area_ratio = float(np.mean(resized > 127))
+            if not minimum_area_ratio <= area_ratio <= maximum_area_ratio:
+                audit_rows.append(
+                    {
+                        "image_token": token,
+                        "patient_id": row["patient_id"],
+                        "series_id": row["series_id"],
+                        "manual_mask_path": str(manual_path),
+                        "status": "REJECTED",
+                        "area_ratio": area_ratio,
+                        "reason": (
+                            "foreground area is empty/nearly empty or covers nearly "
+                            "the complete image"
+                        ),
+                    }
+                )
+                continue
+
+            accepted = dict(row)
+            accepted["manual_mask_exists"] = 1
+            accepted["manual_mask_path"] = str(manual_path)
+            manual_rows.append(accepted)
+            patient_counts[str(row["patient_id"])] += 1
+            fold_counts[int(row["segmentation_fold"])] += 1
+            audit_rows.append(
+                {
+                    "image_token": token,
+                    "patient_id": row["patient_id"],
+                    "series_id": row["series_id"],
+                    "manual_mask_path": str(manual_path),
+                    "status": "ACCEPTED",
+                    "area_ratio": area_ratio,
+                    "reason": "",
+                }
+            )
+
+        audit_path = workspace.root / "attention_unet_manual_only_mask_audit.csv"
+        audit_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(audit_path, "w", newline="", encoding="utf-8") as file:
+            fieldnames = (
+                "image_token",
+                "patient_id",
+                "series_id",
+                "manual_mask_path",
+                "status",
+                "area_ratio",
+                "reason",
+            )
+            writer = csv.DictWriter(file, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(audit_rows)
+
+        if len(manual_rows) < int(minimum_masks):
+            raise RuntimeError(
+                "Manual-only Attention training was stopped: "
+                f"{len(manual_rows)} usable masks were found, but at least "
+                f"{int(minimum_masks)} were requested. Audit: {audit_path}"
+            )
+
+        missing_folds = [
+            fold
+            for fold in range(SETTINGS_ATTENTION.ATTENTION_SEGMENTATION_FOLDS)
+            if fold_counts.get(fold, 0) == 0
+        ]
+        if missing_folds:
+            raise RuntimeError(
+                "Manual masks do not cover every segmentation fold. Missing folds: "
+                f"{missing_folds}. Add masks from more patients before training."
+            )
+        if len(patient_counts) < SETTINGS_ATTENTION.ATTENTION_SEGMENTATION_FOLDS + 1:
+            raise RuntimeError(
+                "Too few patients have manual masks for cross-fitted training: "
+                f"{len(patient_counts)} patients."
+            )
+
+        # Strong guarantee: every row passed to the trainer must resolve to the
+        # manual source. A pseudo-mask can never enter this execution path.
+        for row in manual_rows:
+            _mask_path, source = AttentionTrainingManager._resolved_training_mask(row)
+            if source != "manual":
+                raise RuntimeError(
+                    "Manual-only training invariant failed for token "
+                    f"{row['image_token']}: source={source!r}."
+                )
+
+        manifest_path = workspace.root / "attention_unet_manual_only_manifest.csv"
+        AttentionDataManager.write_attention_manifest(manual_rows, manifest_path)
+
+        summary = {
+            "training_mode": "manual_only",
+            "manual_png_files": int(len(manual_files)),
+            "accepted_manual_masks": int(len(manual_rows)),
+            "rejected_manual_masks": int(
+                sum(row["status"] == "REJECTED" for row in audit_rows)
+            ),
+            "patients_with_manual_masks": int(len(patient_counts)),
+            "manual_masks_per_patient": dict(sorted(patient_counts.items())),
+            "manual_masks_per_segmentation_fold": {
+                str(fold): int(fold_counts.get(fold, 0))
+                for fold in range(SETTINGS_ATTENTION.ATTENTION_SEGMENTATION_FOLDS)
+            },
+            "manifest": str(manifest_path),
+            "audit": str(audit_path),
+            "pseudo_masks_used": 0,
+        }
+        print(
+            "[ATTENTION][MANUAL ONLY] "
+            f"accepted={len(manual_rows)}, rejected="
+            f"{summary['rejected_manual_masks']}, patients={len(patient_counts)}, "
+            f"folds={summary['manual_masks_per_segmentation_fold']}",
+            flush=True,
+        )
+        return manual_rows, summary
+
+    @staticmethod
+    def train_manual_only_and_regenerate(
+        samples,
+        workspace,
+        minimum_masks=1000,
+    ):
+        """Train Attention exclusively from manual masks and regenerate all masks."""
+
+        manual_rows, manual_summary = (
+            AttentionTrainingManager.build_manual_only_training_rows(
+                samples,
+                workspace,
+                minimum_masks=minimum_masks,
+            )
+        )
+        checkpoint_map = AttentionTrainingManager.train_attention_unet_crossfit(
+            manual_rows,
+            workspace,
+        )
+        prediction_rows = MaskReviewManager.generate_attention_review_masks(
+            samples,
+            workspace,
+            checkpoint_map,
+            rows=None,
+            force=True,
+        )
+        AttentionDataManager.clear_attention_image_ram_cache()
+
+        # Extend the standard training summary with an explicit supervision-mode
+        # declaration so later reports cannot mistake this run for pseudo-label
+        # distillation.
+        training_summary = {}
+        if workspace.training_summary_json.is_file():
+            try:
+                training_summary = json.loads(
+                    workspace.training_summary_json.read_text(encoding="utf-8")
+                )
+            except Exception:
+                training_summary = {}
+        training_summary.update(manual_summary)
+        training_summary["generated_attention_masks"] = int(len(prediction_rows))
+        training_summary["checkpoint_paths"] = {
+            str(fold): str(path) for fold, path in checkpoint_map.items()
+        }
+        workspace.training_summary_json.write_text(
+            json.dumps(training_summary, indent=2, sort_keys=True, default=str),
+            encoding="utf-8",
+        )
+
+        return {
+            "status": "MANUAL_ONLY_ATTENTION_MASKS_READY",
+            "training_mode": "manual_only",
+            "manual_masks": int(len(manual_rows)),
+            "pseudo_masks_used": 0,
+            "patients": int(manual_summary["patients_with_manual_masks"]),
+            "generated_masks": int(len(prediction_rows)),
+            "manual_manifest": manual_summary["manifest"],
+            "manual_audit": manual_summary["audit"],
+            "training_summary": str(workspace.training_summary_json),
+            "checkpoints": {
+                str(fold): str(path) for fold, path in checkpoint_map.items()
+            },
+        }
 
     @staticmethod
     def _resolved_training_mask(row):
@@ -14529,6 +14780,15 @@ class PipelineApplication:
             action="store_true",
             help="Do not clear CUDA caches after the selected action finishes.",
         )
+        parser.add_argument(
+            "--attention-min-manual-masks",
+            type=int,
+            default=1000,
+            help=(
+                "Safety minimum for manual-only Attention training. The default "
+                "matches the existing approximately 1200-mask cohort."
+            ),
+        )
         args, unknown = parser.parse_known_args(argv)
         if unknown:
             print(
@@ -14539,10 +14799,17 @@ class PipelineApplication:
             raise ValueError("--attention-editor-limit must be >= 0.")
         if args.attention_review_round < 1:
             raise ValueError("--attention-review-round must be >= 1.")
+        if args.attention_min_manual_masks < 1:
+            raise ValueError("--attention-min-manual-masks must be >= 1.")
         return args
 
     @staticmethod
-    def run_attention_pipeline(samples, workspace, action):
+    def run_attention_pipeline(
+        samples,
+        workspace,
+        action,
+        minimum_manual_masks=1000,
+    ):
         """Execute one neural or cached Attention/segmentation stage."""
 
         ConfigurationManager.validate_attention_extension()
@@ -14564,16 +14831,22 @@ class PipelineApplication:
                 "manifest": str(MaskReviewManager.attention_full_review_manifest_path(workspace)),
             }
 
-        if action not in {
-            "retrain-regenerate-attention",
-            "build-attention-feature-cache",
-        }:
-            raise ValueError(f"Unsupported Attention stage: {action!r}.")
-
-        training_rows = AttentionDataManager.generate_attention_pseudo_masks(samples, workspace)
-        checkpoint_map = AttentionTrainingManager.train_attention_unet_crossfit(training_rows, workspace)
+        if action == "retrain-regenerate-attention-manual-only":
+            return AttentionTrainingManager.train_manual_only_and_regenerate(
+                samples,
+                workspace,
+                minimum_masks=minimum_manual_masks,
+            )
 
         if action == "retrain-regenerate-attention":
+            # Legacy mixed-supervision path retained explicitly: manual masks take
+            # priority, while valid MONAI pseudo-masks fill the remaining subset.
+            training_rows = AttentionDataManager.generate_attention_pseudo_masks(
+                samples, workspace
+            )
+            checkpoint_map = AttentionTrainingManager.train_attention_unet_crossfit(
+                training_rows, workspace
+            )
             rows = MaskReviewManager.generate_attention_review_masks(
                 samples,
                 workspace,
@@ -14584,20 +14857,31 @@ class PipelineApplication:
             AttentionDataManager.clear_attention_image_ram_cache()
             return {
                 "status": "ALL_ATTENTION_REVIEW_MASKS_READY",
+                "training_mode": "manual_plus_monai_pseudo",
                 "n_rows": len(rows),
-                "manifest": str(MaskReviewManager.attention_full_review_manifest_path(workspace)),
+                "manifest": str(
+                    MaskReviewManager.attention_full_review_manifest_path(workspace)
+                ),
             }
 
-        AttentionDataManager.clear_attention_image_ram_cache()
-        bank = AttentionEvaluationManager.extract_attention_patient_feature_bank(
-            samples, workspace, checkpoint_map
-        )
-        return {
-            "status": "ATTENTION_FEATURE_CACHE_READY",
-            "fingerprint": bank["fingerprint"],
-            "n_patients": int(len(bank["patient_ids"])),
-            "output": str(workspace.comparison_output),
-        }
+        if action == "build-attention-feature-cache":
+            # Important: feature extraction reuses the existing checkpoints and
+            # never creates MONAI pseudo-masks or retrains Attention.
+            checkpoint_map = PipelineRunner.existing_attention_checkpoint_map(
+                workspace
+            )
+            AttentionDataManager.clear_attention_image_ram_cache()
+            bank = AttentionEvaluationManager.extract_attention_patient_feature_bank(
+                samples, workspace, checkpoint_map
+            )
+            return {
+                "status": "ATTENTION_FEATURE_CACHE_READY",
+                "fingerprint": bank["fingerprint"],
+                "n_patients": int(len(bank["patient_ids"])),
+                "output": str(workspace.comparison_output),
+            }
+
+        raise ValueError(f"Unsupported Attention stage: {action!r}.")
 
     @staticmethod
     def run_cad_pipeline(argv=None):
@@ -14702,7 +14986,12 @@ class PipelineApplication:
                     flush=True,
                 )
                 print(f"[PIPELINE] workspace={workspace.root}", flush=True)
-                summary = PipelineApplication.run_attention_pipeline(samples, workspace, action)
+                summary = PipelineApplication.run_attention_pipeline(
+                    samples,
+                    workspace,
+                    action,
+                    minimum_manual_masks=args.attention_min_manual_masks,
+                )
                 print(
                     "[PIPELINE] Completed with status="
                     f"{summary.get('status', 'OK')}",
@@ -14768,8 +15057,9 @@ print(
 )
 print(
     "[PIPELINE] GPU actions: build-monai-feature-cache, "
-    "generate-all-monai-masks, retrain-regenerate-attention, "
-    "build-attention-feature-cache. CPU actions: monai-cpu-from-cache, "
+    "generate-all-monai-masks, retrain-regenerate-attention-manual-only, "
+    "retrain-regenerate-attention, build-attention-feature-cache. "
+    "CPU actions: monai-cpu-from-cache, "
     "evaluate-attention-cpu, edit-existing-masks.",
     flush=True,
 )
