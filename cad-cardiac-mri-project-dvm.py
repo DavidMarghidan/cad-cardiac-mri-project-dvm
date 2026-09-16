@@ -1,25 +1,47 @@
 # Inițializare unică + codul complet al pipeline-ului
 #
-# Această celulă conține direct întregul fișier Python. Nu mai este necesar
-# să atașezi sau să cauți separat fișierul .py în /kaggle/working ori /kaggle/input.
+# The class is evaluated before the remaining pipeline settings so environment
+# overrides are applied consistently in scripts and notebooks.
 
 import os
 
-# Setările trebuie definite înainte de importurile și constantele pipeline-ului.
-os.environ.setdefault("CAD_VALIDATION_PROFILE", "fast")
-os.environ["CAD_RUNTIME_DEVICE"] = "cpu"
-os.environ["CAD_SUITE_DEVICE_TAG"] = "cuda"
-os.environ["CAD_FEATURE_CACHE_DEVICE_TAG"] = "cuda"
-os.environ["CAD_ATTENTION_STORE_AUTOMATIC_MASKS_IN_TRANSIENT"] = "0"
-os.environ["CAD_ATTENTION_STORE_PREDICTED_MASKS_IN_TRANSIENT"] = "0"
-os.environ["CAD_ATTENTION_SAVE_ALL_PREDICTED_MASKS"] = "1"
 
-REVIEW_SCOPE = "diverse"   # all | diverse | unreviewed | invalid | disagreement
-REVIEW_LIMIT = 1200         # 0 înseamnă fără limită când scope="all"
-REVIEW_SEED = 42
+class SETTINGS_BOOTSTRAP:
+    """Environment defaults that must be set before the pipeline is imported."""
+
+    CAD_VALIDATION_PROFILE = "fast"
+    CAD_RUNTIME_DEVICE = "cpu"
+    CAD_SUITE_DEVICE_TAG = "cuda"
+    CAD_FEATURE_CACHE_DEVICE_TAG = "cuda"
+    CAD_ATTENTION_STORE_AUTOMATIC_MASKS_IN_TRANSIENT = "0"
+    CAD_ATTENTION_STORE_PREDICTED_MASKS_IN_TRANSIENT = "0"
+    CAD_ATTENTION_SAVE_ALL_PREDICTED_MASKS = "1"
+
+    REVIEW_SCOPE = "diverse"
+    REVIEW_LIMIT = 1200
+    REVIEW_SEED = 42
+
+
+os.environ.setdefault(
+    "CAD_VALIDATION_PROFILE", SETTINGS_BOOTSTRAP.CAD_VALIDATION_PROFILE
+)
+os.environ["CAD_RUNTIME_DEVICE"] = SETTINGS_BOOTSTRAP.CAD_RUNTIME_DEVICE
+os.environ["CAD_SUITE_DEVICE_TAG"] = SETTINGS_BOOTSTRAP.CAD_SUITE_DEVICE_TAG
+os.environ["CAD_FEATURE_CACHE_DEVICE_TAG"] = (
+    SETTINGS_BOOTSTRAP.CAD_FEATURE_CACHE_DEVICE_TAG
+)
+os.environ["CAD_ATTENTION_STORE_AUTOMATIC_MASKS_IN_TRANSIENT"] = (
+    SETTINGS_BOOTSTRAP.CAD_ATTENTION_STORE_AUTOMATIC_MASKS_IN_TRANSIENT
+)
+os.environ["CAD_ATTENTION_STORE_PREDICTED_MASKS_IN_TRANSIENT"] = (
+    SETTINGS_BOOTSTRAP.CAD_ATTENTION_STORE_PREDICTED_MASKS_IN_TRANSIENT
+)
+os.environ["CAD_ATTENTION_SAVE_ALL_PREDICTED_MASKS"] = (
+    SETTINGS_BOOTSTRAP.CAD_ATTENTION_SAVE_ALL_PREDICTED_MASKS
+)
 
 # ---------------------------------------------------------------------------
-# CODUL COMPLET DIN cad-cardiac-mri-project-dvm.py
+# CODUL COMPLET AL PIPELINE-ULUI
 # ---------------------------------------------------------------------------
 
 #%% ============================================================
@@ -144,108 +166,8 @@ from IPython.display import display, HTML, Javascript
 
 
 # =============================
-# CONFIGURATION
+# SETTINGS TYPES
 # =============================
-
-PIPELINE_SCHEMA_ID = "cad-cardiac-mri-current"
-
-
-IMG_SIZE = 224
-# EfficientNet-B0 input resolution.
-#
-# The original JPEG is first placed inside a 256×256 zero-padded MONAI canvas.
-# The complete canvas is then resized to 224×224 for EfficientNet. Because the
-# whole square canvas is resized uniformly, the MONAI mask and EfficientNet
-# image remain spatially aligned.
-
-MONAI_INPUT_SIZE = 256
-# Input size used to train the official ventricular_short_axis_3label bundle.
-# Images smaller than this size are centered and zero-padded instead of being
-# enlarged. This follows the bundle documentation, which states that many
-# training images were smaller than 256×256 and were zero-padded.
-
-BATCH_SIZE = 8
-# Number of slices processed simultaneously.
-#
-# Both MONAI segmentation and EfficientNet inference are performed for every
-# batch, so reduce this value if GPU memory is insufficient. Increase it only
-# after checking GPU memory; batch size changes throughput, not predictions.
-
-RUNTIME_DEVICE_CHOICES = ("auto", "cpu", "cuda")
-RUNTIME_DEVICE_POLICY = os.environ.get(
-    "CAD_RUNTIME_DEVICE", "auto"
-).strip().lower()
-if RUNTIME_DEVICE_POLICY not in RUNTIME_DEVICE_CHOICES:
-    raise ValueError(
-        "CAD_RUNTIME_DEVICE must be one of auto/cpu/cuda; received "
-        f"{RUNTIME_DEVICE_POLICY!r}."
-    )
-
-# Keep one deterministic output directory across a GPU-generation session and
-# a later CPU-evaluation session. Set CAD_SUITE_DEVICE_TAG=cuda before loading
-# the source in both sessions when the frozen neural artifacts originate on GPU.
-SUITE_DEVICE_TAG = os.environ.get(
-    "CAD_SUITE_DEVICE_TAG", "auto"
-).strip().lower()
-if SUITE_DEVICE_TAG not in RUNTIME_DEVICE_CHOICES:
-    raise ValueError(
-        "CAD_SUITE_DEVICE_TAG must be auto/cpu/cuda; received "
-        f"{SUITE_DEVICE_TAG!r}."
-    )
-
-
-def resolved_suite_device_tag():
-    return DEVICE if SUITE_DEVICE_TAG == "auto" else SUITE_DEVICE_TAG
-
-
-
-
-DEVICE = "cuda" if (
-    RUNTIME_DEVICE_POLICY != "cpu" and torch.cuda.is_available()
-) else "cpu"
-# ``DEVICE`` remains a string because the original source compares it with
-# ``"cuda"`` in DataLoader, autocast and cache code. The setter below is the
-# authoritative way to change it between notebook stages.
-
-
-
-
-
-
-
-RANDOM_SEED = 42
-# Fixed seed for repeatable fold assignment and bootstrap resampling. The frozen
-# inference networks contain no dropout at evaluation time, but exact bitwise
-# reproducibility can still depend on hardware/library kernels.
-
-np.random.seed(RANDOM_SEED)
-torch.manual_seed(RANDOM_SEED)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(RANDOM_SEED)
-
-# final-reporting runs favor exact reproducibility over the small throughput
-# gain from non-deterministic convolution algorithms or half precision. The
-# warn_only flag prevents an unsupported deterministic kernel from aborting an
-# otherwise valid Kaggle run while still recording a visible warning.
-torch.backends.cudnn.benchmark = False
-torch.backends.cudnn.deterministic = True
-if hasattr(torch.backends.cudnn, "allow_tf32"):
-    torch.backends.cudnn.allow_tf32 = False
-if hasattr(torch.backends.cuda, "matmul") and hasattr(
-    torch.backends.cuda.matmul,
-    "allow_tf32",
-):
-    torch.backends.cuda.matmul.allow_tf32 = False
-try:
-    torch.set_float32_matmul_precision("highest")
-except (AttributeError, RuntimeError):
-    # Older PyTorch releases may not expose this optional precision control.
-    pass
-try:
-    torch.use_deterministic_algorithms(True, warn_only=True)
-except TypeError:
-    # Compatibility with older PyTorch versions lacking the warn_only keyword.
-    torch.use_deterministic_algorithms(True)
 
 # ---------------------------------------------------------------------------
 # MULTI-EXPERIMENT SUITE CONFIGURATION
@@ -285,348 +207,7 @@ class ExperimentConfig:
     enabled: bool = True
 
 
-# The registry contains the seven models needed for the current analysis.
-EXPERIMENTS_TO_RUN = None
-
-REFERENCE_EXPERIMENT_ID = (
-    "A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA"
-)
-PRIMARY_CANDIDATE_EXPERIMENT_ID = (
-    "A17_HARD_SUPPORT_REGION_NORM_HIER_LR_PCA"
-)
-VALID_ONLY_ABLATION_EXPERIMENT_ID = (
-    "A20_HARD_SUPPORT_REGION_NORM_VALID_ONLY_HIER_LR_PCA"
-)
-FIXED_PERIPHERY_CONTROL_EXPERIMENT_ID = (
-    "C29_FIXED_PERIPHERY_REGION_NORM_HIER_LR_PCA"
-)
-MASK_ONLY_CONTROL_EXPERIMENT_ID = (
-    "C31_A17_EXACT_SUPPORT_MASK_ONLY_HIER_LR_PCA"
-)
-SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID = (
-    "C32_A17_SUPPORT_INTENSITY_AFFINE_SHUFFLED_HIER_LR_PCA"
-)
-COMPLEMENT_CONTROL_EXPERIMENT_ID = (
-    "C33_A17_EXACT_SUPPORT_COMPLEMENT_REGION_NORM_HIER_LR_PCA"
-)
-BASELINE_EXPERIMENT_ID = REFERENCE_EXPERIMENT_ID
-
-# Only the final scientific question is active: does the hard-support cardiac
-# representation outperform the strict-ROI reference and matched shortcut
-# controls, and does that conclusion survive valid-slice filtering?
-EXPERIMENT_REGISTRY = (
-    ExperimentConfig(
-        experiment_id=REFERENCE_EXPERIMENT_ID,
-        description=(
-            "Reference model using a zero-background MONAI ROI with a fixed "
-            "central fallback, hierarchical patient pooling, PCA and Logistic "
-            "Regression."
-        ),
-        feature_mode="standardized_roi_zero_bg_center_fallback",
-        strategy="patient_embedding",
-        role="reference",
-    ),
-    ExperimentConfig(
-        experiment_id=PRIMARY_CANDIDATE_EXPERIMENT_ID,
-        description=(
-            "Primary model using a binary dilated cardiac support, robust "
-            "intensity scaling inside the visible region and fixed-centre "
-            "fallback."
-        ),
-        feature_mode="standardized_hard_support_region_norm",
-        strategy="patient_embedding",
-        role="primary_candidate",
-    ),
-    ExperimentConfig(
-        experiment_id=VALID_ONLY_ABLATION_EXPERIMENT_ID,
-        description=(
-            "Primary model restricted to slices whose standardized MONAI mask "
-            "passes the plausibility gate."
-        ),
-        feature_mode="standardized_hard_support_region_norm",
-        strategy="patient_embedding",
-        slice_filter="standardized_monai_valid",
-        role="ablation",
-    ),
-    ExperimentConfig(
-        experiment_id=FIXED_PERIPHERY_CONTROL_EXPERIMENT_ID,
-        description=(
-            "MONAI-independent peripheral control retaining only pixels outside "
-            "a fixed central square."
-        ),
-        feature_mode="standardized_fixed_periphery_region_norm",
-        strategy="patient_embedding",
-        role="negative_control",
-    ),
-    ExperimentConfig(
-        experiment_id=MASK_ONLY_CONTROL_EXPERIMENT_ID,
-        description=(
-            "Exact binary support used by the primary model with all MRI "
-            "intensities removed."
-        ),
-        feature_mode="standardized_a17_exact_support_mask_only",
-        strategy="patient_embedding",
-        role="segmentation_control",
-    ),
-    ExperimentConfig(
-        experiment_id=SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID,
-        description=(
-            "Exact support and intensity histogram retained while spatial "
-            "anatomy is deterministically shuffled."
-        ),
-        feature_mode="standardized_a17_support_intensity_affine_shuffled",
-        strategy="patient_embedding",
-        role="anatomy_destruction_control",
-    ),
-    ExperimentConfig(
-        experiment_id=COMPLEMENT_CONTROL_EXPERIMENT_ID,
-        description=(
-            "Independently normalized non-padding complement of the exact "
-            "primary-model support."
-        ),
-        feature_mode="standardized_a17_exact_support_complement_region_norm",
-        strategy="patient_embedding",
-        role="negative_control",
-    ),
-)
-# In every pair, delta AUROC is calculated as changed configuration
-# minus reference on the same patient resamples.
-PRIMARY_ABLATION_COMPARISONS = (
-    (
-        "REFERENCE_VS_PRIMARY",
-        REFERENCE_EXPERIMENT_ID,
-        PRIMARY_CANDIDATE_EXPERIMENT_ID,
-        "Hard-support candidate versus strict-ROI reference.",
-    ),
-    (
-        "PRIMARY_ALL_VS_VALID_ONLY",
-        PRIMARY_CANDIDATE_EXPERIMENT_ID,
-        VALID_ONLY_ABLATION_EXPERIMENT_ID,
-        "Effect of removing fallback slices.",
-    ),
-    (
-        "PERIPHERY_VS_PRIMARY",
-        FIXED_PERIPHERY_CONTROL_EXPERIMENT_ID,
-        PRIMARY_CANDIDATE_EXPERIMENT_ID,
-        "Cardiac candidate versus a MONAI-independent periphery.",
-    ),
-    (
-        "MASK_ONLY_VS_PRIMARY",
-        MASK_ONLY_CONTROL_EXPERIMENT_ID,
-        PRIMARY_CANDIDATE_EXPERIMENT_ID,
-        "Support plus MRI intensity versus support geometry alone.",
-    ),
-    (
-        "SHUFFLED_INTENSITY_VS_PRIMARY",
-        SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID,
-        PRIMARY_CANDIDATE_EXPERIMENT_ID,
-        "Intact spatial anatomy versus the same histogram after shuffling.",
-    ),
-    (
-        "COMPLEMENT_VS_PRIMARY",
-        COMPLEMENT_CONTROL_EXPERIMENT_ID,
-        PRIMARY_CANDIDATE_EXPERIMENT_ID,
-        "Primary support versus its exact complement.",
-    ),
-)
-
-N_SPLITS = 5
-CV_RANDOM_STATE = RANDOM_SEED
-INNER_CV_SPLITS = 3
-INNER_CV_RANDOM_STATE = RANDOM_SEED + 1000
-
-CLASSIFIER_C_GRID = (0.01, 0.1, 1.0, 10.0)
-LOGISTIC_MAX_ITER = 4000
-
-
-# The sigmoid calibrator is fitted on inner OOF patient scores without class
-# balancing, so it targets the prevalence of the outer-training cohort rather
-# than an artificial 50/50 prior. The amount of regularization is predeclared.
-PATIENT_PCA_EXPLAINED_VARIANCE = 0.95
-
-THRESHOLD_SELECTION_METHOD = "youden"
-# Supported values:
-#   "youden"           -> maximize sensitivity + specificity - 1
-#   "target_sensitivity" -> choose the largest training-only threshold that
-#                           reaches TARGET_SENSITIVITY when possible
-TARGET_SENSITIVITY = 0.90
-
-BOOTSTRAP_REPLICATES = 2000
-PAIRED_BOOTSTRAP_REPLICATES = 2000
-BOOTSTRAP_CONFIDENCE = 0.95
-
-USE_CUDA_AMP = False
-DATALOADER_NUM_WORKERS = 0
-ENABLE_DETAILED_PROGRESS_PRINTS = True
-PROGRESS_PRINT_EVERY_N_BATCHES = 25
-
-USE_FEATURE_CACHE = True
-FORCE_REBUILD_FEATURE_CACHE = False
-# CPU evaluation can be instructed to fail on a cache miss rather than silently
-# performing MONAI/EfficientNet inference on CPU.
-REQUIRE_EXISTING_FEATURE_CACHE = False
-
-FEATURE_CACHE_DEVICE_TAG = os.environ.get(
-    "CAD_FEATURE_CACHE_DEVICE_TAG", "auto"
-).strip().lower()
-if FEATURE_CACHE_DEVICE_TAG not in RUNTIME_DEVICE_CHOICES:
-    raise ValueError(
-        "CAD_FEATURE_CACHE_DEVICE_TAG must be auto/cpu/cuda; received "
-        f"{FEATURE_CACHE_DEVICE_TAG!r}."
-    )
-
-
-
-
-
-
-FEATURE_CACHE_SCHEMA = "cad-standardized-panel-current"
-EFFICIENTNET_FEATURE_DIM = 1280
-FEATURE_MODES_PER_ENCODER_CALL = 4
-# Encode several requested views per EfficientNet call while bounding VRAM.
-
-
-CENTER_CROP_FALLBACK_FRACTION = 0.60
-STANDARDIZED_CONTENT_LONG_SIDE = 240
-
-
-# ---------------------------------------------------------------------------
-# REGION-NORMALIZED CARDIAC / EXTRACARDIAC REPRESENTATIONS
-# ---------------------------------------------------------------------------
-
-
-HARD_SUPPORT_FALLBACK_FRACTION = 0.65
-# Fixed central support used only when localization fails.
-
-HARD_SUPPORT_DILATION_KERNEL = 15
-# Additional odd-kernel dilation applied to the already dilated MONAI hard mask
-# for the binary-support candidate. This retains nearby myocardium/context while
-# avoiding soft-probability modulation of MRI intensity.
-
-
-FIXED_PERIPHERY_EXCLUSION_FRACTION = 0.75
-# MONAI-independent peripheral control retaining only pixels outside a fixed
-# central square. It tests residual export/protocol signal without using a mask.
-
-REGION_NORM_LOWER_PERCENTILE = 1.0
-REGION_NORM_UPPER_PERCENTILE = 99.0
-REGION_NORM_MIN_PIXELS = 64
-REGION_NORM_HISTOGRAM_BINS = 256
-REGION_NORM_MIN_DYNAMIC_RANGE = 8.0 / 255.0
-# Intensities are robustly rescaled only from pixels inside the region that will
-# remain visible. This removes the coupling in which cardiac intensities could
-# influence the scaling of an outside-heart control.
-# Percentiles are estimated from a fixed 256-bin masked histogram in a batched
-# GPU-friendly implementation. This avoids one sorting/synchronization operation
-# per image while retaining the natural resolution of the source 8-bit JPEGs.
-# A fixed minimum denominator prevents a nearly uniform peripheral region from
-# amplifying one or two JPEG quantization levels to the complete [0,1] range.
-# The standardized branch now resizes the longest retained content dimension
-# to exactly 240 pixels, including upsampling when needed, and centers it in a
-# 256x256 canvas. This removes the previous dependence of pipeline-added
-# padding on native pixel dimensions and on how much dark border was removed.
-# Aspect ratio is still preserved and therefore remains explicitly audited.
-
-# ---------------------------------------------------------------------------
-# EXACT-SUPPORT CONTROL SETTINGS
-# ---------------------------------------------------------------------------
-SUPPORT_INTENSITY_SHUFFLE_SCHEMA = "sha256-affine-permutation-v1"
-# C32 permutes the row-major sequence of pixels inside the exact A17 support by
-# p(i)=(a*i+b) mod n, with a chosen coprime to n from the decoded-pixel hash.
-# This is bijective, deterministic, label-blind, preserves the within-support
-# histogram exactly, and avoids the extreme cost of generating a full random
-# permutation for every one of more than sixty thousand slices.
-
-STANDARDIZATION_LOWER_PERCENTILE = 1.0
-STANDARDIZATION_UPPER_PERCENTILE = 99.0
-STANDARDIZATION_DARK_LINE_MAX_MEAN = 12.0
-STANDARDIZATION_DARK_LINE_MAX_STD = 4.0
-STANDARDIZATION_DARK_PIXEL_MAX_VALUE = 20
-STANDARDIZATION_DARK_PIXEL_MIN_FRACTION = 0.98
-STANDARDIZATION_MAX_CROP_FRACTION_PER_SIDE = 0.20
-STANDARDIZATION_MIN_RETAINED_FRACTION = 0.60
-STANDARDIZATION_MIN_PADDING_RUN = 2
-STANDARDIZATION_FEATURE_NAMES = (
-    "crop_applied",
-    "crop_top_fraction",
-    "crop_bottom_fraction",
-    "crop_left_fraction",
-    "crop_right_fraction",
-    "retained_height_fraction",
-    "retained_width_fraction",
-    "detected_padding_fraction",
-    "robust_lower_intensity_0_1",
-    "robust_upper_intensity_0_1",
-    "robust_dynamic_range_0_1",
-    "fixed_content_height_fraction_of_canvas",
-    "fixed_content_width_fraction_of_canvas",
-    "fixed_pipeline_padding_fraction",
-)
-# Label-blind standardization removes only consecutive edge rows/columns that
-# are nearly uniform and dark. Safety limits prevent aggressive cropping. The
-# retained image is converted into two intensity views on the same fixed
-# geometry: min-max scaling for MONAI and robust 1st/99th-percentile scaling for
-# EfficientNet. The longest retained side is always resized to 240 pixels and
-# centered in a 256x256 canvas, so pipeline padding no longer depends on native
-# resolution or on the amount of detected border removal.
-
-C_SELECTION_AUC_TOLERANCE = 0.01
-# Select the smallest (most regularized) C whose inner AUC is within this
-# absolute tolerance of the best candidate. This prevents tiny inner-CV
-# differences from repeatedly choosing the least regularized edge of the grid.
-
-# ---------------------------------------------------------------------------
-# VALIDATION RUNTIME PROFILE
-# ---------------------------------------------------------------------------
-# ``fast`` is the default for iterative Kaggle development. It preserves the
-# main stability and permutation checks but reduces their repeated fitting cost.
-# ``full`` restores the original high-precision 50/1000/1000 workload.
-# ``smoke`` is intended only for code/debug checks and is not adequate for final
-# scientific reporting.
-#
-# Set the profile BEFORE executing this cell/script, for example:
-#
-#   os.environ["CAD_VALIDATION_PROFILE"] = "fast"   # default
-#   os.environ["CAD_VALIDATION_PROFILE"] = "full"   # final analysis
-#   os.environ["CAD_VALIDATION_PROFILE"] = "smoke"  # debugging only
-#
-# Exact counts can be overridden independently with:
-#   CAD_STABILITY_REPEATS
-#   CAD_PERMUTATION_REPLICATES
-#   CAD_SELECTION_ADJUSTED_PERMUTATIONS
-#
-# The reduced profile changes only repeated patient-level fitting. It does not
-# change image preprocessing, MONAI/Attention masks, EfficientNet embeddings,
-# primary 5-fold nested-CV experiments, patient grouping, or cached features.
-VALIDATION_RUNTIME_PROFILE = os.environ.get(
-    "CAD_VALIDATION_PROFILE", "fast"
-).strip().lower()
-VALIDATION_RUNTIME_PROFILES = {
-    "smoke": {
-        "stability_repeats": 3,
-        "permutation_replicates": 25,
-        "selection_adjusted_permutations": 25,
-    },
-    "fast": {
-        "stability_repeats": 10,
-        "permutation_replicates": 200,
-        "selection_adjusted_permutations": 100,
-    },
-    "full": {
-        "stability_repeats": 50,
-        "permutation_replicates": 1000,
-        "selection_adjusted_permutations": 1000,
-    },
-}
-if VALIDATION_RUNTIME_PROFILE not in VALIDATION_RUNTIME_PROFILES:
-    raise ValueError(
-        "CAD_VALIDATION_PROFILE must be one of: smoke, fast, full. "
-        f"Received {VALIDATION_RUNTIME_PROFILE!r}."
-    )
-_VALIDATION_PROFILE_DEFAULTS = VALIDATION_RUNTIME_PROFILES[
-    VALIDATION_RUNTIME_PROFILE
-]
-
+# region VS CODE OUTLINE — ALL SETTINGS
 
 def _validation_env_positive_int(name, default):
     """Read one strictly positive integer used by repeated analyses."""
@@ -643,7 +224,6 @@ def _validation_env_positive_int(name, default):
         raise ValueError(f"{name} must be at least 1, received {value}.")
     return value
 
-
 def _validation_env_bool(name, default):
     """Read a conventional Boolean environment flag."""
 
@@ -659,342 +239,1081 @@ def _validation_env_bool(name, default):
         f"{name} must be a Boolean token (0/1, true/false), received {raw!r}."
     )
 
+def _env_int(name, default, minimum=1):
+    value = int(os.environ.get(name, default))
+    if value < minimum:
+        raise ValueError(f"{name} must be >= {minimum}; received {value}.")
+    return value
 
-RUN_REPEATED_NESTED_CV_STABILITY = _validation_env_bool(
-    "CAD_RUN_STABILITY", True
-)
-REPEATED_NESTED_CV_REPEATS = _validation_env_positive_int(
-    "CAD_STABILITY_REPEATS",
-    _VALIDATION_PROFILE_DEFAULTS["stability_repeats"],
-)
-REPEATED_NESTED_CV_RANDOM_STATE = RANDOM_SEED + 20_000
+def _env_float(name, default, minimum=None, maximum=None):
+    value = float(os.environ.get(name, default))
+    if minimum is not None and value < minimum:
+        raise ValueError(f"{name} must be >= {minimum}; received {value}.")
+    if maximum is not None and value > maximum:
+        raise ValueError(f"{name} must be <= {maximum}; received {value}.")
+    return value
 
-# Every active experiment is repeated because the registry is already compact.
-STABILITY_EXPERIMENT_IDS = tuple(
-    experiment.experiment_id for experiment in EXPERIMENT_REGISTRY
-)
+def _env_bool(name, default=False):
+    value = str(os.environ.get(name, "1" if default else "0")).strip().lower()
+    if value in {"1", "true", "yes", "y", "on"}:
+        return True
+    if value in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError(f"{name} must be a Boolean value; received {value!r}.")
 
-# All comparisons below use the exact same outer split seeds. The first model
-# is the reference and the second is the changed configuration, so a positive
-# delta means the SECOND named configuration performed better on that repeat.
-# Every comparison uses identical repeated split seeds.
-REPEATED_STABILITY_COMPARISONS = (
-    ("REFERENCE_VS_PRIMARY", REFERENCE_EXPERIMENT_ID, PRIMARY_CANDIDATE_EXPERIMENT_ID,
-     "Strict-ROI reference versus primary hard-support model."),
-    ("PRIMARY_ALL_VS_VALID_ONLY", PRIMARY_CANDIDATE_EXPERIMENT_ID,
-     VALID_ONLY_ABLATION_EXPERIMENT_ID, "All slices versus gate-valid-only slices."),
-    ("MASK_ONLY_VS_PRIMARY", MASK_ONLY_CONTROL_EXPERIMENT_ID,
-     PRIMARY_CANDIDATE_EXPERIMENT_ID, "Support geometry alone versus support plus MRI."),
-    ("SHUFFLED_VS_PRIMARY", SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID,
-     PRIMARY_CANDIDATE_EXPERIMENT_ID, "Shuffled intensities versus intact anatomy."),
-    ("COMPLEMENT_VS_PRIMARY", COMPLEMENT_CONTROL_EXPERIMENT_ID,
-     PRIMARY_CANDIDATE_EXPERIMENT_ID, "Exact complement versus cardiac support."),
-    ("PERIPHERY_VS_PRIMARY", FIXED_PERIPHERY_CONTROL_EXPERIMENT_ID,
-     PRIMARY_CANDIDATE_EXPERIMENT_ID, "Fixed periphery versus cardiac support."),
-)
+class SETTINGS_RUNTIME:
+    """Runtime, reproducibility and progress controls."""
 
-RUN_PATIENT_LABEL_PERMUTATION_TEST = _validation_env_bool(
-    "CAD_RUN_PERMUTATION", True
-)
-LABEL_PERMUTATION_REPLICATES = _validation_env_positive_int(
-    "CAD_PERMUTATION_REPLICATES",
-    _VALIDATION_PROFILE_DEFAULTS["permutation_replicates"],
-)
-LABEL_PERMUTATION_RANDOM_STATE = RANDOM_SEED + 40_000
-PERMUTATION_EXPERIMENT_IDS = (
-    PRIMARY_CANDIDATE_EXPERIMENT_ID,
-)
+    PIPELINE_SCHEMA_ID = "cad-cardiac-mri-current"
 
-# The primary model receives a direct label-permutation test. A separate
-# max-statistic test accounts for choosing among the declared model family.
+    # Primary MONAI/EfficientNet image batch size.
+    # Lower this first after a CUDA OOM; it affects speed, not model semantics.
+    BATCH_SIZE = 8
 
-RUN_MODEL_FAMILY_NESTED_SELECTION = True
-MODEL_FAMILY_NESTED_SELECTION_IDS = (
-    PRIMARY_CANDIDATE_EXPERIMENT_ID,
-    VALID_ONLY_ABLATION_EXPERIMENT_ID,
-    REFERENCE_EXPERIMENT_ID,
-)
+    RUNTIME_DEVICE_CHOICES = ("auto", "cpu", "cuda")
 
-MODEL_FAMILY_SELECTION_AUC_TOLERANCE = 0.01
-# Inside each outer-training cohort, each candidate receives its own inner C
-# selection. The first candidate within this tolerance of the best inner AUROC
-# is chosen, fitted on the complete outer-training cohort, and evaluated
-# once on the untouched outer fold. The primary model is the deterministic
-# near-tie preference.
+    # Default device policy. Use explicit CPU/GPU staged actions in Kaggle.
+    RUNTIME_DEVICE_POLICY = os.environ.get(
+        "CAD_RUNTIME_DEVICE", "auto"
+    ).strip().lower()
 
-RUN_SELECTION_ADJUSTED_PERMUTATION_TEST = _validation_env_bool(
-    "CAD_RUN_SELECTION_ADJUSTED_PERMUTATION", True
-)
-SELECTION_ADJUSTED_PERMUTATION_REPLICATES = (
-    _validation_env_positive_int(
-        "CAD_SELECTION_ADJUSTED_PERMUTATIONS",
-        _VALIDATION_PROFILE_DEFAULTS[
-            "selection_adjusted_permutations"
-        ],
+    # Keep this tag identical in GPU-generation and CPU-evaluation sessions
+    # so both sessions resolve the same output directory.
+    SUITE_DEVICE_TAG = os.environ.get(
+        "CAD_SUITE_DEVICE_TAG", "auto"
+    ).strip().lower()
+
+    # Master seed for patient folds, bootstrap and repeated analyses.
+    RANDOM_SEED = 42
+
+    USE_CUDA_AMP = False
+
+    DATALOADER_NUM_WORKERS = 0
+
+    ENABLE_DETAILED_PROGRESS_PRINTS = True
+
+    PROGRESS_PRINT_EVERY_N_BATCHES = 25
+
+class SETTINGS_EXPERIMENTS:
+    """Active MONAI experiments and predeclared paired comparisons."""
+
+    EXPERIMENTS_TO_RUN = None
+
+    REFERENCE_EXPERIMENT_ID = (
+        "A12_STANDARDIZED_ROI_ZERO_BG_CENTER_FALLBACK_HIER_LR_PCA"
     )
-)
-SELECTION_ADJUSTED_PERMUTATION_RANDOM_STATE = RANDOM_SEED + 60_000
-SELECTION_ADJUSTED_CANDIDATE_EXPERIMENT_IDS = (
-    REFERENCE_EXPERIMENT_ID,
-    PRIMARY_CANDIDATE_EXPERIMENT_ID,
-    VALID_ONLY_ABLATION_EXPERIMENT_ID,
-)
 
-# For every permuted label vector, the full nested fitting path is rerun for
-# every predeclared candidate and the maximum AUROC is stored. Comparing the
-# observed maximum with this maximum-null distribution corrects the permutation
-# result for choosing the best representation from that candidate family.
+    PRIMARY_CANDIDATE_EXPERIMENT_ID = (
+        "A17_HARD_SUPPORT_REGION_NORM_HIER_LR_PCA"
+    )
 
-AUDIT_EXACT_DECODED_PIXEL_DUPLICATES = True
-AUDIT_PERCEPTUAL_NEAR_DUPLICATES = True
-PHASH_HAMMING_THRESHOLD = 3
-# The reviewed audit searches unique 64-bit hashes with a complete BK-tree
-# radius query. It does not skip large buckets or truncate at an arbitrary
-# image-pair count. pHash matches remain screening candidates, not verdicts.
+    VALID_ONLY_ABLATION_EXPERIMENT_ID = (
+        "A20_HARD_SUPPORT_REGION_NORM_VALID_ONLY_HIER_LR_PCA"
+    )
 
-GROUP_SPLITS_BY_EXACT_DUPLICATES = True
-GROUP_SPLITS_BY_PHASH_CANDIDATES = False
-# Perceptual candidates are not automatically treated as confirmed duplicates
-# by default. Set True only after reviewing the saved candidate table.
+    FIXED_PERIPHERY_CONTROL_EXPERIMENT_ID = (
+        "C29_FIXED_PERIPHERY_REGION_NORM_HIER_LR_PCA"
+    )
 
-FAIL_ON_CROSS_PATIENT_EXACT_DUPLICATES = False
-FAIL_ON_CROSS_LABEL_EXACT_DUPLICATES = False
-FAIL_SUITE_IF_ANY_EXPERIMENT_FAILS = False
+    MASK_ONLY_CONTROL_EXPERIMENT_ID = (
+        "C31_A17_EXACT_SUPPORT_MASK_ONLY_HIER_LR_PCA"
+    )
 
-SHORTCUT_WARNING_AUC = 0.65
-MONAI_GATE_RATE_DIFFERENCE_WARNING = 0.20
+    SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID = (
+        "C32_A17_SUPPORT_INTENSITY_AFFINE_SHUFFLED_HIER_LR_PCA"
+    )
 
-# ---------------------------------------------------------------------------
-# MONAI BUNDLE CONFIGURATION
-# ---------------------------------------------------------------------------
+    COMPLEMENT_CONTROL_EXPERIMENT_ID = (
+        "C33_A17_EXACT_SUPPORT_COMPLEMENT_REGION_NORM_HIER_LR_PCA"
+    )
 
-MONAI_BUNDLE_NAME = "ventricular_short_axis_3label"
-# Official MONAI Model Zoo bundle used for cardiac segmentation.
+    BASELINE_EXPERIMENT_ID = REFERENCE_EXPERIMENT_ID
 
-MONAI_BUNDLE_VERSION = "0.3.5"
-# Human-readable bundle version declared by configs/metadata.json.
-
-MONAI_HF_REPO_ID = "MONAI/ventricular_short_axis_3label"
-MONAI_HF_REVISION = "eefc17c8e002cc8a567bbfce8f02d7d3116408f4"
-# The immutable Hugging Face commit corresponding to the pinned metadata
-# release. Pinning a commit, rather than downloading ``main``, prevents a future
-# repository update from silently changing the files used by the experiment.
-
-AUTO_DOWNLOAD_MONAI_BUNDLE = True
-# When True, missing pinned files are downloaded through huggingface_hub.
-# Set False for an offline machine and place at least these files manually:
-#
-#   <MONAI_BUNDLE_DIR>/ventricular_short_axis_3label/models/model.ts
-#   <MONAI_BUNDLE_DIR>/ventricular_short_axis_3label/configs/metadata.json
-#
-# ``models/model.pt`` and ``configs/train.json`` are needed only for the
-# reconstruction fallback described below.
-
-VERIFY_MONAI_ARTIFACT_SHA256 = True
-# Official SHA-256 digests published with the pinned Hugging Face artifacts.
-# Verification is enabled by default because a wrong or corrupted segmentation
-# model would invalidate both the ROI and the frozen feature cache.
-
-MONAI_OFFICIAL_TORCHSCRIPT_SHA256 = (
-    "27d5532401fa6c1883872fa21635adbb7615981e7f385d0c58dd75b355e340b3"
-)
-MONAI_MODEL_SHA256 = (
-    "464ca796028831f6c9e2b1cdaebe9af002fc1d7f494f7a89a63f2079e38837a1"
-)
-
-MONAI_ROI_DILATION_KERNEL = 31
-# Expands the predicted ventricular structures to retain a margin around the
-# myocardium. Must be an odd positive integer so output size remains unchanged.
-# 17  → small spatial expansion
-# 31  → moderate spatial expansion (current setting)
-# 41  → large spatial expansion
-# 51  → very large spatial expansion
-
-MONAI_BACKGROUND_WEIGHT = 0.15
-# Soft ROI background retention.
-#
-# A value of 0 would remove all pixels outside the predicted cardiac region.
-# That is risky under domain shift. A value of 0.15 keeps 15% of the original
-# background signal while emphasizing the predicted heart region.
-# 0.00 = background completely removed
-# 0.15 = background strongly attenuated  ← current setting
-# 0.30 = retains a moderate amount of context
-# 0.40 = retains substantial context
-# 1.00 = effectively no ROI attenuation
-
-MONAI_MIN_HEART_AREA_RATIO = 0.003
-MONAI_MAX_HEART_AREA_RATIO = 0.50
-MONAI_MIN_PEAK_HEART_PROBABILITY = 0.50
-# Initial plausibility thresholds for deciding whether to trust a MONAI mask.
-#
-# These are safeguards, not clinically validated constants. They should be
-# calibrated on a manually reviewed subset of this CAD dataset. A slice falls
-# back to the full image when:
-#   - the predicted heart is nearly empty,
-#   - the predicted heart occupies implausibly much of the field of view, or
-#   - no pixel receives sufficient non-background probability.
-
-# ---------------------------------------------------------------------------
-# EFFICIENTNET NORMALIZATION
-# ---------------------------------------------------------------------------
-
-EFFICIENTNET_WEIGHTS_NAME = "IMAGENET1K_V1"
-# Explicit enum name, rather than DEFAULT, prevents a future torchvision release
-# from silently changing the pretrained checkpoint selected by this experiment.
-
-EFFICIENTNET_MEAN = (0.485, 0.456, 0.406)
-EFFICIENTNET_STD = (0.229, 0.224, 0.225)
-# Mean/std values associated with EfficientNet_B0_Weights.IMAGENET1K_V1.
-# Important: torchvision's complete reference transform also resizes to 256 and
-# center-crops to 224. This pipeline deliberately resizes the COMPLETE aligned
-# 256×256 canvas to 224×224 to avoid discarding peripheral MRI content and to
-# preserve simple MONAI-mask alignment. Therefore only the normalization values
-# and checkpoint are official; the spatial preprocessing is a documented custom
-# adaptation that should be included in the methods and ablated if necessary.
-
-# ---------------------------------------------------------------------------
-# MONAI BUNDLE LOCATION
-# ---------------------------------------------------------------------------
-
-if os.path.exists("/kaggle/working"):
-    default_bundle_parent = Path("/kaggle/working/monai_bundles")
-else:
-    try:
-        default_bundle_parent = Path(__file__).resolve().parent / "monai_bundles"
-    except NameError:
-        # __file__ is unavailable in some notebook environments.
-        default_bundle_parent = Path.cwd() / "monai_bundles"
-
-MONAI_BUNDLE_DIR = Path(
-    os.environ.get("MONAI_BUNDLE_DIR", str(default_bundle_parent))
-)
-# The MONAI_BUNDLE_DIR environment variable can override the default location.
-
-MONAI_TORCHSCRIPT_PATH = Path(
-    os.environ.get(
-        "MONAI_TORCHSCRIPT_PATH",
-        str(
-            MONAI_BUNDLE_DIR
-            / (
-                f"{MONAI_BUNDLE_NAME}_{MONAI_BUNDLE_VERSION}_"
-                f"{MONAI_HF_REVISION[:8]}_fallback_torchscript.pt"
-            )
+    EXPERIMENT_REGISTRY = (
+        ExperimentConfig(
+            experiment_id=REFERENCE_EXPERIMENT_ID,
+            description=(
+                "Reference model using a zero-background MONAI ROI with a fixed "
+                "central fallback, hierarchical patient pooling, PCA and Logistic "
+                "Regression."
+            ),
+            feature_mode="standardized_roi_zero_bg_center_fallback",
+            strategy="patient_embedding",
+            role="reference",
+        ),
+        ExperimentConfig(
+            experiment_id=PRIMARY_CANDIDATE_EXPERIMENT_ID,
+            description=(
+                "Primary model using a binary dilated cardiac support, robust "
+                "intensity scaling inside the visible region and fixed-centre "
+                "fallback."
+            ),
+            feature_mode="standardized_hard_support_region_norm",
+            strategy="patient_embedding",
+            role="primary_candidate",
+        ),
+        ExperimentConfig(
+            experiment_id=VALID_ONLY_ABLATION_EXPERIMENT_ID,
+            description=(
+                "Primary model restricted to slices whose standardized MONAI mask "
+                "passes the plausibility gate."
+            ),
+            feature_mode="standardized_hard_support_region_norm",
+            strategy="patient_embedding",
+            slice_filter="standardized_monai_valid",
+            role="ablation",
+        ),
+        ExperimentConfig(
+            experiment_id=FIXED_PERIPHERY_CONTROL_EXPERIMENT_ID,
+            description=(
+                "MONAI-independent peripheral control retaining only pixels outside "
+                "a fixed central square."
+            ),
+            feature_mode="standardized_fixed_periphery_region_norm",
+            strategy="patient_embedding",
+            role="negative_control",
+        ),
+        ExperimentConfig(
+            experiment_id=MASK_ONLY_CONTROL_EXPERIMENT_ID,
+            description=(
+                "Exact binary support used by the primary model with all MRI "
+                "intensities removed."
+            ),
+            feature_mode="standardized_a17_exact_support_mask_only",
+            strategy="patient_embedding",
+            role="segmentation_control",
+        ),
+        ExperimentConfig(
+            experiment_id=SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID,
+            description=(
+                "Exact support and intensity histogram retained while spatial "
+                "anatomy is deterministically shuffled."
+            ),
+            feature_mode="standardized_a17_support_intensity_affine_shuffled",
+            strategy="patient_embedding",
+            role="anatomy_destruction_control",
+        ),
+        ExperimentConfig(
+            experiment_id=COMPLEMENT_CONTROL_EXPERIMENT_ID,
+            description=(
+                "Independently normalized non-padding complement of the exact "
+                "primary-model support."
+            ),
+            feature_mode="standardized_a17_exact_support_complement_region_norm",
+            strategy="patient_embedding",
+            role="negative_control",
         ),
     )
-)
-# Local TorchScript cache used ONLY by the reconstruction fallback:
-#
-#   official model.pt -> lazy MONAI import -> strict state-dict loading
-#                     -> validated local TorchScript export
-#
-# The normal path loads the official bundle file ``models/model.ts`` directly,
-# so this fallback cache usually never has to be created.
 
-FORCE_REBUILD_MONAI_TORCHSCRIPT = False
-# False (normal): use the verified official model.ts; consult a local fallback
-# cache only when that official artifact cannot execute on the current PyTorch.
-# True: deliberately ignore both TorchScript files and rebuild from model.pt.
-# This is intended for diagnostics, not routine execution.
+    PRIMARY_ABLATION_COMPARISONS = (
+        (
+            "REFERENCE_VS_PRIMARY",
+            REFERENCE_EXPERIMENT_ID,
+            PRIMARY_CANDIDATE_EXPERIMENT_ID,
+            "Hard-support candidate versus strict-ROI reference.",
+        ),
+        (
+            "PRIMARY_ALL_VS_VALID_ONLY",
+            PRIMARY_CANDIDATE_EXPERIMENT_ID,
+            VALID_ONLY_ABLATION_EXPERIMENT_ID,
+            "Effect of removing fallback slices.",
+        ),
+        (
+            "PERIPHERY_VS_PRIMARY",
+            FIXED_PERIPHERY_CONTROL_EXPERIMENT_ID,
+            PRIMARY_CANDIDATE_EXPERIMENT_ID,
+            "Cardiac candidate versus a MONAI-independent periphery.",
+        ),
+        (
+            "MASK_ONLY_VS_PRIMARY",
+            MASK_ONLY_CONTROL_EXPERIMENT_ID,
+            PRIMARY_CANDIDATE_EXPERIMENT_ID,
+            "Support plus MRI intensity versus support geometry alone.",
+        ),
+        (
+            "SHUFFLED_INTENSITY_VS_PRIMARY",
+            SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID,
+            PRIMARY_CANDIDATE_EXPERIMENT_ID,
+            "Intact spatial anatomy versus the same histogram after shuffling.",
+        ),
+        (
+            "COMPLEMENT_VS_PRIMARY",
+            COMPLEMENT_CONTROL_EXPERIMENT_ID,
+            PRIMARY_CANDIDATE_EXPERIMENT_ID,
+            "Primary support versus its exact complement.",
+        ),
+    )
+
+class SETTINGS_VALIDATION:
+    """Patient-level CV, bootstrap, stability and permutation settings."""
+
+    N_SPLITS = 5
+
+    CV_RANDOM_STATE = SETTINGS_RUNTIME.RANDOM_SEED
+
+    INNER_CV_SPLITS = 3
+
+    INNER_CV_RANDOM_STATE = SETTINGS_RUNTIME.RANDOM_SEED + 1000
+
+    CLASSIFIER_C_GRID = (0.01, 0.1, 1.0, 10.0)
+
+    LOGISTIC_MAX_ITER = 4000
+
+    PATIENT_PCA_EXPLAINED_VARIANCE = 0.95
+
+    THRESHOLD_SELECTION_METHOD = "youden"
+
+    TARGET_SENSITIVITY = 0.90
+
+    BOOTSTRAP_REPLICATES = 2000
+
+    PAIRED_BOOTSTRAP_REPLICATES = 2000
+
+    BOOTSTRAP_CONFIDENCE = 0.95
+
+    C_SELECTION_AUC_TOLERANCE = 0.01
+
+    # smoke = code checks only; fast = iterative work; full = final reporting.
+    VALIDATION_RUNTIME_PROFILE = os.environ.get(
+        "CAD_VALIDATION_PROFILE", "fast"
+    ).strip().lower()
+
+    VALIDATION_RUNTIME_PROFILES = {
+        "smoke": {
+            "stability_repeats": 3,
+            "permutation_replicates": 25,
+            "selection_adjusted_permutations": 25,
+        },
+        "fast": {
+            "stability_repeats": 10,
+            "permutation_replicates": 200,
+            "selection_adjusted_permutations": 100,
+        },
+        "full": {
+            "stability_repeats": 50,
+            "permutation_replicates": 1000,
+            "selection_adjusted_permutations": 1000,
+        },
+    }
+
+    _VALIDATION_PROFILE_DEFAULTS = VALIDATION_RUNTIME_PROFILES[
+        VALIDATION_RUNTIME_PROFILE
+    ]
+
+    RUN_REPEATED_NESTED_CV_STABILITY = _validation_env_bool(
+        "CAD_RUN_STABILITY", True
+    )
+
+    REPEATED_NESTED_CV_REPEATS = _validation_env_positive_int(
+        "CAD_STABILITY_REPEATS",
+        _VALIDATION_PROFILE_DEFAULTS["stability_repeats"],
+    )
+
+    REPEATED_NESTED_CV_RANDOM_STATE = SETTINGS_RUNTIME.RANDOM_SEED + 20_000
+
+    STABILITY_EXPERIMENT_IDS = tuple(
+        experiment.experiment_id for experiment in SETTINGS_EXPERIMENTS.EXPERIMENT_REGISTRY
+    )
+
+    REPEATED_STABILITY_COMPARISONS = (
+        ("REFERENCE_VS_PRIMARY", SETTINGS_EXPERIMENTS.REFERENCE_EXPERIMENT_ID, SETTINGS_EXPERIMENTS.PRIMARY_CANDIDATE_EXPERIMENT_ID,
+         "Strict-ROI reference versus primary hard-support model."),
+        ("PRIMARY_ALL_VS_VALID_ONLY", SETTINGS_EXPERIMENTS.PRIMARY_CANDIDATE_EXPERIMENT_ID,
+         SETTINGS_EXPERIMENTS.VALID_ONLY_ABLATION_EXPERIMENT_ID, "All slices versus gate-valid-only slices."),
+        ("MASK_ONLY_VS_PRIMARY", SETTINGS_EXPERIMENTS.MASK_ONLY_CONTROL_EXPERIMENT_ID,
+         SETTINGS_EXPERIMENTS.PRIMARY_CANDIDATE_EXPERIMENT_ID, "Support geometry alone versus support plus MRI."),
+        ("SHUFFLED_VS_PRIMARY", SETTINGS_EXPERIMENTS.SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID,
+         SETTINGS_EXPERIMENTS.PRIMARY_CANDIDATE_EXPERIMENT_ID, "Shuffled intensities versus intact anatomy."),
+        ("COMPLEMENT_VS_PRIMARY", SETTINGS_EXPERIMENTS.COMPLEMENT_CONTROL_EXPERIMENT_ID,
+         SETTINGS_EXPERIMENTS.PRIMARY_CANDIDATE_EXPERIMENT_ID, "Exact complement versus cardiac support."),
+        ("PERIPHERY_VS_PRIMARY", SETTINGS_EXPERIMENTS.FIXED_PERIPHERY_CONTROL_EXPERIMENT_ID,
+         SETTINGS_EXPERIMENTS.PRIMARY_CANDIDATE_EXPERIMENT_ID, "Fixed periphery versus cardiac support."),
+    )
+
+    RUN_PATIENT_LABEL_PERMUTATION_TEST = _validation_env_bool(
+        "CAD_RUN_PERMUTATION", True
+    )
+
+    LABEL_PERMUTATION_REPLICATES = _validation_env_positive_int(
+        "CAD_PERMUTATION_REPLICATES",
+        _VALIDATION_PROFILE_DEFAULTS["permutation_replicates"],
+    )
+
+    LABEL_PERMUTATION_RANDOM_STATE = SETTINGS_RUNTIME.RANDOM_SEED + 40_000
+
+    PERMUTATION_EXPERIMENT_IDS = (
+        SETTINGS_EXPERIMENTS.PRIMARY_CANDIDATE_EXPERIMENT_ID,
+    )
+
+    RUN_MODEL_FAMILY_NESTED_SELECTION = True
+
+    MODEL_FAMILY_NESTED_SELECTION_IDS = (
+        SETTINGS_EXPERIMENTS.PRIMARY_CANDIDATE_EXPERIMENT_ID,
+        SETTINGS_EXPERIMENTS.VALID_ONLY_ABLATION_EXPERIMENT_ID,
+        SETTINGS_EXPERIMENTS.REFERENCE_EXPERIMENT_ID,
+    )
+
+    MODEL_FAMILY_SELECTION_AUC_TOLERANCE = 0.01
+
+    RUN_SELECTION_ADJUSTED_PERMUTATION_TEST = _validation_env_bool(
+        "CAD_RUN_SELECTION_ADJUSTED_PERMUTATION", True
+    )
+
+    SELECTION_ADJUSTED_PERMUTATION_REPLICATES = (
+        _validation_env_positive_int(
+            "CAD_SELECTION_ADJUSTED_PERMUTATIONS",
+            _VALIDATION_PROFILE_DEFAULTS[
+                "selection_adjusted_permutations"
+            ],
+        )
+    )
+
+    SELECTION_ADJUSTED_PERMUTATION_RANDOM_STATE = SETTINGS_RUNTIME.RANDOM_SEED + 60_000
+
+    SELECTION_ADJUSTED_CANDIDATE_EXPERIMENT_IDS = (
+        SETTINGS_EXPERIMENTS.REFERENCE_EXPERIMENT_ID,
+        SETTINGS_EXPERIMENTS.PRIMARY_CANDIDATE_EXPERIMENT_ID,
+        SETTINGS_EXPERIMENTS.VALID_ONLY_ABLATION_EXPERIMENT_ID,
+    )
+
+class SETTINGS_FEATURE_BANK:
+    """Frozen EfficientNet encoder and persistent cache policy."""
+
+    USE_FEATURE_CACHE = True
+
+    # Keep False normally. True forces an expensive full neural cache rebuild.
+    FORCE_REBUILD_FEATURE_CACHE = False
+
+    # CPU-only evaluation sets this True to prevent accidental neural inference.
+    REQUIRE_EXISTING_FEATURE_CACHE = False
+
+    FEATURE_CACHE_DEVICE_TAG = os.environ.get(
+        "CAD_FEATURE_CACHE_DEVICE_TAG", "auto"
+    ).strip().lower()
+
+    FEATURE_CACHE_SCHEMA = "cad-standardized-panel-current"
+
+    EFFICIENTNET_FEATURE_DIM = 1280
+
+    # Increase for throughput only when VRAM allows; lower after an OOM.
+    FEATURE_MODES_PER_ENCODER_CALL = 4
+
+    EFFICIENTNET_WEIGHTS_NAME = "IMAGENET1K_V1"
+
+    EFFICIENTNET_MEAN = (0.485, 0.456, 0.406)
+
+    EFFICIENTNET_STD = (0.229, 0.224, 0.225)
+
+class SETTINGS_PREPROCESSING:
+    """Image standardization, region scaling and exact-support controls."""
+
+    IMG_SIZE = 224
+
+    CENTER_CROP_FALLBACK_FRACTION = 0.60
+
+    STANDARDIZED_CONTENT_LONG_SIDE = 240
+
+    HARD_SUPPORT_FALLBACK_FRACTION = 0.65
+
+    # Must remain odd. Changing it invalidates hard-support feature caches.
+    HARD_SUPPORT_DILATION_KERNEL = 15
+
+    FIXED_PERIPHERY_EXCLUSION_FRACTION = 0.75
+
+    # Robust scaling is estimated only from pixels retained by each representation.
+    REGION_NORM_LOWER_PERCENTILE = 1.0
+
+    REGION_NORM_UPPER_PERCENTILE = 99.0
+
+    REGION_NORM_MIN_PIXELS = 64
+
+    REGION_NORM_HISTOGRAM_BINS = 256
+
+    REGION_NORM_MIN_DYNAMIC_RANGE = 8.0 / 255.0
+
+    SUPPORT_INTENSITY_SHUFFLE_SCHEMA = "sha256-affine-permutation-v1"
+
+    STANDARDIZATION_LOWER_PERCENTILE = 1.0
+
+    STANDARDIZATION_UPPER_PERCENTILE = 99.0
+
+    STANDARDIZATION_DARK_LINE_MAX_MEAN = 12.0
+
+    STANDARDIZATION_DARK_LINE_MAX_STD = 4.0
+
+    STANDARDIZATION_DARK_PIXEL_MAX_VALUE = 20
+
+    STANDARDIZATION_DARK_PIXEL_MIN_FRACTION = 0.98
+
+    STANDARDIZATION_MAX_CROP_FRACTION_PER_SIDE = 0.20
+
+    STANDARDIZATION_MIN_RETAINED_FRACTION = 0.60
+
+    STANDARDIZATION_MIN_PADDING_RUN = 2
+
+    STANDARDIZATION_FEATURE_NAMES = (
+        "crop_applied",
+        "crop_top_fraction",
+        "crop_bottom_fraction",
+        "crop_left_fraction",
+        "crop_right_fraction",
+        "retained_height_fraction",
+        "retained_width_fraction",
+        "detected_padding_fraction",
+        "robust_lower_intensity_0_1",
+        "robust_upper_intensity_0_1",
+        "robust_dynamic_range_0_1",
+        "fixed_content_height_fraction_of_canvas",
+        "fixed_content_width_fraction_of_canvas",
+        "fixed_pipeline_padding_fraction",
+    )
+
+class SETTINGS_AUDIT:
+    """Duplicate-audit and shortcut-warning safeguards."""
+
+    AUDIT_EXACT_DECODED_PIXEL_DUPLICATES = True
+
+    AUDIT_PERCEPTUAL_NEAR_DUPLICATES = True
+
+    PHASH_HAMMING_THRESHOLD = 3
+
+    GROUP_SPLITS_BY_EXACT_DUPLICATES = True
+
+    GROUP_SPLITS_BY_PHASH_CANDIDATES = False
+
+    FAIL_ON_CROSS_PATIENT_EXACT_DUPLICATES = False
+
+    FAIL_ON_CROSS_LABEL_EXACT_DUPLICATES = False
+
+    FAIL_SUITE_IF_ANY_EXPERIMENT_FAILS = False
+
+    SHORTCUT_WARNING_AUC = 0.65
+
+    MONAI_GATE_RATE_DIFFERENCE_WARNING = 0.20
+
+class SETTINGS_REPORTING:
+    """Pipeline-stage and patient-level metadata field definitions."""
+
+    PIPELINE_STAGE_COUNT = 12
+
+    PROVENANCE_FEATURE_NAMES = (
+        "native_height",
+        "native_width",
+        "aspect_ratio_width_over_height",
+        "file_size_bytes",
+        "bytes_per_native_pixel",
+        "raw_mean_intensity",
+        "raw_std_intensity",
+        "raw_entropy_bits",
+        "near_black_fraction",
+        "near_white_fraction",
+        "border_mean_intensity",
+        "border_std_intensity",
+        "border_near_black_fraction",
+        "center_mean_intensity",
+        "edge_pixel_fraction",
+        "laplacian_variance",
+    )
+
+    PROVENANCE_CLASSIFIER_FEATURE_NAMES = (
+        "native_height",
+        "native_width",
+        "aspect_ratio_width_over_height",
+        "file_size_bytes",
+        "bytes_per_native_pixel",
+        "near_black_fraction",
+        "near_white_fraction",
+        "border_mean_intensity",
+        "border_std_intensity",
+        "border_near_black_fraction",
+    )
+
+class SETTINGS_MONAI:
+    """Pinned MONAI model artifact, ROI and plausibility-gate settings."""
+
+    # Pinned by the pretrained MONAI bundle; do not change independently.
+    MONAI_INPUT_SIZE = 256
+
+    MONAI_BUNDLE_NAME = "ventricular_short_axis_3label"
+
+    MONAI_BUNDLE_VERSION = "0.3.5"
+
+    MONAI_HF_REPO_ID = "MONAI/ventricular_short_axis_3label"
+
+    MONAI_HF_REVISION = "eefc17c8e002cc8a567bbfce8f02d7d3116408f4"
+
+    AUTO_DOWNLOAD_MONAI_BUNDLE = True
+
+    VERIFY_MONAI_ARTIFACT_SHA256 = True
+
+    MONAI_OFFICIAL_TORCHSCRIPT_SHA256 = (
+        "27d5532401fa6c1883872fa21635adbb7615981e7f385d0c58dd75b355e340b3"
+    )
+
+    MONAI_MODEL_SHA256 = (
+        "464ca796028831f6c9e2b1cdaebe9af002fc1d7f494f7a89a63f2079e38837a1"
+    )
+
+    # Must remain odd. This controls contextual expansion around ventricular masks.
+    MONAI_ROI_DILATION_KERNEL = 31
+
+    MONAI_BACKGROUND_WEIGHT = 0.15
+
+    # QC gate thresholds are fixed before CAD evaluation and must not be tuned
+    # against AUROC or patient labels.
+    MONAI_MIN_HEART_AREA_RATIO = 0.003
+
+    MONAI_MAX_HEART_AREA_RATIO = 0.50
+
+    MONAI_MIN_PEAK_HEART_PROBABILITY = 0.50
+
+    FORCE_REBUILD_MONAI_TORCHSCRIPT = False
+
+    # Bundle location can be overridden by MONAI_BUNDLE_DIR. On Kaggle it is
+    # stored under /kaggle/working so the pinned artifact survives cell reruns.
+    if Path("/kaggle/working").exists():
+        _DEFAULT_BUNDLE_PARENT = Path("/kaggle/working/monai_bundles")
+    else:
+        try:
+            _DEFAULT_BUNDLE_PARENT = Path(__file__).resolve().parent / "monai_bundles"
+        except NameError:
+            _DEFAULT_BUNDLE_PARENT = Path.cwd() / "monai_bundles"
+
+    MONAI_BUNDLE_DIR = Path(
+        os.environ.get("MONAI_BUNDLE_DIR", str(_DEFAULT_BUNDLE_PARENT))
+    )
+
+    # Local TorchScript is only the reconstruction fallback. The verified
+    # official models/model.ts remains the preferred execution path.
+    MONAI_TORCHSCRIPT_PATH = Path(
+        os.environ.get(
+            "MONAI_TORCHSCRIPT_PATH",
+            str(
+                MONAI_BUNDLE_DIR
+                / (
+                    f"{MONAI_BUNDLE_NAME}_{MONAI_BUNDLE_VERSION}_"
+                    f"{MONAI_HF_REVISION[:8]}_fallback_torchscript.pt"
+                )
+            ),
+        )
+    )
+
+class SETTINGS_ATTENTION:
+    """Attention U-Net architecture, training, inference, storage and evaluation."""
+
+    # Spatial size used by Attention U-Net training, inference and HTML masks.
+    # Changing it invalidates checkpoints, predicted masks and Attention caches.
+    ATTENTION_INPUT_SIZE = 256
+
+    # Cross-fitting folds. Each patient is inferred by a model that excluded that
+    # patient from segmentation training and early stopping.
+    ATTENTION_SEGMENTATION_FOLDS = _env_int(
+        "CAD_ATTENTION_UNET_FOLDS", 5, minimum=2
+    )
+
+    # Model width. Changing it makes existing Attention checkpoints incompatible.
+    ATTENTION_BASE_CHANNELS = _env_int(
+        "CAD_ATTENTION_UNET_BASE_CHANNELS", 24, minimum=4
+    )
+
+    ATTENTION_EPOCHS = _env_int("CAD_ATTENTION_UNET_EPOCHS", 12, minimum=1)
+
+    ATTENTION_EARLY_STOPPING_PATIENCE = _env_int(
+        "CAD_ATTENTION_UNET_EARLY_STOPPING_PATIENCE", 4, minimum=1
+    )
+
+    # Training batch size; lower this first after an Attention CUDA OOM.
+    ATTENTION_BATCH_SIZE = _env_int(
+        "CAD_ATTENTION_UNET_BATCH_SIZE", 12, minimum=1
+    )
+
+    # Inference batch size for full-cohort prediction and review-mask generation.
+    ATTENTION_INFERENCE_BATCH_SIZE = _env_int(
+        "CAD_ATTENTION_UNET_INFERENCE_BATCH_SIZE", SETTINGS_RUNTIME.BATCH_SIZE, minimum=1
+    )
+
+    ATTENTION_LEARNING_RATE = _env_float(
+        "CAD_ATTENTION_UNET_LEARNING_RATE", 1e-3, minimum=1e-8
+    )
+
+    ATTENTION_WEIGHT_DECAY = _env_float(
+        "CAD_ATTENTION_UNET_WEIGHT_DECAY", 1e-4, minimum=0.0
+    )
+
+    ATTENTION_BCE_WEIGHT = _env_float(
+        "CAD_ATTENTION_UNET_BCE_WEIGHT", 0.5, minimum=0.0, maximum=1.0
+    )
+
+    ATTENTION_DICE_WEIGHT = 1.0 - ATTENTION_BCE_WEIGHT
+
+    # Binarization threshold for Attention masks. Changing it invalidates every
+    # mask-derived AU1-AU5 representation and feature cache.
+    ATTENTION_MASK_THRESHOLD = _env_float(
+        "CAD_ATTENTION_UNET_MASK_THRESHOLD", 0.50, minimum=0.0, maximum=1.0
+    )
+
+    # Attention QC thresholds are safeguards, not AUROC tuning parameters.
+    ATTENTION_MIN_HEART_AREA_RATIO = _env_float(
+        "CAD_ATTENTION_UNET_MIN_HEART_AREA_RATIO", 0.003, minimum=0.0, maximum=1.0
+    )
+
+    ATTENTION_MAX_HEART_AREA_RATIO = _env_float(
+        "CAD_ATTENTION_UNET_MAX_HEART_AREA_RATIO", 0.65, minimum=0.0, maximum=1.0
+    )
+
+    ATTENTION_MIN_PEAK_PROBABILITY = _env_float(
+        "CAD_ATTENTION_UNET_MIN_PEAK_PROBABILITY", 0.50, minimum=0.0, maximum=1.0
+    )
+
+    ATTENTION_SUPPORT_DILATION_KERNEL = _env_int(
+        "CAD_ATTENTION_UNET_SUPPORT_DILATION_KERNEL", 15, minimum=1
+    )
+
+    ATTENTION_PSEUDO_MASK_DILATION_KERNEL = _env_int(
+        "CAD_ATTENTION_UNET_PSEUDO_MASK_DILATION_KERNEL", 9, minimum=1
+    )
+
+    # Caps only pseudo-labelled training rows. It does not limit full inference.
+    ATTENTION_MAX_TRAIN_SLICES_PER_SERIES = _env_int(
+        "CAD_ATTENTION_UNET_MAX_TRAIN_SLICES_PER_SERIES", 5, minimum=1
+    )
+
+    # Every saved manual mask is included even when outside this pseudo-label cap.
+    ATTENTION_MAX_TRAIN_SLICES_PER_PATIENT = _env_int(
+        "CAD_ATTENTION_UNET_MAX_TRAIN_SLICES_PER_PATIENT", 40, minimum=1
+    )
+
+    ATTENTION_VALIDATION_PATIENT_FRACTION = _env_float(
+        "CAD_ATTENTION_UNET_VALIDATION_PATIENT_FRACTION",
+        0.20,
+        minimum=0.05,
+        maximum=0.50,
+    )
+
+    ATTENTION_TRAIN_WITH_AMP = _env_bool(
+        "CAD_ATTENTION_UNET_TRAIN_WITH_AMP", True
+    )
+
+    ATTENTION_SAVE_ALL_PREDICTED_MASKS = _env_bool(
+        "CAD_ATTENTION_SAVE_ALL_PREDICTED_MASKS", True
+    )
+
+    _ATTENTION_RUNNING_ON_KAGGLE = Path("/kaggle/working").exists()
+
+    ATTENTION_CACHE_TRAINING_IMAGES = _env_bool(
+        "CAD_ATTENTION_CACHE_TRAINING_IMAGES",
+        not _ATTENTION_RUNNING_ON_KAGGLE,
+    )
+
+    # Transient masks under /kaggle/temp disappear after restart. Keep False when
+    # a later CPU review session must reuse the generated masks.
+    ATTENTION_STORE_AUTOMATIC_MASKS_IN_TRANSIENT = _env_bool(
+        "CAD_ATTENTION_STORE_AUTOMATIC_MASKS_IN_TRANSIENT",
+        _ATTENTION_RUNNING_ON_KAGGLE,
+    )
+
+    # Keep False when predicted Attention masks must survive a Kaggle restart.
+    ATTENTION_STORE_PREDICTED_MASKS_IN_TRANSIENT = _env_bool(
+        "CAD_ATTENTION_STORE_PREDICTED_MASKS_IN_TRANSIENT",
+        _ATTENTION_RUNNING_ON_KAGGLE,
+    )
+
+    ATTENTION_RAM_IMAGE_CACHE_MB = _env_int(
+        "CAD_ATTENTION_RAM_IMAGE_CACHE_MB",
+        384 if _ATTENTION_RUNNING_ON_KAGGLE else 256,
+        minimum=0,
+    )
+
+    ATTENTION_OPTIONAL_DISK_CACHE_MIN_FREE_MB = _env_int(
+        "CAD_ATTENTION_OPTIONAL_DISK_CACHE_MIN_FREE_MB",
+        512,
+        minimum=0,
+    )
+
+    ATTENTION_PERSISTENT_FREE_SPACE_WARNING_MB = _env_int(
+        "CAD_ATTENTION_PERSISTENT_FREE_SPACE_WARNING_MB",
+        512,
+        minimum=0,
+    )
+
+    ATTENTION_PNG_COMPRESSION = _env_int(
+        "CAD_ATTENTION_PNG_COMPRESSION",
+        9,
+        minimum=0,
+    )
+
+    ATTENTION_MANIFEST_CHECKPOINT_EVERY_BATCHES = _env_int(
+        "CAD_ATTENTION_MANIFEST_CHECKPOINT_EVERY_BATCHES",
+        10,
+        minimum=1,
+    )
+
+    ATTENTION_RUN_REPEATED_CV_STABILITY = _env_bool(
+        "CAD_ATTENTION_UNET_RUN_STABILITY",
+        SETTINGS_VALIDATION.RUN_REPEATED_NESTED_CV_STABILITY,
+    )
+
+    ATTENTION_RUN_PERMUTATION_TEST = _env_bool(
+        "CAD_ATTENTION_UNET_RUN_PERMUTATION",
+        SETTINGS_VALIDATION.RUN_PATIENT_LABEL_PERMUTATION_TEST,
+    )
+
+    ATTENTION_REPEATED_CV_REPEATS = _env_int(
+        "CAD_ATTENTION_UNET_REPEATED_CV_REPEATS",
+        SETTINGS_VALIDATION.REPEATED_NESTED_CV_REPEATS,
+        minimum=1,
+    )
+
+    ATTENTION_PERMUTATION_REPLICATES = _env_int(
+        "CAD_ATTENTION_UNET_PERMUTATIONS",
+        SETTINGS_VALIDATION.LABEL_PERMUTATION_REPLICATES,
+        minimum=1,
+    )
+
+    ATTENTION_RANDOM_SEED = _env_int(
+        "CAD_ATTENTION_UNET_RANDOM_SEED", SETTINGS_RUNTIME.RANDOM_SEED + 70_000, minimum=0
+    )
+
+    ATTENTION_EXTERNAL_WEIGHTS = os.environ.get(
+        "CAD_ATTENTION_UNET_WEIGHTS", ""
+    ).strip()
+
+    # Change this schema whenever AU1-AU5 representation semantics change.
+    ATTENTION_FEATURE_CACHE_SCHEMA = (
+        "2026-09-11-attention-unet-crossfit-patient-disk-safe-v2"
+    )
+
+    ATTENTION_FEATURE_MODES = (
+        "AU1_ATTENTION_HARD_SUPPORT_REGION_NORM",
+        "AU2_ATTENTION_HARD_SUPPORT_REGION_NORM_VALID_ONLY",
+        "AU3_ATTENTION_EXACT_SUPPORT_MASK_ONLY",
+        "AU4_ATTENTION_SUPPORT_SHUFFLED_INTENSITY",
+        "AU5_ATTENTION_EXACT_SUPPORT_COMPLEMENT_REGION_NORM",
+    )
+
+    ATTENTION_MANIFEST_FIELDS = (
+        "manifest_index",
+        "image_token",
+        "image_path",
+        "patient_id",
+        "series_id",
+        "segmentation_fold",
+        "cached_image_path",
+        "automatic_mask_path",
+        "manual_mask_path",
+        "predicted_attention_mask_path",
+        "monai_valid",
+        "monai_area_ratio",
+        "monai_peak_probability",
+        "manual_mask_exists",
+    )
+
+    ATTENTION_EXPERIMENTS = (
+        ExperimentConfig(
+            experiment_id="AU1_ATTENTION_HARD_SUPPORT_REGION_NORM_HIER_LR_PCA",
+            description=(
+                "Attention U-Net hard support with region-only MRI normalization, "
+                "fixed-centre fallback, hierarchical patient pooling, PCA and LR."
+            ),
+            feature_mode=ATTENTION_FEATURE_MODES[0],
+            role="attention_candidate",
+        ),
+        ExperimentConfig(
+            experiment_id="AU2_ATTENTION_HARD_SUPPORT_REGION_NORM_VALID_ONLY_HIER_LR_PCA",
+            description=(
+                "AU1 restricted to Attention U-Net gate-valid slices. If a patient "
+                "has zero valid slices, that patient row transparently reuses AU1 "
+                "and is listed in feature-bank metadata rather than being deleted."
+            ),
+            feature_mode=ATTENTION_FEATURE_MODES[1],
+            role="attention_ablation",
+        ),
+        ExperimentConfig(
+            experiment_id="AU3_ATTENTION_EXACT_SUPPORT_MASK_ONLY_HIER_LR_PCA",
+            description="Exact Attention U-Net support geometry with MRI intensity removed.",
+            feature_mode=ATTENTION_FEATURE_MODES[2],
+            role="segmentation_representation_control",
+        ),
+        ExperimentConfig(
+            experiment_id="AU4_ATTENTION_SUPPORT_SHUFFLED_INTENSITY_HIER_LR_PCA",
+            description=(
+                "Exact Attention support and visible intensity multiset with the "
+                "spatial intensity assignment deterministically destroyed."
+            ),
+            feature_mode=ATTENTION_FEATURE_MODES[3],
+            role="anatomy_destruction_control",
+        ),
+        ExperimentConfig(
+            experiment_id="AU5_ATTENTION_EXACT_SUPPORT_COMPLEMENT_REGION_NORM_HIER_LR_PCA",
+            description=(
+                "Independently normalized exact non-padding complement of the "
+                "Attention U-Net support."
+            ),
+            feature_mode=ATTENTION_FEATURE_MODES[4],
+            role="negative_control",
+        ),
+    )
+
+class SETTINGS_REVIEW:
+    """HTML review queue, workflow actions and CSV field contracts."""
+
+    # diverse gives a patient/series-balanced queue; all exposes every mask.
+    REVIEW_SCOPE = "diverse"
+
+    # Use 0 with scope=all for no global queue limit.
+    REVIEW_LIMIT = 1200
+
+    REVIEW_SEED = 42
+
+    ATTENTION_REVIEW_SCHEMA = "cad-mask-review-current"
+
+    ATTENTION_REVIEW_SCOPES = (
+        "all",
+        "diverse",
+        "unreviewed",
+        "invalid",
+        "disagreement",
+        "manual",
+        "reviewed",
+    )
+
+    ATTENTION_ACTION_CHOICES = (
+        "build-monai-feature-cache",
+        "generate-all-monai-masks",
+        "monai-cpu-from-cache",
+        "edit-existing-masks",
+        "retrain-regenerate-attention",
+        "build-attention-feature-cache",
+        "evaluate-attention-cpu",
+    )
+
+    CPU_CACHE_ONLY_ACTIONS = {
+        "monai-cpu-from-cache",
+        "evaluate-attention-cpu",
+        "edit-existing-masks",
+    }
+
+    ATTENTION_REVIEW_MANIFEST_FIELDS = (
+        "review_index",
+        "image_token",
+        "image_path",
+        "patient_id",
+        "series_id",
+        "segmentation_fold",
+        "cached_image_path",
+        "automatic_mask_path",
+        "manual_mask_path",
+        "predicted_attention_mask_path",
+        "monai_valid",
+        "monai_area_ratio",
+        "monai_peak_probability",
+        "attention_valid",
+        "attention_area_ratio",
+        "attention_peak_probability",
+        "dice_attention_vs_monai",
+        "manual_mask_exists",
+        "attention_checkpoint_fingerprint",
+    )
+
+    ATTENTION_REVIEW_HISTORY_FIELDS = (
+        "timestamp_utc",
+        "review_round",
+        "review_source",
+        "action",
+        "image_token",
+        "patient_id",
+        "series_id",
+        "queue_position",
+        "queue_size",
+        "mask_area_ratio",
+        "automatic_mask_path",
+        "manual_mask_path",
+    )
+
+
+def _resolve_dataset_path():
+    kaggle_path = Path("/kaggle/input/datasets/danialsharifrazi/cad-cardiac-mri-dataset")
+    if kaggle_path.exists():
+        return str(kaggle_path)
+    return r"C:\F\_Develop\AI\Datasets\CAD Cardiac MRI Dataset"
+
+
+def _resolve_output_root():
+    if Path("/kaggle/working").exists():
+        return Path("/kaggle/working/cad_patient_pipeline_outputs")
+    try:
+        return Path(__file__).resolve().parent / "cad_patient_pipeline_outputs"
+    except NameError:
+        return Path.cwd() / "cad_patient_pipeline_outputs"
+
+
+def _build_suite_identity():
+    selected = [
+        asdict(experiment)
+        for experiment in SETTINGS_EXPERIMENTS.EXPERIMENT_REGISTRY
+        if experiment.enabled
+        and (
+            SETTINGS_EXPERIMENTS.EXPERIMENTS_TO_RUN is None
+            or experiment.experiment_id
+            in set(SETTINGS_EXPERIMENTS.EXPERIMENTS_TO_RUN)
+        )
+    ]
+    return {
+        "pipeline_schema": SETTINGS_RUNTIME.PIPELINE_SCHEMA_ID,
+        "experiments": selected,
+        "reference_experiment_id": SETTINGS_EXPERIMENTS.REFERENCE_EXPERIMENT_ID,
+        "primary_candidate_experiment_id": SETTINGS_EXPERIMENTS.PRIMARY_CANDIDATE_EXPERIMENT_ID,
+        "valid_only_ablation_experiment_id": SETTINGS_EXPERIMENTS.VALID_ONLY_ABLATION_EXPERIMENT_ID,
+        "control_experiment_ids": (
+            SETTINGS_EXPERIMENTS.FIXED_PERIPHERY_CONTROL_EXPERIMENT_ID,
+            SETTINGS_EXPERIMENTS.MASK_ONLY_CONTROL_EXPERIMENT_ID,
+            SETTINGS_EXPERIMENTS.SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID,
+            SETTINGS_EXPERIMENTS.COMPLEMENT_CONTROL_EXPERIMENT_ID,
+        ),
+        "primary_ablation_comparisons": SETTINGS_EXPERIMENTS.PRIMARY_ABLATION_COMPARISONS,
+        "repeated_stability_comparisons": SETTINGS_VALIDATION.REPEATED_STABILITY_COMPARISONS,
+        "random_seed": SETTINGS_RUNTIME.RANDOM_SEED,
+        "cv_random_state": SETTINGS_VALIDATION.CV_RANDOM_STATE,
+        "inner_cv_random_state": SETTINGS_VALIDATION.INNER_CV_RANDOM_STATE,
+        "n_splits": SETTINGS_VALIDATION.N_SPLITS,
+        "inner_splits": SETTINGS_VALIDATION.INNER_CV_SPLITS,
+        "c_grid": SETTINGS_VALIDATION.CLASSIFIER_C_GRID,
+        "threshold_method": SETTINGS_VALIDATION.THRESHOLD_SELECTION_METHOD,
+        "bootstrap_replicates": SETTINGS_VALIDATION.BOOTSTRAP_REPLICATES,
+        "paired_bootstrap_replicates": SETTINGS_VALIDATION.PAIRED_BOOTSTRAP_REPLICATES,
+        "pca_variance": SETTINGS_VALIDATION.PATIENT_PCA_EXPLAINED_VARIANCE,
+        "feature_cache_schema": SETTINGS_FEATURE_BANK.FEATURE_CACHE_SCHEMA,
+        "device_tag": (
+            DEVICE
+            if SETTINGS_RUNTIME.SUITE_DEVICE_TAG == "auto"
+            else SETTINGS_RUNTIME.SUITE_DEVICE_TAG
+        ),
+        "img_size": SETTINGS_PREPROCESSING.IMG_SIZE,
+        "monai_input_size": SETTINGS_MONAI.MONAI_INPUT_SIZE,
+        "monai_bundle": SETTINGS_MONAI.MONAI_BUNDLE_NAME,
+        "monai_bundle_version": SETTINGS_MONAI.MONAI_BUNDLE_VERSION,
+        "monai_hf_revision": SETTINGS_MONAI.MONAI_HF_REVISION,
+        "hard_support_dilation_kernel": SETTINGS_PREPROCESSING.HARD_SUPPORT_DILATION_KERNEL,
+        "fixed_periphery_exclusion_fraction": SETTINGS_PREPROCESSING.FIXED_PERIPHERY_EXCLUSION_FRACTION,
+        "region_norm_lower_percentile": SETTINGS_PREPROCESSING.REGION_NORM_LOWER_PERCENTILE,
+        "region_norm_upper_percentile": SETTINGS_PREPROCESSING.REGION_NORM_UPPER_PERCENTILE,
+        "region_norm_min_pixels": SETTINGS_PREPROCESSING.REGION_NORM_MIN_PIXELS,
+        "region_norm_histogram_bins": SETTINGS_PREPROCESSING.REGION_NORM_HISTOGRAM_BINS,
+        "region_norm_min_dynamic_range": SETTINGS_PREPROCESSING.REGION_NORM_MIN_DYNAMIC_RANGE,
+        "support_intensity_shuffle_schema": SETTINGS_PREPROCESSING.SUPPORT_INTENSITY_SHUFFLE_SCHEMA,
+        "standardization_feature_names": SETTINGS_PREPROCESSING.STANDARDIZATION_FEATURE_NAMES,
+        "validation_runtime_profile": SETTINGS_VALIDATION.VALIDATION_RUNTIME_PROFILE,
+        "stability_experiment_ids": SETTINGS_VALIDATION.STABILITY_EXPERIMENT_IDS,
+        "permutation_experiment_ids": SETTINGS_VALIDATION.PERMUTATION_EXPERIMENT_IDS,
+        "model_family_selection_ids": SETTINGS_VALIDATION.MODEL_FAMILY_NESTED_SELECTION_IDS,
+        "selection_adjusted_candidate_ids": SETTINGS_VALIDATION.SELECTION_ADJUSTED_CANDIDATE_EXPERIMENT_IDS,
+    }
+
+
+class SETTINGS_PATHS:
+    """Dataset, model, cache and output locations visible in VS Code Outline."""
+
+    DATASET_PATH = _resolve_dataset_path()
+    OUTPUT_ROOT = _resolve_output_root()
+    SUITE_CONFIGURATION_TAG = hashlib.sha256(
+        json.dumps(_build_suite_identity(), sort_keys=True).encode("utf-8")
+    ).hexdigest()[:10]
+    SUITE_NAME = f"multi_experiment_suite__{SUITE_CONFIGURATION_TAG}"
+    OUTPUT_DIR = OUTPUT_ROOT / SUITE_NAME
+    FEATURE_CACHE_ROOT = OUTPUT_ROOT / "feature_bank_cache"
+    CONSOLE_LOG_PATH = OUTPUT_DIR / "console_output.log"
+
+
+
+class SETTINGS:
+    """One navigation root for every settings class."""
+
+    BOOTSTRAP = SETTINGS_BOOTSTRAP
+    RUNTIME = SETTINGS_RUNTIME
+    EXPERIMENTS = SETTINGS_EXPERIMENTS
+    VALIDATION = SETTINGS_VALIDATION
+    PREPROCESSING = SETTINGS_PREPROCESSING
+    FEATURE_BANK = SETTINGS_FEATURE_BANK
+    AUDIT = SETTINGS_AUDIT
+    MONAI = SETTINGS_MONAI
+    ATTENTION = SETTINGS_ATTENTION
+    REVIEW = SETTINGS_REVIEW
+    REPORTING = SETTINGS_REPORTING
+    PATHS = SETTINGS_PATHS
+
+
+# endregion
+
+# Runtime state is deliberately separate from immutable settings.
+
+DEVICE = (
+    "cuda"
+    if SETTINGS_RUNTIME.RUNTIME_DEVICE_POLICY != "cpu"
+    and torch.cuda.is_available()
+    else "cpu"
+)
 
 MONAI_RUNTIME_SOURCE = "not_loaded"
+
 MONAI_RUNTIME_ARTIFACT_PATH = None
-# Populated by load_and_validate_torchscript_segmenter() so run_metadata.json
-# records the artifact actually executed, not merely the files present on disk.
-
-# ---------------------------------------------------------------------------
-# DATASET LOCATION
-# ---------------------------------------------------------------------------
-
-if os.path.exists("/kaggle/input/datasets/danialsharifrazi/cad-cardiac-mri-dataset"):
-    DATASET_PATH = "/kaggle/input/datasets/danialsharifrazi/cad-cardiac-mri-dataset"
-else:
-    DATASET_PATH = r"C:\F\_Develop\AI\Datasets\CAD Cardiac MRI Dataset"
-
-if os.path.exists("/kaggle/working"):
-    OUTPUT_ROOT = Path("/kaggle/working/cad_patient_pipeline_outputs")
-else:
-    try:
-        OUTPUT_ROOT = (
-            Path(__file__).resolve().parent / "cad_patient_pipeline_outputs"
-        )
-    except NameError:
-        OUTPUT_ROOT = Path.cwd() / "cad_patient_pipeline_outputs"
-
-# A deterministic suite tag prevents different registries or evaluation rules
-# from silently overwriting one another. Frozen feature caches remain outside
-# the suite folder because classifier/pooling settings do not change embeddings.
-_selected_experiments_for_identity = [
-    asdict(experiment)
-    for experiment in EXPERIMENT_REGISTRY
-    if experiment.enabled
-    and (
-        EXPERIMENTS_TO_RUN is None
-        or experiment.experiment_id in set(EXPERIMENTS_TO_RUN)
-    )
-]
-
-_suite_identity = {
-    "pipeline_schema": PIPELINE_SCHEMA_ID,
-    "experiments": _selected_experiments_for_identity,
-    "reference_experiment_id": REFERENCE_EXPERIMENT_ID,
-    "primary_candidate_experiment_id": PRIMARY_CANDIDATE_EXPERIMENT_ID,
-    "valid_only_ablation_experiment_id": VALID_ONLY_ABLATION_EXPERIMENT_ID,
-    "control_experiment_ids": (
-        FIXED_PERIPHERY_CONTROL_EXPERIMENT_ID,
-        MASK_ONLY_CONTROL_EXPERIMENT_ID,
-        SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID,
-        COMPLEMENT_CONTROL_EXPERIMENT_ID,
-    ),
-    "primary_ablation_comparisons": PRIMARY_ABLATION_COMPARISONS,
-    "repeated_stability_comparisons": REPEATED_STABILITY_COMPARISONS,
-    "random_seed": RANDOM_SEED,
-    "cv_random_state": CV_RANDOM_STATE,
-    "inner_cv_random_state": INNER_CV_RANDOM_STATE,
-    "n_splits": N_SPLITS,
-    "inner_splits": INNER_CV_SPLITS,
-    "c_grid": CLASSIFIER_C_GRID,
-    "threshold_method": THRESHOLD_SELECTION_METHOD,
-    "bootstrap_replicates": BOOTSTRAP_REPLICATES,
-    "paired_bootstrap_replicates": PAIRED_BOOTSTRAP_REPLICATES,
-    "pca_variance": PATIENT_PCA_EXPLAINED_VARIANCE,
-    "feature_cache_schema": FEATURE_CACHE_SCHEMA,
-    "device_tag": resolved_suite_device_tag(),
-    "img_size": IMG_SIZE,
-    "monai_input_size": MONAI_INPUT_SIZE,
-    "monai_bundle": MONAI_BUNDLE_NAME,
-    "monai_bundle_version": MONAI_BUNDLE_VERSION,
-    "monai_hf_revision": MONAI_HF_REVISION,
-    "hard_support_dilation_kernel": HARD_SUPPORT_DILATION_KERNEL,
-    "fixed_periphery_exclusion_fraction": FIXED_PERIPHERY_EXCLUSION_FRACTION,
-    "region_norm_lower_percentile": REGION_NORM_LOWER_PERCENTILE,
-    "region_norm_upper_percentile": REGION_NORM_UPPER_PERCENTILE,
-    "region_norm_min_pixels": REGION_NORM_MIN_PIXELS,
-    "region_norm_histogram_bins": REGION_NORM_HISTOGRAM_BINS,
-    "region_norm_min_dynamic_range": REGION_NORM_MIN_DYNAMIC_RANGE,
-    "support_intensity_shuffle_schema": SUPPORT_INTENSITY_SHUFFLE_SCHEMA,
-    "standardization_feature_names": STANDARDIZATION_FEATURE_NAMES,
-    "validation_runtime_profile": VALIDATION_RUNTIME_PROFILE,
-    "stability_experiment_ids": STABILITY_EXPERIMENT_IDS,
-    "permutation_experiment_ids": PERMUTATION_EXPERIMENT_IDS,
-    "model_family_selection_ids": MODEL_FAMILY_NESTED_SELECTION_IDS,
-    "selection_adjusted_candidate_ids": SELECTION_ADJUSTED_CANDIDATE_EXPERIMENT_IDS,
-}
 
 
-SUITE_CONFIGURATION_TAG = hashlib.sha256(
-    json.dumps(_suite_identity, sort_keys=True).encode("utf-8")
-).hexdigest()[:10]
-SUITE_NAME = f"multi_experiment_suite__{SUITE_CONFIGURATION_TAG}"
 
-OUTPUT_DIR = OUTPUT_ROOT / SUITE_NAME
-FEATURE_CACHE_ROOT = OUTPUT_ROOT / "feature_bank_cache"
-CONSOLE_LOG_PATH = OUTPUT_DIR / "console_output.log"
+# Deterministic initialization uses the class-based seed.
+
+np.random.seed(SETTINGS_RUNTIME.RANDOM_SEED)
+
+torch.manual_seed(SETTINGS_RUNTIME.RANDOM_SEED)
+
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SETTINGS_RUNTIME.RANDOM_SEED)
+
+torch.backends.cudnn.benchmark = False
+
+torch.backends.cudnn.deterministic = True
+
+if hasattr(torch.backends.cudnn, "allow_tf32"):
+    torch.backends.cudnn.allow_tf32 = False
+
+if hasattr(torch.backends.cuda, "matmul") and hasattr(
+    torch.backends.cuda.matmul, "allow_tf32"
+):
+    torch.backends.cuda.matmul.allow_tf32 = False
+
+try:
+    torch.set_float32_matmul_precision("highest")
+except (AttributeError, RuntimeError):
+    pass
+
+try:
+    torch.use_deterministic_algorithms(True, warn_only=True)
+except TypeError:
+    torch.use_deterministic_algorithms(True)
+
+
+
+# Import-time consistency checks for the most error-prone settings.
+
+if SETTINGS_ATTENTION.ATTENTION_PNG_COMPRESSION > 9:
+    raise ValueError("CAD_ATTENTION_PNG_COMPRESSION must be between 0 and 9.")
+
+if SETTINGS_ATTENTION.ATTENTION_SUPPORT_DILATION_KERNEL % 2 == 0:
+    raise ValueError("CAD_ATTENTION_UNET_SUPPORT_DILATION_KERNEL must be odd.")
+
+if SETTINGS_ATTENTION.ATTENTION_PSEUDO_MASK_DILATION_KERNEL % 2 == 0:
+    raise ValueError("CAD_ATTENTION_UNET_PSEUDO_MASK_DILATION_KERNEL must be odd.")
+
+if (
+    SETTINGS_ATTENTION.ATTENTION_MIN_HEART_AREA_RATIO
+    >= SETTINGS_ATTENTION.ATTENTION_MAX_HEART_AREA_RATIO
+):
+    raise ValueError("Attention U-Net area-ratio limits are inconsistent.")
 
 # =============================
 # EXECUTION STATUS + TIMING HELPERS
 # =============================
 
-PIPELINE_STAGE_COUNT = 12
+SETTINGS_REPORTING.PIPELINE_STAGE_COUNT = 12
 # The number matches the suite orchestration stages inside ``main``.
 
 
@@ -1048,24 +1367,6 @@ PIPELINE_STAGE_COUNT = 12
 # MRI SLICE DATASET + PROVENANCE FEATURES
 # =============================
 
-PROVENANCE_FEATURE_NAMES = (
-    "native_height",
-    "native_width",
-    "aspect_ratio_width_over_height",
-    "file_size_bytes",
-    "bytes_per_native_pixel",
-    "raw_mean_intensity",
-    "raw_std_intensity",
-    "raw_entropy_bits",
-    "near_black_fraction",
-    "near_white_fraction",
-    "border_mean_intensity",
-    "border_std_intensity",
-    "border_near_black_fraction",
-    "center_mean_intensity",
-    "edge_pixel_fraction",
-    "laplacian_variance",
-)
 
 
 # The complete list above is written to the cohort manifest for descriptive
@@ -1075,18 +1376,6 @@ PROVENANCE_FEATURE_NAMES = (
 # sharpness are excluded from that classifier because they can contain genuine
 # anatomical or pathology-related signal and would make the term "provenance
 # only" too strong.
-PROVENANCE_CLASSIFIER_FEATURE_NAMES = (
-    "native_height",
-    "native_width",
-    "aspect_ratio_width_over_height",
-    "file_size_bytes",
-    "bytes_per_native_pixel",
-    "near_black_fraction",
-    "near_white_fraction",
-    "border_mean_intensity",
-    "border_std_intensity",
-    "border_near_black_fraction",
-)
 
 
 
@@ -1137,13 +1426,13 @@ class MRIDataset(Dataset):
         ) = build_label_blind_standardized_image(image)
 
         classifier_gray = cv2.resize(
-            classifier_canvas, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA
+            classifier_canvas, (SETTINGS_PREPROCESSING.IMG_SIZE, SETTINGS_PREPROCESSING.IMG_SIZE), interpolation=cv2.INTER_AREA
         )
         raw_gray = cv2.resize(
-            raw_canvas, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA
+            raw_canvas, (SETTINGS_PREPROCESSING.IMG_SIZE, SETTINGS_PREPROCESSING.IMG_SIZE), interpolation=cv2.INTER_AREA
         )
         padding_gray = cv2.resize(
-            padding_canvas, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_NEAREST
+            padding_canvas, (SETTINGS_PREPROCESSING.IMG_SIZE, SETTINGS_PREPROCESSING.IMG_SIZE), interpolation=cv2.INTER_NEAREST
         )
 
         classifier_hwc = np.stack([classifier_gray] * 3, axis=-1)
@@ -1263,7 +1552,7 @@ class FeatureExtractor(nn.Module):
         initialization_started_at = time.perf_counter()
         print(
             f"[MODEL][EfficientNet] Loading EfficientNet-B0 weights "
-            f"{EFFICIENTNET_WEIGHTS_NAME}.",
+            f"{SETTINGS_FEATURE_BANK.EFFICIENTNET_WEIGHTS_NAME}.",
             flush=True,
         )
         print(
@@ -1273,7 +1562,7 @@ class FeatureExtractor(nn.Module):
         )
 
         weights = models.EfficientNet_B0_Weights[
-            EFFICIENTNET_WEIGHTS_NAME
+            SETTINGS_FEATURE_BANK.EFFICIENTNET_WEIGHTS_NAME
         ]
 
         self.model = models.efficientnet_b0(weights=weights)
@@ -1646,202 +1935,9 @@ from contextlib import contextmanager
 
 
 # ---------------------------------------------------------------------------
-# ATTENTION U-NET CONFIGURATION
+# ATTENTION U-NET SETTINGS
 # ---------------------------------------------------------------------------
-
-def _env_int(name, default, minimum=1):
-    value = int(os.environ.get(name, default))
-    if value < minimum:
-        raise ValueError(f"{name} must be >= {minimum}; received {value}.")
-    return value
-
-
-def _env_float(name, default, minimum=None, maximum=None):
-    value = float(os.environ.get(name, default))
-    if minimum is not None and value < minimum:
-        raise ValueError(f"{name} must be >= {minimum}; received {value}.")
-    if maximum is not None and value > maximum:
-        raise ValueError(f"{name} must be <= {maximum}; received {value}.")
-    return value
-
-
-def _env_bool(name, default=False):
-    value = str(os.environ.get(name, "1" if default else "0")).strip().lower()
-    if value in {"1", "true", "yes", "y", "on"}:
-        return True
-    if value in {"0", "false", "no", "n", "off"}:
-        return False
-    raise ValueError(f"{name} must be a Boolean value; received {value!r}.")
-
-
-ATTENTION_INPUT_SIZE = 256
-ATTENTION_SEGMENTATION_FOLDS = _env_int(
-    "CAD_ATTENTION_UNET_FOLDS", 5, minimum=2
-)
-ATTENTION_BASE_CHANNELS = _env_int(
-    "CAD_ATTENTION_UNET_BASE_CHANNELS", 24, minimum=4
-)
-ATTENTION_EPOCHS = _env_int("CAD_ATTENTION_UNET_EPOCHS", 12, minimum=1)
-ATTENTION_EARLY_STOPPING_PATIENCE = _env_int(
-    "CAD_ATTENTION_UNET_EARLY_STOPPING_PATIENCE", 4, minimum=1
-)
-ATTENTION_BATCH_SIZE = _env_int(
-    "CAD_ATTENTION_UNET_BATCH_SIZE", 12, minimum=1
-)
-ATTENTION_INFERENCE_BATCH_SIZE = _env_int(
-    "CAD_ATTENTION_UNET_INFERENCE_BATCH_SIZE", BATCH_SIZE, minimum=1
-)
-ATTENTION_LEARNING_RATE = _env_float(
-    "CAD_ATTENTION_UNET_LEARNING_RATE", 1e-3, minimum=1e-8
-)
-ATTENTION_WEIGHT_DECAY = _env_float(
-    "CAD_ATTENTION_UNET_WEIGHT_DECAY", 1e-4, minimum=0.0
-)
-ATTENTION_BCE_WEIGHT = _env_float(
-    "CAD_ATTENTION_UNET_BCE_WEIGHT", 0.5, minimum=0.0, maximum=1.0
-)
-ATTENTION_DICE_WEIGHT = 1.0 - ATTENTION_BCE_WEIGHT
-ATTENTION_MASK_THRESHOLD = _env_float(
-    "CAD_ATTENTION_UNET_MASK_THRESHOLD", 0.50, minimum=0.0, maximum=1.0
-)
-ATTENTION_MIN_HEART_AREA_RATIO = _env_float(
-    "CAD_ATTENTION_UNET_MIN_HEART_AREA_RATIO", 0.003, minimum=0.0, maximum=1.0
-)
-ATTENTION_MAX_HEART_AREA_RATIO = _env_float(
-    "CAD_ATTENTION_UNET_MAX_HEART_AREA_RATIO", 0.65, minimum=0.0, maximum=1.0
-)
-ATTENTION_MIN_PEAK_PROBABILITY = _env_float(
-    "CAD_ATTENTION_UNET_MIN_PEAK_PROBABILITY", 0.50, minimum=0.0, maximum=1.0
-)
-ATTENTION_SUPPORT_DILATION_KERNEL = _env_int(
-    "CAD_ATTENTION_UNET_SUPPORT_DILATION_KERNEL", 15, minimum=1
-)
-ATTENTION_PSEUDO_MASK_DILATION_KERNEL = _env_int(
-    "CAD_ATTENTION_UNET_PSEUDO_MASK_DILATION_KERNEL", 9, minimum=1
-)
-ATTENTION_MAX_TRAIN_SLICES_PER_SERIES = _env_int(
-    "CAD_ATTENTION_UNET_MAX_TRAIN_SLICES_PER_SERIES", 5, minimum=1
-)
-ATTENTION_MAX_TRAIN_SLICES_PER_PATIENT = _env_int(
-    "CAD_ATTENTION_UNET_MAX_TRAIN_SLICES_PER_PATIENT", 40, minimum=1
-)
-ATTENTION_VALIDATION_PATIENT_FRACTION = _env_float(
-    "CAD_ATTENTION_UNET_VALIDATION_PATIENT_FRACTION",
-    0.20,
-    minimum=0.05,
-    maximum=0.50,
-)
-ATTENTION_TRAIN_WITH_AMP = _env_bool(
-    "CAD_ATTENTION_UNET_TRAIN_WITH_AMP", True
-)
-ATTENTION_SAVE_ALL_PREDICTED_MASKS = _env_bool(
-    "CAD_ATTENTION_SAVE_ALL_PREDICTED_MASKS", True
-)
-
-# ---------------------------------------------------------------------------
-# ATTENTION IMAGE-CACHE AND STORAGE POLICY
-# ---------------------------------------------------------------------------
-# The multi-view feature bank can consume many gigabytes under
-# /kaggle/working. Caching another 4,715 standardized 256x256 PNG images in the
-# same persistent output filesystem can therefore exhaust Kaggle's write quota.
-# OpenCV then emits only the uninformative message ``libpng error: Write Error``
-# and ``cv2.imwrite`` returns False.
-#
-# Standardized training-image files are an optional acceleration
-# cache, never as required scientific output. On Kaggle the default is:
-#
-#   - retain recently/all selected 256x256 uint8 images in an in-process LRU;
-#   - do not write those images under /kaggle/working;
-#   - if disk caching is explicitly enabled, place it under /kaggle/temp;
-#   - if an optional cache write fails, continue from the freshly preprocessed
-#     NumPy image instead of aborting pseudo-mask generation or training.
-#
-# Automatic/manual masks and checkpoints remain required outputs and continue
-# to be written atomically. Their write failures include free-space diagnostics.
-_ATTENTION_RUNNING_ON_KAGGLE = Path("/kaggle/working").exists()
-ATTENTION_CACHE_TRAINING_IMAGES = _env_bool(
-    "CAD_ATTENTION_CACHE_TRAINING_IMAGES",
-    not _ATTENTION_RUNNING_ON_KAGGLE,
-)
-ATTENTION_STORE_AUTOMATIC_MASKS_IN_TRANSIENT = _env_bool(
-    "CAD_ATTENTION_STORE_AUTOMATIC_MASKS_IN_TRANSIENT",
-    _ATTENTION_RUNNING_ON_KAGGLE,
-)
-ATTENTION_STORE_PREDICTED_MASKS_IN_TRANSIENT = _env_bool(
-    "CAD_ATTENTION_STORE_PREDICTED_MASKS_IN_TRANSIENT",
-    _ATTENTION_RUNNING_ON_KAGGLE,
-)
-ATTENTION_RAM_IMAGE_CACHE_MB = _env_int(
-    "CAD_ATTENTION_RAM_IMAGE_CACHE_MB",
-    384 if _ATTENTION_RUNNING_ON_KAGGLE else 256,
-    minimum=0,
-)
-ATTENTION_OPTIONAL_DISK_CACHE_MIN_FREE_MB = _env_int(
-    "CAD_ATTENTION_OPTIONAL_DISK_CACHE_MIN_FREE_MB",
-    512,
-    minimum=0,
-)
-ATTENTION_PERSISTENT_FREE_SPACE_WARNING_MB = _env_int(
-    "CAD_ATTENTION_PERSISTENT_FREE_SPACE_WARNING_MB",
-    512,
-    minimum=0,
-)
-ATTENTION_PNG_COMPRESSION = _env_int(
-    "CAD_ATTENTION_PNG_COMPRESSION",
-    9,
-    minimum=0,
-)
-if ATTENTION_PNG_COMPRESSION > 9:
-    raise ValueError("CAD_ATTENTION_PNG_COMPRESSION must be between 0 and 9.")
-ATTENTION_MANIFEST_CHECKPOINT_EVERY_BATCHES = _env_int(
-    "CAD_ATTENTION_MANIFEST_CHECKPOINT_EVERY_BATCHES",
-    10,
-    minimum=1,
-)
-
-ATTENTION_RUN_REPEATED_CV_STABILITY = _env_bool(
-    "CAD_ATTENTION_UNET_RUN_STABILITY",
-    RUN_REPEATED_NESTED_CV_STABILITY,
-)
-ATTENTION_RUN_PERMUTATION_TEST = _env_bool(
-    "CAD_ATTENTION_UNET_RUN_PERMUTATION",
-    RUN_PATIENT_LABEL_PERMUTATION_TEST,
-)
-ATTENTION_REPEATED_CV_REPEATS = _env_int(
-    "CAD_ATTENTION_UNET_REPEATED_CV_REPEATS",
-    REPEATED_NESTED_CV_REPEATS,
-    minimum=1,
-)
-ATTENTION_PERMUTATION_REPLICATES = _env_int(
-    "CAD_ATTENTION_UNET_PERMUTATIONS",
-    LABEL_PERMUTATION_REPLICATES,
-    minimum=1,
-)
-ATTENTION_RANDOM_SEED = _env_int(
-    "CAD_ATTENTION_UNET_RANDOM_SEED", RANDOM_SEED + 70_000, minimum=0
-)
-ATTENTION_EXTERNAL_WEIGHTS = os.environ.get(
-    "CAD_ATTENTION_UNET_WEIGHTS", ""
-).strip()
-ATTENTION_FEATURE_CACHE_SCHEMA = (
-    "2026-09-11-attention-unet-crossfit-patient-disk-safe-v2"
-)
-
-ATTENTION_FEATURE_MODES = (
-    "AU1_ATTENTION_HARD_SUPPORT_REGION_NORM",
-    "AU2_ATTENTION_HARD_SUPPORT_REGION_NORM_VALID_ONLY",
-    "AU3_ATTENTION_EXACT_SUPPORT_MASK_ONLY",
-    "AU4_ATTENTION_SUPPORT_SHUFFLED_INTENSITY",
-    "AU5_ATTENTION_EXACT_SUPPORT_COMPLEMENT_REGION_NORM",
-)
-
-if ATTENTION_SUPPORT_DILATION_KERNEL % 2 == 0:
-    raise ValueError("CAD_ATTENTION_UNET_SUPPORT_DILATION_KERNEL must be odd.")
-if ATTENTION_PSEUDO_MASK_DILATION_KERNEL % 2 == 0:
-    raise ValueError("CAD_ATTENTION_UNET_PSEUDO_MASK_DILATION_KERNEL must be odd.")
-if ATTENTION_MIN_HEART_AREA_RATIO >= ATTENTION_MAX_HEART_AREA_RATIO:
-    raise ValueError("Attention U-Net area-ratio limits are inconsistent.")
-
+# See SETTINGS_ATTENTION in the central VS Code Outline settings region.
 
 @dataclass(frozen=True)
 class AttentionWorkspace:
@@ -1867,22 +1963,6 @@ class AttentionWorkspace:
 # LABEL-BLIND TRAINING/REVIEW MANIFEST
 # ---------------------------------------------------------------------------
 
-ATTENTION_MANIFEST_FIELDS = (
-    "manifest_index",
-    "image_token",
-    "image_path",
-    "patient_id",
-    "series_id",
-    "segmentation_fold",
-    "cached_image_path",
-    "automatic_mask_path",
-    "manual_mask_path",
-    "predicted_attention_mask_path",
-    "monai_valid",
-    "monai_area_ratio",
-    "monai_peak_probability",
-    "manual_mask_exists",
-)
 
 
 
@@ -2039,7 +2119,7 @@ class AttentionUNet(nn.Module):
 
     def __init__(self, in_channels=1, out_channels=1, base_channels=None):
         super().__init__()
-        base = int(base_channels or ATTENTION_BASE_CHANNELS)
+        base = int(base_channels or SETTINGS_ATTENTION.ATTENTION_BASE_CHANNELS)
         self.encoder1 = AttentionConvBlock(in_channels, base)
         self.encoder2 = AttentionConvBlock(base, base * 2)
         self.encoder3 = AttentionConvBlock(base * 2, base * 4)
@@ -2107,12 +2187,12 @@ class AttentionMaskTrainingDataset(Dataset):
             )
         image = cv2.resize(
             image,
-            (ATTENTION_INPUT_SIZE, ATTENTION_INPUT_SIZE),
+            (SETTINGS_ATTENTION.ATTENTION_INPUT_SIZE, SETTINGS_ATTENTION.ATTENTION_INPUT_SIZE),
             interpolation=cv2.INTER_AREA,
         ).astype(np.float32) / 255.0
         mask = cv2.resize(
             mask,
-            (ATTENTION_INPUT_SIZE, ATTENTION_INPUT_SIZE),
+            (SETTINGS_ATTENTION.ATTENTION_INPUT_SIZE, SETTINGS_ATTENTION.ATTENTION_INPUT_SIZE),
             interpolation=cv2.INTER_NEAREST,
         ) > 127
 
@@ -2237,14 +2317,14 @@ class _StreamingHierarchicalAttentionPool:
             series_mean = self.series_sums[mode][series_id] / float(count)
             patient_series[self.series_to_patient[series_id]].append(series_mean)
         missing = sorted(set(self.patient_to_label) - set(patient_series))
-        if missing and mode == ATTENTION_FEATURE_MODES[1]:
+        if missing and mode == SETTINGS_ATTENTION.ATTENTION_FEATURE_MODES[1]:
             # A very poor or deliberately conservative segmenter can mark every
             # slice of one patient invalid. Patient-level CV requires one row per
             # Directory_*. For those rare patients only, AU2 transparently falls
             # back to that patient's AU1 pooled representation rather than
             # deleting the patient or aborting the entire suite. The affected IDs
             # are written to feature-bank metadata and must be reported.
-            fallback_mode = ATTENTION_FEATURE_MODES[0]
+            fallback_mode = SETTINGS_ATTENTION.ATTENTION_FEATURE_MODES[0]
             fallback_series = defaultdict(list)
             for series_id in sorted(self.series_sums[fallback_mode]):
                 patient_id = self.series_to_patient[series_id]
@@ -2300,51 +2380,6 @@ class _StreamingHierarchicalAttentionPool:
 # PATIENT-LEVEL AU1-AU5 EVALUATION
 # ---------------------------------------------------------------------------
 
-ATTENTION_EXPERIMENTS = (
-    ExperimentConfig(
-        experiment_id="AU1_ATTENTION_HARD_SUPPORT_REGION_NORM_HIER_LR_PCA",
-        description=(
-            "Attention U-Net hard support with region-only MRI normalization, "
-            "fixed-centre fallback, hierarchical patient pooling, PCA and LR."
-        ),
-        feature_mode=ATTENTION_FEATURE_MODES[0],
-        role="attention_candidate",
-    ),
-    ExperimentConfig(
-        experiment_id="AU2_ATTENTION_HARD_SUPPORT_REGION_NORM_VALID_ONLY_HIER_LR_PCA",
-        description=(
-            "AU1 restricted to Attention U-Net gate-valid slices. If a patient "
-            "has zero valid slices, that patient row transparently reuses AU1 "
-            "and is listed in feature-bank metadata rather than being deleted."
-        ),
-        feature_mode=ATTENTION_FEATURE_MODES[1],
-        role="attention_ablation",
-    ),
-    ExperimentConfig(
-        experiment_id="AU3_ATTENTION_EXACT_SUPPORT_MASK_ONLY_HIER_LR_PCA",
-        description="Exact Attention U-Net support geometry with MRI intensity removed.",
-        feature_mode=ATTENTION_FEATURE_MODES[2],
-        role="segmentation_representation_control",
-    ),
-    ExperimentConfig(
-        experiment_id="AU4_ATTENTION_SUPPORT_SHUFFLED_INTENSITY_HIER_LR_PCA",
-        description=(
-            "Exact Attention support and visible intensity multiset with the "
-            "spatial intensity assignment deterministically destroyed."
-        ),
-        feature_mode=ATTENTION_FEATURE_MODES[3],
-        role="anatomy_destruction_control",
-    ),
-    ExperimentConfig(
-        experiment_id="AU5_ATTENTION_EXACT_SUPPORT_COMPLEMENT_REGION_NORM_HIER_LR_PCA",
-        description=(
-            "Independently normalized exact non-padding complement of the "
-            "Attention U-Net support."
-        ),
-        feature_mode=ATTENTION_FEATURE_MODES[4],
-        role="negative_control",
-    ),
-)
 
 
 
@@ -2391,31 +2426,6 @@ ATTENTION_EXPERIMENTS = (
 from collections import defaultdict as _review_defaultdict
 from datetime import datetime as _review_datetime, timezone as _review_timezone
 
-ATTENTION_REVIEW_SCHEMA = "cad-mask-review-current"
-ATTENTION_REVIEW_SCOPES = (
-    "all",
-    "diverse",
-    "unreviewed",
-    "invalid",
-    "disagreement",
-    "manual",
-    "reviewed",
-)
-ATTENTION_ACTION_CHOICES = (
-    "build-monai-feature-cache",
-    "generate-all-monai-masks",
-    "monai-cpu-from-cache",
-    "edit-existing-masks",
-    "retrain-regenerate-attention",
-    "build-attention-feature-cache",
-    "evaluate-attention-cpu",
-)
-
-CPU_CACHE_ONLY_ACTIONS = {
-    "monai-cpu-from-cache",
-    "evaluate-attention-cpu",
-    "edit-existing-masks",
-}
 
 
 
@@ -2426,41 +2436,7 @@ CPU_CACHE_ONLY_ACTIONS = {
 
 
 
-ATTENTION_REVIEW_MANIFEST_FIELDS = (
-    "review_index",
-    "image_token",
-    "image_path",
-    "patient_id",
-    "series_id",
-    "segmentation_fold",
-    "cached_image_path",
-    "automatic_mask_path",
-    "manual_mask_path",
-    "predicted_attention_mask_path",
-    "monai_valid",
-    "monai_area_ratio",
-    "monai_peak_probability",
-    "attention_valid",
-    "attention_area_ratio",
-    "attention_peak_probability",
-    "dice_attention_vs_monai",
-    "manual_mask_exists",
-    "attention_checkpoint_fingerprint",
-)
-ATTENTION_REVIEW_HISTORY_FIELDS = (
-    "timestamp_utc",
-    "review_round",
-    "review_source",
-    "action",
-    "image_token",
-    "patient_id",
-    "series_id",
-    "queue_position",
-    "queue_size",
-    "mask_area_ratio",
-    "automatic_mask_path",
-    "manual_mask_path",
-)
+
 
 
 
@@ -2638,7 +2614,7 @@ class BaseAttentionMaskEditor:
             raise RuntimeError(f"Could not load automatic mask: {automatic_path}")
         automatic = cv2.resize(
             automatic,
-            (ATTENTION_INPUT_SIZE, ATTENTION_INPUT_SIZE),
+            (SETTINGS_ATTENTION.ATTENTION_INPUT_SIZE, SETTINGS_ATTENTION.ATTENTION_INPUT_SIZE),
             interpolation=cv2.INTER_NEAREST,
         )
 
@@ -2649,7 +2625,7 @@ class BaseAttentionMaskEditor:
                 raise RuntimeError(f"Could not load manual mask: {manual_path}")
             manual = cv2.resize(
                 manual,
-                (ATTENTION_INPUT_SIZE, ATTENTION_INPUT_SIZE),
+                (SETTINGS_ATTENTION.ATTENTION_INPUT_SIZE, SETTINGS_ATTENTION.ATTENTION_INPUT_SIZE),
                 interpolation=cv2.INTER_NEAREST,
             )
             current = manual > 127
@@ -2721,8 +2697,8 @@ class BaseAttentionMaskEditor:
             &nbsp;|&nbsp; {row['series_id']}
             &nbsp;|&nbsp; base={self.base_source}
           </div>
-          <canvas id="{canvas_id}" width="{ATTENTION_INPUT_SIZE*3}"
-                  height="{ATTENTION_INPUT_SIZE*3}"
+          <canvas id="{canvas_id}" width="{SETTINGS_ATTENTION.ATTENTION_INPUT_SIZE*3}"
+                  height="{SETTINGS_ATTENTION.ATTENTION_INPUT_SIZE*3}"
                   style="width:768px;height:768px;max-width:100%;border:1px solid #999;
                          cursor:crosshair;image-rendering:auto;touch-action:none;
                          user-select:none;-webkit-user-select:none;"></canvas>
@@ -2739,8 +2715,8 @@ class BaseAttentionMaskEditor:
           const canvas = document.getElementById({json.dumps(canvas_id)});
           if (!canvas) return;
           const ctx = canvas.getContext('2d');
-          const W = {ATTENTION_INPUT_SIZE};
-          const H = {ATTENTION_INPUT_SIZE};
+          const W = {SETTINGS_ATTENTION.ATTENTION_INPUT_SIZE};
+          const H = {SETTINGS_ATTENTION.ATTENTION_INPUT_SIZE};
           const SCALE = 3;
           const initialRadius = {int(self.brush_radius)};
           const syncPlaceholder = {json.dumps(sync_placeholder)};
@@ -2986,7 +2962,7 @@ class BaseAttentionMaskEditor:
 
             binary = cv2.resize(
                 binary,
-                (ATTENTION_INPUT_SIZE, ATTENTION_INPUT_SIZE),
+                (SETTINGS_ATTENTION.ATTENTION_INPUT_SIZE, SETTINGS_ATTENTION.ATTENTION_INPUT_SIZE),
                 interpolation=cv2.INTER_NEAREST,
             )
             self.mask = (binary > 0).astype(np.uint8)
@@ -3240,7 +3216,7 @@ class AttentionMaskEditor(BaseAttentionMaskEditor):
             raise RuntimeError(f"Could not load automatic mask: {automatic_path}")
         automatic = cv2.resize(
             automatic,
-            (ATTENTION_INPUT_SIZE, ATTENTION_INPUT_SIZE),
+            (SETTINGS_ATTENTION.ATTENTION_INPUT_SIZE, SETTINGS_ATTENTION.ATTENTION_INPUT_SIZE),
             interpolation=cv2.INTER_NEAREST,
         )
         manual_path = Path(row["manual_mask_path"])
@@ -3250,7 +3226,7 @@ class AttentionMaskEditor(BaseAttentionMaskEditor):
                 raise RuntimeError(f"Could not load manual mask: {manual_path}")
             manual = cv2.resize(
                 manual,
-                (ATTENTION_INPUT_SIZE, ATTENTION_INPUT_SIZE),
+                (SETTINGS_ATTENTION.ATTENTION_INPUT_SIZE, SETTINGS_ATTENTION.ATTENTION_INPUT_SIZE),
                 interpolation=cv2.INTER_NEAREST,
             )
             current = manual > 127
@@ -3397,198 +3373,6 @@ class AttentionMaskEditor(BaseAttentionMaskEditor):
 
 
 
-# region VS CODE OUTLINE — IMPORTANT SETTINGS
-
-@dataclass(frozen=True)
-class RuntimeSettings:
-    """Runtime controls that most often need adjustment in Kaggle.
-
-    Change the corresponding ``CAD_*`` environment variables before importing
-    the pipeline. This object is a read-only snapshot of the effective values.
-    """
-
-    # ``cpu`` prevents accidental neural inference; ``cuda`` is required for
-    # practical MONAI/EfficientNet and Attention training speed.
-    device_policy: str = RUNTIME_DEVICE_POLICY
-
-    # Use the same tag in GPU-generation and later CPU-evaluation sessions so
-    # both stages address the same output/cache directories.
-    suite_device_tag: str = SUITE_DEVICE_TAG
-    feature_cache_device_tag: str = FEATURE_CACHE_DEVICE_TAG
-
-    # First setting to lower after a CUDA out-of-memory error.
-    image_batch_size: int = BATCH_SIZE
-
-    # Deterministic seed used for folds, bootstrap and repeated analyses.
-    random_seed: int = RANDOM_SEED
-
-    # AMP is disabled for the locked analysis; enabling it changes numerical
-    # behavior and therefore should be treated as a new experiment.
-    use_cuda_amp: bool = USE_CUDA_AMP
-    dataloader_workers: int = DATALOADER_NUM_WORKERS
-
-
-@dataclass(frozen=True)
-class ValidationSettings:
-    """Patient-level CV and statistical validation workload."""
-
-    # ``smoke`` is debugging only; ``fast`` is iterative work; ``full`` is the
-    # expensive final-reporting profile.
-    profile: str = VALIDATION_RUNTIME_PROFILE
-    outer_folds: int = N_SPLITS
-    inner_folds: int = INNER_CV_SPLITS
-    classifier_c_grid: tuple = CLASSIFIER_C_GRID
-    pca_explained_variance: float = PATIENT_PCA_EXPLAINED_VARIANCE
-
-    # Decision threshold is selected only from inner OOF training predictions.
-    threshold_method: str = THRESHOLD_SELECTION_METHOD
-    target_sensitivity: float = TARGET_SENSITIVITY
-
-    bootstrap_replicates: int = BOOTSTRAP_REPLICATES
-    repeated_cv_repeats: int = REPEATED_NESTED_CV_REPEATS
-    label_permutations: int = LABEL_PERMUTATION_REPLICATES
-    selection_adjusted_permutations: int = (
-        SELECTION_ADJUSTED_PERMUTATION_REPLICATES
-    )
-
-
-@dataclass(frozen=True)
-class MonaiSettings:
-    """Pinned MONAI artifact and plausibility-gate settings.
-
-    Gate thresholds are fixed before evaluation. Do not tune them to improve
-    CAD AUROC; that would couple localization settings to the clinical label.
-    """
-
-    bundle_name: str = MONAI_BUNDLE_NAME
-    bundle_version: str = MONAI_BUNDLE_VERSION
-    repository_id: str = MONAI_HF_REPO_ID
-    repository_revision: str = MONAI_HF_REVISION
-    input_size: int = MONAI_INPUT_SIZE
-    auto_download: bool = AUTO_DOWNLOAD_MONAI_BUNDLE
-    verify_sha256: bool = VERIFY_MONAI_ARTIFACT_SHA256
-    min_area_ratio: float = MONAI_MIN_HEART_AREA_RATIO
-    max_area_ratio: float = MONAI_MAX_HEART_AREA_RATIO
-    min_peak_probability: float = MONAI_MIN_PEAK_HEART_PROBABILITY
-    roi_dilation_kernel: int = MONAI_ROI_DILATION_KERNEL
-
-
-@dataclass(frozen=True)
-class FeatureBankSettings:
-    """Frozen EfficientNet views and persistent feature-cache policy."""
-
-    efficientnet_input_size: int = IMG_SIZE
-    efficientnet_weights: str = EFFICIENTNET_WEIGHTS_NAME
-    feature_dimension: int = EFFICIENTNET_FEATURE_DIM
-
-    # More modes per encoder call can increase throughput but also VRAM usage.
-    modes_per_encoder_call: int = FEATURE_MODES_PER_ENCODER_CALL
-
-    use_cache: bool = USE_FEATURE_CACHE
-
-    # Leave False for normal work. True invalidates/rebuilds an expensive cache.
-    force_rebuild_cache: bool = FORCE_REBUILD_FEATURE_CACHE
-
-    # CPU evaluation should set this True so a cache miss fails immediately
-    # instead of launching hours of neural inference on CPU.
-    require_existing_cache: bool = REQUIRE_EXISTING_FEATURE_CACHE
-
-    fixed_content_long_side: int = STANDARDIZED_CONTENT_LONG_SIDE
-    hard_support_dilation_kernel: int = HARD_SUPPORT_DILATION_KERNEL
-    fixed_periphery_exclusion_fraction: float = (
-        FIXED_PERIPHERY_EXCLUSION_FRACTION
-    )
-
-
-@dataclass(frozen=True)
-class AuditSettings:
-    """Duplicate and shortcut-control safeguards."""
-
-    exact_duplicate_audit: bool = AUDIT_EXACT_DECODED_PIXEL_DUPLICATES
-    perceptual_duplicate_audit: bool = AUDIT_PERCEPTUAL_NEAR_DUPLICATES
-    phash_hamming_threshold: int = PHASH_HAMMING_THRESHOLD
-
-    # Exact duplicate components may be grouped in one fold. pHash candidates
-    # remain manual-screening candidates unless explicitly promoted.
-    group_exact_duplicates: bool = GROUP_SPLITS_BY_EXACT_DUPLICATES
-    group_phash_candidates: bool = GROUP_SPLITS_BY_PHASH_CANDIDATES
-    shortcut_warning_auc: float = SHORTCUT_WARNING_AUC
-
-
-@dataclass(frozen=True)
-class AttentionSettings:
-    """Cross-fitted Attention U-Net training and prediction settings."""
-
-    input_size: int = ATTENTION_INPUT_SIZE
-    folds: int = ATTENTION_SEGMENTATION_FOLDS
-    base_channels: int = ATTENTION_BASE_CHANNELS
-    epochs: int = ATTENTION_EPOCHS
-    early_stopping_patience: int = ATTENTION_EARLY_STOPPING_PATIENCE
-    train_batch_size: int = ATTENTION_BATCH_SIZE
-    inference_batch_size: int = ATTENTION_INFERENCE_BATCH_SIZE
-    learning_rate: float = ATTENTION_LEARNING_RATE
-    weight_decay: float = ATTENTION_WEIGHT_DECAY
-
-    # These caps control pseudo-labelled training diversity, not full-cohort
-    # inference. Every saved manual mask is still added to the next training set.
-    max_train_slices_per_series: int = ATTENTION_MAX_TRAIN_SLICES_PER_SERIES
-    max_train_slices_per_patient: int = ATTENTION_MAX_TRAIN_SLICES_PER_PATIENT
-
-    min_area_ratio: float = ATTENTION_MIN_HEART_AREA_RATIO
-    max_area_ratio: float = ATTENTION_MAX_HEART_AREA_RATIO
-    min_peak_probability: float = ATTENTION_MIN_PEAK_PROBABILITY
-
-    # Keep automatic/predicted masks outside transient storage when review must
-    # survive a Kaggle restart or a GPU→CPU session change.
-    automatic_masks_transient: bool = (
-        ATTENTION_STORE_AUTOMATIC_MASKS_IN_TRANSIENT
-    )
-    predicted_masks_transient: bool = (
-        ATTENTION_STORE_PREDICTED_MASKS_IN_TRANSIENT
-    )
-    save_all_predicted_masks: bool = ATTENTION_SAVE_ALL_PREDICTED_MASKS
-    ram_image_cache_mb: int = ATTENTION_RAM_IMAGE_CACHE_MB
-
-
-@dataclass(frozen=True)
-class ReviewSettings:
-    """HTML editor queue defaults."""
-
-    # ``diverse`` is suitable for a balanced review sample. ``all`` with limit
-    # zero exposes every generated mask and can be much slower to navigate.
-    scope: str = REVIEW_SCOPE
-    limit: int = REVIEW_LIMIT
-    random_seed: int = REVIEW_SEED
-    available_scopes: tuple = ATTENTION_REVIEW_SCOPES
-
-
-@dataclass(frozen=True)
-class PathSettings:
-    """Resolved dataset, output, cache and model locations."""
-
-    dataset_path: str = str(DATASET_PATH)
-    output_dir: str = str(OUTPUT_DIR)
-    feature_cache_root: str = str(FEATURE_CACHE_ROOT)
-    monai_bundle_dir: str = str(MONAI_BUNDLE_DIR)
-
-
-class Settings:
-    """Outline-friendly access to all important effective settings."""
-
-    runtime = RuntimeSettings()
-    validation = ValidationSettings()
-    monai = MonaiSettings()
-    features = FeatureBankSettings()
-    audit = AuditSettings()
-    attention = AttentionSettings()
-    review = ReviewSettings()
-    paths = PathSettings()
-
-
-SETTINGS = Settings()
-
-# endregion
-
 # region VS CODE OUTLINE — FUNCTIONAL SERVICES
 class RuntimeManager:
     """Runtime device selection, progress logging, timing and console capture."""
@@ -3598,7 +3382,7 @@ class RuntimeManager:
         """Resolve auto/cpu/cuda against the live accelerator state."""
 
         requested = str(requested or "auto").strip().lower()
-        if requested not in RUNTIME_DEVICE_CHOICES:
+        if requested not in SETTINGS_RUNTIME.RUNTIME_DEVICE_CHOICES:
             raise ValueError(
                 "Runtime device must be one of auto/cpu/cuda; received "
                 f"{requested!r}."
@@ -3627,11 +3411,11 @@ class RuntimeManager:
             live accelerator. If False, it falls back to CPU with a visible warning.
         """
 
-        global DEVICE, RUNTIME_DEVICE_POLICY
+        global DEVICE
 
         if requested is None:
             requested = os.environ.get(
-                "CAD_RUNTIME_DEVICE", RUNTIME_DEVICE_POLICY
+                "CAD_RUNTIME_DEVICE", SETTINGS_RUNTIME.RUNTIME_DEVICE_POLICY
             )
         policy, resolved = _resolve_requested_runtime_device(requested)
 
@@ -3660,7 +3444,7 @@ class RuntimeManager:
                 pass
 
         DEVICE = resolved
-        RUNTIME_DEVICE_POLICY = policy
+        SETTINGS_RUNTIME.RUNTIME_DEVICE_POLICY = policy
         os.environ["CAD_RUNTIME_DEVICE"] = policy
 
         if previous != resolved or context:
@@ -3677,7 +3461,7 @@ class RuntimeManager:
 
         return set_runtime_device(
             requested=os.environ.get(
-                "CAD_RUNTIME_DEVICE", RUNTIME_DEVICE_POLICY
+                "CAD_RUNTIME_DEVICE", SETTINGS_RUNTIME.RUNTIME_DEVICE_POLICY
             ),
             context=context,
             strict_cuda=False,
@@ -3712,20 +3496,19 @@ class RuntimeManager:
     def set_feature_cache_device_tag(tag="auto"):
         """Select which extraction device identity is used in cache fingerprints."""
 
-        global FEATURE_CACHE_DEVICE_TAG
         tag = str(tag).strip().lower()
-        if tag not in RUNTIME_DEVICE_CHOICES:
+        if tag not in SETTINGS_RUNTIME.RUNTIME_DEVICE_CHOICES:
             raise ValueError(
                 "Feature-cache device tag must be auto/cpu/cuda; received "
                 f"{tag!r}."
             )
-        FEATURE_CACHE_DEVICE_TAG = tag
+        SETTINGS_FEATURE_BANK.FEATURE_CACHE_DEVICE_TAG = tag
         os.environ["CAD_FEATURE_CACHE_DEVICE_TAG"] = tag
         return tag
 
     @staticmethod
     def resolved_feature_cache_device_tag():
-        return DEVICE if FEATURE_CACHE_DEVICE_TAG == "auto" else FEATURE_CACHE_DEVICE_TAG
+        return DEVICE if SETTINGS_FEATURE_BANK.FEATURE_CACHE_DEVICE_TAG == "auto" else SETTINGS_FEATURE_BANK.FEATURE_CACHE_DEVICE_TAG
 
     @staticmethod
     def _synchronize_timing_device():
@@ -3768,12 +3551,12 @@ class RuntimeManager:
 
         print("\n" + "=" * 78, flush=True)
         print(
-            f"[PIPELINE {stage_number:02d}/{PIPELINE_STAGE_COUNT:02d}] "
+            f"[PIPELINE {stage_number:02d}/{SETTINGS_REPORTING.PIPELINE_STAGE_COUNT:02d}] "
             f"START: {title}",
             flush=True,
         )
         print(
-            f"[PIPELINE {stage_number:02d}/{PIPELINE_STAGE_COUNT:02d}] "
+            f"[PIPELINE {stage_number:02d}/{SETTINGS_REPORTING.PIPELINE_STAGE_COUNT:02d}] "
             f"Expected workload: {expected_workload}",
             flush=True,
         )
@@ -3790,14 +3573,14 @@ class RuntimeManager:
         elapsed = time.perf_counter() - started_at
 
         print(
-            f"[PIPELINE {stage_number:02d}/{PIPELINE_STAGE_COUNT:02d}] "
+            f"[PIPELINE {stage_number:02d}/{SETTINGS_REPORTING.PIPELINE_STAGE_COUNT:02d}] "
             f"COMPLETED: {title} in {_format_elapsed_time(elapsed)}",
             flush=True,
         )
 
         if details:
             print(
-                f"[PIPELINE {stage_number:02d}/{PIPELINE_STAGE_COUNT:02d}] "
+                f"[PIPELINE {stage_number:02d}/{SETTINGS_REPORTING.PIPELINE_STAGE_COUNT:02d}] "
                 f"{details}",
                 flush=True,
             )
@@ -3808,7 +3591,7 @@ class RuntimeManager:
     def _print_detail(message):
         """Print a flushed substage message when detailed logging is enabled."""
 
-        if ENABLE_DETAILED_PROGRESS_PRINTS:
+        if SETTINGS_RUNTIME.ENABLE_DETAILED_PROGRESS_PRINTS:
             print(f"[DETAIL] {message}", flush=True)
 
     @staticmethod
@@ -3837,11 +3620,11 @@ class RuntimeManager:
     def run_with_console_logging():
         """Run main() while preserving every print() and traceback in one log."""
 
-        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        SETTINGS_PATHS.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         original_stdout = sys.stdout
         original_stderr = sys.stderr
 
-        with open(CONSOLE_LOG_PATH, "w", encoding="utf-8", buffering=1) as log_file:
+        with open(SETTINGS_PATHS.CONSOLE_LOG_PATH, "w", encoding="utf-8", buffering=1) as log_file:
             sys.stdout = TeeStream(original_stdout, log_file)
             sys.stderr = TeeStream(original_stderr, log_file)
             try:
@@ -3864,16 +3647,16 @@ class ConfigurationManager:
     def get_enabled_experiments():
         """Return the ordered experiment list selected by hard-coded configuration."""
 
-        selected_ids = None if EXPERIMENTS_TO_RUN is None else set(EXPERIMENTS_TO_RUN)
+        selected_ids = None if SETTINGS_EXPERIMENTS.EXPERIMENTS_TO_RUN is None else set(SETTINGS_EXPERIMENTS.EXPERIMENTS_TO_RUN)
         experiments = [
             experiment
-            for experiment in EXPERIMENT_REGISTRY
+            for experiment in SETTINGS_EXPERIMENTS.EXPERIMENT_REGISTRY
             if experiment.enabled
             and (selected_ids is None or experiment.experiment_id in selected_ids)
         ]
 
         if selected_ids is not None:
-            known_ids = {experiment.experiment_id for experiment in EXPERIMENT_REGISTRY}
+            known_ids = {experiment.experiment_id for experiment in SETTINGS_EXPERIMENTS.EXPERIMENT_REGISTRY}
             unknown = sorted(selected_ids - known_ids)
             if unknown:
                 raise ValueError(
@@ -3890,20 +3673,20 @@ class ConfigurationManager:
         experiments = get_enabled_experiments()
         ids = [experiment.experiment_id for experiment in experiments]
         expected_ids = {
-            REFERENCE_EXPERIMENT_ID,
-            PRIMARY_CANDIDATE_EXPERIMENT_ID,
-            VALID_ONLY_ABLATION_EXPERIMENT_ID,
-            FIXED_PERIPHERY_CONTROL_EXPERIMENT_ID,
-            MASK_ONLY_CONTROL_EXPERIMENT_ID,
-            SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID,
-            COMPLEMENT_CONTROL_EXPERIMENT_ID,
+            SETTINGS_EXPERIMENTS.REFERENCE_EXPERIMENT_ID,
+            SETTINGS_EXPERIMENTS.PRIMARY_CANDIDATE_EXPERIMENT_ID,
+            SETTINGS_EXPERIMENTS.VALID_ONLY_ABLATION_EXPERIMENT_ID,
+            SETTINGS_EXPERIMENTS.FIXED_PERIPHERY_CONTROL_EXPERIMENT_ID,
+            SETTINGS_EXPERIMENTS.MASK_ONLY_CONTROL_EXPERIMENT_ID,
+            SETTINGS_EXPERIMENTS.SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID,
+            SETTINGS_EXPERIMENTS.COMPLEMENT_CONTROL_EXPERIMENT_ID,
         }
         if set(ids) != expected_ids or len(ids) != len(expected_ids):
             raise ValueError(
                 "The active registry must contain exactly the seven final "
                 f"experiments; received {ids}."
             )
-        if BASELINE_EXPERIMENT_ID != REFERENCE_EXPERIMENT_ID:
+        if SETTINGS_EXPERIMENTS.BASELINE_EXPERIMENT_ID != SETTINGS_EXPERIMENTS.REFERENCE_EXPERIMENT_ID:
             raise ValueError("BASELINE_EXPERIMENT_ID must equal the reference model.")
 
         allowed_modes = {
@@ -3939,44 +3722,44 @@ class ConfigurationManager:
             if experiment.deduplicate_exact_within_patient:
                 raise ValueError("Within-patient deduplication is audit-only in the final pipeline.")
 
-        if N_SPLITS < 2 or INNER_CV_SPLITS < 2:
+        if SETTINGS_VALIDATION.N_SPLITS < 2 or SETTINGS_VALIDATION.INNER_CV_SPLITS < 2:
             raise ValueError("Outer and inner CV need at least two folds.")
-        if not CLASSIFIER_C_GRID or any(float(value) <= 0 for value in CLASSIFIER_C_GRID):
+        if not SETTINGS_VALIDATION.CLASSIFIER_C_GRID or any(float(value) <= 0 for value in SETTINGS_VALIDATION.CLASSIFIER_C_GRID):
             raise ValueError("CLASSIFIER_C_GRID must contain positive values.")
-        if not 0.0 < PATIENT_PCA_EXPLAINED_VARIANCE <= 1.0:
+        if not 0.0 < SETTINGS_VALIDATION.PATIENT_PCA_EXPLAINED_VARIANCE <= 1.0:
             raise ValueError("PATIENT_PCA_EXPLAINED_VARIANCE must lie in (0,1].")
-        if BOOTSTRAP_REPLICATES < 1 or PAIRED_BOOTSTRAP_REPLICATES < 1:
+        if SETTINGS_VALIDATION.BOOTSTRAP_REPLICATES < 1 or SETTINGS_VALIDATION.PAIRED_BOOTSTRAP_REPLICATES < 1:
             raise ValueError("Bootstrap replicate counts must be positive.")
-        if REPEATED_NESTED_CV_REPEATS < 1:
+        if SETTINGS_VALIDATION.REPEATED_NESTED_CV_REPEATS < 1:
             raise ValueError("Repeated-CV count must be positive.")
-        if LABEL_PERMUTATION_REPLICATES < 1:
+        if SETTINGS_VALIDATION.LABEL_PERMUTATION_REPLICATES < 1:
             raise ValueError("Permutation replicate count must be positive.")
-        if SELECTION_ADJUSTED_PERMUTATION_REPLICATES < 1:
+        if SETTINGS_VALIDATION.SELECTION_ADJUSTED_PERMUTATION_REPLICATES < 1:
             raise ValueError("Selection-adjusted permutation count must be positive.")
 
         enabled = set(ids)
         requested = (
-            set(STABILITY_EXPERIMENT_IDS)
-            | set(PERMUTATION_EXPERIMENT_IDS)
-            | set(MODEL_FAMILY_NESTED_SELECTION_IDS)
-            | set(SELECTION_ADJUSTED_CANDIDATE_EXPERIMENT_IDS)
+            set(SETTINGS_VALIDATION.STABILITY_EXPERIMENT_IDS)
+            | set(SETTINGS_VALIDATION.PERMUTATION_EXPERIMENT_IDS)
+            | set(SETTINGS_VALIDATION.MODEL_FAMILY_NESTED_SELECTION_IDS)
+            | set(SETTINGS_VALIDATION.SELECTION_ADJUSTED_CANDIDATE_EXPERIMENT_IDS)
         )
         missing = sorted(requested - enabled)
         if missing:
             raise ValueError(f"Validation analysis references disabled experiments: {missing}")
 
-        if MODEL_FAMILY_NESTED_SELECTION_IDS[0] != PRIMARY_CANDIDATE_EXPERIMENT_ID:
+        if SETTINGS_VALIDATION.MODEL_FAMILY_NESTED_SELECTION_IDS[0] != SETTINGS_EXPERIMENTS.PRIMARY_CANDIDATE_EXPERIMENT_ID:
             raise ValueError("The primary candidate must be first in model-family ties.")
-        if tuple(PERMUTATION_EXPERIMENT_IDS) != (PRIMARY_CANDIDATE_EXPERIMENT_ID,):
+        if tuple(SETTINGS_VALIDATION.PERMUTATION_EXPERIMENT_IDS) != (SETTINGS_EXPERIMENTS.PRIMARY_CANDIDATE_EXPERIMENT_ID,):
             raise ValueError("The ordinary label-permutation test must target the primary candidate.")
 
         catalog = {experiment.experiment_id: experiment for experiment in experiments}
-        primary = catalog[PRIMARY_CANDIDATE_EXPERIMENT_ID]
-        valid_only = catalog[VALID_ONLY_ABLATION_EXPERIMENT_ID]
+        primary = catalog[SETTINGS_EXPERIMENTS.PRIMARY_CANDIDATE_EXPERIMENT_ID]
+        valid_only = catalog[SETTINGS_EXPERIMENTS.VALID_ONLY_ABLATION_EXPERIMENT_ID]
         exact_controls = (
-            catalog[MASK_ONLY_CONTROL_EXPERIMENT_ID],
-            catalog[SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID],
-            catalog[COMPLEMENT_CONTROL_EXPERIMENT_ID],
+            catalog[SETTINGS_EXPERIMENTS.MASK_ONLY_CONTROL_EXPERIMENT_ID],
+            catalog[SETTINGS_EXPERIMENTS.SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID],
+            catalog[SETTINGS_EXPERIMENTS.COMPLEMENT_CONTROL_EXPERIMENT_ID],
         )
         common_fields = (
             "strategy", "pooling_strategy", "weighting_mode", "classifier_type",
@@ -3996,19 +3779,19 @@ class ConfigurationManager:
         if valid_only.slice_filter != "standardized_monai_valid":
             raise ValueError("The valid-only ablation must use the MONAI-valid filter.")
 
-        if HARD_SUPPORT_DILATION_KERNEL <= 0 or HARD_SUPPORT_DILATION_KERNEL % 2 == 0:
+        if SETTINGS_PREPROCESSING.HARD_SUPPORT_DILATION_KERNEL <= 0 or SETTINGS_PREPROCESSING.HARD_SUPPORT_DILATION_KERNEL % 2 == 0:
             raise ValueError("HARD_SUPPORT_DILATION_KERNEL must be a positive odd integer.")
-        if not 0.0 < FIXED_PERIPHERY_EXCLUSION_FRACTION < 1.0:
+        if not 0.0 < SETTINGS_PREPROCESSING.FIXED_PERIPHERY_EXCLUSION_FRACTION < 1.0:
             raise ValueError("FIXED_PERIPHERY_EXCLUSION_FRACTION must lie in (0,1).")
-        if not 0.0 <= REGION_NORM_LOWER_PERCENTILE < REGION_NORM_UPPER_PERCENTILE <= 100.0:
+        if not 0.0 <= SETTINGS_PREPROCESSING.REGION_NORM_LOWER_PERCENTILE < SETTINGS_PREPROCESSING.REGION_NORM_UPPER_PERCENTILE <= 100.0:
             raise ValueError("Invalid region-normalization percentile interval.")
-        if REGION_NORM_MIN_PIXELS < 1 or REGION_NORM_HISTOGRAM_BINS < 2:
+        if SETTINGS_PREPROCESSING.REGION_NORM_MIN_PIXELS < 1 or SETTINGS_PREPROCESSING.REGION_NORM_HISTOGRAM_BINS < 2:
             raise ValueError("Region-normalization minimums are invalid.")
-        if not 0.0 < REGION_NORM_MIN_DYNAMIC_RANGE <= 1.0:
+        if not 0.0 < SETTINGS_PREPROCESSING.REGION_NORM_MIN_DYNAMIC_RANGE <= 1.0:
             raise ValueError("REGION_NORM_MIN_DYNAMIC_RANGE must lie in (0,1].")
-        if not str(SUPPORT_INTENSITY_SHUFFLE_SCHEMA).strip():
+        if not str(SETTINGS_PREPROCESSING.SUPPORT_INTENSITY_SHUFFLE_SCHEMA).strip():
             raise ValueError("SUPPORT_INTENSITY_SHUFFLE_SCHEMA cannot be empty.")
-        if USE_CUDA_AMP:
+        if SETTINGS_RUNTIME.USE_CUDA_AMP:
             raise ValueError("Deterministic final runs require USE_CUDA_AMP=False.")
 
         run_exact_support_transform_contract_self_test()
@@ -4037,10 +3820,10 @@ class ConfigurationManager:
         bundle_root = locate_monai_bundle_root()
         model_path = bundle_root / "models" / "model.ts"
         return {
-            "pipeline_schema": PIPELINE_SCHEMA_ID,
-            "suite_name": SUITE_NAME,
-            "suite_configuration_tag": SUITE_CONFIGURATION_TAG,
-            "dataset_path": str(DATASET_PATH),
+            "pipeline_schema": SETTINGS_RUNTIME.PIPELINE_SCHEMA_ID,
+            "suite_name": SETTINGS_PATHS.SUITE_NAME,
+            "suite_configuration_tag": SETTINGS_PATHS.SUITE_CONFIGURATION_TAG,
+            "dataset_path": str(SETTINGS_PATHS.DATASET_PATH),
             "n_images": len(samples),
             "n_patients": len(patient_ids),
             "normal_patients": int(np.sum(patient_labels == 0)),
@@ -4048,18 +3831,18 @@ class ConfigurationManager:
             "patient_definition": "Directory_*",
             "feature_bank_fingerprint": fingerprint,
             "feature_cache_status": cache_status,
-            "reference_experiment_id": REFERENCE_EXPERIMENT_ID,
-            "primary_candidate_experiment_id": PRIMARY_CANDIDATE_EXPERIMENT_ID,
+            "reference_experiment_id": SETTINGS_EXPERIMENTS.REFERENCE_EXPERIMENT_ID,
+            "primary_candidate_experiment_id": SETTINGS_EXPERIMENTS.PRIMARY_CANDIDATE_EXPERIMENT_ID,
             "enabled_experiment_ids": [e.experiment_id for e in get_enabled_experiments()],
-            "validation_runtime_profile": VALIDATION_RUNTIME_PROFILE,
+            "validation_runtime_profile": SETTINGS_VALIDATION.VALIDATION_RUNTIME_PROFILE,
             "device": DEVICE,
             "python_version": platform.python_version(),
             "torch_version": torch.__version__,
             "torchvision_version": torchvision.__version__,
             "sklearn_version": sklearn.__version__,
             "opencv_version": cv2.__version__,
-            "monai_bundle": MONAI_BUNDLE_NAME,
-            "monai_bundle_version": MONAI_BUNDLE_VERSION,
+            "monai_bundle": SETTINGS_MONAI.MONAI_BUNDLE_NAME,
+            "monai_bundle_version": SETTINGS_MONAI.MONAI_BUNDLE_VERSION,
             "monai_runtime_source": MONAI_RUNTIME_SOURCE,
             "monai_model_ts_sha256": sha256_file(model_path) if model_path.is_file() else None,
             "exact_duplicate_audit": exact_summary,
@@ -4080,77 +3863,77 @@ class ConfigurationManager:
         """Save the complete current protocol before evaluation begins."""
 
         configuration = {
-            "pipeline_schema": PIPELINE_SCHEMA_ID,
-            "suite_name": SUITE_NAME,
-            "suite_configuration_tag": SUITE_CONFIGURATION_TAG,
-            "reference_experiment_id": REFERENCE_EXPERIMENT_ID,
-            "primary_candidate_experiment_id": PRIMARY_CANDIDATE_EXPERIMENT_ID,
-            "valid_only_ablation_experiment_id": VALID_ONLY_ABLATION_EXPERIMENT_ID,
+            "pipeline_schema": SETTINGS_RUNTIME.PIPELINE_SCHEMA_ID,
+            "suite_name": SETTINGS_PATHS.SUITE_NAME,
+            "suite_configuration_tag": SETTINGS_PATHS.SUITE_CONFIGURATION_TAG,
+            "reference_experiment_id": SETTINGS_EXPERIMENTS.REFERENCE_EXPERIMENT_ID,
+            "primary_candidate_experiment_id": SETTINGS_EXPERIMENTS.PRIMARY_CANDIDATE_EXPERIMENT_ID,
+            "valid_only_ablation_experiment_id": SETTINGS_EXPERIMENTS.VALID_ONLY_ABLATION_EXPERIMENT_ID,
             "control_experiment_ids": [
-                FIXED_PERIPHERY_CONTROL_EXPERIMENT_ID,
-                MASK_ONLY_CONTROL_EXPERIMENT_ID,
-                SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID,
-                COMPLEMENT_CONTROL_EXPERIMENT_ID,
+                SETTINGS_EXPERIMENTS.FIXED_PERIPHERY_CONTROL_EXPERIMENT_ID,
+                SETTINGS_EXPERIMENTS.MASK_ONLY_CONTROL_EXPERIMENT_ID,
+                SETTINGS_EXPERIMENTS.SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID,
+                SETTINGS_EXPERIMENTS.COMPLEMENT_CONTROL_EXPERIMENT_ID,
             ],
             "experiments": [asdict(experiment) for experiment in experiments],
-            "primary_ablation_comparisons": PRIMARY_ABLATION_COMPARISONS,
-            "outer_cv": {"splits": N_SPLITS, "random_state": CV_RANDOM_STATE},
+            "primary_ablation_comparisons": SETTINGS_EXPERIMENTS.PRIMARY_ABLATION_COMPARISONS,
+            "outer_cv": {"splits": SETTINGS_VALIDATION.N_SPLITS, "random_state": SETTINGS_VALIDATION.CV_RANDOM_STATE},
             "inner_cv": {
-                "splits": INNER_CV_SPLITS,
-                "random_state": INNER_CV_RANDOM_STATE,
-                "c_grid": CLASSIFIER_C_GRID,
-                "c_selection_auc_tolerance": C_SELECTION_AUC_TOLERANCE,
-                "threshold_method": THRESHOLD_SELECTION_METHOD,
+                "splits": SETTINGS_VALIDATION.INNER_CV_SPLITS,
+                "random_state": SETTINGS_VALIDATION.INNER_CV_RANDOM_STATE,
+                "c_grid": SETTINGS_VALIDATION.CLASSIFIER_C_GRID,
+                "c_selection_auc_tolerance": SETTINGS_VALIDATION.C_SELECTION_AUC_TOLERANCE,
+                "threshold_method": SETTINGS_VALIDATION.THRESHOLD_SELECTION_METHOD,
             },
             "bootstrap": {
-                "replicates": BOOTSTRAP_REPLICATES,
-                "paired_replicates": PAIRED_BOOTSTRAP_REPLICATES,
-                "confidence": BOOTSTRAP_CONFIDENCE,
+                "replicates": SETTINGS_VALIDATION.BOOTSTRAP_REPLICATES,
+                "paired_replicates": SETTINGS_VALIDATION.PAIRED_BOOTSTRAP_REPLICATES,
+                "confidence": SETTINGS_VALIDATION.BOOTSTRAP_CONFIDENCE,
             },
             "stability": {
-                "enabled": RUN_REPEATED_NESTED_CV_STABILITY,
-                "repeats": REPEATED_NESTED_CV_REPEATS,
-                "experiment_ids": list(STABILITY_EXPERIMENT_IDS),
-                "comparisons": REPEATED_STABILITY_COMPARISONS,
+                "enabled": SETTINGS_VALIDATION.RUN_REPEATED_NESTED_CV_STABILITY,
+                "repeats": SETTINGS_VALIDATION.REPEATED_NESTED_CV_REPEATS,
+                "experiment_ids": list(SETTINGS_VALIDATION.STABILITY_EXPERIMENT_IDS),
+                "comparisons": SETTINGS_VALIDATION.REPEATED_STABILITY_COMPARISONS,
             },
             "permutation": {
-                "enabled": RUN_PATIENT_LABEL_PERMUTATION_TEST,
-                "replicates": LABEL_PERMUTATION_REPLICATES,
-                "experiment_ids": list(PERMUTATION_EXPERIMENT_IDS),
-                "selection_adjusted_enabled": RUN_SELECTION_ADJUSTED_PERMUTATION_TEST,
-                "selection_adjusted_replicates": SELECTION_ADJUSTED_PERMUTATION_REPLICATES,
-                "selection_adjusted_candidate_ids": list(SELECTION_ADJUSTED_CANDIDATE_EXPERIMENT_IDS),
+                "enabled": SETTINGS_VALIDATION.RUN_PATIENT_LABEL_PERMUTATION_TEST,
+                "replicates": SETTINGS_VALIDATION.LABEL_PERMUTATION_REPLICATES,
+                "experiment_ids": list(SETTINGS_VALIDATION.PERMUTATION_EXPERIMENT_IDS),
+                "selection_adjusted_enabled": SETTINGS_VALIDATION.RUN_SELECTION_ADJUSTED_PERMUTATION_TEST,
+                "selection_adjusted_replicates": SETTINGS_VALIDATION.SELECTION_ADJUSTED_PERMUTATION_REPLICATES,
+                "selection_adjusted_candidate_ids": list(SETTINGS_VALIDATION.SELECTION_ADJUSTED_CANDIDATE_EXPERIMENT_IDS),
             },
             "model_family_nested_selection": {
-                "enabled": RUN_MODEL_FAMILY_NESTED_SELECTION,
-                "experiment_ids": list(MODEL_FAMILY_NESTED_SELECTION_IDS),
-                "auc_tolerance": MODEL_FAMILY_SELECTION_AUC_TOLERANCE,
+                "enabled": SETTINGS_VALIDATION.RUN_MODEL_FAMILY_NESTED_SELECTION,
+                "experiment_ids": list(SETTINGS_VALIDATION.MODEL_FAMILY_NESTED_SELECTION_IDS),
+                "auc_tolerance": SETTINGS_VALIDATION.MODEL_FAMILY_SELECTION_AUC_TOLERANCE,
             },
             "preprocessing": {
-                "img_size": IMG_SIZE,
-                "monai_input_size": MONAI_INPUT_SIZE,
-                "standardized_content_long_side": STANDARDIZED_CONTENT_LONG_SIDE,
-                "center_crop_fallback_fraction": CENTER_CROP_FALLBACK_FRACTION,
-                "hard_support_dilation_kernel": HARD_SUPPORT_DILATION_KERNEL,
-                "fixed_periphery_exclusion_fraction": FIXED_PERIPHERY_EXCLUSION_FRACTION,
-                "region_norm_percentiles": [REGION_NORM_LOWER_PERCENTILE, REGION_NORM_UPPER_PERCENTILE],
-                "region_norm_min_pixels": REGION_NORM_MIN_PIXELS,
-                "region_norm_min_dynamic_range": REGION_NORM_MIN_DYNAMIC_RANGE,
-                "support_intensity_shuffle_schema": SUPPORT_INTENSITY_SHUFFLE_SCHEMA,
+                "img_size": SETTINGS_PREPROCESSING.IMG_SIZE,
+                "monai_input_size": SETTINGS_MONAI.MONAI_INPUT_SIZE,
+                "standardized_content_long_side": SETTINGS_PREPROCESSING.STANDARDIZED_CONTENT_LONG_SIDE,
+                "center_crop_fallback_fraction": SETTINGS_PREPROCESSING.CENTER_CROP_FALLBACK_FRACTION,
+                "hard_support_dilation_kernel": SETTINGS_PREPROCESSING.HARD_SUPPORT_DILATION_KERNEL,
+                "fixed_periphery_exclusion_fraction": SETTINGS_PREPROCESSING.FIXED_PERIPHERY_EXCLUSION_FRACTION,
+                "region_norm_percentiles": [SETTINGS_PREPROCESSING.REGION_NORM_LOWER_PERCENTILE, SETTINGS_PREPROCESSING.REGION_NORM_UPPER_PERCENTILE],
+                "region_norm_min_pixels": SETTINGS_PREPROCESSING.REGION_NORM_MIN_PIXELS,
+                "region_norm_min_dynamic_range": SETTINGS_PREPROCESSING.REGION_NORM_MIN_DYNAMIC_RANGE,
+                "support_intensity_shuffle_schema": SETTINGS_PREPROCESSING.SUPPORT_INTENSITY_SHUFFLE_SCHEMA,
             },
             "models": {
-                "monai_bundle": MONAI_BUNDLE_NAME,
-                "monai_bundle_version": MONAI_BUNDLE_VERSION,
-                "monai_hf_revision": MONAI_HF_REVISION,
-                "efficientnet_weights": EFFICIENTNET_WEIGHTS_NAME,
+                "monai_bundle": SETTINGS_MONAI.MONAI_BUNDLE_NAME,
+                "monai_bundle_version": SETTINGS_MONAI.MONAI_BUNDLE_VERSION,
+                "monai_hf_revision": SETTINGS_MONAI.MONAI_HF_REVISION,
+                "efficientnet_weights": SETTINGS_FEATURE_BANK.EFFICIENTNET_WEIGHTS_NAME,
             },
             "runtime": {
-                "validation_profile": VALIDATION_RUNTIME_PROFILE,
-                "device_policy": RUNTIME_DEVICE_POLICY,
-                "suite_device_tag": SUITE_DEVICE_TAG,
-                "feature_cache_device_tag": FEATURE_CACHE_DEVICE_TAG,
+                "validation_profile": SETTINGS_VALIDATION.VALIDATION_RUNTIME_PROFILE,
+                "device_policy": SETTINGS_RUNTIME.RUNTIME_DEVICE_POLICY,
+                "suite_device_tag": SETTINGS_RUNTIME.SUITE_DEVICE_TAG,
+                "feature_cache_device_tag": SETTINGS_FEATURE_BANK.FEATURE_CACHE_DEVICE_TAG,
                 "deterministic_algorithms": True,
-                "cuda_amp": USE_CUDA_AMP,
+                "cuda_amp": SETTINGS_RUNTIME.USE_CUDA_AMP,
             },
         }
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -4166,14 +3949,14 @@ class ConfigurationManager:
         if output.shape != (2, 1, 64, 64) or not torch.isfinite(output).all():
             raise RuntimeError("Attention U-Net architecture self-test failed.")
 
-        hard = torch.zeros(2, 1, IMG_SIZE, IMG_SIZE)
+        hard = torch.zeros(2, 1, SETTINGS_PREPROCESSING.IMG_SIZE, SETTINGS_PREPROCESSING.IMG_SIZE)
         hard[0, 0, 80:130, 85:135] = 1.0
         valid = torch.tensor([True, False])
-        content = torch.ones(2, 1, IMG_SIZE, IMG_SIZE)
+        content = torch.ones(2, 1, SETTINGS_PREPROCESSING.IMG_SIZE, SETTINGS_PREPROCESSING.IMG_SIZE)
         support = create_attention_exact_support_mask(hard, valid, content)
         if support.shape != hard.shape or not torch.any(support[1] > 0.5):
             raise RuntimeError("Attention support/fallback self-test failed.")
-        raw = torch.linspace(0.0, 1.0, IMG_SIZE * IMG_SIZE).reshape(1, 1, IMG_SIZE, IMG_SIZE)
+        raw = torch.linspace(0.0, 1.0, SETTINGS_PREPROCESSING.IMG_SIZE * SETTINGS_PREPROCESSING.IMG_SIZE).reshape(1, 1, SETTINGS_PREPROCESSING.IMG_SIZE, SETTINGS_PREPROCESSING.IMG_SIZE)
         raw = raw.repeat(2, 3, 1, 1)
         au1 = _robust_scale_visible_regions(raw, support)
         hashes = [hashlib.sha256(f"attention-test-{i}".encode()).hexdigest() for i in range(2)]
@@ -4241,11 +4024,11 @@ class ImagePreprocessor:
             return False
 
         return bool(
-            float(values.mean()) <= STANDARDIZATION_DARK_LINE_MAX_MEAN
-            and float(values.std()) <= STANDARDIZATION_DARK_LINE_MAX_STD
+            float(values.mean()) <= SETTINGS_PREPROCESSING.STANDARDIZATION_DARK_LINE_MAX_MEAN
+            and float(values.std()) <= SETTINGS_PREPROCESSING.STANDARDIZATION_DARK_LINE_MAX_STD
             and float(
-                np.mean(values <= STANDARDIZATION_DARK_PIXEL_MAX_VALUE)
-            ) >= STANDARDIZATION_DARK_PIXEL_MIN_FRACTION
+                np.mean(values <= SETTINGS_PREPROCESSING.STANDARDIZATION_DARK_PIXEL_MAX_VALUE)
+            ) >= SETTINGS_PREPROCESSING.STANDARDIZATION_DARK_PIXEL_MIN_FRACTION
         )
 
     @staticmethod
@@ -4274,17 +4057,17 @@ class ImagePreprocessor:
 
         minimum_height = max(
             8,
-            int(np.ceil(height * STANDARDIZATION_MIN_RETAINED_FRACTION)),
+            int(np.ceil(height * SETTINGS_PREPROCESSING.STANDARDIZATION_MIN_RETAINED_FRACTION)),
         )
         minimum_width = max(
             8,
-            int(np.ceil(width * STANDARDIZATION_MIN_RETAINED_FRACTION)),
+            int(np.ceil(width * SETTINGS_PREPROCESSING.STANDARDIZATION_MIN_RETAINED_FRACTION)),
         )
         maximum_vertical_crop = int(
-            np.floor(height * STANDARDIZATION_MAX_CROP_FRACTION_PER_SIDE)
+            np.floor(height * SETTINGS_PREPROCESSING.STANDARDIZATION_MAX_CROP_FRACTION_PER_SIDE)
         )
         maximum_horizontal_crop = int(
-            np.floor(width * STANDARDIZATION_MAX_CROP_FRACTION_PER_SIDE)
+            np.floor(width * SETTINGS_PREPROCESSING.STANDARDIZATION_MAX_CROP_FRACTION_PER_SIDE)
         )
 
         top_crop = 0
@@ -4321,13 +4104,13 @@ class ImagePreprocessor:
 
         # One isolated dark line can occur naturally or through interpolation. The
         # minimum-run rule avoids declaring it an export border without repetition.
-        if top_crop < STANDARDIZATION_MIN_PADDING_RUN:
+        if top_crop < SETTINGS_PREPROCESSING.STANDARDIZATION_MIN_PADDING_RUN:
             top_crop = 0
-        if bottom_crop < STANDARDIZATION_MIN_PADDING_RUN:
+        if bottom_crop < SETTINGS_PREPROCESSING.STANDARDIZATION_MIN_PADDING_RUN:
             bottom_crop = 0
-        if left_crop < STANDARDIZATION_MIN_PADDING_RUN:
+        if left_crop < SETTINGS_PREPROCESSING.STANDARDIZATION_MIN_PADDING_RUN:
             left_crop = 0
-        if right_crop < STANDARDIZATION_MIN_PADDING_RUN:
+        if right_crop < SETTINGS_PREPROCESSING.STANDARDIZATION_MIN_PADDING_RUN:
             right_crop = 0
 
         if height - top_crop - bottom_crop < minimum_height:
@@ -4369,10 +4152,10 @@ class ImagePreprocessor:
             )
 
         lower = float(
-            np.percentile(image_float, STANDARDIZATION_LOWER_PERCENTILE)
+            np.percentile(image_float, SETTINGS_PREPROCESSING.STANDARDIZATION_LOWER_PERCENTILE)
         )
         upper = float(
-            np.percentile(image_float, STANDARDIZATION_UPPER_PERCENTILE)
+            np.percentile(image_float, SETTINGS_PREPROCESSING.STANDARDIZATION_UPPER_PERCENTILE)
         )
 
         if not np.isfinite(lower) or not np.isfinite(upper) or upper <= lower:
@@ -4405,13 +4188,13 @@ class ImagePreprocessor:
                 f"Fixed-content geometry requires positive dimensions, got "
                 f"{height}x{width}."
             )
-        if not 1 <= STANDARDIZED_CONTENT_LONG_SIDE <= MONAI_INPUT_SIZE:
+        if not 1 <= SETTINGS_PREPROCESSING.STANDARDIZED_CONTENT_LONG_SIDE <= SETTINGS_MONAI.MONAI_INPUT_SIZE:
             raise ValueError(
                 "STANDARDIZED_CONTENT_LONG_SIDE must lie between 1 and "
                 "MONAI_INPUT_SIZE."
             )
 
-        scale = float(STANDARDIZED_CONTENT_LONG_SIDE / max(height, width))
+        scale = float(SETTINGS_PREPROCESSING.STANDARDIZED_CONTENT_LONG_SIDE / max(height, width))
         resized_height = max(1, int(round(height * scale)))
         resized_width = max(1, int(round(width * scale)))
 
@@ -4419,14 +4202,14 @@ class ImagePreprocessor:
         # the predeclared target without changing the aspect-ratio calculation for
         # the shorter side.
         if height >= width:
-            resized_height = int(STANDARDIZED_CONTENT_LONG_SIDE)
+            resized_height = int(SETTINGS_PREPROCESSING.STANDARDIZED_CONTENT_LONG_SIDE)
         else:
-            resized_width = int(STANDARDIZED_CONTENT_LONG_SIDE)
+            resized_width = int(SETTINGS_PREPROCESSING.STANDARDIZED_CONTENT_LONG_SIDE)
 
-        resized_height = min(resized_height, MONAI_INPUT_SIZE)
-        resized_width = min(resized_width, MONAI_INPUT_SIZE)
-        top = (MONAI_INPUT_SIZE - resized_height) // 2
-        left = (MONAI_INPUT_SIZE - resized_width) // 2
+        resized_height = min(resized_height, SETTINGS_MONAI.MONAI_INPUT_SIZE)
+        resized_width = min(resized_width, SETTINGS_MONAI.MONAI_INPUT_SIZE)
+        top = (SETTINGS_MONAI.MONAI_INPUT_SIZE - resized_height) // 2
+        left = (SETTINGS_MONAI.MONAI_INPUT_SIZE - resized_width) // 2
         return resized_height, resized_width, top, left, scale
 
     @staticmethod
@@ -4464,7 +4247,7 @@ class ImagePreprocessor:
         resized = np.clip(resized, 0.0, 1.0).astype(np.float32, copy=False)
 
         canvas = np.zeros(
-            (MONAI_INPUT_SIZE, MONAI_INPUT_SIZE),
+            (SETTINGS_MONAI.MONAI_INPUT_SIZE, SETTINGS_MONAI.MONAI_INPUT_SIZE),
             dtype=np.float32,
         )
         canvas[
@@ -4488,7 +4271,7 @@ class ImagePreprocessor:
             _fixed_content_canvas_geometry(height, width)
         )
         canvas = np.ones(
-            (MONAI_INPUT_SIZE, MONAI_INPUT_SIZE),
+            (SETTINGS_MONAI.MONAI_INPUT_SIZE, SETTINGS_MONAI.MONAI_INPUT_SIZE),
             dtype=np.float32,
         )
         canvas[
@@ -4583,12 +4366,12 @@ class ImagePreprocessor:
         detected_padding_fraction = float(
             1.0 - retained_height_fraction * retained_width_fraction
         )
-        content_height_fraction = float(resized_height / MONAI_INPUT_SIZE)
-        content_width_fraction = float(resized_width / MONAI_INPUT_SIZE)
+        content_height_fraction = float(resized_height / SETTINGS_MONAI.MONAI_INPUT_SIZE)
+        content_width_fraction = float(resized_width / SETTINGS_MONAI.MONAI_INPUT_SIZE)
         pipeline_padding_fraction = float(
             1.0
             - (resized_height * resized_width)
-            / float(MONAI_INPUT_SIZE * MONAI_INPUT_SIZE)
+            / float(SETTINGS_MONAI.MONAI_INPUT_SIZE * SETTINGS_MONAI.MONAI_INPUT_SIZE)
         )
 
         features = np.asarray(
@@ -4621,7 +4404,7 @@ class ImagePreprocessor:
             dtype=np.float32,
         )
 
-        if len(features) != len(STANDARDIZATION_FEATURE_NAMES):
+        if len(features) != len(SETTINGS_PREPROCESSING.STANDARDIZATION_FEATURE_NAMES):
             raise RuntimeError(
                 "Standardization feature-name and value counts differ."
             )
@@ -4714,7 +4497,7 @@ class ImagePreprocessor:
             dtype=np.float32,
         )
 
-        if len(features) != len(PROVENANCE_FEATURE_NAMES):
+        if len(features) != len(SETTINGS_REPORTING.PROVENANCE_FEATURE_NAMES):
             raise RuntimeError("Provenance feature-name and value counts differ.")
         if not np.all(np.isfinite(features)):
             raise RuntimeError(
@@ -5019,7 +4802,7 @@ class MonaiSegmenter:
 
         # First try the canonical layout because it is unambiguous and avoids a
         # potentially expensive recursive search through old bundle directories.
-        direct_root = MONAI_BUNDLE_DIR / MONAI_BUNDLE_NAME
+        direct_root = SETTINGS_MONAI.MONAI_BUNDLE_DIR / SETTINGS_MONAI.MONAI_BUNDLE_NAME
 
         if any(
             (direct_root / relative_path).is_file()
@@ -5032,14 +4815,14 @@ class MonaiSegmenter:
 
         # If the canonical location is absent, search deterministic alternate
         # layouts. Candidate paths still must contain the requested bundle slug.
-        if MONAI_BUNDLE_DIR.exists():
+        if SETTINGS_MONAI.MONAI_BUNDLE_DIR.exists():
             candidate_artifacts = []
 
             # Prefer the official TorchScript artifact when several old layouts
             # coexist, then fall back to the state-dict checkpoint.
             for filename in ("model.ts", "model.pt"):
                 candidate_artifacts.extend(
-                    sorted(MONAI_BUNDLE_DIR.rglob(filename))
+                    sorted(SETTINGS_MONAI.MONAI_BUNDLE_DIR.rglob(filename))
                 )
 
             for artifact_path in candidate_artifacts:
@@ -5048,7 +4831,7 @@ class MonaiSegmenter:
 
                 candidate_root = artifact_path.parent.parent
 
-                if MONAI_BUNDLE_NAME in candidate_root.parts:
+                if SETTINGS_MONAI.MONAI_BUNDLE_NAME in candidate_root.parts:
                     return candidate_root
 
         return direct_root
@@ -5083,10 +4866,10 @@ class MonaiSegmenter:
             ) from exc
 
         version = str(metadata.get("version", ""))
-        if version != MONAI_BUNDLE_VERSION:
+        if version != SETTINGS_MONAI.MONAI_BUNDLE_VERSION:
             raise RuntimeError(
                 "MONAI bundle version mismatch: "
-                f"expected {MONAI_BUNDLE_VERSION}, metadata reports {version!r}."
+                f"expected {SETTINGS_MONAI.MONAI_BUNDLE_VERSION}, metadata reports {version!r}."
             )
 
         network_format = metadata.get("network_data_format", {})
@@ -5162,7 +4945,7 @@ class MonaiSegmenter:
     def verify_monai_artifact_sha256(path, expected_sha256, artifact_label):
         """Verify a pinned MONAI artifact before it influences extracted features."""
 
-        if not VERIFY_MONAI_ARTIFACT_SHA256:
+        if not SETTINGS_MONAI.VERIFY_MONAI_ARTIFACT_SHA256:
             return None
 
         if not expected_sha256:
@@ -5234,7 +5017,7 @@ class MonaiSegmenter:
             )
             return bundle_root
 
-        if not AUTO_DOWNLOAD_MONAI_BUNDLE:
+        if not SETTINGS_MONAI.AUTO_DOWNLOAD_MONAI_BUNDLE:
             formatted = "\n  - ".join(missing)
             raise FileNotFoundError(
                 "Required pinned MONAI bundle files are missing and automatic "
@@ -5253,7 +5036,7 @@ class MonaiSegmenter:
 
         print(
             "[MODEL][MONAI] Downloading missing bundle files from the pinned "
-            f"repository revision {MONAI_HF_REVISION[:8]}: {', '.join(missing)}",
+            f"repository revision {SETTINGS_MONAI.MONAI_HF_REVISION[:8]}: {', '.join(missing)}",
             flush=True,
         )
         print(
@@ -5265,16 +5048,16 @@ class MonaiSegmenter:
 
         try:
             snapshot_download(
-                repo_id=MONAI_HF_REPO_ID,
-                revision=MONAI_HF_REVISION,
+                repo_id=SETTINGS_MONAI.MONAI_HF_REPO_ID,
+                revision=SETTINGS_MONAI.MONAI_HF_REVISION,
                 local_dir=str(bundle_root),
                 allow_patterns=list(required_relative_paths),
             )
         except Exception as exc:
             raise RuntimeError(
                 "Automatic pinned MONAI download failed. Verify internet access "
-                f"and repository availability for {MONAI_HF_REPO_ID} at revision "
-                f"{MONAI_HF_REVISION}. For offline execution, copy the requested "
+                f"and repository availability for {SETTINGS_MONAI.MONAI_HF_REPO_ID} at revision "
+                f"{SETTINGS_MONAI.MONAI_HF_REVISION}. For offline execution, copy the requested "
                 f"files manually under {bundle_root}."
             ) from exc
 
@@ -5364,8 +5147,8 @@ class MonaiSegmenter:
                 example_input = torch.zeros(
                     1,
                     1,
-                    MONAI_INPUT_SIZE,
-                    MONAI_INPUT_SIZE,
+                    SETTINGS_MONAI.MONAI_INPUT_SIZE,
+                    SETTINGS_MONAI.MONAI_INPUT_SIZE,
                     device=runtime_device,
                     dtype=torch.float32,
                 )
@@ -5386,8 +5169,8 @@ class MonaiSegmenter:
                 expected_shape = (
                     1,
                     4,
-                    MONAI_INPUT_SIZE,
-                    MONAI_INPUT_SIZE,
+                    SETTINGS_MONAI.MONAI_INPUT_SIZE,
+                    SETTINGS_MONAI.MONAI_INPUT_SIZE,
                 )
                 if tuple(example_output.shape) != expected_shape:
                     raise RuntimeError(
@@ -5540,7 +5323,7 @@ class MonaiSegmenter:
         # NORMAL PATH: OFFICIAL model.ts, NO MONAI IMPORT
         # =========================================================
 
-        if not FORCE_REBUILD_MONAI_TORCHSCRIPT:
+        if not SETTINGS_MONAI.FORCE_REBUILD_MONAI_TORCHSCRIPT:
             bundle_root = ensure_monai_bundle(
                 (
                     "models/model.ts",
@@ -5551,7 +5334,7 @@ class MonaiSegmenter:
 
             verify_monai_artifact_sha256(
                 official_torchscript_path,
-                MONAI_OFFICIAL_TORCHSCRIPT_SHA256,
+                SETTINGS_MONAI.MONAI_OFFICIAL_TORCHSCRIPT_SHA256,
                 "Official MONAI models/model.ts",
             )
 
@@ -5581,12 +5364,12 @@ class MonaiSegmenter:
         # =========================================================
 
         if (
-            MONAI_TORCHSCRIPT_PATH.is_file()
-            and not FORCE_REBUILD_MONAI_TORCHSCRIPT
+            SETTINGS_MONAI.MONAI_TORCHSCRIPT_PATH.is_file()
+            and not SETTINGS_MONAI.FORCE_REBUILD_MONAI_TORCHSCRIPT
         ):
             try:
                 network = load_and_validate_torchscript_segmenter(
-                    MONAI_TORCHSCRIPT_PATH,
+                    SETTINGS_MONAI.MONAI_TORCHSCRIPT_PATH,
                     "locally reconstructed MONAI TorchScript cache",
                 )
                 print(
@@ -5618,7 +5401,7 @@ class MonaiSegmenter:
 
         verify_monai_artifact_sha256(
             model_path,
-            MONAI_MODEL_SHA256,
+            SETTINGS_MONAI.MONAI_MODEL_SHA256,
             "Official MONAI models/model.pt",
         )
         validate_monai_train_config(bundle_root)
@@ -5691,8 +5474,8 @@ class MonaiSegmenter:
         example_input = torch.zeros(
             1,
             1,
-            MONAI_INPUT_SIZE,
-            MONAI_INPUT_SIZE,
+            SETTINGS_MONAI.MONAI_INPUT_SIZE,
+            SETTINGS_MONAI.MONAI_INPUT_SIZE,
             dtype=torch.float32,
         )
 
@@ -5725,8 +5508,8 @@ class MonaiSegmenter:
         if tuple(reference_output.shape) != (
             1,
             4,
-            MONAI_INPUT_SIZE,
-            MONAI_INPUT_SIZE,
+            SETTINGS_MONAI.MONAI_INPUT_SIZE,
+            SETTINGS_MONAI.MONAI_INPUT_SIZE,
         ):
             raise RuntimeError(
                 "Reconstructed MONAI network produced an unexpected output shape: "
@@ -5754,19 +5537,19 @@ class MonaiSegmenter:
         except Exception:
             traced_network.eval()
 
-        MONAI_TORCHSCRIPT_PATH.parent.mkdir(
+        SETTINGS_MONAI.MONAI_TORCHSCRIPT_PATH.parent.mkdir(
             parents=True,
             exist_ok=True,
         )
-        traced_network.save(str(MONAI_TORCHSCRIPT_PATH))
+        traced_network.save(str(SETTINGS_MONAI.MONAI_TORCHSCRIPT_PATH))
 
         print(
             "Saved validated fallback MONAI TorchScript cache: "
-            f"{MONAI_TORCHSCRIPT_PATH}"
+            f"{SETTINGS_MONAI.MONAI_TORCHSCRIPT_PATH}"
         )
 
         network = load_and_validate_torchscript_segmenter(
-            MONAI_TORCHSCRIPT_PATH,
+            SETTINGS_MONAI.MONAI_TORCHSCRIPT_PATH,
             "newly reconstructed MONAI TorchScript cache",
         )
         print(
@@ -5880,9 +5663,9 @@ class MonaiSegmenter:
         # Step 6: apply the predeclared plausibility gate independently to every
         # slice. The result is a Boolean selector for ROI versus full-image fallback.
         valid_mask = (
-            (area_ratio >= MONAI_MIN_HEART_AREA_RATIO)
-            & (area_ratio <= MONAI_MAX_HEART_AREA_RATIO)
-            & (peak_probability >= MONAI_MIN_PEAK_HEART_PROBABILITY)
+            (area_ratio >= SETTINGS_MONAI.MONAI_MIN_HEART_AREA_RATIO)
+            & (area_ratio <= SETTINGS_MONAI.MONAI_MAX_HEART_AREA_RATIO)
+            & (peak_probability >= SETTINGS_MONAI.MONAI_MIN_PEAK_HEART_PROBABILITY)
         )
 
         # Max pooling expands the ROI around the predicted ventricles and
@@ -5892,16 +5675,16 @@ class MonaiSegmenter:
         # The operation adds a contextual margin around the predicted ventricles.
         roi_probability_256 = F.max_pool2d(
             heart_probability,
-            kernel_size=MONAI_ROI_DILATION_KERNEL,
+            kernel_size=SETTINGS_MONAI.MONAI_ROI_DILATION_KERNEL,
             stride=1,
-            padding=MONAI_ROI_DILATION_KERNEL // 2,
+            padding=SETTINGS_MONAI.MONAI_ROI_DILATION_KERNEL // 2,
         )
 
         hard_mask_256 = F.max_pool2d(
             hard_mask_256,
-            kernel_size=MONAI_ROI_DILATION_KERNEL,
+            kernel_size=SETTINGS_MONAI.MONAI_ROI_DILATION_KERNEL,
             stride=1,
-            padding=MONAI_ROI_DILATION_KERNEL // 2,
+            padding=SETTINGS_MONAI.MONAI_ROI_DILATION_KERNEL // 2,
         )
 
         # Step 8: map masks from MONAI coordinates to the aligned 224×224
@@ -5971,7 +5754,7 @@ class MonaiSegmenter:
         # ``None`` preserves the original reviewed baseline. Explicit values allow
         # predeclared strict-ROI ablations without mutating the global configuration.
         if background_weight is None:
-            background_weight = MONAI_BACKGROUND_WEIGHT
+            background_weight = SETTINGS_MONAI.MONAI_BACKGROUND_WEIGHT
         background_weight = float(background_weight)
         if not 0.0 <= background_weight <= 1.0:
             raise ValueError("background_weight must lie in [0,1].")
@@ -6009,13 +5792,13 @@ class MonaiSegmenter:
         # Construct per-channel constants on the same device and with the same
         # dtype as the input, avoiding implicit CPU/GPU copies or dtype promotion.
         mean = torch.tensor(
-            EFFICIENTNET_MEAN,
+            SETTINGS_FEATURE_BANK.EFFICIENTNET_MEAN,
             device=images.device,
             dtype=images.dtype,
         ).view(1, 3, 1, 1)
 
         std = torch.tensor(
-            EFFICIENTNET_STD,
+            SETTINGS_FEATURE_BANK.EFFICIENTNET_STD,
             device=images.device,
             dtype=images.dtype,
         ).view(1, 3, 1, 1)
@@ -6055,27 +5838,27 @@ class FeatureBankManager:
         started = time.perf_counter()
         hasher = hashlib.sha256()
         configuration = {
-            "schema": FEATURE_CACHE_SCHEMA,
+            "schema": SETTINGS_FEATURE_BANK.FEATURE_CACHE_SCHEMA,
             "dataset_path": str(Path(dataset_path).resolve()),
             "required_modes": list(required_efficientnet_feature_modes(get_enabled_experiments())),
-            "img_size": IMG_SIZE,
-            "monai_input_size": MONAI_INPUT_SIZE,
-            "standardized_content_long_side": STANDARDIZED_CONTENT_LONG_SIDE,
-            "center_crop_fallback_fraction": CENTER_CROP_FALLBACK_FRACTION,
-            "hard_support_dilation_kernel": HARD_SUPPORT_DILATION_KERNEL,
-            "fixed_periphery_exclusion_fraction": FIXED_PERIPHERY_EXCLUSION_FRACTION,
+            "img_size": SETTINGS_PREPROCESSING.IMG_SIZE,
+            "monai_input_size": SETTINGS_MONAI.MONAI_INPUT_SIZE,
+            "standardized_content_long_side": SETTINGS_PREPROCESSING.STANDARDIZED_CONTENT_LONG_SIDE,
+            "center_crop_fallback_fraction": SETTINGS_PREPROCESSING.CENTER_CROP_FALLBACK_FRACTION,
+            "hard_support_dilation_kernel": SETTINGS_PREPROCESSING.HARD_SUPPORT_DILATION_KERNEL,
+            "fixed_periphery_exclusion_fraction": SETTINGS_PREPROCESSING.FIXED_PERIPHERY_EXCLUSION_FRACTION,
             "region_norm": [
-                REGION_NORM_LOWER_PERCENTILE,
-                REGION_NORM_UPPER_PERCENTILE,
-                REGION_NORM_MIN_PIXELS,
-                REGION_NORM_HISTOGRAM_BINS,
-                REGION_NORM_MIN_DYNAMIC_RANGE,
+                SETTINGS_PREPROCESSING.REGION_NORM_LOWER_PERCENTILE,
+                SETTINGS_PREPROCESSING.REGION_NORM_UPPER_PERCENTILE,
+                SETTINGS_PREPROCESSING.REGION_NORM_MIN_PIXELS,
+                SETTINGS_PREPROCESSING.REGION_NORM_HISTOGRAM_BINS,
+                SETTINGS_PREPROCESSING.REGION_NORM_MIN_DYNAMIC_RANGE,
             ],
-            "shuffle_schema": SUPPORT_INTENSITY_SHUFFLE_SCHEMA,
-            "monai_bundle": [MONAI_BUNDLE_NAME, MONAI_BUNDLE_VERSION, MONAI_HF_REVISION],
-            "efficientnet_weights": EFFICIENTNET_WEIGHTS_NAME,
+            "shuffle_schema": SETTINGS_PREPROCESSING.SUPPORT_INTENSITY_SHUFFLE_SCHEMA,
+            "monai_bundle": [SETTINGS_MONAI.MONAI_BUNDLE_NAME, SETTINGS_MONAI.MONAI_BUNDLE_VERSION, SETTINGS_MONAI.MONAI_HF_REVISION],
+            "efficientnet_weights": SETTINGS_FEATURE_BANK.EFFICIENTNET_WEIGHTS_NAME,
             "device_tag": resolved_feature_cache_device_tag(),
-            "use_cuda_amp": USE_CUDA_AMP,
+            "use_cuda_amp": SETTINGS_RUNTIME.USE_CUDA_AMP,
         }
         hasher.update(json.dumps(configuration, sort_keys=True).encode("utf-8"))
 
@@ -6185,7 +5968,7 @@ class FeatureBankManager:
 
         n_slices = len(bank["labels"])
         for mode, features in bank["features"].items():
-            if features.shape != (n_slices, EFFICIENTNET_FEATURE_DIM):
+            if features.shape != (n_slices, SETTINGS_FEATURE_BANK.EFFICIENTNET_FEATURE_DIM):
                 raise RuntimeError(
                     f"Feature bank mode {mode!r} has unexpected shape "
                     f"{features.shape}."
@@ -6223,7 +6006,7 @@ class FeatureBankManager:
         images,
         roi_probability,
         valid_mask,
-        fallback_fraction=CENTER_CROP_FALLBACK_FRACTION,
+        fallback_fraction=SETTINGS_PREPROCESSING.CENTER_CROP_FALLBACK_FRACTION,
     ):
         """Use strict zero-background ROI or a fixed center crop when invalid.
 
@@ -6303,7 +6086,7 @@ class FeatureBankManager:
                 "Visible-region masks must align with the image batch and spatial shape."
             )
 
-        bins = int(REGION_NORM_HISTOGRAM_BINS)
+        bins = int(SETTINGS_PREPROCESSING.REGION_NORM_HISTOGRAM_BINS)
         mask = visible_masks > 0.5
         mask_flat = mask[:, 0].reshape(images.shape[0], -1)
         counts = mask_flat.sum(dim=1).to(torch.long)
@@ -6330,14 +6113,14 @@ class FeatureBankManager:
         safe_counts = counts.clamp_min(1)
         lower_rank = (
             torch.floor(
-                (REGION_NORM_LOWER_PERCENTILE / 100.0)
+                (SETTINGS_PREPROCESSING.REGION_NORM_LOWER_PERCENTILE / 100.0)
                 * (safe_counts - 1).to(torch.float32)
             ).to(torch.long)
             + 1
         )
         upper_rank = (
             torch.floor(
-                (REGION_NORM_UPPER_PERCENTILE / 100.0)
+                (SETTINGS_PREPROCESSING.REGION_NORM_UPPER_PERCENTILE / 100.0)
                 * (safe_counts - 1).to(torch.float32)
             ).to(torch.long)
             + 1
@@ -6353,7 +6136,7 @@ class FeatureBankManager:
         lower = lower_bins.to(torch.float32) / float(bins - 1)
         upper = upper_bins.to(torch.float32) / float(bins - 1)
         valid_rows = (
-            (counts >= int(REGION_NORM_MIN_PIXELS))
+            (counts >= int(SETTINGS_PREPROCESSING.REGION_NORM_MIN_PIXELS))
             & torch.isfinite(lower)
             & torch.isfinite(upper)
             & (upper > lower)
@@ -6364,7 +6147,7 @@ class FeatureBankManager:
         scaled = (
             (images.float() - lower)
             / (upper - lower).clamp_min(
-                float(REGION_NORM_MIN_DYNAMIC_RANGE)
+                float(SETTINGS_PREPROCESSING.REGION_NORM_MIN_DYNAMIC_RANGE)
             )
         ).clamp(0.0, 1.0)
         scaled = scaled * mask.to(scaled.dtype)
@@ -6398,7 +6181,7 @@ class FeatureBankManager:
         if len(valid_mask) != hard_mask.shape[0]:
             raise ValueError("valid_mask length must match the image batch size.")
 
-        kernel = int(HARD_SUPPORT_DILATION_KERNEL)
+        kernel = int(SETTINGS_PREPROCESSING.HARD_SUPPORT_DILATION_KERNEL)
         binary_support = (hard_mask > 0.5).to(content_mask.dtype)
         binary_support = F.max_pool2d(
             binary_support,
@@ -6412,7 +6195,7 @@ class FeatureBankManager:
             batch_size,
             height,
             width,
-            HARD_SUPPORT_FALLBACK_FRACTION,
+            SETTINGS_PREPROCESSING.HARD_SUPPORT_FALLBACK_FRACTION,
             hard_mask.device,
             content_mask.dtype,
         )
@@ -6468,7 +6251,7 @@ class FeatureBankManager:
 
         digest = hashlib.sha256(
             (
-                str(SUPPORT_INTENSITY_SHUFFLE_SCHEMA)
+                str(SETTINGS_PREPROCESSING.SUPPORT_INTENSITY_SHUFFLE_SCHEMA)
                 + ":"
                 + str(decoded_pixel_hash)
             ).encode("utf-8")
@@ -6745,7 +6528,7 @@ class FeatureBankManager:
             batch_size,
             height,
             width,
-            FIXED_PERIPHERY_EXCLUSION_FRACTION,
+            SETTINGS_PREPROCESSING.FIXED_PERIPHERY_EXCLUSION_FRACTION,
             raw_images.device,
             raw_images.dtype,
         )
@@ -6769,7 +6552,7 @@ class FeatureBankManager:
         memory maps; metadata.json is the final cache-completion marker.
         """
 
-        allowed_modes = set(required_efficientnet_feature_modes(EXPERIMENT_REGISTRY))
+        allowed_modes = set(required_efficientnet_feature_modes(SETTINGS_EXPERIMENTS.EXPERIMENT_REGISTRY))
         unknown = set(required_modes) - allowed_modes
         if not required_modes or unknown:
             raise ValueError(f"Invalid feature modes: {sorted(unknown)}")
@@ -6790,17 +6573,17 @@ class FeatureBankManager:
                 _feature_mode_path(cache_dir, mode),
                 mode="w+",
                 dtype=np.float32,
-                shape=(n_slices, EFFICIENTNET_FEATURE_DIM),
+                shape=(n_slices, SETTINGS_FEATURE_BANK.EFFICIENTNET_FEATURE_DIM),
             )
             for mode in required_modes
         }
         labels_array = np.empty(n_slices, dtype=np.int64)
         sample_indices_array = np.empty(n_slices, dtype=np.int64)
         provenance_array = np.empty(
-            (n_slices, len(PROVENANCE_FEATURE_NAMES)), dtype=np.float32
+            (n_slices, len(SETTINGS_REPORTING.PROVENANCE_FEATURE_NAMES)), dtype=np.float32
         )
         standardization_array = np.empty(
-            (n_slices, len(STANDARDIZATION_FEATURE_NAMES)), dtype=np.float32
+            (n_slices, len(SETTINGS_PREPROCESSING.STANDARDIZATION_FEATURE_NAMES)), dtype=np.float32
         )
         monai_valid_array = np.zeros(n_slices, dtype=bool)
         area_ratio_array = np.full(n_slices, np.nan, dtype=np.float32)
@@ -6813,15 +6596,15 @@ class FeatureBankManager:
 
         loader = DataLoader(
             dataset,
-            batch_size=BATCH_SIZE,
+            batch_size=SETTINGS_RUNTIME.BATCH_SIZE,
             shuffle=False,
-            num_workers=DATALOADER_NUM_WORKERS,
+            num_workers=SETTINGS_RUNTIME.DATALOADER_NUM_WORKERS,
             pin_memory=(DEVICE == "cuda"),
-            persistent_workers=(DATALOADER_NUM_WORKERS > 0),
+            persistent_workers=(SETTINGS_RUNTIME.DATALOADER_NUM_WORKERS > 0),
         )
         total_batches = len(loader)
-        progress_interval = max(1, PROGRESS_PRINT_EVERY_N_BATCHES, total_batches // 20)
-        autocast_enabled = USE_CUDA_AMP and DEVICE == "cuda"
+        progress_interval = max(1, SETTINGS_RUNTIME.PROGRESS_PRINT_EVERY_N_BATCHES, total_batches // 20)
+        autocast_enabled = SETTINGS_RUNTIME.USE_CUDA_AMP and DEVICE == "cuda"
         started = time.perf_counter()
         processed = 0
 
@@ -6882,7 +6665,7 @@ class FeatureBankManager:
                             standardized_images,
                             roi_probability,
                             valid_mask,
-                            fallback_fraction=CENTER_CROP_FALLBACK_FRACTION,
+                            fallback_fraction=SETTINGS_PREPROCESSING.CENTER_CROP_FALLBACK_FRACTION,
                         )
                     )
                 if "standardized_hard_support_region_norm" in required_modes:
@@ -6921,8 +6704,8 @@ class FeatureBankManager:
                     )
 
                 mode_names = list(required_modes)
-                for offset in range(0, len(mode_names), FEATURE_MODES_PER_ENCODER_CALL):
-                    chunk_modes = mode_names[offset:offset + FEATURE_MODES_PER_ENCODER_CALL]
+                for offset in range(0, len(mode_names), SETTINGS_FEATURE_BANK.FEATURE_MODES_PER_ENCODER_CALL):
+                    chunk_modes = mode_names[offset:offset + SETTINGS_FEATURE_BANK.FEATURE_MODES_PER_ENCODER_CALL]
                     concatenated = torch.cat([variants[mode] for mode in chunk_modes], dim=0)
                     with torch.autocast(
                         device_type="cuda", dtype=torch.float16, enabled=autocast_enabled
@@ -6931,7 +6714,7 @@ class FeatureBankManager:
                             normalize_for_efficientnet(concatenated)
                         ).float()
                     expected_rows = len(indices) * len(chunk_modes)
-                    if encoded.shape != (expected_rows, EFFICIENTNET_FEATURE_DIM):
+                    if encoded.shape != (expected_rows, SETTINGS_FEATURE_BANK.EFFICIENTNET_FEATURE_DIM):
                         raise RuntimeError(
                             f"Unexpected EfficientNet shape for {chunk_modes}: {tuple(encoded.shape)}"
                         )
@@ -6998,12 +6781,12 @@ class FeatureBankManager:
 
         metadata = {
             "fingerprint": fingerprint,
-            "schema": FEATURE_CACHE_SCHEMA,
+            "schema": SETTINGS_FEATURE_BANK.FEATURE_CACHE_SCHEMA,
             "completed_modes": list(required_modes),
             "n_slices": int(n_slices),
-            "feature_dimension": EFFICIENTNET_FEATURE_DIM,
-            "provenance_feature_names": list(PROVENANCE_FEATURE_NAMES),
-            "standardization_feature_names": list(STANDARDIZATION_FEATURE_NAMES),
+            "feature_dimension": SETTINGS_FEATURE_BANK.EFFICIENTNET_FEATURE_DIM,
+            "provenance_feature_names": list(SETTINGS_REPORTING.PROVENANCE_FEATURE_NAMES),
+            "standardization_feature_names": list(SETTINGS_PREPROCESSING.STANDARDIZATION_FEATURE_NAMES),
             "monai_runtime_source": MONAI_RUNTIME_SOURCE,
             "monai_runtime_artifact_path": MONAI_RUNTIME_ARTIFACT_PATH,
         }
@@ -7025,12 +6808,12 @@ class FeatureBankManager:
     def load_or_extract_feature_bank(samples, required_modes, fingerprint, cache_dir):
         """Load a matching bank or perform one fresh multi-view extraction."""
 
-        if USE_FEATURE_CACHE and not FORCE_REBUILD_FEATURE_CACHE:
+        if SETTINGS_FEATURE_BANK.USE_FEATURE_CACHE and not SETTINGS_FEATURE_BANK.FORCE_REBUILD_FEATURE_CACHE:
             bank = load_feature_bank(cache_dir, fingerprint, required_modes)
             if bank is not None:
                 return bank, "HIT"
 
-        if REQUIRE_EXISTING_FEATURE_CACHE:
+        if SETTINGS_FEATURE_BANK.REQUIRE_EXISTING_FEATURE_CACHE:
             raise RuntimeError(
                 "A matching frozen feature bank was not found, and this action is "
                 "cache-only. Run build-monai-feature-cache in a GPU session first. "
@@ -7066,8 +6849,8 @@ class FeatureBankManager:
 
         runtime_cache_dir = (
             cache_dir
-            if USE_FEATURE_CACHE
-            else OUTPUT_DIR / "_runtime_feature_bank"
+            if SETTINGS_FEATURE_BANK.USE_FEATURE_CACHE
+            else SETTINGS_PATHS.OUTPUT_DIR / "_runtime_feature_bank"
         )
         bank = extract_feature_bank(
             dataset=dataset,
@@ -7205,11 +6988,11 @@ class DuplicateAuditManager:
                 flush=True,
             )
 
-        if cross_patient_groups and FAIL_ON_CROSS_PATIENT_EXACT_DUPLICATES:
+        if cross_patient_groups and SETTINGS_AUDIT.FAIL_ON_CROSS_PATIENT_EXACT_DUPLICATES:
             raise RuntimeError(
                 f"Cross-patient exact duplicates found; inspect {output_path}."
             )
-        if cross_label_groups and FAIL_ON_CROSS_LABEL_EXACT_DUPLICATES:
+        if cross_label_groups and SETTINGS_AUDIT.FAIL_ON_CROSS_LABEL_EXACT_DUPLICATES:
             raise RuntimeError(
                 f"Cross-label exact duplicates found; inspect {output_path}."
             )
@@ -7408,7 +7191,7 @@ class DuplicateAuditManager:
         for hash_index, first_hash in enumerate(unique_hashes, start=1):
             for second_hash, distance in tree.query(
                 first_hash,
-                PHASH_HAMMING_THRESHOLD,
+                SETTINGS_AUDIT.PHASH_HAMMING_THRESHOLD,
             ):
                 # Process each unordered unique-hash pair exactly once. Self-pairs
                 # are retained because one pHash value can occur in several patients.
@@ -7548,7 +7331,7 @@ class DuplicateAuditManager:
             "enabled": True,
             "definition": (
                 "Complete unique-hash BK-tree search over 64-bit DCT pHash; "
-                f"cross-patient pairs with Hamming distance <= {PHASH_HAMMING_THRESHOLD}"
+                f"cross-patient pairs with Hamming distance <= {SETTINGS_AUDIT.PHASH_HAMMING_THRESHOLD}"
             ),
             "search_method": "complete_bk_tree_unique_phash_values",
             "unique_phash_values": int(len(unique_hashes)),
@@ -7623,11 +7406,11 @@ class DuplicateAuditManager:
         patient_ids = [str(value) for value in patient_ids]
         union_find = UnionFind(patient_ids)
 
-        if GROUP_SPLITS_BY_EXACT_DUPLICATES:
+        if SETTINGS_AUDIT.GROUP_SPLITS_BY_EXACT_DUPLICATES:
             for first, second in exact_edges:
                 union_find.union(first, second)
 
-        if GROUP_SPLITS_BY_PHASH_CANDIDATES:
+        if SETTINGS_AUDIT.GROUP_SPLITS_BY_PHASH_CANDIDATES:
             for first, second in phash_edges:
                 union_find.union(first, second)
 
@@ -7753,8 +7536,8 @@ class DuplicateAuditManager:
             ordered_ids,
             ordered_labels,
             group_ids,
-            N_SPLITS,
-            CV_RANDOM_STATE,
+            SETTINGS_VALIDATION.N_SPLITS,
+            SETTINGS_VALIDATION.CV_RANDOM_STATE,
         )
 
         component_sizes = {
@@ -7778,7 +7561,7 @@ class DuplicateAuditManager:
                 }
             )
 
-        for fold_index in range(1, N_SPLITS + 1):
+        for fold_index in range(1, SETTINGS_VALIDATION.N_SPLITS + 1):
             fold_rows = [row for row in rows if row["outer_fold"] == fold_index]
             print(
                 f"[FOLD MANIFEST] fold={fold_index}: patients={len(fold_rows)}, "
@@ -7812,7 +7595,7 @@ class DuplicateAuditManager:
             "outer_fold", "duplicate_component_id", "decoded_pixel_sha256",
             "perceptual_hash", "monai_gate_valid", "monai_area_ratio",
             "monai_peak_probability", "monai_mean_foreground_probability",
-            *PROVENANCE_FEATURE_NAMES, *STANDARDIZATION_FEATURE_NAMES,
+            *SETTINGS_REPORTING.PROVENANCE_FEATURE_NAMES, *SETTINGS_PREPROCESSING.STANDARDIZATION_FEATURE_NAMES,
         ]
         with open(output_path, "w", newline="", encoding="utf-8") as file:
             writer = csv.DictWriter(file, fieldnames=fieldnames)
@@ -7838,11 +7621,11 @@ class DuplicateAuditManager:
                 }
                 row.update({
                     name: float(value)
-                    for name, value in zip(PROVENANCE_FEATURE_NAMES, bank["provenance_features"][index])
+                    for name, value in zip(SETTINGS_REPORTING.PROVENANCE_FEATURE_NAMES, bank["provenance_features"][index])
                 })
                 row.update({
                     name: float(value)
-                    for name, value in zip(STANDARDIZATION_FEATURE_NAMES, bank["standardization_features"][index])
+                    for name, value in zip(SETTINGS_PREPROCESSING.STANDARDIZATION_FEATURE_NAMES, bank["standardization_features"][index])
                 })
                 writer.writerow(row)
 
@@ -7877,8 +7660,8 @@ class PatientDataManager:
 
         selected_feature_indices = np.asarray(
             [
-                PROVENANCE_FEATURE_NAMES.index(feature_name)
-                for feature_name in PROVENANCE_CLASSIFIER_FEATURE_NAMES
+                SETTINGS_REPORTING.PROVENANCE_FEATURE_NAMES.index(feature_name)
+                for feature_name in SETTINGS_REPORTING.PROVENANCE_CLASSIFIER_FEATURE_NAMES
             ],
             dtype=np.int64,
         )
@@ -7895,7 +7678,7 @@ class PatientDataManager:
             "mean_series_length",
             "max_series_length",
         ]
-        for feature_name in PROVENANCE_CLASSIFIER_FEATURE_NAMES:
+        for feature_name in SETTINGS_REPORTING.PROVENANCE_CLASSIFIER_FEATURE_NAMES:
             output_names.extend(
                 [
                     f"mean__{feature_name}",
@@ -7959,7 +7742,7 @@ class PatientDataManager:
         patient_labels = []
         rows = []
         output_names = []
-        for feature_name in STANDARDIZATION_FEATURE_NAMES:
+        for feature_name in SETTINGS_PREPROCESSING.STANDARDIZATION_FEATURE_NAMES:
             output_names.extend(
                 [
                     f"mean__{feature_name}",
@@ -8078,7 +7861,7 @@ class PatientDataManager:
                 float(np.mean(values[sampled1])) - float(np.mean(values[sampled0]))
             )
 
-        alpha = 1.0 - BOOTSTRAP_CONFIDENCE
+        alpha = 1.0 - SETTINGS_VALIDATION.BOOTSTRAP_CONFIDENCE
         return (
             float(np.quantile(differences, alpha / 2.0)),
             float(np.quantile(differences, 1.0 - alpha / 2.0)),
@@ -8113,8 +7896,8 @@ class PatientDataManager:
         ci_lower, ci_upper = bootstrap_difference_in_means(
             gate_rates,
             y_qc,
-            BOOTSTRAP_REPLICATES,
-            RANDOM_SEED + 1701,
+            SETTINGS_VALIDATION.BOOTSTRAP_REPLICATES,
+            SETTINGS_RUNTIME.RANDOM_SEED + 1701,
         )
 
         slice_labels = np.asarray(bank["labels"], dtype=np.int64)
@@ -8131,10 +7914,10 @@ class PatientDataManager:
             "slice_level_normal_gate_rate_descriptive": slice_normal_rate,
             "slice_level_sick_gate_rate_descriptive": slice_sick_rate,
             "warning_threshold_absolute_difference": (
-                MONAI_GATE_RATE_DIFFERENCE_WARNING
+                SETTINGS_AUDIT.MONAI_GATE_RATE_DIFFERENCE_WARNING
             ),
             "warning_triggered": bool(
-                abs(difference) >= MONAI_GATE_RATE_DIFFERENCE_WARNING
+                abs(difference) >= SETTINGS_AUDIT.MONAI_GATE_RATE_DIFFERENCE_WARNING
             ),
             "interpretation": (
                 "A large class difference after label-blind standardization may "
@@ -8346,10 +8129,10 @@ class ModelingManager:
             raise ValueError("Only Logistic Regression is supported.")
         steps = [("scaler", StandardScaler())]
         if experiment.use_pca:
-            steps.append(("pca", PCA(n_components=PATIENT_PCA_EXPLAINED_VARIANCE, svd_solver="full")))
+            steps.append(("pca", PCA(n_components=SETTINGS_VALIDATION.PATIENT_PCA_EXPLAINED_VARIANCE, svd_solver="full")))
         steps.append(("classifier", LogisticRegression(
-            C=float(c_value), max_iter=LOGISTIC_MAX_ITER, solver="liblinear",
-            random_state=RANDOM_SEED,
+            C=float(c_value), max_iter=SETTINGS_VALIDATION.LOGISTIC_MAX_ITER, solver="liblinear",
+            random_state=SETTINGS_RUNTIME.RANDOM_SEED,
         )))
         return Pipeline(steps=steps)
 
@@ -8414,7 +8197,7 @@ class ModelingManager:
         )
 
         maximum_splits = min(
-            INNER_CV_SPLITS,
+            SETTINGS_VALIDATION.INNER_CV_SPLITS,
             int(np.bincount(train_labels, minlength=2).min()),
             len(np.unique(groups)),
         )
@@ -8426,7 +8209,7 @@ class ModelingManager:
                     train_labels,
                     groups,
                     n_splits,
-                    INNER_CV_RANDOM_STATE + 100 * outer_fold_index,
+                    SETTINGS_VALIDATION.INNER_CV_RANDOM_STATE + 100 * outer_fold_index,
                 )
                 return folds, n_splits
             except RuntimeError as error:
@@ -8511,7 +8294,7 @@ class ModelingManager:
         if len(thresholds) == 0:
             return 0.5
 
-        if THRESHOLD_SELECTION_METHOD == "youden":
+        if SETTINGS_VALIDATION.THRESHOLD_SELECTION_METHOD == "youden":
             statistic = true_positive_rate - false_positive_rate
             best_value = float(np.max(statistic))
             candidates = np.flatnonzero(
@@ -8520,7 +8303,7 @@ class ModelingManager:
             # A larger threshold is the conservative deterministic tie-break.
             return float(np.max(thresholds[candidates]))
 
-        eligible = np.flatnonzero(true_positive_rate >= TARGET_SENSITIVITY)
+        eligible = np.flatnonzero(true_positive_rate >= SETTINGS_VALIDATION.TARGET_SENSITIVITY)
         if len(eligible) == 0:
             best_index = int(np.argmax(true_positive_rate))
             return float(thresholds[best_index])
@@ -8535,7 +8318,7 @@ class ModelingManager:
     @staticmethod
     def experiment_candidate_c_values(experiment):
         if experiment.tune_c:
-            return tuple(sorted(set(map(float, CLASSIFIER_C_GRID))))
+            return tuple(sorted(set(map(float, SETTINGS_VALIDATION.CLASSIFIER_C_GRID))))
         return (float(experiment.fixed_c),)
 
     @staticmethod
@@ -8588,7 +8371,7 @@ class ModelingManager:
         eligible_results = [
             result
             for result in candidate_results
-            if result["inner_auc"] >= best_inner_auc - C_SELECTION_AUC_TOLERANCE
+            if result["inner_auc"] >= best_inner_auc - SETTINGS_VALIDATION.C_SELECTION_AUC_TOLERANCE
         ]
         selected = sorted(
             eligible_results,
@@ -8606,7 +8389,7 @@ class ModelingManager:
             "selected_c": selected["c_value"],
             "inner_auc": selected["inner_auc"],
             "best_candidate_inner_auc": float(best_inner_auc),
-            "c_selection_auc_tolerance": float(C_SELECTION_AUC_TOLERANCE),
+            "c_selection_auc_tolerance": float(SETTINGS_VALIDATION.C_SELECTION_AUC_TOLERANCE),
             "inner_splits": selected["inner_splits"],
             "inner_probabilities": inner_probabilities,
             "inner_labels": selected["labels"],
@@ -8678,9 +8461,9 @@ class ModelingManager:
         labels,
         probabilities,
         predictions,
-        n_bootstrap=BOOTSTRAP_REPLICATES,
-        confidence=BOOTSTRAP_CONFIDENCE,
-        random_state=RANDOM_SEED,
+        n_bootstrap=SETTINGS_VALIDATION.BOOTSTRAP_REPLICATES,
+        confidence=SETTINGS_VALIDATION.BOOTSTRAP_CONFIDENCE,
+        random_state=SETTINGS_RUNTIME.RANDOM_SEED,
     ):
         """Stratified patient bootstrap intervals for all reported metrics."""
 
@@ -8799,7 +8582,7 @@ class ModelingManager:
         )
         print("=" * 100, flush=True)
 
-        for outer_fold in range(1, N_SPLITS + 1):
+        for outer_fold in range(1, SETTINGS_VALIDATION.N_SPLITS + 1):
             fold_started_at = time.perf_counter()
             train_patients = np.asarray(
                 [
@@ -8826,7 +8609,7 @@ class ModelingManager:
 
             print(
                 f"\n[EXPERIMENT {experiment.experiment_id}] OUTER FOLD "
-                f"{outer_fold}/{N_SPLITS}",
+                f"{outer_fold}/{SETTINGS_VALIDATION.N_SPLITS}",
                 flush=True,
             )
             print(
@@ -9010,7 +8793,7 @@ class ModelingManager:
             labels,
             probabilities,
             predictions,
-            random_state=RANDOM_SEED
+            random_state=SETTINGS_RUNTIME.RANDOM_SEED
             + int(hashlib.sha256(experiment.experiment_id.encode()).hexdigest()[:8], 16),
         )
         runtime_seconds = float(time.perf_counter() - started_at)
@@ -9162,7 +8945,7 @@ class ModelingManager:
             patient_ids,
             patient_labels,
             group_ids,
-            N_SPLITS,
+            SETTINGS_VALIDATION.N_SPLITS,
             int(random_state),
         )
 
@@ -9225,7 +9008,7 @@ class ModelingManager:
         fold_by_patient = {}
         selected_c_by_patient = {}
 
-        for outer_fold in range(1, N_SPLITS + 1):
+        for outer_fold in range(1, SETTINGS_VALIDATION.N_SPLITS + 1):
             train_patients = np.asarray(
                 [
                     patient_id
@@ -9323,12 +9106,12 @@ class ModelingManager:
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         exact_ids = (
-            REFERENCE_EXPERIMENT_ID,
-            MASK_ONLY_CONTROL_EXPERIMENT_ID,
-            SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID,
-            COMPLEMENT_CONTROL_EXPERIMENT_ID,
+            SETTINGS_EXPERIMENTS.REFERENCE_EXPERIMENT_ID,
+            SETTINGS_EXPERIMENTS.MASK_ONLY_CONTROL_EXPERIMENT_ID,
+            SETTINGS_EXPERIMENTS.SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID,
+            SETTINGS_EXPERIMENTS.COMPLEMENT_CONTROL_EXPERIMENT_ID,
         )
-        required_ids = exact_ids + (VALID_ONLY_ABLATION_EXPERIMENT_ID,)
+        required_ids = exact_ids + (SETTINGS_EXPERIMENTS.VALID_ONLY_ABLATION_EXPERIMENT_ID,)
         missing = [
             experiment_id
             for experiment_id in required_ids
@@ -9345,7 +9128,7 @@ class ModelingManager:
             )
             return summary
 
-        candidate = prepared_by_id[REFERENCE_EXPERIMENT_ID]
+        candidate = prepared_by_id[SETTINGS_EXPERIMENTS.REFERENCE_EXPERIMENT_ID]
         candidate_patients = np.asarray(candidate["patient_ids"]).astype(str)
         candidate_labels = np.asarray(candidate["y"], dtype=np.int64)
         candidate_source = int(candidate["n_source_slices"])
@@ -9381,7 +9164,7 @@ class ModelingManager:
                 "n_patients": int(len(patients)),
             }
 
-        valid_only = prepared_by_id[VALID_ONLY_ABLATION_EXPERIMENT_ID]
+        valid_only = prepared_by_id[SETTINGS_EXPERIMENTS.VALID_ONLY_ABLATION_EXPERIMENT_ID]
         valid_patients = np.asarray(valid_only["patient_ids"]).astype(str)
         valid_labels = np.asarray(valid_only["y"], dtype=np.int64)
         valid_source = int(valid_only["n_source_slices"])
@@ -9399,7 +9182,7 @@ class ModelingManager:
             "status": "OK",
             "exact_all_slice_experiment_ids": list(exact_ids),
             "exact_all_slice_rows": exact_rows,
-            "valid_only_experiment_id": VALID_ONLY_ABLATION_EXPERIMENT_ID,
+            "valid_only_experiment_id": SETTINGS_EXPERIMENTS.VALID_ONLY_ABLATION_EXPERIMENT_ID,
             "valid_only_n_source_slices": valid_source,
             "valid_only_n_retained_slices": valid_retained,
             "valid_only_retained_fraction": float(
@@ -9449,7 +9232,7 @@ class ModelingManager:
 
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-        candidate_ids = tuple(MODEL_FAMILY_NESTED_SELECTION_IDS)
+        candidate_ids = tuple(SETTINGS_VALIDATION.MODEL_FAMILY_NESTED_SELECTION_IDS)
 
         patient_to_fold = {
             str(row["patient_id"]): int(row["outer_fold"])
@@ -9507,7 +9290,7 @@ class ModelingManager:
             flush=True,
         )
 
-        for outer_fold in range(1, N_SPLITS + 1):
+        for outer_fold in range(1, SETTINGS_VALIDATION.N_SPLITS + 1):
             train_patients = np.asarray(
                 [
                     patient_id
@@ -9554,7 +9337,7 @@ class ModelingManager:
                 row
                 for row in candidate_selections
                 if row["inner_auc"]
-                >= best_inner_auc - MODEL_FAMILY_SELECTION_AUC_TOLERANCE
+                >= best_inner_auc - SETTINGS_VALIDATION.MODEL_FAMILY_SELECTION_AUC_TOLERANCE
             ]
             chosen = min(eligible, key=lambda row: row["order_index"])
             eligible_ids = {
@@ -9660,7 +9443,7 @@ class ModelingManager:
             labels,
             scores,
             (scores >= 0.5).astype(np.int64),
-            random_state=RANDOM_SEED + 71_001,
+            random_state=SETTINGS_RUNTIME.RANDOM_SEED + 71_001,
         )
 
         patient_rows = [
@@ -9688,7 +9471,7 @@ class ModelingManager:
             "candidate_experiment_ids": list(candidate_ids),
             "tie_break_order": list(candidate_ids),
             "inner_auc_tolerance": float(
-                MODEL_FAMILY_SELECTION_AUC_TOLERANCE
+                SETTINGS_VALIDATION.MODEL_FAMILY_SELECTION_AUC_TOLERANCE
             ),
             "outer_oof_auc": auc,
             "outer_oof_auc_ci": discrimination_intervals["auc"],
@@ -9768,13 +9551,13 @@ class ModelingManager:
         score_values_by_patient = defaultdict(list)
 
         print(
-            f"[STABILITY] Running {REPEATED_NESTED_CV_REPEATS} repeated nested "
+            f"[STABILITY] Running {SETTINGS_VALIDATION.REPEATED_NESTED_CV_REPEATS} repeated nested "
             f"patient-level splits for {experiment.experiment_id}.",
             flush=True,
         )
 
-        for repeat_index in range(REPEATED_NESTED_CV_REPEATS):
-            seed = REPEATED_NESTED_CV_RANDOM_STATE + repeat_index
+        for repeat_index in range(SETTINGS_VALIDATION.REPEATED_NESTED_CV_REPEATS):
+            seed = SETTINGS_VALIDATION.REPEATED_NESTED_CV_RANDOM_STATE + repeat_index
             fold_rows = _build_fold_manifest_rows_for_seed(
                 patient_ids,
                 patient_labels,
@@ -9827,7 +9610,7 @@ class ModelingManager:
 
             print(
                 f"[STABILITY] repeat={repeat_index + 1}/"
-                f"{REPEATED_NESTED_CV_REPEATS}, seed={seed}, "
+                f"{SETTINGS_VALIDATION.REPEATED_NESTED_CV_REPEATS}, seed={seed}, "
                 f"AUC={auc:.4f}, AUPRC={auprc:.4f}",
                 flush=True,
             )
@@ -9855,7 +9638,7 @@ class ModelingManager:
         summary = {
             "status": "OK",
             "experiment_id": experiment.experiment_id,
-            "repeats": int(REPEATED_NESTED_CV_REPEATS),
+            "repeats": int(SETTINGS_VALIDATION.REPEATED_NESTED_CV_REPEATS),
             "auc_mean": float(np.mean(auc_values)),
             "auc_median": float(np.median(auc_values)),
             "auc_std": float(np.std(auc_values)),
@@ -9925,10 +9708,10 @@ class ModelingManager:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         config_by_id = {
             experiment.experiment_id: experiment
-            for experiment in EXPERIMENT_REGISTRY
+            for experiment in SETTINGS_EXPERIMENTS.EXPERIMENT_REGISTRY
         }
         rows = []
-        for experiment_id in STABILITY_EXPERIMENT_IDS:
+        for experiment_id in SETTINGS_VALIDATION.STABILITY_EXPERIMENT_IDS:
             summary = stability_summaries.get(
                 experiment_id,
                 {"status": "SKIPPED_MISSING_SUMMARY"},
@@ -9940,7 +9723,7 @@ class ModelingManager:
                 "role": experiment.role,
                 "description": experiment.description,
                 "is_primary_candidate": int(
-                    experiment_id == REFERENCE_EXPERIMENT_ID
+                    experiment_id == SETTINGS_EXPERIMENTS.REFERENCE_EXPERIMENT_ID
                 ),
                 "repeats": summary.get("repeats", ""),
                 "auc_median": summary.get("auc_median", ""),
@@ -10231,17 +10014,17 @@ class ModelingManager:
             str(row["patient_id"]): str(row["duplicate_component_id"])
             for row in base_fold_manifest_rows
         }
-        rng = np.random.default_rng(LABEL_PERMUTATION_RANDOM_STATE)
+        rng = np.random.default_rng(SETTINGS_VALIDATION.LABEL_PERMUTATION_RANDOM_STATE)
         rows = []
-        progress_interval = max(1, LABEL_PERMUTATION_REPLICATES // 10)
+        progress_interval = max(1, SETTINGS_VALIDATION.LABEL_PERMUTATION_REPLICATES // 10)
 
         print(
-            f"[PERMUTATION] Running {LABEL_PERMUTATION_REPLICATES} patient-label "
+            f"[PERMUTATION] Running {SETTINGS_VALIDATION.LABEL_PERMUTATION_REPLICATES} patient-label "
             f"permutations for {experiment.experiment_id}.",
             flush=True,
         )
 
-        for permutation_index in range(LABEL_PERMUTATION_REPLICATES):
+        for permutation_index in range(SETTINGS_VALIDATION.LABEL_PERMUTATION_REPLICATES):
             permuted_labels = rng.permutation(original_labels)
             permuted_prepared = dict(prepared)
             permuted_prepared["patient_ids"] = patient_ids
@@ -10253,7 +10036,7 @@ class ModelingManager:
             # splitting rule itself is conditioned on the same seed as the observed
             # analysis. This yields a cleaner Monte-Carlo randomization test than
             # adding a second source of split randomness to every null replicate.
-            fold_seed = CV_RANDOM_STATE
+            fold_seed = SETTINGS_VALIDATION.CV_RANDOM_STATE
             fold_rows = _build_fold_manifest_rows_for_seed(
                 patient_ids,
                 permuted_labels,
@@ -10278,11 +10061,11 @@ class ModelingManager:
             if (
                 permutation_index == 0
                 or (permutation_index + 1) % progress_interval == 0
-                or permutation_index + 1 == LABEL_PERMUTATION_REPLICATES
+                or permutation_index + 1 == SETTINGS_VALIDATION.LABEL_PERMUTATION_REPLICATES
             ):
                 print(
                     f"[PERMUTATION] {permutation_index + 1}/"
-                    f"{LABEL_PERMUTATION_REPLICATES} complete; latest AUC={auc:.4f}",
+                    f"{SETTINGS_VALIDATION.LABEL_PERMUTATION_REPLICATES} complete; latest AUC={auc:.4f}",
                     flush=True,
                 )
 
@@ -10291,13 +10074,13 @@ class ModelingManager:
         )
         empirical_p_value = float(
             (1 + np.sum(null_aucs >= float(observed_auc)))
-            / (LABEL_PERMUTATION_REPLICATES + 1)
+            / (SETTINGS_VALIDATION.LABEL_PERMUTATION_REPLICATES + 1)
         )
         summary = {
             "status": "OK",
             "experiment_id": experiment.experiment_id,
             "observed_auc": float(observed_auc),
-            "permutation_replicates": int(LABEL_PERMUTATION_REPLICATES),
+            "permutation_replicates": int(SETTINGS_VALIDATION.LABEL_PERMUTATION_REPLICATES),
             "null_auc_mean": float(np.mean(null_aucs)),
             "null_auc_median": float(np.median(null_aucs)),
             "null_auc_std": float(np.std(null_aucs)),
@@ -10305,7 +10088,7 @@ class ModelingManager:
             "null_auc_q975": float(np.quantile(null_aucs, 0.975)),
             "empirical_one_sided_p_value": empirical_p_value,
             "permutation_unit": "Directory_* patient labels",
-            "outer_cv_random_state": int(CV_RANDOM_STATE),
+            "outer_cv_random_state": int(SETTINGS_VALIDATION.CV_RANDOM_STATE),
             "outer_cv_randomness_varied_across_permutations": False,
             "interpretation": (
                 "The complete patient-level nested fitting procedure is repeated "
@@ -10356,7 +10139,7 @@ class ModelingManager:
 
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-        candidate_ids = tuple(SELECTION_ADJUSTED_CANDIDATE_EXPERIMENT_IDS)
+        candidate_ids = tuple(SETTINGS_VALIDATION.SELECTION_ADJUSTED_CANDIDATE_EXPERIMENT_IDS)
 
         first_id = candidate_ids[0]
         first_prepared = prepared_by_id[first_id]
@@ -10418,32 +10201,32 @@ class ModelingManager:
         )
 
         rng = np.random.default_rng(
-            SELECTION_ADJUSTED_PERMUTATION_RANDOM_STATE
+            SETTINGS_VALIDATION.SELECTION_ADJUSTED_PERMUTATION_RANDOM_STATE
         )
         maximum_rows = []
         candidate_rows = []
         winner_counts = {candidate_id: 0 for candidate_id in candidate_ids}
         progress_interval = max(
             1,
-            SELECTION_ADJUSTED_PERMUTATION_REPLICATES // 10,
+            SETTINGS_VALIDATION.SELECTION_ADJUSTED_PERMUTATION_REPLICATES // 10,
         )
 
         print(
             "[PERMUTATION][MAX] Running "
-            f"{SELECTION_ADJUSTED_PERMUTATION_REPLICATES} max-statistic "
+            f"{SETTINGS_VALIDATION.SELECTION_ADJUSTED_PERMUTATION_REPLICATES} max-statistic "
             f"permutations across {len(candidate_ids)} candidates.",
             flush=True,
         )
 
         for permutation_index in range(
-            SELECTION_ADJUSTED_PERMUTATION_REPLICATES
+            SETTINGS_VALIDATION.SELECTION_ADJUSTED_PERMUTATION_REPLICATES
         ):
             permuted_labels = rng.permutation(original_labels)
             # The observed candidate-family maximum and every permuted maximum use
             # the same outer-CV random-state policy. Only the patient labels are
             # randomized; candidate representations, hyperparameter procedure and
             # algorithmic split seed remain fixed.
-            fold_seed = CV_RANDOM_STATE
+            fold_seed = SETTINGS_VALIDATION.CV_RANDOM_STATE
             fold_rows = _build_fold_manifest_rows_for_seed(
                 patient_ids,
                 permuted_labels,
@@ -10494,11 +10277,11 @@ class ModelingManager:
                 permutation_index == 0
                 or (permutation_index + 1) % progress_interval == 0
                 or permutation_index + 1
-                == SELECTION_ADJUSTED_PERMUTATION_REPLICATES
+                == SETTINGS_VALIDATION.SELECTION_ADJUSTED_PERMUTATION_REPLICATES
             ):
                 print(
                     f"[PERMUTATION][MAX] {permutation_index + 1}/"
-                    f"{SELECTION_ADJUSTED_PERMUTATION_REPLICATES} complete; "
+                    f"{SETTINGS_VALIDATION.SELECTION_ADJUSTED_PERMUTATION_REPLICATES} complete; "
                     f"latest max AUC={maximum_auc:.4f} ({winning_id})",
                     flush=True,
                 )
@@ -10509,7 +10292,7 @@ class ModelingManager:
         )
         empirical_p_value = float(
             (1 + np.sum(null_maxima >= observed_max_auc))
-            / (SELECTION_ADJUSTED_PERMUTATION_REPLICATES + 1)
+            / (SETTINGS_VALIDATION.SELECTION_ADJUSTED_PERMUTATION_REPLICATES + 1)
         )
         individual_candidate_summaries = {}
         for candidate_id in candidate_ids:
@@ -10530,7 +10313,7 @@ class ModelingManager:
                 "null_auc_q975": float(np.quantile(candidate_null, 0.975)),
                 "unadjusted_empirical_one_sided_p_value": float(
                     (1 + np.sum(candidate_null >= observed_candidate_auc))
-                    / (SELECTION_ADJUSTED_PERMUTATION_REPLICATES + 1)
+                    / (SETTINGS_VALIDATION.SELECTION_ADJUSTED_PERMUTATION_REPLICATES + 1)
                 ),
             }
 
@@ -10541,7 +10324,7 @@ class ModelingManager:
             "observed_maximum_auc": float(observed_max_auc),
             "observed_winning_experiment_id": observed_winner,
             "permutation_replicates": int(
-                SELECTION_ADJUSTED_PERMUTATION_REPLICATES
+                SETTINGS_VALIDATION.SELECTION_ADJUSTED_PERMUTATION_REPLICATES
             ),
             "null_maximum_auc_mean": float(np.mean(null_maxima)),
             "null_maximum_auc_median": float(np.median(null_maxima)),
@@ -10549,7 +10332,7 @@ class ModelingManager:
             "null_maximum_auc_q025": float(np.quantile(null_maxima, 0.025)),
             "null_maximum_auc_q975": float(np.quantile(null_maxima, 0.975)),
             "empirical_familywise_one_sided_p_value": empirical_p_value,
-            "outer_cv_random_state": int(CV_RANDOM_STATE),
+            "outer_cv_random_state": int(SETTINGS_VALIDATION.CV_RANDOM_STATE),
             "outer_cv_randomness_varied_across_permutations": False,
             "null_winner_counts": winner_counts,
             "individual_candidate_null_summaries": (
@@ -10599,9 +10382,9 @@ class ModelingManager:
         baseline_labels,
         baseline_scores,
         comparison_scores,
-        n_bootstrap=PAIRED_BOOTSTRAP_REPLICATES,
-        confidence=BOOTSTRAP_CONFIDENCE,
-        random_state=RANDOM_SEED,
+        n_bootstrap=SETTINGS_VALIDATION.PAIRED_BOOTSTRAP_REPLICATES,
+        confidence=SETTINGS_VALIDATION.BOOTSTRAP_CONFIDENCE,
+        random_state=SETTINGS_RUNTIME.RANDOM_SEED,
     ):
         """Paired patient bootstrap for comparison AUC minus baseline AUC."""
 
@@ -10654,7 +10437,7 @@ class ModelingManager:
             for result in results
             if result.get("status") == "OK"
         }
-        if BASELINE_EXPERIMENT_ID not in successful:
+        if SETTINGS_EXPERIMENTS.BASELINE_EXPERIMENT_ID not in successful:
             print(
                 "[COMPARISON] Baseline failed or is missing; paired comparisons "
                 "cannot be calculated.",
@@ -10662,7 +10445,7 @@ class ModelingManager:
             )
             return []
 
-        baseline = successful[BASELINE_EXPERIMENT_ID]
+        baseline = successful[SETTINGS_EXPERIMENTS.BASELINE_EXPERIMENT_ID]
         baseline_order = np.argsort(baseline["patient_ids"].astype(str))
         baseline_patients = baseline["patient_ids"][baseline_order].astype(str)
         baseline_labels = baseline["labels"][baseline_order]
@@ -10689,11 +10472,11 @@ class ModelingManager:
                 baseline_labels,
                 baseline_scores,
                 scores,
-                random_state=RANDOM_SEED
+                random_state=SETTINGS_RUNTIME.RANDOM_SEED
                 + int(hashlib.sha256(experiment_id.encode()).hexdigest()[:8], 16),
             )
             row = {
-                "baseline_experiment_id": BASELINE_EXPERIMENT_ID,
+                "baseline_experiment_id": SETTINGS_EXPERIMENTS.BASELINE_EXPERIMENT_ID,
                 "comparison_experiment_id": experiment_id,
                 **comparison,
             }
@@ -10721,7 +10504,7 @@ class ModelingManager:
             reference_id,
             comparison_id,
             scientific_question,
-        ) in PRIMARY_ABLATION_COMPARISONS:
+        ) in SETTINGS_EXPERIMENTS.PRIMARY_ABLATION_COMPARISONS:
             missing = [
                 experiment_id
                 for experiment_id in (reference_id, comparison_id)
@@ -10770,7 +10553,7 @@ class ModelingManager:
                 reference_labels,
                 reference_scores,
                 comparison_scores,
-                random_state=RANDOM_SEED
+                random_state=SETTINGS_RUNTIME.RANDOM_SEED
                 + int(
                     hashlib.sha256(comparison_name.encode()).hexdigest()[:8],
                     16,
@@ -10984,9 +10767,9 @@ class ModelingManager:
                 path.write_text("status\n", encoding="utf-8")
 
         final_report = {
-            "pipeline_schema": PIPELINE_SCHEMA_ID,
-            "reference_experiment_id": REFERENCE_EXPERIMENT_ID,
-            "primary_candidate_experiment_id": PRIMARY_CANDIDATE_EXPERIMENT_ID,
+            "pipeline_schema": SETTINGS_RUNTIME.PIPELINE_SCHEMA_ID,
+            "reference_experiment_id": SETTINGS_EXPERIMENTS.REFERENCE_EXPERIMENT_ID,
+            "primary_candidate_experiment_id": SETTINGS_EXPERIMENTS.PRIMARY_CANDIDATE_EXPERIMENT_ID,
             "successful_experiments": len(summary_rows),
             "failed_experiments": len(failed_results),
             "experiment_summary": summary_rows,
@@ -11020,7 +10803,7 @@ class ModelingManager:
         print("-" * 118, flush=True)
 
         for row in summary_rows:
-            if row["role"] in {"negative_control", "segmentation_control", "anatomy_destruction_control"} and row["auc"] >= SHORTCUT_WARNING_AUC:
+            if row["role"] in {"negative_control", "segmentation_control", "anatomy_destruction_control"} and row["auc"] >= SETTINGS_AUDIT.SHORTCUT_WARNING_AUC:
                 print(
                     f"[SHORTCUT WARNING] {row['experiment_id']} AUC={row['auc']:.4f} "
                     "exceeds the warning threshold; candidate performance is not "
@@ -11077,8 +10860,8 @@ class PipelineRunner:
         print("\n" + "#" * 100, flush=True)
         print("CAD CARDIAC MRI — PATIENT-LEVEL RESEARCH PIPELINE", flush=True)
         print("#" * 100, flush=True)
-        print(f"[SUITE] Dataset: {DATASET_PATH}", flush=True)
-        print(f"[SUITE] Output: {OUTPUT_DIR}", flush=True)
+        print(f"[SUITE] Dataset: {SETTINGS_PATHS.DATASET_PATH}", flush=True)
+        print(f"[SUITE] Output: {SETTINGS_PATHS.OUTPUT_DIR}", flush=True)
         print(f"[SUITE] Device: {DEVICE}", flush=True)
         if DEVICE == "cuda":
             print(
@@ -11096,14 +10879,14 @@ class PipelineRunner:
         )
         print(
             "[SUITE] Validation profile="
-            f"{VALIDATION_RUNTIME_PROFILE}; stability="
-            f"{RUN_REPEATED_NESTED_CV_STABILITY} × "
-            f"{REPEATED_NESTED_CV_REPEATS} repeats × "
-            f"{len(STABILITY_EXPERIMENT_IDS)} experiments; ordinary permutation="
-            f"{RUN_PATIENT_LABEL_PERMUTATION_TEST} × "
-            f"{LABEL_PERMUTATION_REPLICATES}; selection-adjusted permutation="
-            f"{RUN_SELECTION_ADJUSTED_PERMUTATION_TEST} × "
-            f"{SELECTION_ADJUSTED_PERMUTATION_REPLICATES}.",
+            f"{SETTINGS_VALIDATION.VALIDATION_RUNTIME_PROFILE}; stability="
+            f"{SETTINGS_VALIDATION.RUN_REPEATED_NESTED_CV_STABILITY} × "
+            f"{SETTINGS_VALIDATION.REPEATED_NESTED_CV_REPEATS} repeats × "
+            f"{len(SETTINGS_VALIDATION.STABILITY_EXPERIMENT_IDS)} experiments; ordinary permutation="
+            f"{SETTINGS_VALIDATION.RUN_PATIENT_LABEL_PERMUTATION_TEST} × "
+            f"{SETTINGS_VALIDATION.LABEL_PERMUTATION_REPLICATES}; selection-adjusted permutation="
+            f"{SETTINGS_VALIDATION.RUN_SELECTION_ADJUSTED_PERMUTATION_TEST} × "
+            f"{SETTINGS_VALIDATION.SELECTION_ADJUSTED_PERMUTATION_REPLICATES}.",
             flush=True,
         )
 
@@ -11145,7 +10928,7 @@ class PipelineRunner:
             "Create output structure and save predeclared configuration",
             "Fast filesystem and JSON operations.",
         )
-        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        SETTINGS_PATHS.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         # The suite directory is deterministic for a given configuration. Remove
         # stale run-specific subdirectories before a rerun so an old successful
         # summary cannot be mistaken for the result of a newly failed experiment.
@@ -11157,19 +10940,19 @@ class PipelineRunner:
             "stability",
             "permutation",
         ):
-            directory = OUTPUT_DIR / subdirectory_name
+            directory = SETTINGS_PATHS.OUTPUT_DIR / subdirectory_name
             if directory.exists():
                 shutil.rmtree(directory)
             directory.mkdir(parents=True, exist_ok=True)
         write_suite_configuration(
-            OUTPUT_DIR / "suite_configuration.json",
+            SETTINGS_PATHS.OUTPUT_DIR / "suite_configuration.json",
             experiments,
         )
         stage_durations["02 Output structure"] = _print_stage_complete(
             2,
             "Create output structure and save predeclared configuration",
             stage_started,
-            f"Configuration: {OUTPUT_DIR / 'suite_configuration.json'}",
+            f"Configuration: {SETTINGS_PATHS.OUTPUT_DIR / 'suite_configuration.json'}",
         )
 
         # ======================================================================
@@ -11186,7 +10969,7 @@ class PipelineRunner:
             "Discover Directory_* patients and image rows",
             "Depends on filesystem and folder count; no pixel decoding yet.",
         )
-        samples = load_samples(DATASET_PATH)
+        samples = load_samples(SETTINGS_PATHS.DATASET_PATH)
         stage_durations["03 Dataset discovery"] = _print_stage_complete(
             3,
             "Discover Directory_* patients and image rows",
@@ -11209,8 +10992,8 @@ class PipelineRunner:
             "variants are encoded and cached.",
         )
         required_modes = required_efficientnet_feature_modes(experiments)
-        fingerprint = feature_bank_fingerprint(samples, DATASET_PATH)
-        cache_dir = FEATURE_CACHE_ROOT / fingerprint[:16]
+        fingerprint = feature_bank_fingerprint(samples, SETTINGS_PATHS.DATASET_PATH)
+        cache_dir = SETTINGS_PATHS.FEATURE_CACHE_ROOT / fingerprint[:16]
         bank, cache_status = load_or_extract_feature_bank(
             samples,
             required_modes,
@@ -11241,9 +11024,9 @@ class PipelineRunner:
             "Audit exact and perceptual cross-patient duplicates",
             "Hash grouping and pHash candidate search; no neural-network inference.",
         )
-        if AUDIT_EXACT_DECODED_PIXEL_DUPLICATES:
+        if SETTINGS_AUDIT.AUDIT_EXACT_DECODED_PIXEL_DUPLICATES:
             exact_summary, exact_edges = audit_exact_decoded_pixel_duplicates(
-                OUTPUT_DIR / "audits" / "exact_decoded_pixel_duplicate_groups.csv",
+                SETTINGS_PATHS.OUTPUT_DIR / "audits" / "exact_decoded_pixel_duplicate_groups.csv",
                 samples,
                 bank["decoded_pixel_hashes"],
             )
@@ -11251,9 +11034,9 @@ class PipelineRunner:
             exact_summary = {"enabled": False}
             exact_edges = set()
 
-        if AUDIT_PERCEPTUAL_NEAR_DUPLICATES:
+        if SETTINGS_AUDIT.AUDIT_PERCEPTUAL_NEAR_DUPLICATES:
             phash_summary, phash_edges = audit_perceptual_near_duplicate_candidates(
-                OUTPUT_DIR
+                SETTINGS_PATHS.OUTPUT_DIR
                 / "audits"
                 / "perceptual_near_duplicate_patient_pairs.csv",
                 samples,
@@ -11294,11 +11077,11 @@ class PipelineRunner:
             phash_edges,
         )
         write_patient_fold_manifest(
-            OUTPUT_DIR / "manifests" / "patient_fold_manifest.csv",
+            SETTINGS_PATHS.OUTPUT_DIR / "manifests" / "patient_fold_manifest.csv",
             fold_manifest_rows,
         )
         write_cohort_manifest(
-            OUTPUT_DIR / "manifests" / "cohort_manifest.csv",
+            SETTINGS_PATHS.OUTPUT_DIR / "manifests" / "cohort_manifest.csv",
             samples,
             bank,
             fold_manifest_rows,
@@ -11327,31 +11110,31 @@ class PipelineRunner:
             standardized_monai_gate_comparison,
             standardized_monai_qc_set,
         ) = write_standardized_monai_qc_outputs(
-            OUTPUT_DIR / "audits",
+            SETTINGS_PATHS.OUTPUT_DIR / "audits",
             bank,
         )
         write_patient_tabular_features(
-            OUTPUT_DIR / "audits" / "patient_provenance_features.csv",
+            SETTINGS_PATHS.OUTPUT_DIR / "audits" / "patient_provenance_features.csv",
             *provenance_set,
         )
         write_patient_tabular_features(
-            OUTPUT_DIR / "audits" / "patient_standardization_features.csv",
+            SETTINGS_PATHS.OUTPUT_DIR / "audits" / "patient_standardization_features.csv",
             *standardization_set,
         )
         write_tabular_class_summary(
-            OUTPUT_DIR / "audits" / "provenance_class_summary.csv",
+            SETTINGS_PATHS.OUTPUT_DIR / "audits" / "provenance_class_summary.csv",
             provenance_set[0],
             provenance_set[1],
             provenance_set[3],
         )
         write_tabular_class_summary(
-            OUTPUT_DIR / "audits" / "standardization_class_summary.csv",
+            SETTINGS_PATHS.OUTPUT_DIR / "audits" / "standardization_class_summary.csv",
             standardization_set[0],
             standardization_set[1],
             standardization_set[3],
         )
         write_tabular_class_summary(
-            OUTPUT_DIR / "audits" / "standardized_monai_qc_class_summary.csv",
+            SETTINGS_PATHS.OUTPUT_DIR / "audits" / "standardized_monai_qc_class_summary.csv",
             standardized_monai_qc_set[0],
             standardized_monai_qc_set[1],
             standardized_monai_qc_set[3],
@@ -11388,7 +11171,7 @@ class PipelineRunner:
                 f"{experiment.experiment_id}",
                 flush=True,
             )
-            experiment_output = OUTPUT_DIR / "experiments" / experiment.experiment_id
+            experiment_output = SETTINGS_PATHS.OUTPUT_DIR / "experiments" / experiment.experiment_id
             preparation_key = experiment_preparation_cache_key(experiment)
 
             try:
@@ -11433,7 +11216,7 @@ class PipelineRunner:
                 )
                 traceback.print_exc(file=sys.stdout)
 
-                if FAIL_SUITE_IF_ANY_EXPERIMENT_FAILS:
+                if SETTINGS_AUDIT.FAIL_SUITE_IF_ANY_EXPERIMENT_FAILS:
                     raise
 
         stage_durations["08 Experiment execution"] = _print_stage_complete(
@@ -11478,33 +11261,33 @@ class PipelineRunner:
                 )
             ]
             for experiment_id in (
-                REFERENCE_EXPERIMENT_ID,
-                VALID_ONLY_ABLATION_EXPERIMENT_ID,
-                MASK_ONLY_CONTROL_EXPERIMENT_ID,
-                SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID,
-                COMPLEMENT_CONTROL_EXPERIMENT_ID,
+                SETTINGS_EXPERIMENTS.REFERENCE_EXPERIMENT_ID,
+                SETTINGS_EXPERIMENTS.VALID_ONLY_ABLATION_EXPERIMENT_ID,
+                SETTINGS_EXPERIMENTS.MASK_ONLY_CONTROL_EXPERIMENT_ID,
+                SETTINGS_EXPERIMENTS.SHUFFLED_INTENSITY_CONTROL_EXPERIMENT_ID,
+                SETTINGS_EXPERIMENTS.COMPLEMENT_CONTROL_EXPERIMENT_ID,
             )
             if experiment_id in successful_by_id
         }
         exact_support_row_contract_summary = audit_exact_support_prepared_row_contract(
             exact_support_contract_prepared,
-            OUTPUT_DIR / "audits" / "exact_support_row_contract.json",
+            SETTINGS_PATHS.OUTPUT_DIR / "audits" / "exact_support_row_contract.json",
         )
         candidate_family_output_dir = (
-            OUTPUT_DIR / "comparison" / "model_family_nested_selection"
+            SETTINGS_PATHS.OUTPUT_DIR / "comparison" / "model_family_nested_selection"
         )
         candidate_family_output_dir.mkdir(parents=True, exist_ok=True)
-        if RUN_MODEL_FAMILY_NESTED_SELECTION:
+        if SETTINGS_VALIDATION.RUN_MODEL_FAMILY_NESTED_SELECTION:
             missing_candidate_ids = [
                 experiment_id
-                for experiment_id in MODEL_FAMILY_NESTED_SELECTION_IDS
+                for experiment_id in SETTINGS_VALIDATION.MODEL_FAMILY_NESTED_SELECTION_IDS
                 if experiment_id not in successful_by_id
             ]
             if missing_candidate_ids:
                 candidate_family_selection_summary = {
                     "status": "SKIPPED_MISSING_OR_FAILED_EXPERIMENT",
                     "candidate_experiment_ids": list(
-                        MODEL_FAMILY_NESTED_SELECTION_IDS
+                        SETTINGS_VALIDATION.MODEL_FAMILY_NESTED_SELECTION_IDS
                     ),
                     "missing_experiments": missing_candidate_ids,
                 }
@@ -11522,7 +11305,7 @@ class PipelineRunner:
                             )
                         ]
                         for experiment_id in (
-                            MODEL_FAMILY_NESTED_SELECTION_IDS
+                            SETTINGS_VALIDATION.MODEL_FAMILY_NESTED_SELECTION_IDS
                         )
                     }
                     candidate_family_selection_summary = (
@@ -11550,7 +11333,7 @@ class PipelineRunner:
             candidate_family_selection_summary = {
                 "status": "SKIPPED_DISABLED",
                 "candidate_experiment_ids": list(
-                    MODEL_FAMILY_NESTED_SELECTION_IDS
+                    SETTINGS_VALIDATION.MODEL_FAMILY_NESTED_SELECTION_IDS
                 ),
             }
             print("[EXACT SUPPORT MODEL SELECTION] SKIPPED by configuration.", flush=True)
@@ -11573,7 +11356,7 @@ class PipelineRunner:
             primary_ablation_rows,
             candidate_family_selection_summary,
             exact_support_row_contract_summary,
-            OUTPUT_DIR / "comparison",
+            SETTINGS_PATHS.OUTPUT_DIR / "comparison",
         )
         stage_durations["09 Master comparisons"] = _print_stage_complete(
             9,
@@ -11601,10 +11384,10 @@ class PipelineRunner:
             "Several patient-level reruns for selected models and controls; frozen features are reused.",
         )
         stability_summaries = {}
-        stability_root = OUTPUT_DIR / "stability"
+        stability_root = SETTINGS_PATHS.OUTPUT_DIR / "stability"
         stability_root.mkdir(parents=True, exist_ok=True)
 
-        if RUN_REPEATED_NESTED_CV_STABILITY:
+        if SETTINGS_VALIDATION.RUN_REPEATED_NESTED_CV_STABILITY:
             successful_by_id = {
                 result["config"].experiment_id: result
                 for result in successful_results
@@ -11614,7 +11397,7 @@ class PipelineRunner:
                 for experiment in experiments
             }
 
-            for stability_experiment_id in STABILITY_EXPERIMENT_IDS:
+            for stability_experiment_id in SETTINGS_VALIDATION.STABILITY_EXPERIMENT_IDS:
                 experiment = experiments_by_id[stability_experiment_id]
                 result = successful_by_id.get(stability_experiment_id)
                 preparation_key = experiment_preparation_cache_key(experiment)
@@ -11646,7 +11429,7 @@ class PipelineRunner:
 
             stability_paired_summary = compare_repeated_nested_cv_pairs(
                 stability_root,
-                REPEATED_STABILITY_COMPARISONS,
+                SETTINGS_VALIDATION.REPEATED_STABILITY_COMPARISONS,
             )
             stability_ranking_rows = write_repeated_stability_ranking(
                 stability_summaries,
@@ -11654,8 +11437,8 @@ class PipelineRunner:
             )
             stability_summary = {
                 "status": "OK",
-                "repeats_per_experiment": int(REPEATED_NESTED_CV_REPEATS),
-                "experiment_ids": list(STABILITY_EXPERIMENT_IDS),
+                "repeats_per_experiment": int(SETTINGS_VALIDATION.REPEATED_NESTED_CV_REPEATS),
+                "experiment_ids": list(SETTINGS_VALIDATION.STABILITY_EXPERIMENT_IDS),
                 "experiment_summaries": stability_summaries,
                 "paired_comparisons": stability_paired_summary,
                 "ranking_order": [
@@ -11683,7 +11466,7 @@ class PipelineRunner:
             }
             stability_summary = {
                 "status": "SKIPPED_DISABLED",
-                "experiment_ids": list(STABILITY_EXPERIMENT_IDS),
+                "experiment_ids": list(SETTINGS_VALIDATION.STABILITY_EXPERIMENT_IDS),
                 "paired_comparisons": stability_paired_summary,
             }
             print("[STABILITY] SKIPPED by configuration.", flush=True)
@@ -11700,7 +11483,7 @@ class PipelineRunner:
             10,
             "Run repeated nested-CV split-stability analyses",
             stage_started,
-            f"Completed={successful_stability_runs}/{len(STABILITY_EXPERIMENT_IDS)} configured experiments.",
+            f"Completed={successful_stability_runs}/{len(SETTINGS_VALIDATION.STABILITY_EXPERIMENT_IDS)} configured experiments.",
         )
 
         # ======================================================================
@@ -11727,8 +11510,8 @@ class PipelineRunner:
             for experiment in experiments
         }
 
-        if RUN_PATIENT_LABEL_PERMUTATION_TEST:
-            for permutation_experiment_id in PERMUTATION_EXPERIMENT_IDS:
+        if SETTINGS_VALIDATION.RUN_PATIENT_LABEL_PERMUTATION_TEST:
+            for permutation_experiment_id in SETTINGS_VALIDATION.PERMUTATION_EXPERIMENT_IDS:
                 permutation_result = successful_by_id.get(
                     permutation_experiment_id
                 )
@@ -11736,7 +11519,7 @@ class PipelineRunner:
                     permutation_experiment_id
                 ]
                 experiment_output_dir = (
-                    OUTPUT_DIR / "permutation" / permutation_experiment_id
+                    SETTINGS_PATHS.OUTPUT_DIR / "permutation" / permutation_experiment_id
                 )
                 experiment_output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -11775,7 +11558,7 @@ class PipelineRunner:
 
             permutation_summary = {
                 "status": "OK",
-                "experiment_ids": list(PERMUTATION_EXPERIMENT_IDS),
+                "experiment_ids": list(SETTINGS_VALIDATION.PERMUTATION_EXPERIMENT_IDS),
                 "experiment_summaries": permutation_summaries,
                 "interpretation": (
                     "Each configured patient-embedding model is tested by "
@@ -11787,19 +11570,19 @@ class PipelineRunner:
         else:
             permutation_summary = {
                 "status": "SKIPPED_DISABLED",
-                "experiment_ids": list(PERMUTATION_EXPERIMENT_IDS),
+                "experiment_ids": list(SETTINGS_VALIDATION.PERMUTATION_EXPERIMENT_IDS),
                 "experiment_summaries": {},
             }
             print("[PERMUTATION] SKIPPED by configuration.", flush=True)
 
         selection_adjusted_output_dir = (
-            OUTPUT_DIR / "permutation" / "selection_adjusted_candidate_family"
+            SETTINGS_PATHS.OUTPUT_DIR / "permutation" / "selection_adjusted_candidate_family"
         )
         selection_adjusted_output_dir.mkdir(parents=True, exist_ok=True)
-        if RUN_SELECTION_ADJUSTED_PERMUTATION_TEST:
+        if SETTINGS_VALIDATION.RUN_SELECTION_ADJUSTED_PERMUTATION_TEST:
             missing_selection_candidates = [
                 experiment_id
-                for experiment_id in SELECTION_ADJUSTED_CANDIDATE_EXPERIMENT_IDS
+                for experiment_id in SETTINGS_VALIDATION.SELECTION_ADJUSTED_CANDIDATE_EXPERIMENT_IDS
                 if experiment_id not in successful_by_id
                 or experiment_id not in experiments_by_id
             ]
@@ -11807,7 +11590,7 @@ class PipelineRunner:
                 selection_adjusted_summary = {
                     "status": "SKIPPED_MISSING_OR_FAILED_EXPERIMENT",
                     "candidate_experiment_ids": list(
-                        SELECTION_ADJUSTED_CANDIDATE_EXPERIMENT_IDS
+                        SETTINGS_VALIDATION.SELECTION_ADJUSTED_CANDIDATE_EXPERIMENT_IDS
                     ),
                     "missing_experiments": missing_selection_candidates,
                 }
@@ -11825,7 +11608,7 @@ class PipelineRunner:
                             )
                         ]
                         for experiment_id in (
-                            SELECTION_ADJUSTED_CANDIDATE_EXPERIMENT_IDS
+                            SETTINGS_VALIDATION.SELECTION_ADJUSTED_CANDIDATE_EXPERIMENT_IDS
                         )
                     }
                     observed_auc_by_id = {
@@ -11834,7 +11617,7 @@ class PipelineRunner:
                             ["metrics"]["auc"]
                         )
                         for experiment_id in (
-                            SELECTION_ADJUSTED_CANDIDATE_EXPERIMENT_IDS
+                            SETTINGS_VALIDATION.SELECTION_ADJUSTED_CANDIDATE_EXPERIMENT_IDS
                         )
                     }
                     selection_adjusted_summary = (
@@ -11863,7 +11646,7 @@ class PipelineRunner:
             selection_adjusted_summary = {
                 "status": "SKIPPED_DISABLED",
                 "candidate_experiment_ids": list(
-                    SELECTION_ADJUSTED_CANDIDATE_EXPERIMENT_IDS
+                    SETTINGS_VALIDATION.SELECTION_ADJUSTED_CANDIDATE_EXPERIMENT_IDS
                 ),
             }
             print("[PERMUTATION][MAX] SKIPPED by configuration.", flush=True)
@@ -11880,7 +11663,7 @@ class PipelineRunner:
         )
 
         (
-            OUTPUT_DIR / "permutation" / "patient_label_permutation_summary.json"
+            SETTINGS_PATHS.OUTPUT_DIR / "permutation" / "patient_label_permutation_summary.json"
         ).write_text(
             json.dumps(permutation_summary, indent=2, sort_keys=True),
             encoding="utf-8",
@@ -11928,7 +11711,7 @@ class PipelineRunner:
             failed_results=failed_results,
             total_runtime=total_runtime,
         )
-        (OUTPUT_DIR / "suite_run_metadata.json").write_text(
+        (SETTINGS_PATHS.OUTPUT_DIR / "suite_run_metadata.json").write_text(
             json.dumps(metadata, indent=2, sort_keys=True),
             encoding="utf-8",
         )
@@ -11937,13 +11720,13 @@ class PipelineRunner:
             12,
             "Print final comparison and save suite metadata",
             stage_started,
-            f"Master summary: {OUTPUT_DIR / 'comparison' / 'experiment_summary.csv'}",
+            f"Master summary: {SETTINGS_PATHS.OUTPUT_DIR / 'comparison' / 'experiment_summary.csv'}",
         )
 
         total_runtime = time.perf_counter() - pipeline_started_at
         _print_timing_summary(stage_durations, total_runtime)
-        print(f"\n[SUITE] Outputs saved under: {OUTPUT_DIR}", flush=True)
-        print(f"[SUITE] Console log: {CONSOLE_LOG_PATH}", flush=True)
+        print(f"\n[SUITE] Outputs saved under: {SETTINGS_PATHS.OUTPUT_DIR}", flush=True)
+        print(f"[SUITE] Console log: {SETTINGS_PATHS.CONSOLE_LOG_PATH}", flush=True)
         print(
             f"[SUITE] Completed with {len(successful_results)} successful and "
             f"{len(failed_results)} failed experiments in "
@@ -11964,11 +11747,11 @@ class PipelineRunner:
         refresh_runtime_device("build MONAI/EfficientNet feature cache")
         validate_configuration()
         experiments = get_enabled_experiments()
-        dataset_path = Path(dataset_path or DATASET_PATH)
+        dataset_path = Path(dataset_path or SETTINGS_PATHS.DATASET_PATH)
         samples = load_samples(dataset_path)
         required_modes = required_efficientnet_feature_modes(experiments)
         fingerprint = feature_bank_fingerprint(samples, dataset_path)
-        cache_dir = FEATURE_CACHE_ROOT / fingerprint[:16]
+        cache_dir = SETTINGS_PATHS.FEATURE_CACHE_ROOT / fingerprint[:16]
         bank, cache_status = load_or_extract_feature_bank(
             samples,
             required_modes,
@@ -11998,7 +11781,7 @@ class PipelineRunner:
 
         checkpoint_map = {}
         missing = []
-        for fold in range(ATTENTION_SEGMENTATION_FOLDS):
+        for fold in range(SETTINGS_ATTENTION.ATTENTION_SEGMENTATION_FOLDS):
             path = _checkpoint_path(workspace, fold)
             if path.is_file():
                 checkpoint_map[fold] = path
@@ -12045,7 +11828,7 @@ class PipelineRunner:
             "labels": loaded["labels"].astype(np.int64),
             "features": {
                 mode: loaded[f"X__{mode}"].astype(np.float32)
-                for mode in ATTENTION_FEATURE_MODES
+                for mode in SETTINGS_ATTENTION.ATTENTION_FEATURE_MODES
             },
             "metadata": metadata,
         }
@@ -12084,7 +11867,7 @@ class AttentionDataManager:
             default_root = (
                 Path("/kaggle/working/cad_attention_unet_workspace")
                 if Path("/kaggle/working").exists()
-                else OUTPUT_ROOT / "cad_attention_unet_workspace"
+                else SETTINGS_PATHS.OUTPUT_ROOT / "cad_attention_unet_workspace"
             )
             root = Path(
                 os.environ.get("CAD_ATTENTION_UNET_WORK_ROOT", str(default_root))
@@ -12092,7 +11875,7 @@ class AttentionDataManager:
         else:
             root = Path(root)
 
-        if _ATTENTION_RUNNING_ON_KAGGLE:
+        if SETTINGS_ATTENTION._ATTENTION_RUNNING_ON_KAGGLE:
             default_transient_root = Path(
                 "/kaggle/temp/cad_attention_unet_transient"
             )
@@ -12113,7 +11896,7 @@ class AttentionDataManager:
         except OSError as error:
             fallback = (
                 Path("/tmp/cad_attention_unet_transient")
-                if _ATTENTION_RUNNING_ON_KAGGLE
+                if SETTINGS_ATTENTION._ATTENTION_RUNNING_ON_KAGGLE
                 else root / "_transient"
             )
             print(
@@ -12131,12 +11914,12 @@ class AttentionDataManager:
 
         automatic_masks = (
             transient_root / "automatic_masks"
-            if ATTENTION_STORE_AUTOMATIC_MASKS_IN_TRANSIENT
+            if SETTINGS_ATTENTION.ATTENTION_STORE_AUTOMATIC_MASKS_IN_TRANSIENT
             else root / "automatic_masks"
         )
         predicted_masks = (
             transient_root / "predicted_attention_masks"
-            if ATTENTION_STORE_PREDICTED_MASKS_IN_TRANSIENT
+            if SETTINGS_ATTENTION.ATTENTION_STORE_PREDICTED_MASKS_IN_TRANSIENT
             else root / "predicted_attention_masks"
         )
 
@@ -12152,7 +11935,7 @@ class AttentionDataManager:
             manifest_csv=root / "attention_unet_mask_manifest.csv",
             training_summary_json=root / "attention_unet_training_summary.json",
             console_log=root / "attention_unet_console.log",
-            comparison_output=OUTPUT_DIR / "attention_unet_comparison",
+            comparison_output=SETTINGS_PATHS.OUTPUT_DIR / "attention_unet_comparison",
         )
         for directory in (
             workspace.root,
@@ -12215,13 +11998,13 @@ class AttentionDataManager:
         ordered = sorted(
             patient_ids,
             key=lambda patient_id: hashlib.sha256(
-                f"{ATTENTION_RANDOM_SEED}|segmentation-fold|{patient_id}".encode(
+                f"{SETTINGS_ATTENTION.ATTENTION_RANDOM_SEED}|segmentation-fold|{patient_id}".encode(
                     "utf-8"
                 )
             ).hexdigest(),
         )
         return {
-            patient_id: int(index % ATTENTION_SEGMENTATION_FOLDS)
+            patient_id: int(index % SETTINGS_ATTENTION.ATTENTION_SEGMENTATION_FOLDS)
             for index, patient_id in enumerate(ordered)
         }
 
@@ -12236,13 +12019,13 @@ class AttentionDataManager:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             with open(temporary, "w", newline="", encoding="utf-8") as file:
-                writer = csv.DictWriter(file, fieldnames=ATTENTION_MANIFEST_FIELDS)
+                writer = csv.DictWriter(file, fieldnames=SETTINGS_ATTENTION.ATTENTION_MANIFEST_FIELDS)
                 writer.writeheader()
                 for row in rows:
                     writer.writerow(
                         {
                             field: row.get(field, "")
-                            for field in ATTENTION_MANIFEST_FIELDS
+                            for field in SETTINGS_ATTENTION.ATTENTION_MANIFEST_FIELDS
                         }
                     )
             os.replace(temporary, path)
@@ -12266,7 +12049,7 @@ class AttentionDataManager:
             )
         with open(workspace.manifest_csv, newline="", encoding="utf-8") as file:
             reader = csv.DictReader(file)
-            missing = sorted(set(ATTENTION_MANIFEST_FIELDS) - set(reader.fieldnames or []))
+            missing = sorted(set(SETTINGS_ATTENTION.ATTENTION_MANIFEST_FIELDS) - set(reader.fieldnames or []))
             if missing:
                 raise RuntimeError(f"Attention manifest is missing columns: {missing}")
             return list(reader)
@@ -12287,12 +12070,12 @@ class AttentionDataManager:
         ) = build_label_blind_standardized_image(image)
         raw_224 = cv2.resize(
             raw_canvas.astype(np.float32),
-            (IMG_SIZE, IMG_SIZE),
+            (SETTINGS_PREPROCESSING.IMG_SIZE, SETTINGS_PREPROCESSING.IMG_SIZE),
             interpolation=cv2.INTER_AREA,
         )
         padding_224 = cv2.resize(
             padding_canvas.astype(np.float32),
-            (IMG_SIZE, IMG_SIZE),
+            (SETTINGS_PREPROCESSING.IMG_SIZE, SETTINGS_PREPROCESSING.IMG_SIZE),
             interpolation=cv2.INTER_NEAREST,
         )
         content_224 = np.clip(1.0 - padding_224, 0.0, 1.0)
@@ -12369,8 +12152,8 @@ class AttentionDataManager:
         )
         print(
             "[ATTENTION][STORAGE] standardized-image disk cache="
-            f"{ATTENTION_CACHE_TRAINING_IMAGES}; RAM cache limit="
-            f"{ATTENTION_RAM_IMAGE_CACHE_MB} MiB.",
+            f"{SETTINGS_ATTENTION.ATTENTION_CACHE_TRAINING_IMAGES}; RAM cache limit="
+            f"{SETTINGS_ATTENTION.ATTENTION_RAM_IMAGE_CACHE_MB} MiB.",
             flush=True,
         )
         try:
@@ -12378,12 +12161,12 @@ class AttentionDataManager:
                 _existing_parent(workspace.root)
             ).free
             warning_threshold = (
-                int(ATTENTION_PERSISTENT_FREE_SPACE_WARNING_MB) * 1024 * 1024
+                int(SETTINGS_ATTENTION.ATTENTION_PERSISTENT_FREE_SPACE_WARNING_MB) * 1024 * 1024
             )
             if persistent_free < warning_threshold:
                 print(
                     "[ATTENTION][STORAGE][WARNING] Persistent free space is below "
-                    f"{ATTENTION_PERSISTENT_FREE_SPACE_WARNING_MB} MiB. Automatic "
+                    f"{SETTINGS_ATTENTION.ATTENTION_PERSISTENT_FREE_SPACE_WARNING_MB} MiB. Automatic "
                     "masks and image cache are transient, but manual masks, five "
                     "checkpoints, logs and comparison outputs still require "
                     "/kaggle/working space. Remove obsolete feature-bank caches or "
@@ -12400,7 +12183,7 @@ class AttentionDataManager:
         *,
         required,
         purpose,
-        png_compression=ATTENTION_PNG_COMPRESSION,
+        png_compression=SETTINGS_ATTENTION.ATTENTION_PNG_COMPRESSION,
         optional_reserve_mb=0,
     ):
         """Encode with OpenCV, then write and atomically replace the final file.
@@ -12490,7 +12273,7 @@ class AttentionDataManager:
     def _attention_ram_cache_get(key):
         """Return and refresh one LRU entry, or None when absent/disabled."""
 
-        if ATTENTION_RAM_IMAGE_CACHE_MB <= 0:
+        if SETTINGS_ATTENTION.ATTENTION_RAM_IMAGE_CACHE_MB <= 0:
             return None
         key = str(key)
         image = _ATTENTION_IMAGE_RAM_CACHE.pop(key, None)
@@ -12504,7 +12287,7 @@ class AttentionDataManager:
         """Insert one uint8 image and evict oldest entries above the byte limit."""
 
         global _ATTENTION_IMAGE_RAM_CACHE_BYTES
-        limit = int(ATTENTION_RAM_IMAGE_CACHE_MB) * 1024 * 1024
+        limit = int(SETTINGS_ATTENTION.ATTENTION_RAM_IMAGE_CACHE_MB) * 1024 * 1024
         if limit <= 0:
             return
         key = str(key)
@@ -12562,11 +12345,11 @@ class AttentionDataManager:
             return cached
 
         path = Path(row["cached_image_path"])
-        if ATTENTION_CACHE_TRAINING_IMAGES and path.is_file():
+        if SETTINGS_ATTENTION.ATTENTION_CACHE_TRAINING_IMAGES and path.is_file():
             disk_image = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
             if (
                 disk_image is not None
-                and disk_image.shape == (ATTENTION_INPUT_SIZE, ATTENTION_INPUT_SIZE)
+                and disk_image.shape == (SETTINGS_ATTENTION.ATTENTION_INPUT_SIZE, SETTINGS_ATTENTION.ATTENTION_INPUT_SIZE)
             ):
                 disk_image = np.ascontiguousarray(disk_image, dtype=np.uint8)
                 _attention_ram_cache_put(token, disk_image)
@@ -12591,7 +12374,7 @@ class AttentionDataManager:
         _attention_ram_cache_put(token, encoded)
 
         if (
-            ATTENTION_CACHE_TRAINING_IMAGES
+            SETTINGS_ATTENTION.ATTENTION_CACHE_TRAINING_IMAGES
             and _ATTENTION_OPTIONAL_DISK_CACHE_DISABLED_REASON is None
         ):
             written = _atomic_cv2_write(
@@ -12599,7 +12382,7 @@ class AttentionDataManager:
                 encoded,
                 required=False,
                 purpose="optional cached standardized training image",
-                optional_reserve_mb=ATTENTION_OPTIONAL_DISK_CACHE_MIN_FREE_MB,
+                optional_reserve_mb=SETTINGS_ATTENTION.ATTENTION_OPTIONAL_DISK_CACHE_MIN_FREE_MB,
             )
             if not written:
                 _ATTENTION_OPTIONAL_DISK_CACHE_DISABLED_REASON = (
@@ -12664,7 +12447,7 @@ class AttentionDataManager:
         subset_rows = [rows[index] for index in missing_indices]
         loader = DataLoader(
             _AttentionManifestImageDataset(subset_rows),
-            batch_size=ATTENTION_INFERENCE_BATCH_SIZE,
+            batch_size=SETTINGS_ATTENTION.ATTENTION_INFERENCE_BATCH_SIZE,
             shuffle=False,
             num_workers=0,
             pin_memory=(DEVICE == "cuda"),
@@ -12696,15 +12479,15 @@ class AttentionDataManager:
                     area = hard.mean(dim=(1, 2, 3))
                     peak = heart_probability.amax(dim=(1, 2, 3))
                     valid = (
-                        (area >= MONAI_MIN_HEART_AREA_RATIO)
-                        & (area <= MONAI_MAX_HEART_AREA_RATIO)
-                        & (peak >= MONAI_MIN_PEAK_HEART_PROBABILITY)
+                        (area >= SETTINGS_MONAI.MONAI_MIN_HEART_AREA_RATIO)
+                        & (area <= SETTINGS_MONAI.MONAI_MAX_HEART_AREA_RATIO)
+                        & (peak >= SETTINGS_MONAI.MONAI_MIN_PEAK_HEART_PROBABILITY)
                     )
                     hard = F.max_pool2d(
                         hard,
-                        kernel_size=ATTENTION_PSEUDO_MASK_DILATION_KERNEL,
+                        kernel_size=SETTINGS_ATTENTION.ATTENTION_PSEUDO_MASK_DILATION_KERNEL,
                         stride=1,
-                        padding=ATTENTION_PSEUDO_MASK_DILATION_KERNEL // 2,
+                        padding=SETTINGS_ATTENTION.ATTENTION_PSEUDO_MASK_DILATION_KERNEL // 2,
                     )
 
                     for batch_position, subset_index_tensor in enumerate(local_indices):
@@ -12733,7 +12516,7 @@ class AttentionDataManager:
                     completed_batches = int(batch_number)
                     if (
                         batch_number
-                        % ATTENTION_MANIFEST_CHECKPOINT_EVERY_BATCHES
+                        % SETTINGS_ATTENTION.ATTENTION_MANIFEST_CHECKPOINT_EVERY_BATCHES
                         == 0
                     ):
                         write_attention_manifest(rows, workspace.manifest_csv)
@@ -12793,7 +12576,7 @@ class AttentionTrainingManager:
     def attention_segmentation_loss(logits, targets):
         bce = F.binary_cross_entropy_with_logits(logits.float(), targets.float())
         dice_loss = 1.0 - soft_dice_coefficient_from_logits(logits, targets)
-        return ATTENTION_BCE_WEIGHT * bce + ATTENTION_DICE_WEIGHT * dice_loss
+        return SETTINGS_ATTENTION.ATTENTION_BCE_WEIGHT * bce + SETTINGS_ATTENTION.ATTENTION_DICE_WEIGHT * dice_loss
 
     @staticmethod
     def _resolved_training_mask(row):
@@ -12814,17 +12597,17 @@ class AttentionTrainingManager:
 
         hasher = hashlib.sha256()
         settings = {
-            "schema": ATTENTION_FEATURE_CACHE_SCHEMA,
+            "schema": SETTINGS_ATTENTION.ATTENTION_FEATURE_CACHE_SCHEMA,
             "target_fold": int(target_fold),
-            "base_channels": ATTENTION_BASE_CHANNELS,
-            "epochs": ATTENTION_EPOCHS,
-            "patience": ATTENTION_EARLY_STOPPING_PATIENCE,
-            "learning_rate": ATTENTION_LEARNING_RATE,
-            "weight_decay": ATTENTION_WEIGHT_DECAY,
-            "bce_weight": ATTENTION_BCE_WEIGHT,
-            "dice_weight": ATTENTION_DICE_WEIGHT,
-            "threshold": ATTENTION_MASK_THRESHOLD,
-            "random_seed": ATTENTION_RANDOM_SEED,
+            "base_channels": SETTINGS_ATTENTION.ATTENTION_BASE_CHANNELS,
+            "epochs": SETTINGS_ATTENTION.ATTENTION_EPOCHS,
+            "patience": SETTINGS_ATTENTION.ATTENTION_EARLY_STOPPING_PATIENCE,
+            "learning_rate": SETTINGS_ATTENTION.ATTENTION_LEARNING_RATE,
+            "weight_decay": SETTINGS_ATTENTION.ATTENTION_WEIGHT_DECAY,
+            "bce_weight": SETTINGS_ATTENTION.ATTENTION_BCE_WEIGHT,
+            "dice_weight": SETTINGS_ATTENTION.ATTENTION_DICE_WEIGHT,
+            "threshold": SETTINGS_ATTENTION.ATTENTION_MASK_THRESHOLD,
+            "random_seed": SETTINGS_ATTENTION.ATTENTION_RANDOM_SEED,
         }
         hasher.update(json.dumps(settings, sort_keys=True).encode("utf-8"))
         for row in sorted(rows, key=lambda x: x["image_token"]):
@@ -12856,12 +12639,12 @@ class AttentionTrainingManager:
         ordered = sorted(
             set(map(str, patient_ids)),
             key=lambda patient_id: hashlib.sha256(
-                f"{ATTENTION_RANDOM_SEED}|validation|{target_fold}|{patient_id}".encode(
+                f"{SETTINGS_ATTENTION.ATTENTION_RANDOM_SEED}|validation|{target_fold}|{patient_id}".encode(
                     "utf-8"
                 )
             ).hexdigest(),
         )
-        count = max(1, int(round(len(ordered) * ATTENTION_VALIDATION_PATIENT_FRACTION)))
+        count = max(1, int(round(len(ordered) * SETTINGS_ATTENTION.ATTENTION_VALIDATION_PATIENT_FRACTION)))
         count = min(count, max(1, len(ordered) - 1))
         return set(ordered[:count])
 
@@ -12869,8 +12652,8 @@ class AttentionTrainingManager:
     def train_attention_unet_crossfit(rows, workspace):
         """Train or reuse one patient-excluded Attention U-Net per target fold."""
 
-        if ATTENTION_EXTERNAL_WEIGHTS:
-            external_path = Path(ATTENTION_EXTERNAL_WEIGHTS)
+        if SETTINGS_ATTENTION.ATTENTION_EXTERNAL_WEIGHTS:
+            external_path = Path(SETTINGS_ATTENTION.ATTENTION_EXTERNAL_WEIGHTS)
             if not external_path.is_file():
                 raise FileNotFoundError(
                     f"External Attention U-Net checkpoint not found: {external_path}"
@@ -12891,7 +12674,7 @@ class AttentionTrainingManager:
                 json.dumps(summary, indent=2, sort_keys=True, default=str),
                 encoding="utf-8",
             )
-            return {fold: external_path for fold in range(ATTENTION_SEGMENTATION_FOLDS)}
+            return {fold: external_path for fold in range(SETTINGS_ATTENTION.ATTENTION_SEGMENTATION_FOLDS)}
 
         eligible_rows = []
         source_counts = defaultdict(int)
@@ -12907,7 +12690,7 @@ class AttentionTrainingManager:
 
         checkpoint_map = {}
         fold_summaries = []
-        for target_fold in range(ATTENTION_SEGMENTATION_FOLDS):
+        for target_fold in range(SETTINGS_ATTENTION.ATTENTION_SEGMENTATION_FOLDS):
             candidate_rows = [
                 row
                 for row in eligible_rows
@@ -12950,32 +12733,32 @@ class AttentionTrainingManager:
                         flush=True,
                     )
 
-            torch.manual_seed(ATTENTION_RANDOM_SEED + target_fold)
+            torch.manual_seed(SETTINGS_ATTENTION.ATTENTION_RANDOM_SEED + target_fold)
             if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(ATTENTION_RANDOM_SEED + target_fold)
+                torch.cuda.manual_seed_all(SETTINGS_ATTENTION.ATTENTION_RANDOM_SEED + target_fold)
             model = AttentionUNet().to(DEVICE)
             optimizer = torch.optim.AdamW(
                 model.parameters(),
-                lr=ATTENTION_LEARNING_RATE,
-                weight_decay=ATTENTION_WEIGHT_DECAY,
+                lr=SETTINGS_ATTENTION.ATTENTION_LEARNING_RATE,
+                weight_decay=SETTINGS_ATTENTION.ATTENTION_WEIGHT_DECAY,
             )
-            amp_enabled = bool(ATTENTION_TRAIN_WITH_AMP and DEVICE == "cuda")
+            amp_enabled = bool(SETTINGS_ATTENTION.ATTENTION_TRAIN_WITH_AMP and DEVICE == "cuda")
             scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
             train_dataset = AttentionMaskTrainingDataset(
                 train_rows,
                 augment=True,
-                seed=ATTENTION_RANDOM_SEED + target_fold * 100,
+                seed=SETTINGS_ATTENTION.ATTENTION_RANDOM_SEED + target_fold * 100,
             )
             validation_dataset = AttentionMaskTrainingDataset(
                 validation_rows,
                 augment=False,
-                seed=ATTENTION_RANDOM_SEED + target_fold * 100 + 1,
+                seed=SETTINGS_ATTENTION.ATTENTION_RANDOM_SEED + target_fold * 100 + 1,
             )
             generator = torch.Generator()
-            generator.manual_seed(ATTENTION_RANDOM_SEED + target_fold)
+            generator.manual_seed(SETTINGS_ATTENTION.ATTENTION_RANDOM_SEED + target_fold)
             train_loader = DataLoader(
                 train_dataset,
-                batch_size=ATTENTION_BATCH_SIZE,
+                batch_size=SETTINGS_ATTENTION.ATTENTION_BATCH_SIZE,
                 shuffle=True,
                 generator=generator,
                 num_workers=0,
@@ -12983,7 +12766,7 @@ class AttentionTrainingManager:
             )
             validation_loader = DataLoader(
                 validation_dataset,
-                batch_size=ATTENTION_BATCH_SIZE,
+                batch_size=SETTINGS_ATTENTION.ATTENTION_BATCH_SIZE,
                 shuffle=False,
                 num_workers=0,
                 pin_memory=(DEVICE == "cuda"),
@@ -13002,7 +12785,7 @@ class AttentionTrainingManager:
                 flush=True,
             )
 
-            for epoch in range(ATTENTION_EPOCHS):
+            for epoch in range(SETTINGS_ATTENTION.ATTENTION_EPOCHS):
                 train_dataset.set_epoch(epoch)
                 model.train()
                 train_losses = []
@@ -13054,7 +12837,7 @@ class AttentionTrainingManager:
                 )
                 print(
                     f"[ATTENTION][TRAIN] fold={target_fold}, epoch={epoch + 1}/"
-                    f"{ATTENTION_EPOCHS}, train_loss={mean_train_loss:.5f}, "
+                    f"{SETTINGS_ATTENTION.ATTENTION_EPOCHS}, train_loss={mean_train_loss:.5f}, "
                     f"val_loss={mean_validation_loss:.5f}, "
                     f"val_soft_dice={mean_validation_dice:.4f}",
                     flush=True,
@@ -13069,7 +12852,7 @@ class AttentionTrainingManager:
                     }
                 else:
                     epochs_without_improvement += 1
-                    if epochs_without_improvement >= ATTENTION_EARLY_STOPPING_PATIENCE:
+                    if epochs_without_improvement >= SETTINGS_ATTENTION.ATTENTION_EARLY_STOPPING_PATIENCE:
                         print(
                             f"[ATTENTION][TRAIN] fold={target_fold} early stopping "
                             f"after epoch {epoch + 1}.",
@@ -13105,7 +12888,7 @@ class AttentionTrainingManager:
                     "model_config": {
                         "in_channels": 1,
                         "out_channels": 1,
-                        "base_channels": ATTENTION_BASE_CHANNELS,
+                        "base_channels": SETTINGS_ATTENTION.ATTENTION_BASE_CHANNELS,
                     },
                     "summary": fold_summary,
                 },
@@ -13119,7 +12902,7 @@ class AttentionTrainingManager:
 
         summary = {
             "status": "OK",
-            "segmentation_folds": int(ATTENTION_SEGMENTATION_FOLDS),
+            "segmentation_folds": int(SETTINGS_ATTENTION.ATTENTION_SEGMENTATION_FOLDS),
             "eligible_training_images": int(len(eligible_rows)),
             "mask_source_counts": dict(source_counts),
             "folds": fold_summaries,
@@ -13141,7 +12924,7 @@ class AttentionTrainingManager:
         output = []
         for index in range(probability_256.shape[0]):
             mask = probability_256[index, 0].detach().cpu().numpy()
-            component = _largest_connected_component(mask >= ATTENTION_MASK_THRESHOLD)
+            component = _largest_connected_component(mask >= SETTINGS_ATTENTION.ATTENTION_MASK_THRESHOLD)
             output.append(torch.from_numpy(component.astype(np.float32)))
         return torch.stack(output, dim=0).unsqueeze(1).to(probability_256.device)
 
@@ -13151,9 +12934,9 @@ class AttentionTrainingManager:
 
         dilated = F.max_pool2d(
             (hard_mask_224 > 0.5).float(),
-            kernel_size=ATTENTION_SUPPORT_DILATION_KERNEL,
+            kernel_size=SETTINGS_ATTENTION.ATTENTION_SUPPORT_DILATION_KERNEL,
             stride=1,
-            padding=ATTENTION_SUPPORT_DILATION_KERNEL // 2,
+            padding=SETTINGS_ATTENTION.ATTENTION_SUPPORT_DILATION_KERNEL // 2,
         )
         support = torch.zeros_like(dilated)
         height, width = support.shape[-2:]
@@ -13166,7 +12949,7 @@ class AttentionTrainingManager:
                     width,
                     (height - 1) / 2.0,
                     (width - 1) / 2.0,
-                    HARD_SUPPORT_FALLBACK_FRACTION,
+                    SETTINGS_PREPROCESSING.HARD_SUPPORT_FALLBACK_FRACTION,
                 )
                 support[index, 0, top:bottom, left:right] = 1.0
         return (support * (content_mask > 0.5).float()).clamp(0.0, 1.0)
@@ -13196,15 +12979,15 @@ class AttentionEvaluationManager:
     @staticmethod
     def _attention_feature_fingerprint(samples, checkpoint_map):
         hasher = hashlib.sha256()
-        hasher.update(ATTENTION_FEATURE_CACHE_SCHEMA.encode("utf-8"))
+        hasher.update(SETTINGS_ATTENTION.ATTENTION_FEATURE_CACHE_SCHEMA.encode("utf-8"))
         settings = {
-            "mask_threshold": ATTENTION_MASK_THRESHOLD,
-            "min_area": ATTENTION_MIN_HEART_AREA_RATIO,
-            "max_area": ATTENTION_MAX_HEART_AREA_RATIO,
-            "min_peak": ATTENTION_MIN_PEAK_PROBABILITY,
-            "support_dilation": ATTENTION_SUPPORT_DILATION_KERNEL,
-            "efficientnet_weights": EFFICIENTNET_WEIGHTS_NAME,
-            "feature_dim": EFFICIENTNET_FEATURE_DIM,
+            "mask_threshold": SETTINGS_ATTENTION.ATTENTION_MASK_THRESHOLD,
+            "min_area": SETTINGS_ATTENTION.ATTENTION_MIN_HEART_AREA_RATIO,
+            "max_area": SETTINGS_ATTENTION.ATTENTION_MAX_HEART_AREA_RATIO,
+            "min_peak": SETTINGS_ATTENTION.ATTENTION_MIN_PEAK_PROBABILITY,
+            "support_dilation": SETTINGS_ATTENTION.ATTENTION_SUPPORT_DILATION_KERNEL,
+            "efficientnet_weights": SETTINGS_FEATURE_BANK.EFFICIENTNET_WEIGHTS_NAME,
+            "feature_dim": SETTINGS_FEATURE_BANK.EFFICIENTNET_FEATURE_DIM,
         }
         hasher.update(json.dumps(settings, sort_keys=True).encode("utf-8"))
         for fold in sorted(checkpoint_map):
@@ -13234,7 +13017,7 @@ class AttentionEvaluationManager:
         state_dict, metadata = _load_attention_state_dict(checkpoint_path)
         model_config = metadata.get("model_config", {}) if isinstance(metadata, dict) else {}
         model = AttentionUNet(
-            base_channels=int(model_config.get("base_channels", ATTENTION_BASE_CHANNELS))
+            base_channels=int(model_config.get("base_channels", SETTINGS_ATTENTION.ATTENTION_BASE_CHANNELS))
         )
         model.load_state_dict(state_dict, strict=True)
         return model.to(DEVICE).eval(), metadata
@@ -13262,7 +13045,7 @@ class AttentionEvaluationManager:
                     "labels": loaded["labels"].astype(np.int64),
                     "features": {
                         mode: loaded[f"X__{mode}"].astype(np.float32)
-                        for mode in ATTENTION_FEATURE_MODES
+                        for mode in SETTINGS_ATTENTION.ATTENTION_FEATURE_MODES
                     },
                     "metadata": metadata,
                 }
@@ -13271,14 +13054,14 @@ class AttentionEvaluationManager:
         review_rows = read_attention_manifest(workspace)
         review_by_token = {row["image_token"]: row for row in review_rows}
         review_tokens = set(review_by_token)
-        pool = _StreamingHierarchicalAttentionPool(ATTENTION_FEATURE_MODES)
+        pool = _StreamingHierarchicalAttentionPool(SETTINGS_ATTENTION.ATTENTION_FEATURE_MODES)
         slice_qc_rows = []
         predicted_mask_writes_enabled = True
         encoder = FeatureExtractor().to(DEVICE).eval()
         for parameter in encoder.parameters():
             parameter.requires_grad_(False)
 
-        for target_fold in range(ATTENTION_SEGMENTATION_FOLDS):
+        for target_fold in range(SETTINGS_ATTENTION.ATTENTION_SEGMENTATION_FOLDS):
             fold_samples = [
                 sample
                 for sample in samples
@@ -13291,7 +13074,7 @@ class AttentionEvaluationManager:
             )
             loader = DataLoader(
                 AttentionInferenceDataset(fold_samples),
-                batch_size=ATTENTION_INFERENCE_BATCH_SIZE,
+                batch_size=SETTINGS_ATTENTION.ATTENTION_INFERENCE_BATCH_SIZE,
                 shuffle=False,
                 num_workers=0,
                 pin_memory=(DEVICE == "cuda"),
@@ -13324,13 +13107,13 @@ class AttentionEvaluationManager:
                     area_ratio = hard_256.mean(dim=(1, 2, 3))
                     peak_probability = probability_256.amax(dim=(1, 2, 3))
                     valid_mask = (
-                        (area_ratio >= ATTENTION_MIN_HEART_AREA_RATIO)
-                        & (area_ratio <= ATTENTION_MAX_HEART_AREA_RATIO)
-                        & (peak_probability >= ATTENTION_MIN_PEAK_PROBABILITY)
+                        (area_ratio >= SETTINGS_ATTENTION.ATTENTION_MIN_HEART_AREA_RATIO)
+                        & (area_ratio <= SETTINGS_ATTENTION.ATTENTION_MAX_HEART_AREA_RATIO)
+                        & (peak_probability >= SETTINGS_ATTENTION.ATTENTION_MIN_PEAK_PROBABILITY)
                     )
                     hard_224 = F.interpolate(
                         hard_256,
-                        size=(IMG_SIZE, IMG_SIZE),
+                        size=(SETTINGS_PREPROCESSING.IMG_SIZE, SETTINGS_PREPROCESSING.IMG_SIZE),
                         mode="nearest",
                     )
                     support = create_attention_exact_support_mask(
@@ -13346,17 +13129,17 @@ class AttentionEvaluationManager:
                     ).float()
                     au5 = _robust_scale_visible_regions(raw_images, complement)
                     variants = {
-                        ATTENTION_FEATURE_MODES[0]: au1,
-                        ATTENTION_FEATURE_MODES[1]: au1,
-                        ATTENTION_FEATURE_MODES[2]: au3,
-                        ATTENTION_FEATURE_MODES[3]: au4,
-                        ATTENTION_FEATURE_MODES[4]: au5,
+                        SETTINGS_ATTENTION.ATTENTION_FEATURE_MODES[0]: au1,
+                        SETTINGS_ATTENTION.ATTENTION_FEATURE_MODES[1]: au1,
+                        SETTINGS_ATTENTION.ATTENTION_FEATURE_MODES[2]: au3,
+                        SETTINGS_ATTENTION.ATTENTION_FEATURE_MODES[3]: au4,
+                        SETTINGS_ATTENTION.ATTENTION_FEATURE_MODES[4]: au5,
                     }
 
                     embeddings_by_mode = {}
                     mode_list = list(variants)
-                    for start in range(0, len(mode_list), FEATURE_MODES_PER_ENCODER_CALL):
-                        chunk_modes = mode_list[start:start + FEATURE_MODES_PER_ENCODER_CALL]
+                    for start in range(0, len(mode_list), SETTINGS_FEATURE_BANK.FEATURE_MODES_PER_ENCODER_CALL):
+                        chunk_modes = mode_list[start:start + SETTINGS_FEATURE_BANK.FEATURE_MODES_PER_ENCODER_CALL]
                         normalized = torch.cat(
                             [normalize_for_efficientnet(variants[mode]) for mode in chunk_modes],
                             dim=0,
@@ -13370,8 +13153,8 @@ class AttentionEvaluationManager:
 
                     labels_np = labels.numpy().astype(np.int64)
                     valid_np = valid_mask.cpu().numpy().astype(bool)
-                    for mode in ATTENTION_FEATURE_MODES:
-                        keep = valid_np if mode == ATTENTION_FEATURE_MODES[1] else None
+                    for mode in SETTINGS_ATTENTION.ATTENTION_FEATURE_MODES:
+                        keep = valid_np if mode == SETTINGS_ATTENTION.ATTENTION_FEATURE_MODES[1] else None
                         pool.add(
                             mode,
                             embeddings_by_mode[mode],
@@ -13386,7 +13169,7 @@ class AttentionEvaluationManager:
                     for index in range(len(labels_np)):
                         token = str(image_tokens[index])
                         review_row = review_by_token.get(token)
-                        save_prediction = ATTENTION_SAVE_ALL_PREDICTED_MASKS or token in review_tokens
+                        save_prediction = SETTINGS_ATTENTION.ATTENTION_SAVE_ALL_PREDICTED_MASKS or token in review_tokens
                         predicted_path = workspace.predicted_masks / f"{token}.png"
                         prediction_written = False
                         if save_prediction and predicted_mask_writes_enabled:
@@ -13448,7 +13231,7 @@ class AttentionEvaluationManager:
         patient_ids = None
         labels = None
         features = {}
-        for mode in ATTENTION_FEATURE_MODES:
+        for mode in SETTINGS_ATTENTION.ATTENTION_FEATURE_MODES:
             X_mode, y_mode, patients_mode = pool.finalize(mode)
             if patient_ids is None:
                 patient_ids = patients_mode
@@ -13461,7 +13244,7 @@ class AttentionEvaluationManager:
             npz_path,
             patient_ids=np.asarray(patient_ids).astype(str),
             labels=np.asarray(labels, dtype=np.int64),
-            **{f"X__{mode}": features[mode] for mode in ATTENTION_FEATURE_MODES},
+            **{f"X__{mode}": features[mode] for mode in SETTINGS_ATTENTION.ATTENTION_FEATURE_MODES},
         )
         with open(
             output_dir / "attention_unet_slice_qc.csv",
@@ -13517,10 +13300,10 @@ class AttentionEvaluationManager:
         metadata = {
             "status": "OK",
             "fingerprint": fingerprint,
-            "schema": ATTENTION_FEATURE_CACHE_SCHEMA,
+            "schema": SETTINGS_ATTENTION.ATTENTION_FEATURE_CACHE_SCHEMA,
             "n_patients": int(len(patient_ids)),
             "n_images": int(len(samples)),
-            "feature_modes": list(ATTENTION_FEATURE_MODES),
+            "feature_modes": list(SETTINGS_ATTENTION.ATTENTION_FEATURE_MODES),
             "storage_policy": {
                 "persistent_workspace": str(workspace.root),
                 "transient_root": str(workspace.transient_root),
@@ -13528,10 +13311,10 @@ class AttentionEvaluationManager:
                 "predicted_masks": str(workspace.predicted_masks),
                 "cached_training_images": str(workspace.cached_images),
                 "training_image_disk_cache_enabled": bool(
-                    ATTENTION_CACHE_TRAINING_IMAGES
+                    SETTINGS_ATTENTION.ATTENTION_CACHE_TRAINING_IMAGES
                 ),
                 "training_image_ram_cache_mb": int(
-                    ATTENTION_RAM_IMAGE_CACHE_MB
+                    SETTINGS_ATTENTION.ATTENTION_RAM_IMAGE_CACHE_MB
                 ),
             },
             "retained_slice_counts": dict(pool.retained_slice_counts),
@@ -13559,10 +13342,10 @@ class AttentionEvaluationManager:
     def _load_or_create_classification_fold_manifest(samples, workspace):
         """Reuse patient folds when present; otherwise create the same contract."""
 
-        candidate_paths = [OUTPUT_DIR / "manifests" / "patient_fold_manifest.csv"]
+        candidate_paths = [SETTINGS_PATHS.OUTPUT_DIR / "manifests" / "patient_fold_manifest.csv"]
         candidate_paths.extend(
             sorted(
-                OUTPUT_ROOT.glob(
+                SETTINGS_PATHS.OUTPUT_ROOT.glob(
                     "multi_experiment_suite__*/manifests/patient_fold_manifest.csv"
                 ),
                 key=lambda path: path.stat().st_mtime_ns,
@@ -13596,7 +13379,7 @@ class AttentionEvaluationManager:
         labels = np.asarray([patient_to_label[p] for p in patients], dtype=np.int64)
         groups = patients.copy()
         folds = assign_stratified_patient_folds(
-            patients, labels, groups, N_SPLITS, CV_RANDOM_STATE
+            patients, labels, groups, SETTINGS_VALIDATION.N_SPLITS, SETTINGS_VALIDATION.CV_RANDOM_STATE
         )
         rows = [
             {
@@ -13619,24 +13402,21 @@ class AttentionEvaluationManager:
     def _temporary_attention_analysis_settings():
         """Temporarily use Attention-specific repeated/permutation replicate counts."""
 
-        global REPEATED_NESTED_CV_REPEATS
-        global LABEL_PERMUTATION_REPLICATES
-        global LABEL_PERMUTATION_RANDOM_STATE
         original = (
-            REPEATED_NESTED_CV_REPEATS,
-            LABEL_PERMUTATION_REPLICATES,
-            LABEL_PERMUTATION_RANDOM_STATE,
+            SETTINGS_VALIDATION.REPEATED_NESTED_CV_REPEATS,
+            SETTINGS_VALIDATION.LABEL_PERMUTATION_REPLICATES,
+            SETTINGS_VALIDATION.LABEL_PERMUTATION_RANDOM_STATE,
         )
-        REPEATED_NESTED_CV_REPEATS = ATTENTION_REPEATED_CV_REPEATS
-        LABEL_PERMUTATION_REPLICATES = ATTENTION_PERMUTATION_REPLICATES
-        LABEL_PERMUTATION_RANDOM_STATE = ATTENTION_RANDOM_SEED + 40_000
+        SETTINGS_VALIDATION.REPEATED_NESTED_CV_REPEATS = SETTINGS_ATTENTION.ATTENTION_REPEATED_CV_REPEATS
+        SETTINGS_VALIDATION.LABEL_PERMUTATION_REPLICATES = SETTINGS_ATTENTION.ATTENTION_PERMUTATION_REPLICATES
+        SETTINGS_VALIDATION.LABEL_PERMUTATION_RANDOM_STATE = SETTINGS_ATTENTION.ATTENTION_RANDOM_SEED + 40_000
         try:
             yield
         finally:
             (
-                REPEATED_NESTED_CV_REPEATS,
-                LABEL_PERMUTATION_REPLICATES,
-                LABEL_PERMUTATION_RANDOM_STATE,
+                SETTINGS_VALIDATION.REPEATED_NESTED_CV_REPEATS,
+                SETTINGS_VALIDATION.LABEL_PERMUTATION_REPLICATES,
+                SETTINGS_VALIDATION.LABEL_PERMUTATION_RANDOM_STATE,
             ) = original
 
     @staticmethod
@@ -13653,17 +13433,17 @@ class AttentionEvaluationManager:
     @staticmethod
     def _find_monai_candidate_predictions():
         direct = (
-            OUTPUT_DIR
+            SETTINGS_PATHS.OUTPUT_DIR
             / "experiments"
-            / PRIMARY_CANDIDATE_EXPERIMENT_ID
+            / SETTINGS_EXPERIMENTS.PRIMARY_CANDIDATE_EXPERIMENT_ID
             / "patient_oof_predictions.csv"
         )
         if direct.is_file():
             return direct
         candidates = sorted(
-            OUTPUT_ROOT.glob(
+            SETTINGS_PATHS.OUTPUT_ROOT.glob(
                 "multi_experiment_suite__*/experiments/"
-                f"{PRIMARY_CANDIDATE_EXPERIMENT_ID}/patient_oof_predictions.csv"
+                f"{SETTINGS_EXPERIMENTS.PRIMARY_CANDIDATE_EXPERIMENT_ID}/patient_oof_predictions.csv"
             ),
             key=lambda path: path.stat().st_mtime_ns,
             reverse=True,
@@ -13676,11 +13456,11 @@ class AttentionEvaluationManager:
 
         print(
             "[ATTENTION][VALIDATION] profile="
-            f"{VALIDATION_RUNTIME_PROFILE}; stability="
-            f"{ATTENTION_RUN_REPEATED_CV_STABILITY} × "
-            f"{ATTENTION_REPEATED_CV_REPEATS} repeats for each AU model; "
-            f"permutation={ATTENTION_RUN_PERMUTATION_TEST} × "
-            f"{ATTENTION_PERMUTATION_REPLICATES} replicates.",
+            f"{SETTINGS_VALIDATION.VALIDATION_RUNTIME_PROFILE}; stability="
+            f"{SETTINGS_ATTENTION.ATTENTION_RUN_REPEATED_CV_STABILITY} × "
+            f"{SETTINGS_ATTENTION.ATTENTION_REPEATED_CV_REPEATS} repeats for each AU model; "
+            f"permutation={SETTINGS_ATTENTION.ATTENTION_RUN_PERMUTATION_TEST} × "
+            f"{SETTINGS_ATTENTION.ATTENTION_PERMUTATION_REPLICATES} replicates.",
             flush=True,
         )
 
@@ -13694,7 +13474,7 @@ class AttentionEvaluationManager:
         prepared_by_id = {}
 
         with _temporary_attention_analysis_settings():
-            for experiment in ATTENTION_EXPERIMENTS:
+            for experiment in SETTINGS_ATTENTION.ATTENTION_EXPERIMENTS:
                 X = bank["features"][experiment.feature_mode]
                 prepared = {
                     "unit": "patient",
@@ -13720,7 +13500,7 @@ class AttentionEvaluationManager:
                     evaluation_root / experiment.experiment_id,
                 )
                 results[experiment.experiment_id] = result
-                if ATTENTION_RUN_REPEATED_CV_STABILITY:
+                if SETTINGS_ATTENTION.ATTENTION_RUN_REPEATED_CV_STABILITY:
                     stability[experiment.experiment_id] = (
                         run_repeated_nested_cv_stability(
                             experiment,
@@ -13736,15 +13516,15 @@ class AttentionEvaluationManager:
                         "status": "SKIPPED_DISABLED",
                         "experiment_id": experiment.experiment_id,
                         "configured_repeats": int(
-                            ATTENTION_REPEATED_CV_REPEATS
+                            SETTINGS_ATTENTION.ATTENTION_REPEATED_CV_REPEATS
                         ),
                     }
 
-            au1_id = ATTENTION_EXPERIMENTS[0].experiment_id
+            au1_id = SETTINGS_ATTENTION.ATTENTION_EXPERIMENTS[0].experiment_id
             au1_result = results[au1_id]
-            if ATTENTION_RUN_PERMUTATION_TEST:
+            if SETTINGS_ATTENTION.ATTENTION_RUN_PERMUTATION_TEST:
                 permutation = run_patient_label_permutation_test(
-                    ATTENTION_EXPERIMENTS[0],
+                    SETTINGS_ATTENTION.ATTENTION_EXPERIMENTS[0],
                     prepared_by_id[au1_id],
                     fold_rows,
                     float(au1_result["summary"]["metrics"]["auc"]),
@@ -13755,13 +13535,13 @@ class AttentionEvaluationManager:
                     "status": "SKIPPED_DISABLED",
                     "experiment_id": au1_id,
                     "configured_replicates": int(
-                        ATTENTION_PERMUTATION_REPLICATES
+                        SETTINGS_ATTENTION.ATTENTION_PERMUTATION_REPLICATES
                     ),
                 }
 
-        au1 = results[ATTENTION_EXPERIMENTS[0].experiment_id]
+        au1 = results[SETTINGS_ATTENTION.ATTENTION_EXPERIMENTS[0].experiment_id]
         pairwise = {}
-        for experiment in ATTENTION_EXPERIMENTS[1:]:
+        for experiment in SETTINGS_ATTENTION.ATTENTION_EXPERIMENTS[1:]:
             comparison = results[experiment.experiment_id]
             au1_order = np.argsort(au1["patient_ids"].astype(str))
             comparison_order = np.argsort(comparison["patient_ids"].astype(str))
@@ -13776,7 +13556,7 @@ class AttentionEvaluationManager:
                 au1["labels"][au1_order],
                 comparison["probabilities"][comparison_order],
                 au1["probabilities"][au1_order],
-                random_state=ATTENTION_RANDOM_SEED
+                random_state=SETTINGS_ATTENTION.ATTENTION_RANDOM_SEED
                 + int(hashlib.sha256(experiment.experiment_id.encode()).hexdigest()[:8], 16),
             )
 
@@ -13793,13 +13573,13 @@ class AttentionEvaluationManager:
                     au1_labels,
                     monai_scores,
                     au1_scores,
-                    random_state=ATTENTION_RANDOM_SEED + 91_000,
+                    random_state=SETTINGS_ATTENTION.ATTENTION_RANDOM_SEED + 91_000,
                 )
                 monai_comparison = {
                     "status": "OK",
-                    "monai_experiment_id": PRIMARY_CANDIDATE_EXPERIMENT_ID,
+                    "monai_experiment_id": SETTINGS_EXPERIMENTS.PRIMARY_CANDIDATE_EXPERIMENT_ID,
                     "monai_prediction_csv": str(monai_path),
-                    "attention_experiment_id": ATTENTION_EXPERIMENTS[0].experiment_id,
+                    "attention_experiment_id": SETTINGS_ATTENTION.ATTENTION_EXPERIMENTS[0].experiment_id,
                     "monai_auc": float(roc_auc_score(monai_labels, monai_scores)),
                     "attention_auc": float(roc_auc_score(au1_labels, au1_scores)),
                     "attention_minus_monai": comparison,
@@ -13819,10 +13599,10 @@ class AttentionEvaluationManager:
                 "automatic_masks": str(workspace.automatic_masks),
                 "predicted_masks": str(workspace.predicted_masks),
                 "training_image_disk_cache_enabled": bool(
-                    ATTENTION_CACHE_TRAINING_IMAGES
+                    SETTINGS_ATTENTION.ATTENTION_CACHE_TRAINING_IMAGES
                 ),
                 "training_image_ram_cache_mb": int(
-                    ATTENTION_RAM_IMAGE_CACHE_MB
+                    SETTINGS_ATTENTION.ATTENTION_RAM_IMAGE_CACHE_MB
                 ),
             },
             "fold_manifest": str(fold_path),
@@ -13832,16 +13612,16 @@ class AttentionEvaluationManager:
                 for experiment_id, result in results.items()
             },
             "validation_runtime": {
-                "profile": VALIDATION_RUNTIME_PROFILE,
+                "profile": SETTINGS_VALIDATION.VALIDATION_RUNTIME_PROFILE,
                 "run_repeated_cv": bool(
-                    ATTENTION_RUN_REPEATED_CV_STABILITY
+                    SETTINGS_ATTENTION.ATTENTION_RUN_REPEATED_CV_STABILITY
                 ),
                 "repeated_cv_repeats": int(
-                    ATTENTION_REPEATED_CV_REPEATS
+                    SETTINGS_ATTENTION.ATTENTION_REPEATED_CV_REPEATS
                 ),
-                "run_permutation": bool(ATTENTION_RUN_PERMUTATION_TEST),
+                "run_permutation": bool(SETTINGS_ATTENTION.ATTENTION_RUN_PERMUTATION_TEST),
                 "permutation_replicates": int(
-                    ATTENTION_PERMUTATION_REPLICATES
+                    SETTINGS_ATTENTION.ATTENTION_PERMUTATION_REPLICATES
                 ),
             },
             "repeated_nested_cv": stability,
@@ -14036,7 +13816,7 @@ class MaskReviewManager:
         )
         for index, row in enumerate(rows):
             row["review_index"] = int(index)
-        _review_atomic_csv(rows, path, ATTENTION_REVIEW_MANIFEST_FIELDS)
+        _review_atomic_csv(rows, path, SETTINGS_REVIEW.ATTENTION_REVIEW_MANIFEST_FIELDS)
         print(
             f"[ATTENTION][REVIEW] Full manifest: {len(rows)} images -> {path}",
             flush=True,
@@ -14053,7 +13833,7 @@ class MaskReviewManager:
         with open(path, newline="", encoding="utf-8") as file:
             rows = list(csv.DictReader(file))
         missing = sorted(
-            set(ATTENTION_REVIEW_MANIFEST_FIELDS)
+            set(SETTINGS_REVIEW.ATTENTION_REVIEW_MANIFEST_FIELDS)
             - set(rows[0].keys() if rows else ())
         )
         if missing:
@@ -14099,7 +13879,7 @@ class MaskReviewManager:
         }
         with open(path, "a", newline="", encoding="utf-8") as file:
             writer = csv.DictWriter(
-                file, fieldnames=list(ATTENTION_REVIEW_HISTORY_FIELDS)
+                file, fieldnames=list(SETTINGS_REVIEW.ATTENTION_REVIEW_HISTORY_FIELDS)
             )
             if write_header:
                 writer.writeheader()
@@ -14215,9 +13995,9 @@ class MaskReviewManager:
         scope = str(scope).lower()
         if source not in {"monai", "attention"}:
             raise ValueError("review source must be 'monai' or 'attention'.")
-        if scope not in ATTENTION_REVIEW_SCOPES:
+        if scope not in SETTINGS_REVIEW.ATTENTION_REVIEW_SCOPES:
             raise ValueError(
-                f"review scope must be one of {ATTENTION_REVIEW_SCOPES}."
+                f"review scope must be one of {SETTINGS_REVIEW.ATTENTION_REVIEW_SCOPES}."
             )
 
         rows = [dict(row) for row in rows]
@@ -14284,7 +14064,7 @@ class MaskReviewManager:
     def _review_manifest_image_loader(rows):
         return DataLoader(
             _AttentionManifestImageDataset(rows),
-            batch_size=ATTENTION_INFERENCE_BATCH_SIZE,
+            batch_size=SETTINGS_ATTENTION.ATTENTION_INFERENCE_BATCH_SIZE,
             shuffle=False,
             num_workers=0,
             pin_memory=(DEVICE == "cuda"),
@@ -14342,15 +14122,15 @@ class MaskReviewManager:
                 area = hard.mean(dim=(1, 2, 3))
                 peak = heart_probability.amax(dim=(1, 2, 3))
                 valid = (
-                    (area >= MONAI_MIN_HEART_AREA_RATIO)
-                    & (area <= MONAI_MAX_HEART_AREA_RATIO)
-                    & (peak >= MONAI_MIN_PEAK_HEART_PROBABILITY)
+                    (area >= SETTINGS_MONAI.MONAI_MIN_HEART_AREA_RATIO)
+                    & (area <= SETTINGS_MONAI.MONAI_MAX_HEART_AREA_RATIO)
+                    & (peak >= SETTINGS_MONAI.MONAI_MIN_PEAK_HEART_PROBABILITY)
                 )
                 hard = F.max_pool2d(
                     hard,
-                    kernel_size=ATTENTION_PSEUDO_MASK_DILATION_KERNEL,
+                    kernel_size=SETTINGS_ATTENTION.ATTENTION_PSEUDO_MASK_DILATION_KERNEL,
                     stride=1,
-                    padding=ATTENTION_PSEUDO_MASK_DILATION_KERNEL // 2,
+                    padding=SETTINGS_ATTENTION.ATTENTION_PSEUDO_MASK_DILATION_KERNEL // 2,
                 )
                 for batch_position, local_index_tensor in enumerate(local_indices):
                     row = missing[int(local_index_tensor)]
@@ -14373,12 +14153,12 @@ class MaskReviewManager:
                     _review_atomic_csv(
                         full_rows,
                         attention_full_review_manifest_path(workspace),
-                        ATTENTION_REVIEW_MANIFEST_FIELDS,
+                        SETTINGS_REVIEW.ATTENTION_REVIEW_MANIFEST_FIELDS,
                     )
         _review_atomic_csv(
             full_rows,
             attention_full_review_manifest_path(workspace),
-            ATTENTION_REVIEW_MANIFEST_FIELDS,
+            SETTINGS_REVIEW.ATTENTION_REVIEW_MANIFEST_FIELDS,
         )
         del model
         if DEVICE == "cuda":
@@ -14469,7 +14249,7 @@ class MaskReviewManager:
             model, _metadata = _load_attention_model(checkpoint_map[target_fold])
             loader = DataLoader(
                 AttentionInferenceDataset(fold_samples),
-                batch_size=ATTENTION_INFERENCE_BATCH_SIZE,
+                batch_size=SETTINGS_ATTENTION.ATTENTION_INFERENCE_BATCH_SIZE,
                 shuffle=False,
                 num_workers=0,
                 pin_memory=(DEVICE == "cuda"),
@@ -14486,9 +14266,9 @@ class MaskReviewManager:
                     area = hard.mean(dim=(1, 2, 3))
                     peak = probability.amax(dim=(1, 2, 3))
                     valid = (
-                        (area >= ATTENTION_MIN_HEART_AREA_RATIO)
-                        & (area <= ATTENTION_MAX_HEART_AREA_RATIO)
-                        & (peak >= ATTENTION_MIN_PEAK_PROBABILITY)
+                        (area >= SETTINGS_ATTENTION.ATTENTION_MIN_HEART_AREA_RATIO)
+                        & (area <= SETTINGS_ATTENTION.ATTENTION_MAX_HEART_AREA_RATIO)
+                        & (peak >= SETTINGS_ATTENTION.ATTENTION_MIN_PEAK_PROBABILITY)
                     )
                     hard_np = hard[:, 0].cpu().numpy() > 0.5
                     for position, token in enumerate(image_tokens):
@@ -14513,7 +14293,7 @@ class MaskReviewManager:
                             if monai is not None:
                                 monai = cv2.resize(
                                     monai,
-                                    (ATTENTION_INPUT_SIZE, ATTENTION_INPUT_SIZE),
+                                    (SETTINGS_ATTENTION.ATTENTION_INPUT_SIZE, SETTINGS_ATTENTION.ATTENTION_INPUT_SIZE),
                                     interpolation=cv2.INTER_NEAREST,
                                 ) > 127
                                 row["dice_attention_vs_monai"] = _dice_binary(
@@ -14524,7 +14304,7 @@ class MaskReviewManager:
                         _review_atomic_csv(
                             full_rows,
                             attention_full_review_manifest_path(workspace),
-                            ATTENTION_REVIEW_MANIFEST_FIELDS,
+                            SETTINGS_REVIEW.ATTENTION_REVIEW_MANIFEST_FIELDS,
                         )
             del model
             if DEVICE == "cuda":
@@ -14533,13 +14313,13 @@ class MaskReviewManager:
         _review_atomic_csv(
             full_rows,
             attention_full_review_manifest_path(workspace),
-            ATTENTION_REVIEW_MANIFEST_FIELDS,
+            SETTINGS_REVIEW.ATTENTION_REVIEW_MANIFEST_FIELDS,
         )
         metadata_path.write_text(
             json.dumps(
                 {
                     "status": "OK",
-                    "version": ATTENTION_REVIEW_SCHEMA,
+                    "version": SETTINGS_REVIEW.ATTENTION_REVIEW_SCHEMA,
                     "checkpoint_fingerprint": fingerprint,
                     "generated_masks": int(generated),
                     "target_rows": int(len(target_rows)),
@@ -14592,7 +14372,7 @@ class MaskReviewManager:
             )
             series_selected.extend(
                 _evenly_spaced_subset(
-                    ordered, ATTENTION_MAX_TRAIN_SLICES_PER_SERIES
+                    ordered, SETTINGS_ATTENTION.ATTENTION_MAX_TRAIN_SLICES_PER_SERIES
                 )
             )
         by_patient = _review_defaultdict(list)
@@ -14604,7 +14384,7 @@ class MaskReviewManager:
                 by_patient[patient_id], key=lambda row: row["image_token"]
             )
             for row in _evenly_spaced_subset(
-                ordered, ATTENTION_MAX_TRAIN_SLICES_PER_PATIENT
+                ordered, SETTINGS_ATTENTION.ATTENTION_MAX_TRAIN_SLICES_PER_PATIENT
             ):
                 selected[row["image_token"]] = row
         base_count = len(selected)
@@ -14700,7 +14480,7 @@ class PipelineApplication:
         )
         parser.add_argument(
             "--attention-action",
-            choices=ATTENTION_ACTION_CHOICES,
+            choices=SETTINGS_REVIEW.ATTENTION_ACTION_CHOICES,
             required=True,
         )
         parser.add_argument("--attention-work-root", default=None)
@@ -14713,7 +14493,7 @@ class PipelineApplication:
         )
         parser.add_argument(
             "--attention-editor-scope",
-            choices=ATTENTION_REVIEW_SCOPES,
+            choices=SETTINGS_REVIEW.ATTENTION_REVIEW_SCOPES,
             default="diverse",
             help="all/diverse/unreviewed/invalid/disagreement/manual/reviewed",
         )
@@ -14727,11 +14507,11 @@ class PipelineApplication:
         parser.add_argument("--attention-review-round", type=int, default=1)
         parser.add_argument(
             "--attention-dataset-path",
-            default=str(DATASET_PATH),
+            default=str(SETTINGS_PATHS.DATASET_PATH),
         )
         parser.add_argument(
             "--runtime-device",
-            choices=RUNTIME_DEVICE_CHOICES,
+            choices=SETTINGS_RUNTIME.RUNTIME_DEVICE_CHOICES,
             default=os.environ.get("CAD_RUNTIME_DEVICE", "auto"),
             help=(
                 "Use cuda for neural inference/training and cpu for review, CV, "
@@ -14740,7 +14520,7 @@ class PipelineApplication:
         )
         parser.add_argument(
             "--feature-cache-device-tag",
-            choices=RUNTIME_DEVICE_CHOICES,
+            choices=SETTINGS_RUNTIME.RUNTIME_DEVICE_CHOICES,
             default=os.environ.get("CAD_FEATURE_CACHE_DEVICE_TAG", "auto"),
             help="Device identity of the frozen feature cache.",
         )
@@ -14827,7 +14607,7 @@ class PipelineApplication:
         action = args.attention_action
 
         requested_device = args.runtime_device
-        if action in CPU_CACHE_ONLY_ACTIONS and requested_device == "auto":
+        if action in SETTINGS_REVIEW.CPU_CACHE_ONLY_ACTIONS and requested_device == "auto":
             requested_device = "cpu"
         set_runtime_device(
             requested=requested_device,
@@ -14844,9 +14624,8 @@ class PipelineApplication:
                     release_gpu_resources(action)
 
         if action == "monai-cpu-from-cache":
-            global REQUIRE_EXISTING_FEATURE_CACHE
-            previous_cache_requirement = REQUIRE_EXISTING_FEATURE_CACHE
-            REQUIRE_EXISTING_FEATURE_CACHE = True
+            previous_cache_requirement = SETTINGS_FEATURE_BANK.REQUIRE_EXISTING_FEATURE_CACHE
+            SETTINGS_FEATURE_BANK.REQUIRE_EXISTING_FEATURE_CACHE = True
             try:
                 run_with_console_logging()
                 return {
@@ -14855,7 +14634,7 @@ class PipelineApplication:
                     "feature_cache_device_tag": resolved_feature_cache_device_tag(),
                 }
             finally:
-                REQUIRE_EXISTING_FEATURE_CACHE = previous_cache_requirement
+                SETTINGS_FEATURE_BANK.REQUIRE_EXISTING_FEATURE_CACHE = previous_cache_requirement
                 if not args.keep_gpu_memory:
                     release_gpu_resources(action)
 
@@ -15149,15 +14928,18 @@ run_cad_pipeline = PipelineApplication.run_cad_pipeline
 
 __all__ = [
     "SETTINGS",
-    "Settings",
-    "RuntimeSettings",
-    "ValidationSettings",
-    "MonaiSettings",
-    "FeatureBankSettings",
-    "AuditSettings",
-    "AttentionSettings",
-    "ReviewSettings",
-    "PathSettings",
+    "SETTINGS_BOOTSTRAP",
+    "SETTINGS_RUNTIME",
+    "SETTINGS_EXPERIMENTS",
+    "SETTINGS_VALIDATION",
+    "SETTINGS_PREPROCESSING",
+    "SETTINGS_FEATURE_BANK",
+    "SETTINGS_AUDIT",
+    "SETTINGS_MONAI",
+    "SETTINGS_ATTENTION",
+    "SETTINGS_REVIEW",
+    "SETTINGS_REPORTING",
+    "SETTINGS_PATHS",
     "RuntimeManager",
     "ConfigurationManager",
     "ImagePreprocessor",
@@ -15194,6 +14976,18 @@ print(
     flush=True,
 )
 
+
+
+# region OPTIONAL COMPATIBILITY ALIASES
+# New code should use SETTINGS_<DOMAIN>.<NAME>. These aliases are read-only
+# snapshots retained for older notebooks and can be removed after migration.
+ATTENTION_INPUT_SIZE = SETTINGS_ATTENTION.ATTENTION_INPUT_SIZE
+ATTENTION_SEGMENTATION_FOLDS = SETTINGS_ATTENTION.ATTENTION_SEGMENTATION_FOLDS
+ATTENTION_BASE_CHANNELS = SETTINGS_ATTENTION.ATTENTION_BASE_CHANNELS
+MONAI_INPUT_SIZE = SETTINGS_MONAI.MONAI_INPUT_SIZE
+IMG_SIZE = SETTINGS_PREPROCESSING.IMG_SIZE
+BATCH_SIZE = SETTINGS_RUNTIME.BATCH_SIZE
+# endregion
 
 # ---------------------------------------------------------------------------
 # STANDALONE ENTRYPOINT
