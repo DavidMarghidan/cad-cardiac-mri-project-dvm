@@ -2705,7 +2705,7 @@ class BaseAttentionMaskEditor:
                          user-select:none;-webkit-user-select:none;"></canvas>
           <div style="font-size:12px;margin-top:5px">
             <b>Left drag = draw</b> &nbsp;|&nbsp; <b>Right drag = erase</b> &nbsp;|&nbsp;
-            D/E = mode &nbsp;|&nbsp; S = save &nbsp;|&nbsp; R = reset &nbsp;|&nbsp;
+            D/E = mode &nbsp;|&nbsp; S = save&next &nbsp;|&nbsp; R = Reset to image &nbsp;|&nbsp;
             C = clear &nbsp;|&nbsp; N/P = navigate
           </div>
         </div>
@@ -2883,9 +2883,9 @@ class BaseAttentionMaskEditor:
             if (['d','e','s','r','c','n','p'].includes(k)) e.preventDefault();
             if (k === 'd') mode = 'draw';
             else if (k === 'e') mode = 'erase';
-            else if (k === 's') Array.from(document.querySelectorAll('button')).find(x => x.innerText === 'Save manual')?.click();
+            else if (k === 's') Array.from(document.querySelectorAll('button')).find(x => x.innerText === 'Save & Next')?.click();
             else if (k === 'r') Array.from(document.querySelectorAll('button')).find(x => x.innerText === 'Reset to auto')?.click();
-            else if (k === 'c') Array.from(document.querySelectorAll('button')).find(x => x.innerText === 'Clear')?.click();
+            else if (k === 'c') Array.from(document.querySelectorAll('button')).find(x => x.innerText === 'Reset to image')?.click();
             else if (k === 'n') Array.from(document.querySelectorAll('button')).find(x => x.innerText === 'Next')?.click();
             else if (k === 'p') Array.from(document.querySelectorAll('button')).find(x => x.innerText === 'Previous')?.click();
           }});
@@ -3171,22 +3171,23 @@ class AttentionMaskEditor(BaseAttentionMaskEditor):
             [
                 widgets.HBox(
                     [
-                        self.previous_button,
+                        self.previous_button, 
                         self.next_button,
-                        self.save_button,
                         self.save_next_button,
-                        self.accept_button,
-                        self.skip_button,
+                        self.clear_drawn_button,
+                        self.reset_button,
+                        self.save_button,                        
                     ]
                 ),
                 widgets.HBox(
                     [
-                        self.reset_button,
-                        self.clear_drawn_button,
+                        self.accept_button,
+                        self.skip_button,
                         self.clear_button,
                         self.delete_manual_button,
                     ]
                 ),
+                
                 widgets.HBox([self.brush_slider, self.status]),
                 self.mask_sync,
                 self.output,
@@ -5833,15 +5834,52 @@ class FeatureBankManager:
         return tuple(mode for mode in canonical_order if mode in requested)
 
     @staticmethod
+    def _stable_dataset_signature(samples):
+        """Hash the immutable dataset identity without filesystem modification times.
+
+        Kaggle may remount the same read-only dataset with different ``st_mtime_ns``
+        values after a restart. Modification time is therefore not a feature-affecting
+        property and must not invalidate an otherwise identical frozen feature bank.
+        Relative Directory_* token, label, patient, series and byte size remain part
+        of the signature. The Kaggle source dataset is treated as immutable.
+        """
+
+        hasher = hashlib.sha256()
+        for image_path, label, patient_id, series_id in samples:
+            path = Path(image_path)
+            stat = path.stat()
+            parts = path.parts
+            relative = None
+            for index, part in enumerate(parts):
+                if str(part).startswith("Directory_"):
+                    relative = "/".join(map(str, parts[index:]))
+                    break
+            if relative is None:
+                relative = str(path.resolve())
+            row = (
+                relative,
+                int(label),
+                str(patient_id),
+                str(series_id),
+                int(stat.st_size),
+            )
+            hasher.update(repr(row).encode("utf-8"))
+        return hasher.hexdigest()
+
+    @staticmethod
     def feature_bank_fingerprint(samples, dataset_path):
-        """Hash dataset file metadata and every setting that changes frozen views."""
+        """Hash stable dataset identity and every setting that changes frozen views."""
 
         started = time.perf_counter()
-        hasher = hashlib.sha256()
         configuration = {
             "schema": SETTINGS_FEATURE_BANK.FEATURE_CACHE_SCHEMA,
-            "dataset_path": str(Path(dataset_path).resolve()),
-            "required_modes": list(FeatureBankManager.required_efficientnet_feature_modes(ConfigurationManager.get_enabled_experiments())),
+            "dataset_signature_schema": "directory-token-label-patient-series-size-v1",
+            "dataset_signature": FeatureBankManager._stable_dataset_signature(samples),
+            "required_modes": list(
+                FeatureBankManager.required_efficientnet_feature_modes(
+                    ConfigurationManager.get_enabled_experiments()
+                )
+            ),
             "img_size": SETTINGS_PREPROCESSING.IMG_SIZE,
             "monai_input_size": SETTINGS_MONAI.MONAI_INPUT_SIZE,
             "standardized_content_long_side": SETTINGS_PREPROCESSING.STANDARDIZED_CONTENT_LONG_SIDE,
@@ -5856,37 +5894,26 @@ class FeatureBankManager:
                 SETTINGS_PREPROCESSING.REGION_NORM_MIN_DYNAMIC_RANGE,
             ],
             "shuffle_schema": SETTINGS_PREPROCESSING.SUPPORT_INTENSITY_SHUFFLE_SCHEMA,
-            "monai_bundle": [SETTINGS_MONAI.MONAI_BUNDLE_NAME, SETTINGS_MONAI.MONAI_BUNDLE_VERSION, SETTINGS_MONAI.MONAI_HF_REVISION],
+            "monai_bundle": [
+                SETTINGS_MONAI.MONAI_BUNDLE_NAME,
+                SETTINGS_MONAI.MONAI_BUNDLE_VERSION,
+                SETTINGS_MONAI.MONAI_HF_REVISION,
+            ],
             "efficientnet_weights": SETTINGS_FEATURE_BANK.EFFICIENTNET_WEIGHTS_NAME,
             "device_tag": RuntimeManager.resolved_feature_cache_device_tag(),
             "use_cuda_amp": SETTINGS_RUNTIME.USE_CUDA_AMP,
         }
-        hasher.update(json.dumps(configuration, sort_keys=True).encode("utf-8"))
-
-        dataset_root = Path(dataset_path).resolve()
-        total = len(samples)
-        checkpoints = set(np.linspace(0, max(total - 1, 0), min(11, max(total, 1)), dtype=int))
-        for index, sample in enumerate(samples):
-            image_path, label, patient_id, series_id = sample
-            path = Path(image_path)
-            stat = path.stat()
-            try:
-                relative = str(path.resolve().relative_to(dataset_root))
-            except ValueError:
-                relative = str(path.resolve())
-            row = (relative, int(label), str(patient_id), str(series_id), int(stat.st_size), int(stat.st_mtime_ns))
-            hasher.update(repr(row).encode("utf-8"))
-            if index in checkpoints:
-                percent = 100.0 * (index + 1) / max(total, 1)
-                print(f"[FEATURE BANK FINGERPRINT] {index + 1}/{total} files ({percent:.0f}%)", flush=True)
-
-        digest = hasher.hexdigest()
+        digest = hashlib.sha256(
+            json.dumps(configuration, sort_keys=True).encode("utf-8")
+        ).hexdigest()
         print(
-            f"[FEATURE BANK] Fingerprint completed in "
-            f"{RuntimeManager._format_elapsed_time(time.perf_counter() - started)}: {digest[:16]}...",
+            f"[FEATURE BANK] Stable fingerprint completed in "
+            f"{RuntimeManager._format_elapsed_time(time.perf_counter() - started)}: "
+            f"{digest[:16]}...",
             flush=True,
         )
         return digest
+
 
     @staticmethod
     def _feature_bank_shared_paths(cache_dir):
@@ -6783,6 +6810,8 @@ class FeatureBankManager:
         metadata = {
             "fingerprint": fingerprint,
             "schema": SETTINGS_FEATURE_BANK.FEATURE_CACHE_SCHEMA,
+            "dataset_signature_schema": "directory-token-label-patient-series-size-v1",
+            "dataset_signature": FeatureBankManager._stable_dataset_signature(dataset.samples),
             "completed_modes": list(required_modes),
             "n_slices": int(n_slices),
             "feature_dimension": SETTINGS_FEATURE_BANK.EFFICIENTNET_FEATURE_DIM,
@@ -6806,19 +6835,134 @@ class FeatureBankManager:
         return loaded
 
     @staticmethod
+    def _feature_bank_rows_match_samples(bank, samples):
+        """Verify row identity before accepting a cache built by an older fingerprint."""
+
+        if len(bank["labels"]) != len(samples):
+            return False
+        expected_labels = np.asarray([int(row[1]) for row in samples], dtype=np.int64)
+        expected_patients = np.asarray([str(row[2]) for row in samples])
+        expected_series = np.asarray([str(row[3]) for row in samples])
+        expected_indices = np.arange(len(samples), dtype=np.int64)
+        return bool(
+            np.array_equal(np.asarray(bank["labels"]), expected_labels)
+            and np.array_equal(np.asarray(bank["patient_ids"]).astype(str), expected_patients)
+            and np.array_equal(np.asarray(bank["series_ids"]).astype(str), expected_series)
+            and np.array_equal(np.asarray(bank["sample_indices"]), expected_indices)
+        )
+
+    @staticmethod
+    def _find_compatible_feature_bank(samples, required_modes, current_fingerprint, exact_cache_dir):
+        """Find a scientifically compatible cache created before stable fingerprints.
+
+        Compatibility requires the same schema, modes, slice count and exact row-level
+        labels/patient/series order. New caches additionally carry the stable dataset
+        signature. Legacy caches without that field are accepted only after the full
+        row-identity check and are annotated for future sessions.
+        """
+
+        root = SETTINGS_PATHS.FEATURE_CACHE_ROOT
+        if not root.is_dir():
+            return None
+        stable_signature = FeatureBankManager._stable_dataset_signature(samples)
+        candidates = sorted(
+            (path for path in root.iterdir() if path.is_dir() and path != exact_cache_dir),
+            key=lambda path: path.stat().st_mtime_ns,
+            reverse=True,
+        )
+        for candidate in candidates:
+            metadata_path = candidate / "metadata.json"
+            if not metadata_path.is_file():
+                continue
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if metadata.get("schema") != SETTINGS_FEATURE_BANK.FEATURE_CACHE_SCHEMA:
+                continue
+            if int(metadata.get("n_slices", -1)) != len(samples):
+                continue
+            if not set(required_modes).issubset(set(metadata.get("completed_modes", []))):
+                continue
+            saved_signature = str(metadata.get("dataset_signature", ""))
+            if saved_signature and saved_signature != stable_signature:
+                continue
+            saved_fingerprint = str(metadata.get("fingerprint", ""))
+            if not saved_fingerprint:
+                continue
+            bank = FeatureBankManager.load_feature_bank(
+                candidate,
+                saved_fingerprint,
+                required_modes,
+            )
+            if bank is None or not FeatureBankManager._feature_bank_rows_match_samples(bank, samples):
+                continue
+
+            if not saved_signature:
+                print(
+                    "[FEATURE BANK][COMPATIBILITY] Reusing a legacy cache after "
+                    "verifying exact label/patient/series row alignment. The prior "
+                    "fingerprint depended on unstable Kaggle file mtimes.",
+                    flush=True,
+                )
+            else:
+                print(
+                    "[FEATURE BANK][COMPATIBILITY] Reusing a cache with the same "
+                    "stable dataset signature and representation contract.",
+                    flush=True,
+                )
+            metadata["dataset_signature_schema"] = (
+                "directory-token-label-patient-series-size-v1"
+            )
+            metadata["dataset_signature"] = stable_signature
+            aliases = set(metadata.get("stable_fingerprint_aliases", []))
+            aliases.add(current_fingerprint)
+            metadata["stable_fingerprint_aliases"] = sorted(aliases)
+            try:
+                metadata_path.write_text(
+                    json.dumps(metadata, indent=2, sort_keys=True),
+                    encoding="utf-8",
+                )
+            except OSError:
+                pass
+            bank["metadata"] = metadata
+            bank["compatible_current_fingerprint"] = current_fingerprint
+            return bank
+        return None
+
+    @staticmethod
     def load_or_extract_feature_bank(samples, required_modes, fingerprint, cache_dir):
-        """Load a matching bank or perform one fresh multi-view extraction."""
+        """Load an exact/compatible bank or perform one fresh multi-view extraction."""
 
         if SETTINGS_FEATURE_BANK.USE_FEATURE_CACHE and not SETTINGS_FEATURE_BANK.FORCE_REBUILD_FEATURE_CACHE:
             bank = FeatureBankManager.load_feature_bank(cache_dir, fingerprint, required_modes)
             if bank is not None:
                 return bank, "HIT"
+            bank = FeatureBankManager._find_compatible_feature_bank(
+                samples,
+                required_modes,
+                fingerprint,
+                cache_dir,
+            )
+            if bank is not None:
+                return bank, "COMPATIBLE_HIT"
 
         if SETTINGS_FEATURE_BANK.REQUIRE_EXISTING_FEATURE_CACHE:
+            available = []
+            if SETTINGS_PATHS.FEATURE_CACHE_ROOT.is_dir():
+                available = sorted(
+                    path.name
+                    for path in SETTINGS_PATHS.FEATURE_CACHE_ROOT.iterdir()
+                    if path.is_dir()
+                )
             raise RuntimeError(
-                "A matching frozen feature bank was not found, and this action is "
-                "cache-only. Run build-monai-feature-cache in a GPU session first. "
-                f"Expected cache directory: {cache_dir}"
+                "A matching or row-compatible frozen feature bank was not found, "
+                "and this action is cache-only. Run the notebook cell "
+                "'GPU A — construiește/reutilizează feature bank-ul celor 7 "
+                "experimente MONAI' once in a GPU session, preserve /kaggle/working, "
+                "then restart with Accelerator=None. "
+                f"Expected stable cache directory: {cache_dir}. "
+                f"Existing cache directories: {available[:12]}"
             )
 
         print(
@@ -6828,20 +6972,15 @@ class FeatureBankManager:
         )
         dataset = MRIDataset(samples, transform)
 
-        # Keep this set synchronized with every representation that consumes a
-        # MONAI probability map, hard mask, gate decision, or bounding box. This is
-        # Every active image representation depends on standardized MONAI output.
         monai_dependent_modes = {
-            'standardized_roi_zero_bg_center_fallback',
-            'standardized_hard_support_region_norm',
-            'standardized_fixed_periphery_region_norm',
-            'standardized_a17_exact_support_mask_only',
-            'standardized_a17_support_intensity_affine_shuffled',
-            'standardized_a17_exact_support_complement_region_norm',
+            "standardized_roi_zero_bg_center_fallback",
+            "standardized_hard_support_region_norm",
+            "standardized_fixed_periphery_region_norm",
+            "standardized_a17_exact_support_mask_only",
+            "standardized_a17_support_intensity_affine_shuffled",
+            "standardized_a17_exact_support_complement_region_norm",
         }
-        need_monai = any(
-            mode in monai_dependent_modes for mode in required_modes
-        )
+        need_monai = any(mode in monai_dependent_modes for mode in required_modes)
         monai_segmenter = MonaiSegmenter.build_monai_segmenter() if need_monai else None
 
         feature_extractor = FeatureExtractor().to(DEVICE)
@@ -6868,6 +7007,7 @@ class FeatureBankManager:
             torch.cuda.empty_cache()
 
         return bank, "MISS"
+
 
 
 class DuplicateAuditManager:
@@ -11800,41 +11940,15 @@ class PipelineRunner:
 
     @staticmethod
     def load_existing_attention_feature_bank(samples, workspace, checkpoint_map):
-        """CPU stage: load an already generated AU1-AU5 patient feature bank."""
+        """CPU stage: load a current or safely migrated AU1-AU5 feature bank."""
 
-        output_dir = workspace.comparison_output
-        npz_path = output_dir / "attention_unet_patient_feature_bank.npz"
-        metadata_path = output_dir / "attention_unet_feature_bank_metadata.json"
-        if not npz_path.is_file() or not metadata_path.is_file():
-            raise FileNotFoundError(
-                "Attention patient feature bank is missing. Run "
-                "build-attention-feature-cache in a GPU session first."
-            )
-        checkpoint_fingerprint = AttentionEvaluationManager._attention_feature_fingerprint(
-            samples, checkpoint_map
+        return AttentionEvaluationManager.load_compatible_attention_feature_bank(
+            samples,
+            workspace,
+            checkpoint_map,
+            stale_policy="raise",
         )
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        if metadata.get("fingerprint") != checkpoint_fingerprint:
-            raise RuntimeError(
-                "The existing Attention feature bank does not match the current "
-                "checkpoints/dataset. Rebuild it in a GPU session with "
-                "build-attention-feature-cache."
-            )
-        loaded = np.load(npz_path, allow_pickle=False)
-        print(
-            f"[STAGED][CPU] Loading Attention patient feature bank: {npz_path}",
-            flush=True,
-        )
-        return {
-            "fingerprint": checkpoint_fingerprint,
-            "patient_ids": loaded["patient_ids"].astype(str),
-            "labels": loaded["labels"].astype(np.int64),
-            "features": {
-                mode: loaded[f"X__{mode}"].astype(np.float32)
-                for mode in SETTINGS_ATTENTION.ATTENTION_FEATURE_MODES
-            },
-            "metadata": metadata,
-        }
+
 
     @staticmethod
     def _review_mask_exists(row, source):
@@ -13228,10 +13342,37 @@ class AttentionEvaluationManager:
     """Attention patient feature bank, AU1-AU5 evaluation and MONAI comparison."""
 
     @staticmethod
+    def _attention_checkpoint_hashes(checkpoint_map):
+        return {
+            str(fold): hashlib.sha256(Path(path).read_bytes()).hexdigest()
+            for fold, path in sorted(checkpoint_map.items())
+        }
+
+    @staticmethod
+    def _attention_dataset_signature(samples):
+        """Stable image-cohort signature that intentionally excludes file mtimes."""
+
+        hasher = hashlib.sha256()
+        for image_path, label, patient_id, series_id in samples:
+            path = Path(image_path)
+            row = (
+                AttentionDataManager._directory_scoped_relative_token(image_path),
+                int(label),
+                str(patient_id),
+                str(series_id),
+                int(path.stat().st_size),
+            )
+            hasher.update(repr(row).encode("utf-8"))
+        return hasher.hexdigest()
+
+    @staticmethod
     def _attention_feature_fingerprint(samples, checkpoint_map):
         hasher = hashlib.sha256()
-        hasher.update(SETTINGS_ATTENTION.ATTENTION_FEATURE_CACHE_SCHEMA.encode("utf-8"))
-        settings = {
+        payload = {
+            "schema": SETTINGS_ATTENTION.ATTENTION_FEATURE_CACHE_SCHEMA,
+            "dataset_signature_schema": "directory-token-label-patient-series-size-v1",
+            "dataset_signature": AttentionEvaluationManager._attention_dataset_signature(samples),
+            "checkpoint_sha256": AttentionEvaluationManager._attention_checkpoint_hashes(checkpoint_map),
             "mask_threshold": SETTINGS_ATTENTION.ATTENTION_MASK_THRESHOLD,
             "min_area": SETTINGS_ATTENTION.ATTENTION_MIN_HEART_AREA_RATIO,
             "max_area": SETTINGS_ATTENTION.ATTENTION_MAX_HEART_AREA_RATIO,
@@ -13240,19 +13381,233 @@ class AttentionEvaluationManager:
             "efficientnet_weights": SETTINGS_FEATURE_BANK.EFFICIENTNET_WEIGHTS_NAME,
             "feature_dim": SETTINGS_FEATURE_BANK.EFFICIENTNET_FEATURE_DIM,
         }
-        hasher.update(json.dumps(settings, sort_keys=True).encode("utf-8"))
-        for fold in sorted(checkpoint_map):
-            path = Path(checkpoint_map[fold])
-            hasher.update(str(fold).encode("utf-8"))
-            hasher.update(hashlib.sha256(path.read_bytes()).digest())
-        for image_path, _label, patient_id, series_id in samples:
-            stat = Path(image_path).stat()
-            hasher.update(AttentionDataManager._directory_scoped_relative_token(image_path).encode("utf-8"))
-            hasher.update(str(patient_id).encode("utf-8"))
-            hasher.update(str(series_id).encode("utf-8"))
-            hasher.update(str(stat.st_size).encode("utf-8"))
-            hasher.update(str(stat.st_mtime_ns).encode("utf-8"))
+        hasher.update(json.dumps(payload, sort_keys=True).encode("utf-8"))
         return hasher.hexdigest()
+
+    @staticmethod
+    def _expected_patient_label_map(samples):
+        expected = {}
+        for _path, label, patient_id, _series_id in samples:
+            patient_id = str(patient_id)
+            label = int(label)
+            if patient_id in expected and expected[patient_id] != label:
+                raise RuntimeError(f"Inconsistent label for {patient_id}.")
+            expected[patient_id] = label
+        return expected
+
+    @staticmethod
+    def _attention_bank_candidates(workspace):
+        current = workspace.comparison_output
+        candidates = [current]
+        if SETTINGS_PATHS.OUTPUT_ROOT.is_dir():
+            candidates.extend(
+                sorted(
+                    (
+                        path
+                        for path in SETTINGS_PATHS.OUTPUT_ROOT.glob(
+                            "multi_experiment_suite__*/attention_unet_comparison"
+                        )
+                        if path != current
+                    ),
+                    key=lambda path: path.stat().st_mtime_ns,
+                    reverse=True,
+                )
+            )
+        return candidates
+
+    @staticmethod
+    def load_compatible_attention_feature_bank(
+        samples,
+        workspace,
+        checkpoint_map,
+        stale_policy="raise",
+    ):
+        """Load/migrate a current or legacy AU1-AU5 bank without hiding true staleness.
+
+        Old fingerprints included Kaggle file modification times. A legacy bank is
+        reused only when the patient/label cohort, feature schema/modes and checkpoint
+        provenance are compatible. If a checkpoint is newer than the bank or exact
+        checkpoint hashes disagree, the bank remains stale and GPU rebuilding is
+        required.
+        """
+
+        current_fingerprint = AttentionEvaluationManager._attention_feature_fingerprint(
+            samples, checkpoint_map
+        )
+        current_dataset_signature = AttentionEvaluationManager._attention_dataset_signature(
+            samples
+        )
+        current_checkpoint_hashes = AttentionEvaluationManager._attention_checkpoint_hashes(
+            checkpoint_map
+        )
+        current_review_fingerprint = MaskReviewManager._review_checkpoint_fingerprint(
+            checkpoint_map
+        )
+        expected_patient_labels = AttentionEvaluationManager._expected_patient_label_map(
+            samples
+        )
+        stale_reasons = []
+
+        for output_dir in AttentionEvaluationManager._attention_bank_candidates(workspace):
+            npz_path = output_dir / "attention_unet_patient_feature_bank.npz"
+            metadata_path = output_dir / "attention_unet_feature_bank_metadata.json"
+            if not npz_path.is_file() or not metadata_path.is_file():
+                continue
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                loaded = np.load(npz_path, allow_pickle=False)
+            except Exception as error:
+                stale_reasons.append(f"{output_dir}: unreadable ({error})")
+                continue
+
+            required_arrays = {"patient_ids", "labels"} | {
+                f"X__{mode}" for mode in SETTINGS_ATTENTION.ATTENTION_FEATURE_MODES
+            }
+            if not required_arrays.issubset(set(loaded.files)):
+                stale_reasons.append(f"{output_dir}: missing AU1-AU5 arrays")
+                continue
+            patient_ids = loaded["patient_ids"].astype(str)
+            labels = loaded["labels"].astype(np.int64)
+            observed = {patient: int(label) for patient, label in zip(patient_ids, labels)}
+            if observed != expected_patient_labels:
+                stale_reasons.append(f"{output_dir}: patient/label cohort differs")
+                continue
+            if metadata.get("schema") != SETTINGS_ATTENTION.ATTENTION_FEATURE_CACHE_SCHEMA:
+                stale_reasons.append(f"{output_dir}: feature schema differs")
+                continue
+            if set(metadata.get("feature_modes", [])) != set(
+                SETTINGS_ATTENTION.ATTENTION_FEATURE_MODES
+            ):
+                stale_reasons.append(f"{output_dir}: feature modes differ")
+                continue
+            if int(metadata.get("n_images", -1)) != len(samples):
+                stale_reasons.append(f"{output_dir}: image count differs")
+                continue
+
+            compatible = metadata.get("fingerprint") == current_fingerprint
+            migration_reason = ""
+            if not compatible:
+                saved_dataset_signature = str(metadata.get("dataset_signature", ""))
+                saved_checkpoint_hashes = {
+                    str(key): str(value)
+                    for key, value in metadata.get("checkpoint_sha256", {}).items()
+                }
+                if saved_dataset_signature and saved_checkpoint_hashes:
+                    compatible = (
+                        saved_dataset_signature == current_dataset_signature
+                        and saved_checkpoint_hashes == current_checkpoint_hashes
+                    )
+                    if compatible:
+                        migration_reason = "stable provenance matched"
+                else:
+                    # Legacy metadata: require matching fold/path names and evidence
+                    # that the bank was produced after the current checkpoints.
+                    saved_paths = {
+                        str(key): Path(value).name
+                        for key, value in metadata.get("checkpoints", {}).items()
+                    }
+                    current_paths = {
+                        str(key): Path(value).name
+                        for key, value in checkpoint_map.items()
+                    }
+                    bank_time = min(npz_path.stat().st_mtime_ns, metadata_path.stat().st_mtime_ns)
+                    checkpoints_not_newer = all(
+                        Path(path).stat().st_mtime_ns <= bank_time + 2_000_000_000
+                        for path in checkpoint_map.values()
+                    )
+                    prediction_metadata_path = (
+                        MaskReviewManager.attention_prediction_generation_path(workspace)
+                    )
+                    prediction_provenance_ok = False
+                    if prediction_metadata_path.is_file():
+                        try:
+                            prediction_metadata = json.loads(
+                                prediction_metadata_path.read_text(encoding="utf-8")
+                            )
+                            prediction_provenance_ok = (
+                                prediction_metadata.get("checkpoint_fingerprint")
+                                == current_review_fingerprint
+                                and prediction_metadata_path.stat().st_mtime_ns
+                                <= bank_time + 2_000_000_000
+                            )
+                        except Exception:
+                            prediction_provenance_ok = False
+                    compatible = (
+                        saved_paths == current_paths
+                        and (checkpoints_not_newer or prediction_provenance_ok)
+                    )
+                    if compatible:
+                        migration_reason = (
+                            "legacy metadata matched cohort/checkpoint paths and "
+                            "artifact creation order"
+                        )
+
+            if not compatible:
+                stale_reasons.append(
+                    f"{output_dir}: checkpoint or dataset provenance differs"
+                )
+                continue
+
+            if metadata.get("fingerprint") != current_fingerprint:
+                previous_fingerprint = metadata.get("fingerprint", "")
+                metadata["legacy_fingerprint_migrated_from"] = previous_fingerprint
+                metadata["fingerprint"] = current_fingerprint
+                metadata["dataset_signature_schema"] = (
+                    "directory-token-label-patient-series-size-v1"
+                )
+                metadata["dataset_signature"] = current_dataset_signature
+                metadata["checkpoint_sha256"] = current_checkpoint_hashes
+                metadata["checkpoint_review_fingerprint"] = current_review_fingerprint
+                metadata["migration_reason"] = migration_reason
+                metadata_path.write_text(
+                    json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8"
+                )
+                print(
+                    "[ATTENTION][FEATURES][COMPATIBILITY] Migrated an existing "
+                    "AU1-AU5 bank from the old mtime-sensitive fingerprint after "
+                    f"provenance validation: {output_dir}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[ATTENTION][FEATURES] Reusing patient feature bank: {npz_path}",
+                    flush=True,
+                )
+
+            return {
+                "fingerprint": current_fingerprint,
+                "patient_ids": patient_ids,
+                "labels": labels,
+                "features": {
+                    mode: loaded[f"X__{mode}"].astype(np.float32)
+                    for mode in SETTINGS_ATTENTION.ATTENTION_FEATURE_MODES
+                },
+                "metadata": metadata,
+            }
+
+        if stale_policy == "return_none":
+            if stale_reasons:
+                print(
+                    "[ATTENTION][FEATURES] Existing banks are stale/incompatible; "
+                    "GPU extraction will rebuild the current bank. Reasons: "
+                    + " | ".join(stale_reasons[:4]),
+                    flush=True,
+                )
+            return None
+        if stale_reasons:
+            raise RuntimeError(
+                "The existing Attention feature bank does not match the current "
+                "checkpoints/dataset after stable-provenance validation. Run the "
+                "notebook cell 'GPU B — AU1–AU5 din checkpointurile manual-only' "
+                "again, then restart with Accelerator=None. Details: "
+                + " | ".join(stale_reasons[:6])
+            )
+        raise FileNotFoundError(
+            "Attention patient feature bank is missing. Run the notebook cell "
+            "'GPU B — AU1–AU5 din checkpointurile manual-only' in a GPU session "
+            "first and preserve /kaggle/working before CPU evaluation."
+        )
+
 
     @staticmethod
     def _dice_binary(first, second):
@@ -13282,24 +13637,14 @@ class AttentionEvaluationManager:
         npz_path = output_dir / "attention_unet_patient_feature_bank.npz"
         metadata_path = output_dir / "attention_unet_feature_bank_metadata.json"
         fingerprint = AttentionEvaluationManager._attention_feature_fingerprint(samples, checkpoint_map)
-        if npz_path.is_file() and metadata_path.is_file():
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-            if metadata.get("fingerprint") == fingerprint:
-                loaded = np.load(npz_path, allow_pickle=False)
-                print(
-                    f"[ATTENTION][FEATURES] Reusing patient feature bank: {npz_path}",
-                    flush=True,
-                )
-                return {
-                    "fingerprint": fingerprint,
-                    "patient_ids": loaded["patient_ids"].astype(str),
-                    "labels": loaded["labels"].astype(np.int64),
-                    "features": {
-                        mode: loaded[f"X__{mode}"].astype(np.float32)
-                        for mode in SETTINGS_ATTENTION.ATTENTION_FEATURE_MODES
-                    },
-                    "metadata": metadata,
-                }
+        existing = AttentionEvaluationManager.load_compatible_attention_feature_bank(
+            samples,
+            workspace,
+            checkpoint_map,
+            stale_policy="return_none",
+        )
+        if existing is not None:
+            return existing
 
         patient_to_fold = AttentionDataManager.build_attention_patient_folds(samples)
         try:
@@ -13562,6 +13907,10 @@ class AttentionEvaluationManager:
             "status": "OK",
             "fingerprint": fingerprint,
             "schema": SETTINGS_ATTENTION.ATTENTION_FEATURE_CACHE_SCHEMA,
+            "dataset_signature_schema": "directory-token-label-patient-series-size-v1",
+            "dataset_signature": AttentionEvaluationManager._attention_dataset_signature(samples),
+            "checkpoint_sha256": AttentionEvaluationManager._attention_checkpoint_hashes(checkpoint_map),
+            "checkpoint_review_fingerprint": MaskReviewManager._review_checkpoint_fingerprint(checkpoint_map),
             "n_patients": int(len(patient_ids)),
             "n_images": int(len(samples)),
             "feature_modes": list(SETTINGS_ATTENTION.ATTENTION_FEATURE_MODES),
