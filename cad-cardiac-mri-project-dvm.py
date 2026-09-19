@@ -17,8 +17,8 @@ class SETTINGS_BOOTSTRAP:
     CAD_ATTENTION_STORE_PREDICTED_MASKS_IN_TRANSIENT = "0"
     CAD_ATTENTION_SAVE_ALL_PREDICTED_MASKS = "1"
 
-    REVIEW_SCOPE = "diverse"
-    REVIEW_LIMIT = 1200
+    REVIEW_SCOPE = "novel_per_patient"
+    REVIEW_LIMIT = 300
     REVIEW_SEED = 42
 
 
@@ -865,6 +865,100 @@ class SETTINGS_ATTENTION:
         "CAD_ATTENTION_UNET_MIN_PEAK_PROBABILITY", 0.50, minimum=0.0, maximum=1.0
     )
 
+    # Post-training calibration is learned independently inside each segmentation
+    # fold from that fold's patient-disjoint manual validation subset. CAD labels
+    # and target-fold patients are never used. The selected threshold is saved in
+    # the checkpoint and reused by full-cohort inference.
+    ATTENTION_CALIBRATION_THRESHOLDS = (
+        0.25, 0.30, 0.35, 0.40, 0.45,
+        0.50, 0.55, 0.60, 0.65, 0.70,
+    )
+    ATTENTION_CALIBRATION_INVALID_PENALTY = _env_float(
+        "CAD_ATTENTION_CALIBRATION_INVALID_PENALTY", 0.25, minimum=0.0
+    )
+    ATTENTION_CALIBRATION_FALSE_EMPTY_PENALTY = _env_float(
+        "CAD_ATTENTION_CALIBRATION_FALSE_EMPTY_PENALTY", 0.10, minimum=0.0
+    )
+
+    # Invalid masks are repaired without CAD labels. TTA is run only for initially
+    # invalid rows, so ordinary valid inference keeps the original cost. Threshold,
+    # connected-component and same-series geometric repairs are all audited.
+    ATTENTION_REPAIR_SCHEMA = "fold-calibrated-tta-component-series-v1"
+    ATTENTION_REPAIR_TTA_ENABLED = _env_bool(
+        "CAD_ATTENTION_REPAIR_TTA_ENABLED", True
+    )
+    ATTENTION_REPAIR_TTA_ROTATION_DEGREES = _env_float(
+        "CAD_ATTENTION_REPAIR_TTA_ROTATION_DEGREES", 5.0, minimum=0.0, maximum=15.0
+    )
+    ATTENTION_REPAIR_THRESHOLD_OFFSETS = (
+        -0.15, -0.10, -0.05, 0.0, 0.05, 0.10, 0.15
+    )
+    ATTENTION_REPAIR_MORPHOLOGY_KERNEL = _env_int(
+        "CAD_ATTENTION_REPAIR_MORPHOLOGY_KERNEL", 5, minimum=1
+    )
+    ATTENTION_REPAIR_MIN_COMPONENT_AREA_RATIO = _env_float(
+        "CAD_ATTENTION_REPAIR_MIN_COMPONENT_AREA_RATIO", 0.0005,
+        minimum=0.0, maximum=0.10,
+    )
+    ATTENTION_REPAIR_MAX_BOUNDARY_TOUCH_FRACTION = _env_float(
+        "CAD_ATTENTION_REPAIR_MAX_BOUNDARY_TOUCH_FRACTION", 0.35,
+        minimum=0.0, maximum=1.0,
+    )
+    ATTENTION_REPAIR_MAX_CENTROID_DISTANCE = _env_float(
+        "CAD_ATTENTION_REPAIR_MAX_CENTROID_DISTANCE", 0.45,
+        minimum=0.0, maximum=1.5,
+    )
+    ATTENTION_REPAIR_SERIES_PRIOR_ENABLED = _env_bool(
+        "CAD_ATTENTION_REPAIR_SERIES_PRIOR_ENABLED", True
+    )
+    ATTENTION_REPAIR_SERIES_MIN_VALID_MASKS = _env_int(
+        "CAD_ATTENTION_REPAIR_SERIES_MIN_VALID_MASKS", 2, minimum=1
+    )
+    ATTENTION_REPAIR_SERIES_MAX_CENTROID_DISTANCE = _env_float(
+        "CAD_ATTENTION_REPAIR_SERIES_MAX_CENTROID_DISTANCE", 0.30,
+        minimum=0.0, maximum=1.5,
+    )
+    ATTENTION_REPAIR_SERIES_MIN_AREA_MULTIPLIER = _env_float(
+        "CAD_ATTENTION_REPAIR_SERIES_MIN_AREA_MULTIPLIER", 0.35,
+        minimum=0.01, maximum=1.0,
+    )
+    ATTENTION_REPAIR_SERIES_MAX_AREA_MULTIPLIER = _env_float(
+        "CAD_ATTENTION_REPAIR_SERIES_MAX_AREA_MULTIPLIER", 2.85,
+        minimum=1.0,
+    )
+
+    # Manual masks with no selected foreground are excluded before training and
+    # from the manual-only classification experiment. These thresholds are fixed,
+    # label-blind QC safeguards and must not be tuned against AUROC.
+    ATTENTION_MANUAL_MASK_MIN_AREA_RATIO = _env_float(
+        "CAD_ATTENTION_MANUAL_MASK_MIN_AREA_RATIO", 0.0005, minimum=0.0, maximum=1.0
+    )
+    ATTENTION_MANUAL_MASK_MAX_AREA_RATIO = _env_float(
+        "CAD_ATTENTION_MANUAL_MASK_MAX_AREA_RATIO", 0.98, minimum=0.0, maximum=1.0
+    )
+
+    # Image-quality filtering is calculated on a fixed 128x128 label-blind
+    # standardized thumbnail. The absolute limits catch extreme corruption; the
+    # per-patient quantiles conservatively remove only each patient's worst tails.
+    ATTENTION_QUALITY_THUMBNAIL_SIZE = _env_int(
+        "CAD_ATTENTION_QUALITY_THUMBNAIL_SIZE", 128, minimum=32
+    )
+    ATTENTION_QUALITY_MIN_DYNAMIC_RANGE = _env_float(
+        "CAD_ATTENTION_QUALITY_MIN_DYNAMIC_RANGE", 12.0, minimum=0.0
+    )
+    ATTENTION_QUALITY_MIN_LAPLACIAN_VARIANCE = _env_float(
+        "CAD_ATTENTION_QUALITY_MIN_LAPLACIAN_VARIANCE", 4.0, minimum=0.0
+    )
+    ATTENTION_QUALITY_MAX_NOISE_RATIO = _env_float(
+        "CAD_ATTENTION_QUALITY_MAX_NOISE_RATIO", 0.30, minimum=0.0
+    )
+    ATTENTION_QUALITY_PATIENT_BLUR_QUANTILE = _env_float(
+        "CAD_ATTENTION_QUALITY_PATIENT_BLUR_QUANTILE", 0.03, minimum=0.0, maximum=0.25
+    )
+    ATTENTION_QUALITY_PATIENT_NOISE_QUANTILE = _env_float(
+        "CAD_ATTENTION_QUALITY_PATIENT_NOISE_QUANTILE", 0.97, minimum=0.75, maximum=1.0
+    )
+
     ATTENTION_SUPPORT_DILATION_KERNEL = _env_int(
         "CAD_ATTENTION_UNET_SUPPORT_DILATION_KERNEL", 15, minimum=1
     )
@@ -980,7 +1074,7 @@ class SETTINGS_ATTENTION:
 
     # Change this schema whenever AU1-AU5 representation semantics change.
     ATTENTION_FEATURE_CACHE_SCHEMA = (
-        "2026-09-11-attention-unet-crossfit-patient-disk-safe-v2"
+        "2026-09-19-attention-manual-matched-au8-au9-v5"
     )
 
     ATTENTION_FEATURE_MODES = (
@@ -989,6 +1083,17 @@ class SETTINGS_ATTENTION:
         "AU3_ATTENTION_EXACT_SUPPORT_MASK_ONLY",
         "AU4_ATTENTION_SUPPORT_SHUFFLED_INTENSITY",
         "AU5_ATTENTION_EXACT_SUPPORT_COMPLEMENT_REGION_NORM",
+    )
+
+    # AU6-AU9 use the identical non-empty, quality-valid manual-mask slice set.
+    # AU6/AU7 use manual supports. AU8/AU9 use cross-fitted Attention supports on
+    # those exact same images, without valid-mask filtering or central fallback.
+    # This isolates segmentation-mask quality from image-selection effects.
+    ATTENTION_MANUAL_FEATURE_MODES = (
+        "AU6_MANUAL_MASK_CLEAN_REGION_NORM",
+        "AU7_MANUAL_MASK_CLEAN_COMPLEMENT_REGION_NORM",
+        "AU8_ATTENTION_MATCHED_MANUAL_SUBSET_REGION_NORM",
+        "AU9_ATTENTION_MATCHED_MANUAL_SUBSET_COMPLEMENT_REGION_NORM",
     )
 
     ATTENTION_MANIFEST_FIELDS = (
@@ -1054,24 +1159,78 @@ class SETTINGS_ATTENTION:
         ),
     )
 
+    ATTENTION_MANUAL_EXPERIMENTS = (
+        ExperimentConfig(
+            experiment_id="AU6_MANUAL_MASK_CLEAN_REGION_NORM_HIER_LR_PCA",
+            description=(
+                "MRI intensity inside non-empty manual cardiac masks only, after "
+                "label-blind blur/noise exclusion and hierarchical patient pooling."
+            ),
+            feature_mode=ATTENTION_MANUAL_FEATURE_MODES[0],
+            role="manual_mask_candidate",
+        ),
+        ExperimentConfig(
+            experiment_id="AU7_MANUAL_MASK_CLEAN_COMPLEMENT_REGION_NORM_HIER_LR_PCA",
+            description=(
+                "Matched complement control using exactly the same manual-mask, "
+                "quality-valid slices as AU6."
+            ),
+            feature_mode=ATTENTION_MANUAL_FEATURE_MODES[1],
+            role="manual_mask_negative_control",
+        ),
+        ExperimentConfig(
+            experiment_id="AU8_ATTENTION_MATCHED_MANUAL_SUBSET_REGION_NORM_HIER_LR_PCA",
+            description=(
+                "Cross-fitted Attention support evaluated on exactly the same "
+                "non-empty, quality-valid manual-mask slices as AU6. The raw "
+                "predicted support is used without validity filtering or central "
+                "fallback, isolating automatic-versus-manual mask quality."
+            ),
+            feature_mode=ATTENTION_MANUAL_FEATURE_MODES[2],
+            role="matched_attention_candidate",
+        ),
+        ExperimentConfig(
+            experiment_id="AU9_ATTENTION_MATCHED_MANUAL_SUBSET_COMPLEMENT_REGION_NORM_HIER_LR_PCA",
+            description=(
+                "Complement of the cross-fitted Attention support on exactly the "
+                "same slices used by AU6/AU7/AU8, with no validity filtering or fallback."
+            ),
+            feature_mode=ATTENTION_MANUAL_FEATURE_MODES[3],
+            role="matched_attention_negative_control",
+        ),
+    )
+
 class SETTINGS_REVIEW:
     """HTML review queue, workflow actions and CSV field contracts."""
 
-    # diverse gives a patient/series-balanced queue; all exposes every mask.
-    REVIEW_SCOPE = "diverse"
+    # novel_per_patient selects new, quality-valid and non-redundant rows.
+    REVIEW_SCOPE = "novel_per_patient"
 
-    # Use 0 with scope=all for no global queue limit.
-    REVIEW_LIMIT = 1200
+    # Ten novel images per each of 30 patients gives a compact 300-row queue.
+    REVIEW_LIMIT = 300
 
     REVIEW_SEED = 42
+
+    # A candidate is rejected when its 64-bit pHash is within this Hamming radius
+    # of any image with a usable manual mask. This avoids spending review time on
+    # neighbouring/near-duplicate slices that are already represented manually.
+    ATTENTION_REVIEW_MANUAL_PHASH_MAX_DISTANCE = _env_int(
+        "CAD_ATTENTION_REVIEW_MANUAL_PHASH_MAX_DISTANCE", 6, minimum=0
+    )
+    ATTENTION_REVIEW_NOVEL_PER_PATIENT = _env_int(
+        "CAD_ATTENTION_REVIEW_NOVEL_PER_PATIENT", 10, minimum=1
+    )
+    ATTENTION_REVIEW_QUALITY_SCHEMA = "label-blind-quality-phash-v1"
 
     ATTENTION_REVIEW_SCHEMA = "cad-mask-review-current"
 
     ATTENTION_REVIEW_SCOPES = (
         "all",
         "diverse",
+        "novel_per_patient",
         "unreviewed",
         "invalid",
+        "invalid_after_retrain",
         "disagreement",
         "manual",
         "reviewed",
@@ -1109,10 +1268,34 @@ class SETTINGS_REVIEW:
         "monai_area_ratio",
         "monai_peak_probability",
         "attention_valid",
+        "attention_valid_initial",
+        "attention_valid_final",
+        "attention_invalid_reason_initial",
+        "attention_invalid_reason_final",
+        "attention_repair_method",
+        "attention_threshold_used",
+        "attention_tta_variance",
+        "attention_component_count",
+        "attention_boundary_touch_fraction",
+        "attention_centroid_x",
+        "attention_centroid_y",
+        "attention_mean_inside_probability",
+        "attention_repair_score",
+        "attention_series_prior_used",
         "attention_area_ratio",
         "attention_peak_probability",
         "dice_attention_vs_monai",
         "manual_mask_exists",
+        "manual_mask_area_ratio",
+        "manual_mask_usable",
+        "manual_mask_rejection_reason",
+        "perceptual_hash",
+        "image_quality_sharpness",
+        "image_quality_noise_ratio",
+        "image_quality_dynamic_range",
+        "image_quality_valid",
+        "image_quality_reason",
+        "minimum_manual_phash_distance",
         "attention_checkpoint_fingerprint",
     )
 
@@ -2292,7 +2475,10 @@ class _StreamingHierarchicalAttentionPool:
         if keep is None:
             keep = np.ones(len(embeddings), dtype=bool)
         keep = np.asarray(keep, dtype=bool)
-        for index in np.flatnonzero(keep):
+        # Register every patient/series before applying the slice filter. This
+        # makes a patient with zero repaired-valid slices an explicit error
+        # rather than silently shrinking the patient-level cohort.
+        for index in range(len(embeddings)):
             patient_id = str(patient_ids[index])
             series_id = str(series_ids[index])
             label = int(labels[index])
@@ -2301,6 +2487,9 @@ class _StreamingHierarchicalAttentionPool:
                 raise RuntimeError(f"Inconsistent label for {patient_id}.")
             self.patient_to_label[patient_id] = label
             self.series_to_patient[series_id] = patient_id
+        for index in np.flatnonzero(keep):
+            patient_id = str(patient_ids[index])
+            series_id = str(series_ids[index])
             if series_id not in self.series_sums[mode]:
                 self.series_sums[mode][series_id] = np.zeros(
                     embeddings.shape[1], dtype=np.float64
@@ -3244,22 +3433,35 @@ class AttentionMaskEditor(BaseAttentionMaskEditor):
 
     def _update_review_status(self, prefix=""):
         row = self.rows[self.index]
-        manual = Path(row["manual_mask_path"]).is_file()
+        manual_qc = MaskReviewManager._manual_mask_qc(row)
+        row.update(manual_qc)
         if self.base_source == "attention":
             valid = row.get("attention_valid", "")
             peak = row.get("attention_peak_probability", "")
             agreement = row.get("dice_attention_vs_monai", "")
-            qc = f"valid={valid}, peak={peak}, Dice-vs-MONAI={agreement}"
+            qc = (
+                f"valid={valid}, peak={peak}, Dice-vs-MONAI={agreement}, "
+                f"repair={row.get('attention_repair_method', '')}, "
+                f"reason={row.get('attention_invalid_reason_final', '')}"
+            )
         else:
             valid = row.get("monai_valid", "")
             peak = row.get("monai_peak_probability", "")
             qc = f"valid={valid}, peak={peak}"
+        quality = (
+            f"quality={row.get('image_quality_valid', '')}, "
+            f"sharp={row.get('image_quality_sharpness', '')}, "
+            f"noise={row.get('image_quality_noise_ratio', '')}, "
+            f"d_manual={row.get('minimum_manual_phash_distance', '')}"
+        )
         self.status.value = (
             f"<span style='margin-left:12px'><b>{prefix}</b> "
             f"source={self.base_source}; scope={self.review_scope}; "
             f"round={self.review_round}; index={self.index + 1}/{len(self.rows)}; "
-            f"manual={'yes' if manual else 'no'}; {qc}</span>"
+            f"manual={'yes' if manual_qc['manual_mask_exists'] else 'no'}; "
+            f"manual_usable={manual_qc['manual_mask_usable']}; {qc}; {quality}</span>"
         )
+
 
     def _log(self, action, mask=None):
         MaskReviewManager._review_append_review_event(
@@ -3282,9 +3484,7 @@ class AttentionMaskEditor(BaseAttentionMaskEditor):
             required=True,
             purpose="manual Attention U-Net mask",
         )
-        overlay_path = Path(self.workspace.mask_overlays) / (
-            f"{row['image_token']}.png"
-        )
+        overlay_path = Path(self.workspace.mask_overlays) / f"{row['image_token']}.png"
         base = np.stack([self.image] * 3, axis=-1)
         overlay = base.copy()
         overlay[..., 0] = np.maximum(overlay[..., 0], self.mask * 0.90)
@@ -3299,10 +3499,18 @@ class AttentionMaskEditor(BaseAttentionMaskEditor):
             required=False,
             purpose="optional manual-mask review overlay",
         )
-        row["manual_mask_exists"] = 1
+        row.update(MaskReviewManager._manual_mask_qc(row))
         self._log("save_manual", self.mask)
-        self._update_review_status("Saved manual.")
-        print(f"[ATTENTION][EDITOR] Saved manual mask: {path}", flush=True)
+        if row["manual_mask_usable"]:
+            prefix = "Saved manual; eligible for training and matched AU6-AU9 evaluation."
+        else:
+            prefix = (
+                "Saved, but excluded from training/experiments: "
+                f"{row['manual_mask_rejection_reason']}."
+            )
+        self._update_review_status(prefix)
+        print(f"[ATTENTION][EDITOR] Saved manual mask: {path} | {prefix}", flush=True)
+
 
     def _save_next_click(self, _button):
         try:
@@ -3956,8 +4164,8 @@ class ConfigurationManager:
         valid = torch.tensor([True, False])
         content = torch.ones(2, 1, SETTINGS_PREPROCESSING.IMG_SIZE, SETTINGS_PREPROCESSING.IMG_SIZE)
         support = AttentionTrainingManager.create_attention_exact_support_mask(hard, valid, content)
-        if support.shape != hard.shape or not torch.any(support[1] > 0.5):
-            raise RuntimeError("Attention support/fallback self-test failed.")
+        if support.shape != hard.shape or torch.any(support[1] > 0.5):
+            raise RuntimeError("Attention no-fallback support self-test failed.")
         raw = torch.linspace(0.0, 1.0, SETTINGS_PREPROCESSING.IMG_SIZE * SETTINGS_PREPROCESSING.IMG_SIZE).reshape(1, 1, SETTINGS_PREPROCESSING.IMG_SIZE, SETTINGS_PREPROCESSING.IMG_SIZE)
         raw = raw.repeat(2, 3, 1, 1)
         au1 = FeatureBankManager._robust_scale_visible_regions(raw, support)
@@ -12696,23 +12904,240 @@ class AttentionTrainingManager:
         return SETTINGS_ATTENTION.ATTENTION_BCE_WEIGHT * bce + SETTINGS_ATTENTION.ATTENTION_DICE_WEIGHT * dice_loss
 
     @staticmethod
+    def _mask_geometry_numpy(mask):
+        """Return normalized area/centroid/boundary/compactness for one binary mask."""
+
+        mask = np.asarray(mask, dtype=bool)
+        height, width = mask.shape
+        area_pixels = int(mask.sum())
+        area_ratio = float(area_pixels / max(height * width, 1))
+        if area_pixels == 0:
+            return {
+                "area_ratio": 0.0,
+                "centroid_x": float("nan"),
+                "centroid_y": float("nan"),
+                "boundary_touch_fraction": 1.0,
+                "compactness": 0.0,
+            }
+        y, x = np.nonzero(mask)
+        centroid_x = float((x.mean() + 0.5) / max(width, 1))
+        centroid_y = float((y.mean() + 0.5) / max(height, 1))
+        border = max(1, int(round(min(height, width) * 0.02)))
+        border_mask = np.zeros_like(mask, dtype=bool)
+        border_mask[:border, :] = True
+        border_mask[-border:, :] = True
+        border_mask[:, :border] = True
+        border_mask[:, -border:] = True
+        boundary_fraction = float(np.logical_and(mask, border_mask).sum() / area_pixels)
+        contours, _hierarchy = cv2.findContours(
+            mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        perimeter = float(sum(cv2.arcLength(contour, True) for contour in contours))
+        compactness = float(
+            4.0 * math.pi * area_pixels / max(perimeter * perimeter, 1e-6)
+        )
+        compactness = float(np.clip(compactness, 0.0, 1.0))
+        return {
+            "area_ratio": area_ratio,
+            "centroid_x": centroid_x,
+            "centroid_y": centroid_y,
+            "boundary_touch_fraction": boundary_fraction,
+            "compactness": compactness,
+        }
+
+    @staticmethod
+    def _connected_component_masks(binary, closing_kernel=1):
+        """Return non-trivial connected components sorted by descending area."""
+
+        binary = np.asarray(binary, dtype=np.uint8)
+        kernel_size = int(max(1, closing_kernel))
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+        if kernel_size > 1:
+            kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+            binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+        count, labels, stats, _centroids = cv2.connectedComponentsWithStats(
+            binary, connectivity=8
+        )
+        minimum_pixels = max(
+            4,
+            int(round(
+                SETTINGS_ATTENTION.ATTENTION_REPAIR_MIN_COMPONENT_AREA_RATIO
+                * binary.shape[0] * binary.shape[1]
+            )),
+        )
+        components = []
+        for label in range(1, count):
+            area = int(stats[label, cv2.CC_STAT_AREA])
+            if area < minimum_pixels:
+                continue
+            components.append((area, labels == label))
+        components.sort(key=lambda item: item[0], reverse=True)
+        return [component for _area, component in components], len(components)
+
+    @staticmethod
+    def _largest_component_at_threshold(probability, threshold, closing_kernel=1):
+        components, component_count = AttentionTrainingManager._connected_component_masks(
+            np.asarray(probability) >= float(threshold),
+            closing_kernel=closing_kernel,
+        )
+        if not components:
+            return np.zeros_like(probability, dtype=bool), component_count
+        return components[0].astype(bool), component_count
+
+    @staticmethod
+    def _calibrate_attention_postprocessing(model, validation_loader, validation_rows):
+        """Calibrate one fold from patient-disjoint manual validation masks only."""
+
+        token_to_patient = {
+            str(row["image_token"]): str(row["patient_id"])
+            for row in validation_rows
+        }
+        probabilities = []
+        targets = []
+        tokens = []
+        model.eval()
+        with torch.inference_mode():
+            for images, masks, batch_tokens, _sources in validation_loader:
+                images = images.to(DEVICE, non_blocking=True)
+                probability = torch.sigmoid(model(images).float()).cpu().numpy()[:, 0]
+                probabilities.append(probability.astype(np.float32))
+                targets.append((masks.numpy()[:, 0] > 0.5))
+                tokens.extend(map(str, batch_tokens))
+        probabilities = np.concatenate(probabilities, axis=0)
+        targets = np.concatenate(targets, axis=0).astype(bool)
+
+        target_geometry = [
+            AttentionTrainingManager._mask_geometry_numpy(mask)
+            for mask in targets
+        ]
+        areas = np.asarray([row["area_ratio"] for row in target_geometry], dtype=np.float64)
+        centroids = np.asarray(
+            [[row["centroid_x"], row["centroid_y"]] for row in target_geometry],
+            dtype=np.float64,
+        )
+        boundaries = np.asarray(
+            [row["boundary_touch_fraction"] for row in target_geometry],
+            dtype=np.float64,
+        )
+        centroid_median = np.nanmedian(centroids, axis=0)
+        centroid_distances = np.sqrt(
+            np.nansum((centroids - centroid_median[None, :]) ** 2, axis=1)
+        )
+        calibrated_min_area = max(
+            float(SETTINGS_ATTENTION.ATTENTION_MIN_HEART_AREA_RATIO),
+            float(np.quantile(areas, 0.01) * 0.50),
+        )
+        calibrated_max_area = min(
+            float(SETTINGS_ATTENTION.ATTENTION_MAX_HEART_AREA_RATIO),
+            float(np.quantile(areas, 0.99) * 1.50),
+        )
+        if calibrated_min_area >= calibrated_max_area:
+            calibrated_min_area = float(SETTINGS_ATTENTION.ATTENTION_MIN_HEART_AREA_RATIO)
+            calibrated_max_area = float(SETTINGS_ATTENTION.ATTENTION_MAX_HEART_AREA_RATIO)
+        calibrated_centroid_distance = min(
+            float(SETTINGS_ATTENTION.ATTENTION_REPAIR_MAX_CENTROID_DISTANCE),
+            max(0.15, float(np.quantile(centroid_distances, 0.99) + 0.05)),
+        )
+        calibrated_boundary = min(
+            float(SETTINGS_ATTENTION.ATTENTION_REPAIR_MAX_BOUNDARY_TOUCH_FRACTION),
+            max(0.10, float(np.quantile(boundaries, 0.99) + 0.05)),
+        )
+
+        threshold_rows = []
+        for threshold in SETTINGS_ATTENTION.ATTENTION_CALIBRATION_THRESHOLDS:
+            per_patient = defaultdict(list)
+            invalid = 0
+            false_empty = 0
+            for probability, target, token in zip(probabilities, targets, tokens):
+                predicted, _count = AttentionTrainingManager._largest_component_at_threshold(
+                    probability, threshold, closing_kernel=1
+                )
+                denominator = int(predicted.sum() + target.sum())
+                dice = (
+                    1.0
+                    if denominator == 0
+                    else float(2.0 * np.logical_and(predicted, target).sum() / denominator)
+                )
+                per_patient[token_to_patient[token]].append(dice)
+                geometry = AttentionTrainingManager._mask_geometry_numpy(predicted)
+                if not predicted.any():
+                    false_empty += 1
+                if not (
+                    calibrated_min_area <= geometry["area_ratio"] <= calibrated_max_area
+                ):
+                    invalid += 1
+            patient_balanced_dice = float(np.mean([
+                np.mean(values) for values in per_patient.values()
+            ]))
+            invalid_rate = float(invalid / max(len(targets), 1))
+            false_empty_rate = float(false_empty / max(len(targets), 1))
+            score = float(
+                patient_balanced_dice
+                - SETTINGS_ATTENTION.ATTENTION_CALIBRATION_INVALID_PENALTY * invalid_rate
+                - SETTINGS_ATTENTION.ATTENTION_CALIBRATION_FALSE_EMPTY_PENALTY * false_empty_rate
+            )
+            threshold_rows.append({
+                "threshold": float(threshold),
+                "patient_balanced_dice": patient_balanced_dice,
+                "invalid_rate": invalid_rate,
+                "false_empty_rate": false_empty_rate,
+                "selection_score": score,
+            })
+
+        selected = max(
+            threshold_rows,
+            key=lambda row: (
+                row["selection_score"],
+                row["patient_balanced_dice"],
+                -abs(row["threshold"] - 0.50),
+            ),
+        )
+        calibration = {
+            "schema": SETTINGS_ATTENTION.ATTENTION_REPAIR_SCHEMA,
+            "selected_threshold": float(selected["threshold"]),
+            "validation_patient_balanced_dice": float(
+                selected["patient_balanced_dice"]
+            ),
+            "validation_invalid_rate": float(selected["invalid_rate"]),
+            "validation_false_empty_rate": float(selected["false_empty_rate"]),
+            "manual_area_median": float(np.median(areas)),
+            "manual_area_q01": float(np.quantile(areas, 0.01)),
+            "manual_area_q99": float(np.quantile(areas, 0.99)),
+            "min_area_ratio": float(calibrated_min_area),
+            "max_area_ratio": float(calibrated_max_area),
+            "centroid_x": float(centroid_median[0]),
+            "centroid_y": float(centroid_median[1]),
+            "max_centroid_distance": float(calibrated_centroid_distance),
+            "max_boundary_touch_fraction": float(calibrated_boundary),
+            "validation_images": int(len(targets)),
+            "validation_patients": int(len(per_patient)),
+            "threshold_candidates": threshold_rows,
+        }
+        print(
+            "[ATTENTION][CALIBRATION] "
+            f"threshold={calibration['selected_threshold']:.2f}, "
+            f"patient_balanced_dice={calibration['validation_patient_balanced_dice']:.4f}, "
+            f"invalid_rate={calibration['validation_invalid_rate']:.4f}, "
+            f"area=[{calibration['min_area_ratio']:.4f}, "
+            f"{calibration['max_area_ratio']:.4f}]",
+            flush=True,
+        )
+        return calibration
+
+    @staticmethod
     def build_manual_only_training_rows(
         samples,
         workspace,
-        minimum_masks=1000,
-        minimum_area_ratio=0.0005,
-        maximum_area_ratio=0.98,
+        minimum_masks=800,
+        minimum_area_ratio=None,
+        maximum_area_ratio=None,
     ):
-        """Build a training cohort containing only readable manual masks.
+        """Build manual-only training rows after mask and image-quality QC."""
 
-        No MONAI pseudo-mask is generated or accepted here. The method scans the
-        full label-blind review manifest, maps every ``manual_masks/*.png`` file
-        back to its source image, excludes unreadable/empty/nearly-full masks,
-        and writes an auditable manual-only manifest before training.
-        """
-
-        full_rows = MaskReviewManager.build_attention_full_review_manifest(
-            samples, workspace
+        full_rows = MaskReviewManager.build_attention_full_review_manifest(samples, workspace)
+        quality = MaskReviewManager.build_attention_image_quality_audit(
+            full_rows, workspace, refresh=False
         )
         rows_by_token = {row["image_token"]: row for row in full_rows}
         manual_files = {
@@ -12720,7 +13145,6 @@ class AttentionTrainingManager:
             for path in Path(workspace.manual_masks).glob("*.png")
             if path.is_file()
         }
-
         manual_rows = []
         audit_rows = []
         patient_counts = defaultdict(int)
@@ -12729,137 +13153,107 @@ class AttentionTrainingManager:
         for token, manual_path in sorted(manual_files.items()):
             row = rows_by_token.get(token)
             if row is None:
-                audit_rows.append(
-                    {
-                        "image_token": token,
-                        "patient_id": "",
-                        "series_id": "",
-                        "manual_mask_path": str(manual_path),
-                        "status": "REJECTED",
-                        "area_ratio": "",
-                        "reason": "manual mask token is absent from the current dataset",
-                    }
-                )
+                audit_rows.append({
+                    "image_token": token, "patient_id": "", "series_id": "",
+                    "manual_mask_path": str(manual_path), "status": "REJECTED",
+                    "area_ratio": "", "image_quality_valid": "",
+                    "image_quality_reason": "", "sharpness": "", "noise_ratio": "",
+                    "reason": "manual mask token is absent from the current dataset",
+                })
                 continue
-
-            mask = cv2.imread(str(manual_path), cv2.IMREAD_GRAYSCALE)
-            if mask is None:
-                audit_rows.append(
-                    {
-                        "image_token": token,
-                        "patient_id": row["patient_id"],
-                        "series_id": row["series_id"],
-                        "manual_mask_path": str(manual_path),
-                        "status": "REJECTED",
-                        "area_ratio": "",
-                        "reason": "mask is unreadable",
-                    }
+            row = dict(row)
+            row.update(MaskReviewManager._manual_mask_qc(row))
+            quality_row = quality.get(token, {})
+            row.update({
+                key: quality_row.get(key, "")
+                for key in (
+                    "perceptual_hash", "image_quality_sharpness",
+                    "image_quality_noise_ratio", "image_quality_dynamic_range",
+                    "image_quality_valid", "image_quality_reason",
                 )
+            })
+            reasons = []
+            if MaskReviewManager._review_to_int(row.get("manual_mask_usable"), 0) != 1:
+                reasons.append(str(row.get("manual_mask_rejection_reason") or "invalid_manual_mask"))
+            if MaskReviewManager._review_to_int(row.get("image_quality_valid"), 0) != 1:
+                reasons.append(str(row.get("image_quality_reason") or "blur_or_noise"))
+            accepted = not reasons
+            audit_rows.append({
+                "image_token": token,
+                "patient_id": row["patient_id"],
+                "series_id": row["series_id"],
+                "manual_mask_path": str(manual_path),
+                "status": "ACCEPTED" if accepted else "REJECTED",
+                "area_ratio": row.get("manual_mask_area_ratio", ""),
+                "image_quality_valid": row.get("image_quality_valid", ""),
+                "image_quality_reason": row.get("image_quality_reason", ""),
+                "sharpness": row.get("image_quality_sharpness", ""),
+                "noise_ratio": row.get("image_quality_noise_ratio", ""),
+                "reason": ";".join(reasons),
+            })
+            if not accepted:
                 continue
-
-            resized = cv2.resize(
-                mask,
-                (
-                    SETTINGS_ATTENTION.ATTENTION_INPUT_SIZE,
-                    SETTINGS_ATTENTION.ATTENTION_INPUT_SIZE,
-                ),
-                interpolation=cv2.INTER_NEAREST,
-            )
-            area_ratio = float(np.mean(resized > 127))
-            if not minimum_area_ratio <= area_ratio <= maximum_area_ratio:
-                audit_rows.append(
-                    {
-                        "image_token": token,
-                        "patient_id": row["patient_id"],
-                        "series_id": row["series_id"],
-                        "manual_mask_path": str(manual_path),
-                        "status": "REJECTED",
-                        "area_ratio": area_ratio,
-                        "reason": (
-                            "foreground area is empty/nearly empty or covers nearly "
-                            "the complete image"
-                        ),
-                    }
-                )
-                continue
-
-            accepted = dict(row)
-            accepted["manual_mask_exists"] = 1
-            accepted["manual_mask_path"] = str(manual_path)
-            manual_rows.append(accepted)
+            row["manual_mask_path"] = str(manual_path)
+            manual_rows.append(row)
             patient_counts[str(row["patient_id"])] += 1
             fold_counts[int(row["segmentation_fold"])] += 1
-            audit_rows.append(
-                {
-                    "image_token": token,
-                    "patient_id": row["patient_id"],
-                    "series_id": row["series_id"],
-                    "manual_mask_path": str(manual_path),
-                    "status": "ACCEPTED",
-                    "area_ratio": area_ratio,
-                    "reason": "",
-                }
-            )
 
         audit_path = workspace.root / "attention_unet_manual_only_mask_audit.csv"
         audit_path.parent.mkdir(parents=True, exist_ok=True)
+        fieldnames = (
+            "image_token", "patient_id", "series_id", "manual_mask_path", "status",
+            "area_ratio", "image_quality_valid", "image_quality_reason", "sharpness",
+            "noise_ratio", "reason",
+        )
         with open(audit_path, "w", newline="", encoding="utf-8") as file:
-            fieldnames = (
-                "image_token",
-                "patient_id",
-                "series_id",
-                "manual_mask_path",
-                "status",
-                "area_ratio",
-                "reason",
-            )
             writer = csv.DictWriter(file, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(audit_rows)
 
         if len(manual_rows) < int(minimum_masks):
             raise RuntimeError(
-                "Manual-only Attention training was stopped: "
-                f"{len(manual_rows)} usable masks were found, but at least "
+                "Manual-only Attention training was stopped after empty/blur/noise "
+                f"filtering: {len(manual_rows)} usable masks remain, but at least "
                 f"{int(minimum_masks)} were requested. Audit: {audit_path}"
             )
-
         missing_folds = [
-            fold
-            for fold in range(SETTINGS_ATTENTION.ATTENTION_SEGMENTATION_FOLDS)
+            fold for fold in range(SETTINGS_ATTENTION.ATTENTION_SEGMENTATION_FOLDS)
             if fold_counts.get(fold, 0) == 0
         ]
         if missing_folds:
             raise RuntimeError(
-                "Manual masks do not cover every segmentation fold. Missing folds: "
-                f"{missing_folds}. Add masks from more patients before training."
+                f"Quality-valid manual masks do not cover folds {missing_folds}."
             )
         if len(patient_counts) < SETTINGS_ATTENTION.ATTENTION_SEGMENTATION_FOLDS + 1:
             raise RuntimeError(
-                "Too few patients have manual masks for cross-fitted training: "
-                f"{len(patient_counts)} patients."
+                "Too few patients retain quality-valid manual masks for cross-fitting: "
+                f"{len(patient_counts)}."
             )
-
-        # Strong guarantee: every row passed to the trainer must resolve to the
-        # manual source. A pseudo-mask can never enter this execution path.
         for row in manual_rows:
-            _mask_path, source = AttentionTrainingManager._resolved_training_mask(row)
-            if source != "manual":
+            _mask_path, mask_source = AttentionTrainingManager._resolved_training_mask(row)
+            if mask_source != "manual":
                 raise RuntimeError(
-                    "Manual-only training invariant failed for token "
-                    f"{row['image_token']}: source={source!r}."
+                    f"Manual-only invariant failed for {row['image_token']}: {mask_source}."
                 )
 
         manifest_path = workspace.root / "attention_unet_manual_only_manifest.csv"
         AttentionDataManager.write_attention_manifest(manual_rows, manifest_path)
-
+        rejected_quality = sum(
+            row["status"] == "REJECTED" and bool(row["image_quality_reason"])
+            for row in audit_rows
+        )
+        rejected_empty = sum(
+            row["status"] == "REJECTED"
+            and "empty" in str(row["reason"])
+            for row in audit_rows
+        )
         summary = {
-            "training_mode": "manual_only",
+            "training_mode": "manual_only_quality_filtered",
             "manual_png_files": int(len(manual_files)),
             "accepted_manual_masks": int(len(manual_rows)),
-            "rejected_manual_masks": int(
-                sum(row["status"] == "REJECTED" for row in audit_rows)
-            ),
+            "rejected_manual_masks": int(sum(r["status"] == "REJECTED" for r in audit_rows)),
+            "rejected_empty_manual_masks": int(rejected_empty),
+            "rejected_blur_or_noise": int(rejected_quality),
             "patients_with_manual_masks": int(len(patient_counts)),
             "manual_masks_per_patient": dict(sorted(patient_counts.items())),
             "manual_masks_per_segmentation_fold": {
@@ -12868,22 +13262,24 @@ class AttentionTrainingManager:
             },
             "manifest": str(manifest_path),
             "audit": str(audit_path),
+            "image_quality_audit": str(MaskReviewManager.attention_image_quality_audit_path(workspace)),
             "pseudo_masks_used": 0,
         }
         print(
-            "[ATTENTION][MANUAL ONLY] "
-            f"accepted={len(manual_rows)}, rejected="
-            f"{summary['rejected_manual_masks']}, patients={len(patient_counts)}, "
-            f"folds={summary['manual_masks_per_segmentation_fold']}",
+            "[ATTENTION][MANUAL ONLY][QUALITY] "
+            f"accepted={len(manual_rows)}, rejected={summary['rejected_manual_masks']}, "
+            f"empty={rejected_empty}, blur_or_noise={rejected_quality}, "
+            f"patients={len(patient_counts)}",
             flush=True,
         )
         return manual_rows, summary
+
 
     @staticmethod
     def train_manual_only_and_regenerate(
         samples,
         workspace,
-        minimum_masks=1000,
+        minimum_masks=800,
     ):
         """Train Attention exclusively from manual masks and regenerate all masks."""
 
@@ -12920,6 +13316,16 @@ class AttentionTrainingManager:
                 training_summary = {}
         training_summary.update(manual_summary)
         training_summary["generated_attention_masks"] = int(len(prediction_rows))
+        prediction_metadata_path = (
+            MaskReviewManager.attention_prediction_generation_path(workspace)
+        )
+        if prediction_metadata_path.is_file():
+            try:
+                training_summary["post_retrain_repair"] = json.loads(
+                    prediction_metadata_path.read_text(encoding="utf-8")
+                )
+            except Exception:
+                pass
         training_summary["checkpoint_paths"] = {
             str(fold): str(path) for fold, path in checkpoint_map.items()
         }
@@ -12935,6 +13341,9 @@ class AttentionTrainingManager:
             "pseudo_masks_used": 0,
             "patients": int(manual_summary["patients_with_manual_masks"]),
             "generated_masks": int(len(prediction_rows)),
+            "invalid_after_retrain": str(
+                MaskReviewManager.attention_invalid_after_retrain_path(workspace)
+            ),
             "manual_manifest": manual_summary["manifest"],
             "manual_audit": manual_summary["audit"],
             "training_summary": str(workspace.training_summary_json),
@@ -12958,11 +13367,12 @@ class AttentionTrainingManager:
 
     @staticmethod
     def _attention_training_fingerprint(rows, target_fold):
-        """Fingerprint all masks and settings that can affect one checkpoint."""
+        """Fingerprint masks and every setting affecting one calibrated checkpoint."""
 
         hasher = hashlib.sha256()
         settings = {
             "schema": SETTINGS_ATTENTION.ATTENTION_FEATURE_CACHE_SCHEMA,
+            "repair_schema": SETTINGS_ATTENTION.ATTENTION_REPAIR_SCHEMA,
             "target_fold": int(target_fold),
             "base_channels": SETTINGS_ATTENTION.ATTENTION_BASE_CHANNELS,
             "epochs": SETTINGS_ATTENTION.ATTENTION_EPOCHS,
@@ -12971,18 +13381,27 @@ class AttentionTrainingManager:
             "weight_decay": SETTINGS_ATTENTION.ATTENTION_WEIGHT_DECAY,
             "bce_weight": SETTINGS_ATTENTION.ATTENTION_BCE_WEIGHT,
             "dice_weight": SETTINGS_ATTENTION.ATTENTION_DICE_WEIGHT,
-            "threshold": SETTINGS_ATTENTION.ATTENTION_MASK_THRESHOLD,
+            "calibration_thresholds": list(
+                SETTINGS_ATTENTION.ATTENTION_CALIBRATION_THRESHOLDS
+            ),
+            "repair_threshold_offsets": list(
+                SETTINGS_ATTENTION.ATTENTION_REPAIR_THRESHOLD_OFFSETS
+            ),
+            "repair_tta": SETTINGS_ATTENTION.ATTENTION_REPAIR_TTA_ENABLED,
+            "repair_rotation": SETTINGS_ATTENTION.ATTENTION_REPAIR_TTA_ROTATION_DEGREES,
+            "repair_morphology_kernel": SETTINGS_ATTENTION.ATTENTION_REPAIR_MORPHOLOGY_KERNEL,
             "random_seed": SETTINGS_ATTENTION.ATTENTION_RANDOM_SEED,
         }
         hasher.update(json.dumps(settings, sort_keys=True).encode("utf-8"))
-        for row in sorted(rows, key=lambda x: x["image_token"]):
-            mask_path, source = AttentionTrainingManager._resolved_training_mask(row)
+        for row in sorted(rows, key=lambda item: item["image_token"]):
+            mask_path, source_name = AttentionTrainingManager._resolved_training_mask(row)
             if mask_path is None:
                 continue
             hasher.update(row["image_token"].encode("utf-8"))
-            hasher.update(str(source).encode("utf-8"))
+            hasher.update(str(source_name).encode("utf-8"))
             hasher.update(hashlib.sha256(Path(mask_path).read_bytes()).digest())
         return hasher.hexdigest()
+
 
     @staticmethod
     def _checkpoint_path(workspace, fold):
@@ -13227,6 +13646,10 @@ class AttentionTrainingManager:
 
             if best_state is None:
                 raise RuntimeError(f"Fold {target_fold}: no valid checkpoint was produced.")
+            model.load_state_dict(best_state, strict=True)
+            calibration = AttentionTrainingManager._calibrate_attention_postprocessing(
+                model, validation_loader, validation_rows
+            )
             fold_summary = {
                 "target_segmentation_fold": int(target_fold),
                 "train_patients": sorted({row["patient_id"] for row in train_rows}),
@@ -13242,6 +13665,7 @@ class AttentionTrainingManager:
                 "validation_images": int(len(validation_rows)),
                 "best_epoch": int(best_epoch),
                 "best_validation_soft_dice": float(best_dice),
+                "calibration": calibration,
                 "history": history,
                 "fingerprint": fingerprint,
             }
@@ -13256,6 +13680,8 @@ class AttentionTrainingManager:
                         "base_channels": SETTINGS_ATTENTION.ATTENTION_BASE_CHANNELS,
                     },
                     "summary": fold_summary,
+                    "calibration": calibration,
+                    "repair_schema": SETTINGS_ATTENTION.ATTENTION_REPAIR_SCHEMA,
                 },
                 str(checkpoint_path),
             )
@@ -13295,7 +13721,12 @@ class AttentionTrainingManager:
 
     @staticmethod
     def create_attention_exact_support_mask(hard_mask_224, valid_mask, content_mask):
-        """Create one authoritative support for AU1/AU3/AU4/AU5."""
+        """Create matched inside/outside support without any invalid-mask fallback.
+
+        A mask that remains invalid after fold calibration, TTA, adaptive threshold
+        and component/series repair contributes to neither AU1 nor AU5. This prevents
+        a large fixed central square from silently injecting extracardiac signal.
+        """
 
         dilated = F.max_pool2d(
             (hard_mask_224 > 0.5).float(),
@@ -13303,21 +13734,15 @@ class AttentionTrainingManager:
             stride=1,
             padding=SETTINGS_ATTENTION.ATTENTION_SUPPORT_DILATION_KERNEL // 2,
         )
-        support = torch.zeros_like(dilated)
-        height, width = support.shape[-2:]
-        for index in range(support.shape[0]):
-            if bool(valid_mask[index].item()) and bool(torch.any(dilated[index] > 0.5)):
-                support[index] = dilated[index]
-            else:
-                top, bottom, left, right = FeatureBankManager._fixed_square_bounds(
-                    height,
-                    width,
-                    (height - 1) / 2.0,
-                    (width - 1) / 2.0,
-                    SETTINGS_PREPROCESSING.HARD_SUPPORT_FALLBACK_FRACTION,
-                )
-                support[index, 0, top:bottom, left:right] = 1.0
-        return (support * (content_mask > 0.5).float()).clamp(0.0, 1.0)
+        validity = valid_mask.reshape(-1, 1, 1, 1).to(
+            device=dilated.device, dtype=dilated.dtype
+        )
+        return (
+            dilated
+            * validity
+            * (content_mask > 0.5).float()
+        ).clamp(0.0, 1.0)
+
 
     @staticmethod
     def create_attention_support_shuffled_images(au1_images, support, decoded_hashes):
@@ -13366,23 +13791,59 @@ class AttentionEvaluationManager:
         return hasher.hexdigest()
 
     @staticmethod
-    def _attention_feature_fingerprint(samples, checkpoint_map):
+    def _manual_mask_signature(workspace):
+        hasher = hashlib.sha256()
+        count = 0
+        for path in sorted(Path(workspace.manual_masks).glob("*.png")):
+            if not path.is_file():
+                continue
+            hasher.update(path.name.encode("utf-8"))
+            hasher.update(hashlib.sha256(path.read_bytes()).digest())
+            count += 1
+        return {"count": count, "sha256": hasher.hexdigest()}
+
+    @staticmethod
+    def _attention_feature_fingerprint(samples, checkpoint_map, workspace):
         hasher = hashlib.sha256()
         payload = {
             "schema": SETTINGS_ATTENTION.ATTENTION_FEATURE_CACHE_SCHEMA,
+            "repair_schema": SETTINGS_ATTENTION.ATTENTION_REPAIR_SCHEMA,
             "dataset_signature_schema": "directory-token-label-patient-series-size-v1",
             "dataset_signature": AttentionEvaluationManager._attention_dataset_signature(samples),
             "checkpoint_sha256": AttentionEvaluationManager._attention_checkpoint_hashes(checkpoint_map),
-            "mask_threshold": SETTINGS_ATTENTION.ATTENTION_MASK_THRESHOLD,
-            "min_area": SETTINGS_ATTENTION.ATTENTION_MIN_HEART_AREA_RATIO,
-            "max_area": SETTINGS_ATTENTION.ATTENTION_MAX_HEART_AREA_RATIO,
-            "min_peak": SETTINGS_ATTENTION.ATTENTION_MIN_PEAK_PROBABILITY,
+            "manual_mask_signature": AttentionEvaluationManager._manual_mask_signature(workspace),
+            "quality_schema": MaskReviewManager._attention_quality_schema(),
+            "quality_settings": {
+                "min_dynamic_range": SETTINGS_ATTENTION.ATTENTION_QUALITY_MIN_DYNAMIC_RANGE,
+                "min_laplacian": SETTINGS_ATTENTION.ATTENTION_QUALITY_MIN_LAPLACIAN_VARIANCE,
+                "max_noise_ratio": SETTINGS_ATTENTION.ATTENTION_QUALITY_MAX_NOISE_RATIO,
+                "blur_quantile": SETTINGS_ATTENTION.ATTENTION_QUALITY_PATIENT_BLUR_QUANTILE,
+                "noise_quantile": SETTINGS_ATTENTION.ATTENTION_QUALITY_PATIENT_NOISE_QUANTILE,
+            },
+            "repair_settings": {
+                "tta_enabled": SETTINGS_ATTENTION.ATTENTION_REPAIR_TTA_ENABLED,
+                "tta_rotation": SETTINGS_ATTENTION.ATTENTION_REPAIR_TTA_ROTATION_DEGREES,
+                "threshold_offsets": list(SETTINGS_ATTENTION.ATTENTION_REPAIR_THRESHOLD_OFFSETS),
+                "morphology_kernel": SETTINGS_ATTENTION.ATTENTION_REPAIR_MORPHOLOGY_KERNEL,
+                "series_prior": SETTINGS_ATTENTION.ATTENTION_REPAIR_SERIES_PRIOR_ENABLED,
+                "series_min_valid": SETTINGS_ATTENTION.ATTENTION_REPAIR_SERIES_MIN_VALID_MASKS,
+                "no_central_fallback": True,
+            },
             "support_dilation": SETTINGS_ATTENTION.ATTENTION_SUPPORT_DILATION_KERNEL,
             "efficientnet_weights": SETTINGS_FEATURE_BANK.EFFICIENTNET_WEIGHTS_NAME,
             "feature_dim": SETTINGS_FEATURE_BANK.EFFICIENTNET_FEATURE_DIM,
+            "manual_feature_modes": list(SETTINGS_ATTENTION.ATTENTION_MANUAL_FEATURE_MODES),
+            "manual_matched_attention_contract": {
+                "same_slice_set_as_manual_modes": True,
+                "cross_fitted_predictions": True,
+                "validity_filter_applied": False,
+                "central_fallback_applied": False,
+            },
         }
         hasher.update(json.dumps(payload, sort_keys=True).encode("utf-8"))
         return hasher.hexdigest()
+
+
 
     @staticmethod
     def _expected_patient_label_map(samples):
@@ -13422,30 +13883,14 @@ class AttentionEvaluationManager:
         checkpoint_map,
         stale_policy="raise",
     ):
-        """Load/migrate a current or legacy AU1-AU5 bank without hiding true staleness.
-
-        Old fingerprints included Kaggle file modification times. A legacy bank is
-        reused only when the patient/label cohort, feature schema/modes and checkpoint
-        provenance are compatible. If a checkpoint is newer than the bank or exact
-        checkpoint hashes disagree, the bank remains stale and GPU rebuilding is
-        required.
-        """
+        """Load a current AU1-AU9 bank; old schemas must be rebuilt on GPU."""
 
         current_fingerprint = AttentionEvaluationManager._attention_feature_fingerprint(
-            samples, checkpoint_map
+            samples, checkpoint_map, workspace
         )
-        current_dataset_signature = AttentionEvaluationManager._attention_dataset_signature(
-            samples
-        )
-        current_checkpoint_hashes = AttentionEvaluationManager._attention_checkpoint_hashes(
-            checkpoint_map
-        )
-        current_review_fingerprint = MaskReviewManager._review_checkpoint_fingerprint(
-            checkpoint_map
-        )
-        expected_patient_labels = AttentionEvaluationManager._expected_patient_label_map(
-            samples
-        )
+        current_dataset_signature = AttentionEvaluationManager._attention_dataset_signature(samples)
+        current_checkpoint_hashes = AttentionEvaluationManager._attention_checkpoint_hashes(checkpoint_map)
+        expected_patient_labels = AttentionEvaluationManager._expected_patient_label_map(samples)
         stale_reasons = []
 
         for output_dir in AttentionEvaluationManager._attention_bank_candidates(workspace):
@@ -13462,118 +13907,62 @@ class AttentionEvaluationManager:
 
             required_arrays = {"patient_ids", "labels"} | {
                 f"X__{mode}" for mode in SETTINGS_ATTENTION.ATTENTION_FEATURE_MODES
+            } | {
+                "manual_patient_ids", "manual_labels"
+            } | {
+                f"X__{mode}" for mode in SETTINGS_ATTENTION.ATTENTION_MANUAL_FEATURE_MODES
             }
             if not required_arrays.issubset(set(loaded.files)):
-                stale_reasons.append(f"{output_dir}: missing AU1-AU5 arrays")
+                stale_reasons.append(f"{output_dir}: missing AU1-AU9 arrays")
                 continue
+            if metadata.get("schema") != SETTINGS_ATTENTION.ATTENTION_FEATURE_CACHE_SCHEMA:
+                stale_reasons.append(f"{output_dir}: feature schema differs")
+                continue
+            if set(metadata.get("feature_modes", [])) != set(SETTINGS_ATTENTION.ATTENTION_FEATURE_MODES):
+                stale_reasons.append(f"{output_dir}: AU1-AU5 feature modes differ")
+                continue
+            if set(metadata.get("manual_feature_modes", [])) != set(
+                SETTINGS_ATTENTION.ATTENTION_MANUAL_FEATURE_MODES
+            ):
+                stale_reasons.append(f"{output_dir}: AU6-AU9 feature modes differ")
+                continue
+            if int(metadata.get("n_images", -1)) != len(samples):
+                stale_reasons.append(f"{output_dir}: image count differs")
+                continue
+
             patient_ids = loaded["patient_ids"].astype(str)
             labels = loaded["labels"].astype(np.int64)
             observed = {patient: int(label) for patient, label in zip(patient_ids, labels)}
             if observed != expected_patient_labels:
                 stale_reasons.append(f"{output_dir}: patient/label cohort differs")
                 continue
-            if metadata.get("schema") != SETTINGS_ATTENTION.ATTENTION_FEATURE_CACHE_SCHEMA:
-                stale_reasons.append(f"{output_dir}: feature schema differs")
-                continue
-            if set(metadata.get("feature_modes", [])) != set(
-                SETTINGS_ATTENTION.ATTENTION_FEATURE_MODES
+            manual_patient_ids = loaded["manual_patient_ids"].astype(str)
+            manual_labels = loaded["manual_labels"].astype(np.int64)
+            if any(
+                patient not in expected_patient_labels
+                or expected_patient_labels[patient] != int(label)
+                for patient, label in zip(manual_patient_ids, manual_labels)
             ):
-                stale_reasons.append(f"{output_dir}: feature modes differ")
-                continue
-            if int(metadata.get("n_images", -1)) != len(samples):
-                stale_reasons.append(f"{output_dir}: image count differs")
+                stale_reasons.append(f"{output_dir}: manual subset labels differ")
                 continue
 
-            compatible = metadata.get("fingerprint") == current_fingerprint
-            migration_reason = ""
-            if not compatible:
-                saved_dataset_signature = str(metadata.get("dataset_signature", ""))
-                saved_checkpoint_hashes = {
-                    str(key): str(value)
-                    for key, value in metadata.get("checkpoint_sha256", {}).items()
-                }
-                if saved_dataset_signature and saved_checkpoint_hashes:
-                    compatible = (
-                        saved_dataset_signature == current_dataset_signature
-                        and saved_checkpoint_hashes == current_checkpoint_hashes
-                    )
-                    if compatible:
-                        migration_reason = "stable provenance matched"
-                else:
-                    # Legacy metadata: require matching fold/path names and evidence
-                    # that the bank was produced after the current checkpoints.
-                    saved_paths = {
-                        str(key): Path(value).name
-                        for key, value in metadata.get("checkpoints", {}).items()
-                    }
-                    current_paths = {
-                        str(key): Path(value).name
-                        for key, value in checkpoint_map.items()
-                    }
-                    bank_time = min(npz_path.stat().st_mtime_ns, metadata_path.stat().st_mtime_ns)
-                    checkpoints_not_newer = all(
-                        Path(path).stat().st_mtime_ns <= bank_time + 2_000_000_000
-                        for path in checkpoint_map.values()
-                    )
-                    prediction_metadata_path = (
-                        MaskReviewManager.attention_prediction_generation_path(workspace)
-                    )
-                    prediction_provenance_ok = False
-                    if prediction_metadata_path.is_file():
-                        try:
-                            prediction_metadata = json.loads(
-                                prediction_metadata_path.read_text(encoding="utf-8")
-                            )
-                            prediction_provenance_ok = (
-                                prediction_metadata.get("checkpoint_fingerprint")
-                                == current_review_fingerprint
-                                and prediction_metadata_path.stat().st_mtime_ns
-                                <= bank_time + 2_000_000_000
-                            )
-                        except Exception:
-                            prediction_provenance_ok = False
-                    compatible = (
-                        saved_paths == current_paths
-                        and (checkpoints_not_newer or prediction_provenance_ok)
-                    )
-                    if compatible:
-                        migration_reason = (
-                            "legacy metadata matched cohort/checkpoint paths and "
-                            "artifact creation order"
-                        )
-
+            saved_dataset_signature = str(metadata.get("dataset_signature", ""))
+            saved_checkpoint_hashes = {
+                str(key): str(value)
+                for key, value in metadata.get("checkpoint_sha256", {}).items()
+            }
+            compatible = (
+                metadata.get("fingerprint") == current_fingerprint
+                and saved_dataset_signature == current_dataset_signature
+                and saved_checkpoint_hashes == current_checkpoint_hashes
+            )
             if not compatible:
                 stale_reasons.append(
-                    f"{output_dir}: checkpoint or dataset provenance differs"
+                    f"{output_dir}: checkpoint, manual masks, quality rules or dataset differ"
                 )
                 continue
 
-            if metadata.get("fingerprint") != current_fingerprint:
-                previous_fingerprint = metadata.get("fingerprint", "")
-                metadata["legacy_fingerprint_migrated_from"] = previous_fingerprint
-                metadata["fingerprint"] = current_fingerprint
-                metadata["dataset_signature_schema"] = (
-                    "directory-token-label-patient-series-size-v1"
-                )
-                metadata["dataset_signature"] = current_dataset_signature
-                metadata["checkpoint_sha256"] = current_checkpoint_hashes
-                metadata["checkpoint_review_fingerprint"] = current_review_fingerprint
-                metadata["migration_reason"] = migration_reason
-                metadata_path.write_text(
-                    json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8"
-                )
-                print(
-                    "[ATTENTION][FEATURES][COMPATIBILITY] Migrated an existing "
-                    "AU1-AU5 bank from the old mtime-sensitive fingerprint after "
-                    f"provenance validation: {output_dir}",
-                    flush=True,
-                )
-            else:
-                print(
-                    f"[ATTENTION][FEATURES] Reusing patient feature bank: {npz_path}",
-                    flush=True,
-                )
-
+            print(f"[ATTENTION][FEATURES] Reusing AU1-AU9 bank: {npz_path}", flush=True)
             return {
                 "fingerprint": current_fingerprint,
                 "patient_ids": patient_ids,
@@ -13582,31 +13971,34 @@ class AttentionEvaluationManager:
                     mode: loaded[f"X__{mode}"].astype(np.float32)
                     for mode in SETTINGS_ATTENTION.ATTENTION_FEATURE_MODES
                 },
+                "manual_patient_ids": manual_patient_ids,
+                "manual_labels": manual_labels,
+                "manual_features": {
+                    mode: loaded[f"X__{mode}"].astype(np.float32)
+                    for mode in SETTINGS_ATTENTION.ATTENTION_MANUAL_FEATURE_MODES
+                },
                 "metadata": metadata,
             }
 
         if stale_policy == "return_none":
             if stale_reasons:
                 print(
-                    "[ATTENTION][FEATURES] Existing banks are stale/incompatible; "
-                    "GPU extraction will rebuild the current bank. Reasons: "
-                    + " | ".join(stale_reasons[:4]),
+                    "[ATTENTION][FEATURES] Existing banks need one GPU rebuild for "
+                    "quality-filtered AU1-AU9. Reasons: " + " | ".join(stale_reasons[:4]),
                     flush=True,
                 )
             return None
         if stale_reasons:
             raise RuntimeError(
-                "The existing Attention feature bank does not match the current "
-                "checkpoints/dataset after stable-provenance validation. Run the "
-                "notebook cell 'GPU B — AU1–AU5 din checkpointurile manual-only' "
-                "again, then restart with Accelerator=None. Details: "
+                "The existing Attention feature bank predates or does not match the "
+                "quality/manual-mask experiment. Rerun GPU B once. Details: "
                 + " | ".join(stale_reasons[:6])
             )
         raise FileNotFoundError(
-            "Attention patient feature bank is missing. Run the notebook cell "
-            "'GPU B — AU1–AU5 din checkpointurile manual-only' in a GPU session "
-            "first and preserve /kaggle/working before CPU evaluation."
+            "Attention AU1-AU9 feature bank is missing. Run GPU B once with the "
+            "current manual masks/checkpoints."
         )
+
 
 
     @staticmethod
@@ -13617,6 +14009,376 @@ class AttentionEvaluationManager:
         if denominator == 0:
             return 1.0
         return float(2.0 * np.logical_and(first, second).sum() / denominator)
+
+    @staticmethod
+    def _checkpoint_calibration(metadata):
+        calibration = {}
+        if isinstance(metadata, dict):
+            calibration = metadata.get("calibration", {}) or {}
+            if not calibration and isinstance(metadata.get("summary"), dict):
+                calibration = metadata["summary"].get("calibration", {}) or {}
+        return {
+            "schema": calibration.get("schema", "fixed-default"),
+            "selected_threshold": float(
+                calibration.get(
+                    "selected_threshold",
+                    SETTINGS_ATTENTION.ATTENTION_MASK_THRESHOLD,
+                )
+            ),
+            "manual_area_median": float(
+                calibration.get("manual_area_median", 0.12)
+            ),
+            "min_area_ratio": float(
+                calibration.get(
+                    "min_area_ratio",
+                    SETTINGS_ATTENTION.ATTENTION_MIN_HEART_AREA_RATIO,
+                )
+            ),
+            "max_area_ratio": float(
+                calibration.get(
+                    "max_area_ratio",
+                    SETTINGS_ATTENTION.ATTENTION_MAX_HEART_AREA_RATIO,
+                )
+            ),
+            "centroid_x": float(calibration.get("centroid_x", 0.50)),
+            "centroid_y": float(calibration.get("centroid_y", 0.50)),
+            "max_centroid_distance": float(
+                calibration.get(
+                    "max_centroid_distance",
+                    SETTINGS_ATTENTION.ATTENTION_REPAIR_MAX_CENTROID_DISTANCE,
+                )
+            ),
+            "max_boundary_touch_fraction": float(
+                calibration.get(
+                    "max_boundary_touch_fraction",
+                    SETTINGS_ATTENTION.ATTENTION_REPAIR_MAX_BOUNDARY_TOUCH_FRACTION,
+                )
+            ),
+        }
+
+    @staticmethod
+    def _tta_probability_mean_variance(model, images, base_probability):
+        """Conservative TTA for initially invalid rows only."""
+
+        probabilities = [base_probability]
+        flipped = torch.flip(images, dims=[3])
+        flipped_probability = torch.sigmoid(model(flipped).float())
+        probabilities.append(torch.flip(flipped_probability, dims=[3]))
+        degrees = float(SETTINGS_ATTENTION.ATTENTION_REPAIR_TTA_ROTATION_DEGREES)
+        if degrees > 0.0:
+            for angle in (-degrees, degrees):
+                rotated = torchvision.transforms.functional.rotate(
+                    images,
+                    angle=angle,
+                    interpolation=transforms.InterpolationMode.BILINEAR,
+                    fill=0.0,
+                )
+                rotated_probability = torch.sigmoid(model(rotated).float())
+                restored = torchvision.transforms.functional.rotate(
+                    rotated_probability,
+                    angle=-angle,
+                    interpolation=transforms.InterpolationMode.BILINEAR,
+                    fill=0.0,
+                )
+                probabilities.append(restored)
+        stack = torch.stack(probabilities, dim=0)
+        return stack.mean(dim=0), stack.var(dim=0, unbiased=False)
+
+    @staticmethod
+    def _evaluate_attention_candidate(
+        mask,
+        probability,
+        calibration,
+        threshold,
+        component_count,
+        tta_variance=0.0,
+        series_prior=None,
+    ):
+        mask = np.asarray(mask, dtype=bool)
+        probability = np.asarray(probability, dtype=np.float32)
+        geometry = AttentionTrainingManager._mask_geometry_numpy(mask)
+        if mask.any():
+            mean_probability = float(probability[mask].mean())
+            peak_probability = float(probability[mask].max())
+        else:
+            mean_probability = 0.0
+            peak_probability = float(probability.max()) if probability.size else 0.0
+
+        target_area = max(float(calibration["manual_area_median"]), 1e-6)
+        target_x = float(calibration["centroid_x"])
+        target_y = float(calibration["centroid_y"])
+        max_centroid_distance = float(calibration["max_centroid_distance"])
+        prior_used = bool(series_prior)
+        if prior_used:
+            target_area = max(float(series_prior["area_ratio"]), 1e-6)
+            target_x = float(series_prior["centroid_x"])
+            target_y = float(series_prior["centroid_y"])
+            max_centroid_distance = min(
+                max_centroid_distance,
+                float(SETTINGS_ATTENTION.ATTENTION_REPAIR_SERIES_MAX_CENTROID_DISTANCE),
+            )
+
+        if np.isfinite(geometry["centroid_x"]):
+            centroid_distance = float(math.hypot(
+                geometry["centroid_x"] - target_x,
+                geometry["centroid_y"] - target_y,
+            ))
+        else:
+            centroid_distance = float("inf")
+
+        reasons = []
+        area_ratio = float(geometry["area_ratio"])
+        if not mask.any():
+            reasons.append("empty")
+        if area_ratio < float(calibration["min_area_ratio"]):
+            reasons.append("area_too_small")
+        if area_ratio > float(calibration["max_area_ratio"]):
+            reasons.append("area_too_large")
+        required_peak = max(
+            0.30,
+            min(
+                float(SETTINGS_ATTENTION.ATTENTION_MIN_PEAK_PROBABILITY),
+                float(threshold),
+            ),
+        )
+        if peak_probability + 1e-6 < required_peak:
+            reasons.append("low_peak_probability")
+        if centroid_distance > max_centroid_distance:
+            reasons.append("centroid_implausible")
+        if geometry["boundary_touch_fraction"] > float(
+            calibration["max_boundary_touch_fraction"]
+        ):
+            reasons.append("boundary_touch")
+        if mean_probability < max(0.20, float(threshold) * 0.75):
+            reasons.append("low_mean_probability")
+        if prior_used:
+            minimum_area = (
+                float(series_prior["area_ratio"])
+                * SETTINGS_ATTENTION.ATTENTION_REPAIR_SERIES_MIN_AREA_MULTIPLIER
+            )
+            maximum_area = (
+                float(series_prior["area_ratio"])
+                * SETTINGS_ATTENTION.ATTENTION_REPAIR_SERIES_MAX_AREA_MULTIPLIER
+            )
+            if not minimum_area <= area_ratio <= maximum_area:
+                reasons.append("series_area_mismatch")
+
+        area_score = float(math.exp(-abs(math.log(max(area_ratio, 1e-6) / target_area))))
+        centroid_score = float(math.exp(-centroid_distance / max(max_centroid_distance, 1e-6)))
+        boundary_score = float(
+            1.0
+            - min(
+                geometry["boundary_touch_fraction"]
+                / max(float(calibration["max_boundary_touch_fraction"]), 1e-6),
+                1.0,
+            )
+        )
+        variance_penalty = float(min(max(tta_variance, 0.0) / 0.05, 1.0))
+        score = float(
+            0.35 * mean_probability
+            + 0.25 * area_score
+            + 0.20 * centroid_score
+            + 0.10 * geometry["compactness"]
+            + 0.10 * boundary_score
+            - 0.10 * variance_penalty
+        )
+        return {
+            **geometry,
+            "peak_probability": peak_probability,
+            "mean_inside_probability": mean_probability,
+            "centroid_distance": centroid_distance,
+            "component_count": int(component_count),
+            "threshold": float(threshold),
+            "tta_variance": float(tta_variance),
+            "series_prior_used": int(prior_used),
+            "valid": int(not reasons),
+            "invalid_reason": ";".join(reasons),
+            "score": score,
+        }
+
+    @staticmethod
+    def _repair_attention_probability(
+        probability,
+        calibration,
+        tta_variance=0.0,
+        series_prior=None,
+    ):
+        """Choose the best audited component; never create a central fallback."""
+
+        probability = np.asarray(probability, dtype=np.float32)
+        base_threshold = float(calibration["selected_threshold"])
+        native_mask, native_count = AttentionTrainingManager._largest_component_at_threshold(
+            probability, base_threshold, closing_kernel=1
+        )
+        native_metrics = AttentionEvaluationManager._evaluate_attention_candidate(
+            native_mask,
+            probability,
+            calibration,
+            base_threshold,
+            native_count,
+            tta_variance=tta_variance,
+            series_prior=None,
+        )
+        if native_metrics["valid"] and series_prior is None:
+            return native_mask, {
+                "initial_valid": 1,
+                "initial_reason": "",
+                "final_valid": 1,
+                "final_reason": "",
+                "repair_method": "valid_native",
+                **native_metrics,
+            }
+
+        threshold_values = sorted({
+            float(np.clip(base_threshold + offset, 0.05, 0.95))
+            for offset in SETTINGS_ATTENTION.ATTENTION_REPAIR_THRESHOLD_OFFSETS
+        })
+        candidates = []
+        for threshold in threshold_values:
+            components, component_count = AttentionTrainingManager._connected_component_masks(
+                probability >= threshold,
+                closing_kernel=SETTINGS_ATTENTION.ATTENTION_REPAIR_MORPHOLOGY_KERNEL,
+            )
+            if not components:
+                components = [np.zeros_like(probability, dtype=bool)]
+            for component_index, component in enumerate(components):
+                metrics = AttentionEvaluationManager._evaluate_attention_candidate(
+                    component,
+                    probability,
+                    calibration,
+                    threshold,
+                    component_count,
+                    tta_variance=tta_variance,
+                    series_prior=series_prior,
+                )
+                candidates.append((
+                    int(metrics["valid"]),
+                    float(metrics["score"]),
+                    -abs(float(threshold) - base_threshold),
+                    -component_index,
+                    component,
+                    metrics,
+                ))
+        best = max(candidates, key=lambda item: item[:4])
+        _valid_rank, _score, _threshold_distance, _component_rank, best_mask, best_metrics = best
+        if best_metrics["valid"]:
+            if series_prior is not None:
+                method = "valid_repaired_series_prior"
+            elif abs(float(best_metrics["threshold"]) - base_threshold) > 1e-8:
+                method = "valid_repaired_threshold"
+            else:
+                method = "valid_repaired_component"
+        else:
+            method = "invalid_unresolved"
+        return best_mask, {
+            "initial_valid": int(native_metrics["valid"]),
+            "initial_reason": str(native_metrics["invalid_reason"]),
+            "final_valid": int(best_metrics["valid"]),
+            "final_reason": str(best_metrics["invalid_reason"]),
+            "repair_method": method,
+            **best_metrics,
+        }
+
+    @staticmethod
+    def predict_attention_batch_with_repair(
+        model,
+        attention_inputs,
+        checkpoint_metadata,
+        series_priors=None,
+    ):
+        """Predict one batch and repair only initially invalid masks with TTA."""
+
+        calibration = AttentionEvaluationManager._checkpoint_calibration(
+            checkpoint_metadata
+        )
+        base_probability = torch.sigmoid(model(attention_inputs).float())
+        base_np = base_probability[:, 0].detach().cpu().numpy()
+        initial = []
+        invalid_indices = []
+        for index, probability in enumerate(base_np):
+            _mask, metrics = AttentionEvaluationManager._repair_attention_probability(
+                probability,
+                calibration,
+                tta_variance=0.0,
+                series_prior=None,
+            )
+            initial.append(metrics)
+            if not metrics["initial_valid"]:
+                invalid_indices.append(index)
+
+        repaired_probability = base_probability
+        tta_variance = torch.zeros_like(base_probability)
+        if invalid_indices and SETTINGS_ATTENTION.ATTENTION_REPAIR_TTA_ENABLED:
+            index_tensor = torch.as_tensor(
+                invalid_indices, dtype=torch.long, device=attention_inputs.device
+            )
+            mean_probability, variance = AttentionEvaluationManager._tta_probability_mean_variance(
+                model,
+                attention_inputs.index_select(0, index_tensor),
+                base_probability.index_select(0, index_tensor),
+            )
+            repaired_probability = base_probability.clone()
+            tta_variance = torch.zeros_like(base_probability)
+            repaired_probability.index_copy_(0, index_tensor, mean_probability)
+            tta_variance.index_copy_(0, index_tensor, variance)
+
+        probability_np = repaired_probability[:, 0].detach().cpu().numpy()
+        variance_np = tta_variance[:, 0].mean(dim=(1, 2)).detach().cpu().numpy()
+        results = []
+        masks = []
+        for index, probability in enumerate(probability_np):
+            prior = None if series_priors is None else series_priors[index]
+            if initial[index]["initial_valid"] and prior is None:
+                mask, metrics = AttentionEvaluationManager._repair_attention_probability(
+                    probability,
+                    calibration,
+                    tta_variance=float(variance_np[index]),
+                    series_prior=None,
+                )
+            else:
+                mask, metrics = AttentionEvaluationManager._repair_attention_probability(
+                    probability,
+                    calibration,
+                    tta_variance=float(variance_np[index]),
+                    series_prior=prior,
+                )
+                metrics["initial_valid"] = int(initial[index]["initial_valid"])
+                metrics["initial_reason"] = str(initial[index]["initial_reason"])
+            masks.append(mask.astype(np.float32))
+            results.append(metrics)
+        hard = torch.from_numpy(np.stack(masks, axis=0)).unsqueeze(1).to(
+            attention_inputs.device
+        )
+        return hard, results
+
+    @staticmethod
+    def build_attention_series_priors(rows):
+        """Build median area/centroid priors from repaired valid masks per series."""
+
+        grouped = defaultdict(list)
+        for row in rows:
+            if MaskReviewManager._review_to_int(
+                row.get("attention_valid_final", row.get("attention_valid")), 0
+            ) != 1:
+                continue
+            area = MaskReviewManager._review_to_float(row.get("attention_area_ratio"))
+            centroid_x = MaskReviewManager._review_to_float(row.get("attention_centroid_x"))
+            centroid_y = MaskReviewManager._review_to_float(row.get("attention_centroid_y"))
+            if not all(np.isfinite(value) for value in (area, centroid_x, centroid_y)):
+                continue
+            grouped[str(row["series_id"])].append((area, centroid_x, centroid_y))
+        priors = {}
+        for series_id, values in grouped.items():
+            if len(values) < SETTINGS_ATTENTION.ATTENTION_REPAIR_SERIES_MIN_VALID_MASKS:
+                continue
+            array = np.asarray(values, dtype=np.float64)
+            priors[series_id] = {
+                "area_ratio": float(np.median(array[:, 0])),
+                "centroid_x": float(np.median(array[:, 1])),
+                "centroid_y": float(np.median(array[:, 2])),
+                "n_valid_masks": int(len(values)),
+            }
+        return priors
 
     @staticmethod
     def _load_attention_model(checkpoint_path):
@@ -13630,13 +14392,13 @@ class AttentionEvaluationManager:
 
     @staticmethod
     def extract_attention_patient_feature_bank(samples, workspace, checkpoint_map):
-        """Infer cross-fit masks, encode AU1-AU5 and pool to patient vectors."""
+        """Infer AU1-AU5 and build exact-row-matched manual/Attention AU6-AU9."""
 
         output_dir = workspace.comparison_output
         output_dir.mkdir(parents=True, exist_ok=True)
         npz_path = output_dir / "attention_unet_patient_feature_bank.npz"
         metadata_path = output_dir / "attention_unet_feature_bank_metadata.json"
-        fingerprint = AttentionEvaluationManager._attention_feature_fingerprint(samples, checkpoint_map)
+        fingerprint = AttentionEvaluationManager._attention_feature_fingerprint(samples, checkpoint_map, workspace)
         existing = AttentionEvaluationManager.load_compatible_attention_feature_bank(
             samples,
             workspace,
@@ -13647,20 +14409,31 @@ class AttentionEvaluationManager:
             return existing
 
         patient_to_fold = AttentionDataManager.build_attention_patient_folds(samples)
-        try:
-            review_rows = AttentionDataManager.read_attention_manifest(workspace)
-        except FileNotFoundError:
-            try:
-                review_rows = MaskReviewManager.read_attention_full_review_manifest(
-                    workspace
+        review_rows = MaskReviewManager.generate_attention_review_masks(
+            samples, workspace, checkpoint_map, rows=None, force=False
+        )
+        quality_by_token = MaskReviewManager.build_attention_image_quality_audit(
+            review_rows, workspace, refresh=False
+        )
+        for row in review_rows:
+            row.update(MaskReviewManager._manual_mask_qc(row))
+            row.update({
+                key: quality_by_token.get(row["image_token"], {}).get(key, "")
+                for key in (
+                    "perceptual_hash", "image_quality_sharpness",
+                    "image_quality_noise_ratio", "image_quality_dynamic_range",
+                    "image_quality_valid", "image_quality_reason",
                 )
-            except FileNotFoundError:
-                review_rows = MaskReviewManager.build_attention_full_review_manifest(
-                    samples, workspace
-                )
+            })
         review_by_token = {row["image_token"]: row for row in review_rows}
         review_tokens = set(review_by_token)
         pool = _StreamingHierarchicalAttentionPool(SETTINGS_ATTENTION.ATTENTION_FEATURE_MODES)
+        manual_pool = _StreamingHierarchicalAttentionPool(
+            SETTINGS_ATTENTION.ATTENTION_MANUAL_FEATURE_MODES
+        )
+        manual_subset_tokens = []
+        manual_subset_attention_valid_count = 0
+        manual_subset_attention_invalid_count = 0
         slice_qc_rows = []
         predicted_mask_writes_enabled = True
         encoder = FeatureExtractor().to(DEVICE).eval()
@@ -13675,8 +14448,8 @@ class AttentionEvaluationManager:
             ]
             if not fold_samples:
                 continue
-            model, checkpoint_metadata = AttentionEvaluationManager._load_attention_model(
-                checkpoint_map[target_fold]
+            checkpoint_metadata = torch.load(
+                str(checkpoint_map[target_fold]), map_location="cpu"
             )
             loader = DataLoader(
                 AttentionInferenceDataset(fold_samples),
@@ -13704,18 +14477,71 @@ class AttentionEvaluationManager:
                         decoded_hashes,
                         image_tokens,
                     ) = batch
-                    attention_inputs = attention_inputs.to(DEVICE, non_blocking=True)
                     raw_images = raw_images.to(DEVICE, non_blocking=True)
                     content_masks = content_masks.to(DEVICE, non_blocking=True)
-                    logits = model(attention_inputs)
-                    probability_256 = torch.sigmoid(logits.float())
-                    hard_256 = AttentionTrainingManager._attention_binary_masks(probability_256)
-                    area_ratio = hard_256.mean(dim=(1, 2, 3))
-                    peak_probability = probability_256.amax(dim=(1, 2, 3))
-                    valid_mask = (
-                        (area_ratio >= SETTINGS_ATTENTION.ATTENTION_MIN_HEART_AREA_RATIO)
-                        & (area_ratio <= SETTINGS_ATTENTION.ATTENTION_MAX_HEART_AREA_RATIO)
-                        & (peak_probability >= SETTINGS_ATTENTION.ATTENTION_MIN_PEAK_PROBABILITY)
+                    token_list = [str(token) for token in image_tokens]
+                    masks = []
+                    valid_initial_np = []
+                    valid_final_np = []
+                    area_values = []
+                    peak_values = []
+                    for token in token_list:
+                        row = review_by_token[token]
+                        mask = cv2.imread(
+                            str(row["predicted_attention_mask_path"]),
+                            cv2.IMREAD_GRAYSCALE,
+                        )
+                        if mask is None:
+                            mask = np.zeros(
+                                (
+                                    SETTINGS_ATTENTION.ATTENTION_INPUT_SIZE,
+                                    SETTINGS_ATTENTION.ATTENTION_INPUT_SIZE,
+                                ),
+                                dtype=np.uint8,
+                            )
+                        mask = cv2.resize(
+                            mask,
+                            (
+                                SETTINGS_ATTENTION.ATTENTION_INPUT_SIZE,
+                                SETTINGS_ATTENTION.ATTENTION_INPUT_SIZE,
+                            ),
+                            interpolation=cv2.INTER_NEAREST,
+                        ) > 127
+                        masks.append(mask.astype(np.float32))
+                        valid_initial_np.append(
+                            MaskReviewManager._review_to_int(
+                                row.get("attention_valid_initial"), 0
+                            ) == 1
+                        )
+                        valid_final_np.append(
+                            MaskReviewManager._review_to_int(
+                                row.get("attention_valid_final", row.get("attention_valid")),
+                                0,
+                            ) == 1
+                        )
+                        area_values.append(
+                            MaskReviewManager._review_to_float(
+                                row.get("attention_area_ratio"), 0.0
+                            )
+                        )
+                        peak_values.append(
+                            MaskReviewManager._review_to_float(
+                                row.get("attention_peak_probability"), 0.0
+                            )
+                        )
+                    hard_256 = torch.from_numpy(
+                        np.stack(masks, axis=0)
+                    ).unsqueeze(1).to(DEVICE)
+                    valid_initial_np = np.asarray(valid_initial_np, dtype=bool)
+                    valid_final_np = np.asarray(valid_final_np, dtype=bool)
+                    valid_mask = torch.as_tensor(
+                        valid_final_np, dtype=torch.bool, device=DEVICE
+                    )
+                    area_ratio = torch.as_tensor(
+                        area_values, dtype=torch.float32, device=DEVICE
+                    )
+                    peak_probability = torch.as_tensor(
+                        peak_values, dtype=torch.float32, device=DEVICE
                     )
                     hard_224 = F.interpolate(
                         hard_256,
@@ -13758,17 +14584,143 @@ class AttentionEvaluationManager:
                             ]
 
                     labels_np = labels.numpy().astype(np.int64)
-                    valid_np = valid_mask.cpu().numpy().astype(bool)
+                    valid_np = valid_final_np
+                    quality_np = np.asarray([
+                        MaskReviewManager._review_to_int(
+                            quality_by_token.get(token, {}).get("image_quality_valid"), 0
+                        ) == 1
+                        for token in token_list
+                    ], dtype=bool)
                     for mode in SETTINGS_ATTENTION.ATTENTION_FEATURE_MODES:
-                        keep = valid_np if mode == SETTINGS_ATTENTION.ATTENTION_FEATURE_MODES[1] else None
+                        keep = quality_np.copy()
+                        if mode == SETTINGS_ATTENTION.ATTENTION_FEATURE_MODES[1]:
+                            # AU2 is the strict native-valid ablation.
+                            keep &= valid_initial_np
+                        else:
+                            # AU1/AU3/AU4/AU5 share the exact repaired-valid rows.
+                            keep &= valid_np
                         pool.add(
-                            mode,
-                            embeddings_by_mode[mode],
-                            patient_ids,
-                            series_ids,
-                            labels_np,
-                            keep=keep,
+                            mode, embeddings_by_mode[mode], patient_ids, series_ids,
+                            labels_np, keep=keep,
                         )
+
+                    # AU6-AU9 use exactly the same non-empty, quality-valid
+                    # manual-mask slice rows. AU6/AU7 use the manual support;
+                    # AU8/AU9 use the cross-fitted Attention support on those rows.
+                    manual_indices = []
+                    manual_masks_224 = []
+                    for batch_index, token in enumerate(token_list):
+                        row = review_by_token.get(token)
+                        if row is None:
+                            continue
+                        if MaskReviewManager._review_to_int(
+                            row.get("manual_mask_usable"), 0
+                        ) != 1 or not quality_np[batch_index]:
+                            continue
+                        manual = cv2.imread(
+                            str(row["manual_mask_path"]), cv2.IMREAD_GRAYSCALE
+                        )
+                        if manual is None:
+                            continue
+                        manual = cv2.resize(
+                            manual,
+                            (SETTINGS_PREPROCESSING.IMG_SIZE, SETTINGS_PREPROCESSING.IMG_SIZE),
+                            interpolation=cv2.INTER_NEAREST,
+                        )
+                        manual_indices.append(batch_index)
+                        manual_masks_224.append((manual > 127).astype(np.float32))
+                    if manual_indices:
+                        index_array = np.asarray(manual_indices, dtype=np.int64)
+                        index_tensor = torch.as_tensor(
+                            manual_indices, dtype=torch.long, device=DEVICE
+                        )
+                        manual_content = content_masks.index_select(0, index_tensor)
+                        manual_raw = raw_images.index_select(0, index_tensor)
+
+                        manual_support = torch.from_numpy(
+                            np.stack(manual_masks_224, axis=0)
+                        ).unsqueeze(1).to(DEVICE)
+                        manual_support = F.max_pool2d(
+                            manual_support,
+                            kernel_size=SETTINGS_ATTENTION.ATTENTION_SUPPORT_DILATION_KERNEL,
+                            stride=1,
+                            padding=SETTINGS_ATTENTION.ATTENTION_SUPPORT_DILATION_KERNEL // 2,
+                        )
+                        manual_support = (
+                            manual_support * (manual_content > 0.5).float()
+                        ).clamp(0.0, 1.0)
+                        manual_inside = FeatureBankManager._robust_scale_visible_regions(
+                            manual_raw, manual_support
+                        )
+                        manual_complement = FeatureBankManager._robust_scale_visible_regions(
+                            manual_raw,
+                            ((manual_content > 0.5) & (manual_support <= 0.5)).float(),
+                        )
+
+                        # Matched automatic support: same rows, same dilation and
+                        # content mask as the manual branch, but no valid-mask gate
+                        # and no fixed-centre fallback. Empty/poor predictions remain
+                        # genuine automatic-segmentation failures rather than changing
+                        # the evaluated image subset.
+                        matched_attention_support = F.max_pool2d(
+                            (hard_224.index_select(0, index_tensor) > 0.5).float(),
+                            kernel_size=SETTINGS_ATTENTION.ATTENTION_SUPPORT_DILATION_KERNEL,
+                            stride=1,
+                            padding=SETTINGS_ATTENTION.ATTENTION_SUPPORT_DILATION_KERNEL // 2,
+                        )
+                        matched_attention_support = (
+                            matched_attention_support * (manual_content > 0.5).float()
+                        ).clamp(0.0, 1.0)
+                        matched_attention_inside = (
+                            FeatureBankManager._robust_scale_visible_regions(
+                                manual_raw, matched_attention_support
+                            )
+                        )
+                        matched_attention_complement = (
+                            FeatureBankManager._robust_scale_visible_regions(
+                                manual_raw,
+                                (
+                                    (manual_content > 0.5)
+                                    & (matched_attention_support <= 0.5)
+                                ).float(),
+                            )
+                        )
+
+                        matched_variants = (
+                            manual_inside,
+                            manual_complement,
+                            matched_attention_inside,
+                            matched_attention_complement,
+                        )
+                        manual_normalized = torch.cat(
+                            [
+                                MonaiSegmenter.normalize_for_efficientnet(image)
+                                for image in matched_variants
+                            ],
+                            dim=0,
+                        )
+                        manual_encoded = encoder(manual_normalized).float().cpu().numpy()
+                        manual_count = len(manual_indices)
+                        selected_tokens = [token_list[i] for i in manual_indices]
+                        manual_subset_tokens.extend(selected_tokens)
+                        selected_valid = valid_final_np[index_array]
+                        manual_subset_attention_valid_count += int(selected_valid.sum())
+                        manual_subset_attention_invalid_count += int(
+                            len(selected_valid) - selected_valid.sum()
+                        )
+                        manual_patient_ids = [str(patient_ids[i]) for i in manual_indices]
+                        manual_series_ids = [str(series_ids[i]) for i in manual_indices]
+                        manual_labels = labels_np[index_array]
+                        for mode_index, mode in enumerate(
+                            SETTINGS_ATTENTION.ATTENTION_MANUAL_FEATURE_MODES
+                        ):
+                            manual_pool.add(
+                                mode,
+                                manual_encoded[
+                                    mode_index * manual_count:(mode_index + 1) * manual_count
+                                ],
+                                manual_patient_ids, manual_series_ids, manual_labels,
+                            )
 
                     hard_cpu = hard_256[:, 0].cpu().numpy() > 0.5
                     support_fraction = support.mean(dim=(1, 2, 3)).cpu().numpy()
@@ -13816,6 +14768,13 @@ class AttentionEvaluationManager:
                                 "series_id": str(series_ids[index]),
                                 "segmentation_fold": int(target_fold),
                                 "attention_valid": int(valid_np[index]),
+                                "attention_valid_initial": int(valid_initial_np[index]),
+                                "attention_valid_final": int(valid_np[index]),
+                                "attention_repair_method": review_row.get("attention_repair_method", "") if review_row else "",
+                                "attention_invalid_reason_final": review_row.get("attention_invalid_reason_final", "") if review_row else "",
+                                "attention_threshold_used": review_row.get("attention_threshold_used", "") if review_row else "",
+                                "attention_tta_variance": review_row.get("attention_tta_variance", "") if review_row else "",
+                                "attention_series_prior_used": review_row.get("attention_series_prior_used", "") if review_row else "",
                                 "attention_area_ratio": float(area_ratio[index].cpu().item()),
                                 "attention_peak_probability": float(
                                     peak_probability[index].cpu().item()
@@ -13828,9 +14787,23 @@ class AttentionEvaluationManager:
                                 ),
                                 "image_token": token,
                                 "checkpoint": str(checkpoint_map[target_fold]),
+                                "image_quality_valid": int(quality_np[index]),
+                                "image_quality_reason": quality_by_token.get(token, {}).get("image_quality_reason", ""),
+                                "image_quality_sharpness": quality_by_token.get(token, {}).get("image_quality_sharpness", ""),
+                                "image_quality_noise_ratio": quality_by_token.get(token, {}).get("image_quality_noise_ratio", ""),
+                                "manual_mask_usable": review_row.get("manual_mask_usable", 0) if review_row else 0,
+                                "manual_clean_experiment_included": int(
+                                    bool(review_row)
+                                    and MaskReviewManager._review_to_int(review_row.get("manual_mask_usable"), 0) == 1
+                                    and bool(quality_np[index])
+                                ),
+                                "matched_attention_experiment_included": int(
+                                    bool(review_row)
+                                    and MaskReviewManager._review_to_int(review_row.get("manual_mask_usable"), 0) == 1
+                                    and bool(quality_np[index])
+                                ),
                             }
                         )
-            del model
             if DEVICE == "cuda":
                 torch.cuda.empty_cache()
 
@@ -13846,12 +14819,58 @@ class AttentionEvaluationManager:
                 raise RuntimeError(f"Patient alignment differs for {mode}.")
             features[mode] = X_mode
 
-        np.savez_compressed(
-            npz_path,
-            patient_ids=np.asarray(patient_ids).astype(str),
-            labels=np.asarray(labels, dtype=np.int64),
-            **{f"X__{mode}": features[mode] for mode in SETTINGS_ATTENTION.ATTENTION_FEATURE_MODES},
-        )
+        manual_patient_ids = np.asarray([], dtype=str)
+        manual_labels = np.asarray([], dtype=np.int64)
+        manual_features = {}
+        if manual_pool.retained_slice_counts[
+            SETTINGS_ATTENTION.ATTENTION_MANUAL_FEATURE_MODES[0]
+        ] > 0:
+            for mode in SETTINGS_ATTENTION.ATTENTION_MANUAL_FEATURE_MODES:
+                X_mode, y_mode, patients_mode = manual_pool.finalize(mode)
+                if manual_patient_ids.size == 0:
+                    manual_patient_ids = patients_mode
+                    manual_labels = y_mode
+                elif not np.array_equal(manual_patient_ids, patients_mode) or not np.array_equal(manual_labels, y_mode):
+                    raise RuntimeError(f"Manual patient alignment differs for {mode}.")
+                manual_features[mode] = X_mode
+        else:
+            for mode in SETTINGS_ATTENTION.ATTENTION_MANUAL_FEATURE_MODES:
+                manual_features[mode] = np.zeros(
+                    (0, SETTINGS_FEATURE_BANK.EFFICIENTNET_FEATURE_DIM), dtype=np.float32
+                )
+
+        matched_counts = {
+            mode: int(manual_pool.retained_slice_counts[mode])
+            for mode in SETTINGS_ATTENTION.ATTENTION_MANUAL_FEATURE_MODES
+        }
+        if len(set(matched_counts.values())) > 1:
+            raise RuntimeError(
+                "AU6-AU9 do not use the same retained slice count: "
+                f"{matched_counts}"
+            )
+        if len(manual_subset_tokens) != len(set(manual_subset_tokens)):
+            raise RuntimeError(
+                "The matched manual subset contains duplicate image tokens."
+            )
+        manual_subset_signature = hashlib.sha256(
+            "\n".join(sorted(manual_subset_tokens)).encode("utf-8")
+        ).hexdigest()
+
+        payload = {
+            "patient_ids": np.asarray(patient_ids).astype(str),
+            "labels": np.asarray(labels, dtype=np.int64),
+            "manual_patient_ids": np.asarray(manual_patient_ids).astype(str),
+            "manual_labels": np.asarray(manual_labels, dtype=np.int64),
+        }
+        payload.update({
+            f"X__{mode}": features[mode]
+            for mode in SETTINGS_ATTENTION.ATTENTION_FEATURE_MODES
+        })
+        payload.update({
+            f"X__{mode}": manual_features[mode]
+            for mode in SETTINGS_ATTENTION.ATTENTION_MANUAL_FEATURE_MODES
+        })
+        np.savez_compressed(npz_path, **payload)
         with open(
             output_dir / "attention_unet_slice_qc.csv",
             "w",
@@ -13914,6 +14933,25 @@ class AttentionEvaluationManager:
             "n_patients": int(len(patient_ids)),
             "n_images": int(len(samples)),
             "feature_modes": list(SETTINGS_ATTENTION.ATTENTION_FEATURE_MODES),
+            "manual_feature_modes": list(SETTINGS_ATTENTION.ATTENTION_MANUAL_FEATURE_MODES),
+            "manual_mask_signature": AttentionEvaluationManager._manual_mask_signature(workspace),
+            "quality_schema": MaskReviewManager._attention_quality_schema(),
+            "manual_clean_patients": np.asarray(manual_patient_ids).astype(str).tolist(),
+            "manual_clean_patient_count": int(len(manual_patient_ids)),
+            "manual_matched_slice_count": int(len(manual_subset_tokens)),
+            "manual_matched_subset_signature": manual_subset_signature,
+            "manual_matched_attention_valid_final_count": int(
+                manual_subset_attention_valid_count
+            ),
+            "manual_matched_attention_invalid_final_count": int(
+                manual_subset_attention_invalid_count
+            ),
+            "manual_matched_contract": {
+                "same_slice_rows_for_au6_to_au9": True,
+                "attention_support_uses_cross_fitted_prediction": True,
+                "attention_validity_filter_applied": False,
+                "central_fallback_applied": False,
+            },
             "storage_policy": {
                 "persistent_workspace": str(workspace.root),
                 "transient_root": str(workspace.transient_root),
@@ -13927,14 +14965,20 @@ class AttentionEvaluationManager:
                     SETTINGS_ATTENTION.ATTENTION_RAM_IMAGE_CACHE_MB
                 ),
             },
-            "retained_slice_counts": dict(pool.retained_slice_counts),
+            "retained_slice_counts": {
+                **dict(pool.retained_slice_counts),
+                **dict(manual_pool.retained_slice_counts),
+            },
             "patient_level_fallbacks": dict(pool.patient_level_fallbacks),
             "checkpoints": {str(key): str(value) for key, value in checkpoint_map.items()},
             "methodological_note": (
-                "Each patient is segmented by the checkpoint associated with that "
-                "patient's label-blind segmentation fold. With locally trained "
-                "checkpoints, that patient's masks were excluded from optimization "
-                "and early stopping."
+                "Each patient uses its patient-excluded fold checkpoint. Masks are "
+                "fold-calibrated and repaired by label-blind TTA/threshold/component/"
+                "series rules. AU1 and AU5 use exactly the same final-valid rows; "
+                "invalid_unresolved rows receive no central fallback and are excluded. "
+                "AU6-AU9 use one identical manual-clean slice set: AU6/AU7 use "
+                "manual supports and AU8/AU9 use cross-fitted Attention supports "
+                "without validity filtering or fallback."
             ),
         }
         metadata_path.write_text(
@@ -13945,8 +14989,12 @@ class AttentionEvaluationManager:
             "patient_ids": patient_ids,
             "labels": labels,
             "features": features,
+            "manual_patient_ids": manual_patient_ids,
+            "manual_labels": manual_labels,
+            "manual_features": manual_features,
             "metadata": metadata,
         }
+
 
     @staticmethod
     def _load_or_create_classification_fold_manifest(samples, workspace):
@@ -14062,7 +15110,7 @@ class AttentionEvaluationManager:
 
     @staticmethod
     def evaluate_attention_feature_bank(samples, workspace, bank):
-        """Run AU1-AU5 nested CV plus profile-controlled stability/permutation and MONAI comparison."""
+        """Run AU1-AU5 plus exact-row-matched manual/Attention AU6-AU9."""
 
         print(
             "[ATTENTION][VALIDATION] profile="
@@ -14130,6 +15178,87 @@ class AttentionEvaluationManager:
                         ),
                     }
 
+            manual_status = {"status": "SKIPPED_NO_USABLE_MANUAL_FEATURES"}
+            manual_patient_ids = np.asarray(
+                bank.get("manual_patient_ids", []), dtype=str
+            )
+            full_patient_ids = np.asarray(bank["patient_ids"], dtype=str)
+            if manual_patient_ids.size:
+                missing_manual_patients = sorted(
+                    set(full_patient_ids.tolist()) - set(manual_patient_ids.tolist())
+                )
+                if missing_manual_patients:
+                    manual_status = {
+                        "status": "SKIPPED_INCOMPLETE_PATIENT_COVERAGE",
+                        "manual_patient_count": int(len(manual_patient_ids)),
+                        "missing_patients": missing_manual_patients,
+                        "note": (
+                            "AU6-AU9 require at least one non-empty, quality-valid "
+                            "manual-mask slice for every patient to preserve both "
+                            "the shared fold contract and exact matched-slice comparisons."
+                        ),
+                    }
+                else:
+                    for experiment in SETTINGS_ATTENTION.ATTENTION_MANUAL_EXPERIMENTS:
+                        X = bank["manual_features"][experiment.feature_mode]
+                        prepared = {
+                            "unit": "patient",
+                            "X": np.asarray(X, dtype=np.float32),
+                            "y": np.asarray(bank["manual_labels"], dtype=np.int64),
+                            "patient_ids": manual_patient_ids,
+                            "feature_names": tuple(
+                                f"embedding_{index:04d}" for index in range(X.shape[1])
+                            ),
+                            "slice_filter": "manual_mask_nonempty_and_quality_valid",
+                            "n_source_slices": int(len(samples)),
+                            "n_retained_slices": int(
+                                bank["metadata"]["retained_slice_counts"][
+                                    experiment.feature_mode
+                                ]
+                            ),
+                        }
+                        prepared_by_id[experiment.experiment_id] = prepared
+                        result = ModelingManager.run_one_experiment(
+                            experiment, prepared, fold_rows,
+                            evaluation_root / experiment.experiment_id,
+                        )
+                        results[experiment.experiment_id] = result
+                        if SETTINGS_ATTENTION.ATTENTION_RUN_REPEATED_CV_STABILITY:
+                            stability[experiment.experiment_id] = (
+                                ModelingManager.run_repeated_nested_cv_stability(
+                                    experiment, prepared, fold_rows,
+                                    evaluation_root / experiment.experiment_id / "stability",
+                                )
+                            )
+                        else:
+                            stability[experiment.experiment_id] = {
+                                "status": "SKIPPED_DISABLED",
+                                "experiment_id": experiment.experiment_id,
+                            }
+                    manual_status = {
+                        "status": "OK",
+                        "manual_patient_count": int(len(manual_patient_ids)),
+                        "manual_modes": list(
+                            SETTINGS_ATTENTION.ATTENTION_MANUAL_FEATURE_MODES
+                        ),
+                        "matched_slice_count": int(
+                            bank["metadata"].get("manual_matched_slice_count", 0)
+                        ),
+                        "matched_subset_signature": bank["metadata"].get(
+                            "manual_matched_subset_signature", ""
+                        ),
+                        "attention_valid_on_matched_subset": int(
+                            bank["metadata"].get(
+                                "manual_matched_attention_valid_final_count", 0
+                            )
+                        ),
+                        "attention_invalid_on_matched_subset": int(
+                            bank["metadata"].get(
+                                "manual_matched_attention_invalid_final_count", 0
+                            )
+                        ),
+                    }
+
             au1_id = SETTINGS_ATTENTION.ATTENTION_EXPERIMENTS[0].experiment_id
             au1_result = results[au1_id]
             if SETTINGS_ATTENTION.ATTENTION_RUN_PERMUTATION_TEST:
@@ -14151,7 +15280,12 @@ class AttentionEvaluationManager:
 
         au1 = results[SETTINGS_ATTENTION.ATTENTION_EXPERIMENTS[0].experiment_id]
         pairwise = {}
-        for experiment in SETTINGS_ATTENTION.ATTENTION_EXPERIMENTS[1:]:
+        comparison_experiments = list(SETTINGS_ATTENTION.ATTENTION_EXPERIMENTS[1:])
+        if manual_status.get("status") == "OK":
+            comparison_experiments.extend(
+                SETTINGS_ATTENTION.ATTENTION_MANUAL_EXPERIMENTS
+            )
+        for experiment in comparison_experiments:
             comparison = results[experiment.experiment_id]
             au1_order = np.argsort(au1["patient_ids"].astype(str))
             comparison_order = np.argsort(comparison["patient_ids"].astype(str))
@@ -14168,6 +15302,165 @@ class AttentionEvaluationManager:
                 au1["probabilities"][au1_order],
                 random_state=SETTINGS_ATTENTION.ATTENTION_RANDOM_SEED
                 + int(hashlib.sha256(experiment.experiment_id.encode()).hexdigest()[:8], 16),
+            )
+
+        au1_mode = SETTINGS_ATTENTION.ATTENTION_FEATURE_MODES[0]
+        au2_mode = SETTINGS_ATTENTION.ATTENTION_FEATURE_MODES[1]
+        au1_features = np.asarray(bank["features"][au1_mode], dtype=np.float32)
+        au2_features = np.asarray(bank["features"][au2_mode], dtype=np.float32)
+        au1_result_for_equivalence = results[
+            SETTINGS_ATTENTION.ATTENTION_EXPERIMENTS[0].experiment_id
+        ]
+        au2_result_for_equivalence = results[
+            SETTINGS_ATTENTION.ATTENTION_EXPERIMENTS[1].experiment_id
+        ]
+        au1_au2_equivalence = {
+            "status": (
+                "IDENTICAL_TO_AU1"
+                if np.array_equal(au1_features, au2_features)
+                else "DIFFERENT_FROM_AU1"
+            ),
+            "feature_arrays_identical": bool(
+                np.array_equal(au1_features, au2_features)
+            ),
+            "max_absolute_feature_difference": float(
+                np.max(np.abs(au1_features - au2_features))
+            ),
+            "oof_scores_identical": bool(
+                np.array_equal(
+                    np.asarray(au1_result_for_equivalence["probabilities"]),
+                    np.asarray(au2_result_for_equivalence["probabilities"]),
+                )
+            ),
+            "au1_retained_slices": int(
+                bank["metadata"]["retained_slice_counts"][au1_mode]
+            ),
+            "au2_retained_slices": int(
+                bank["metadata"]["retained_slice_counts"][au2_mode]
+            ),
+            "au2_patient_level_fallbacks": bank["metadata"].get(
+                "patient_level_fallbacks", {}
+            ).get(au2_mode, []),
+            "interpretation": (
+                "If identical, AU2 does not provide an independent ablation under "
+                "the locked gate; thresholds were not retuned after seeing AUC."
+            ),
+        }
+
+        manual_inside_vs_complement = {"status": "UNAVAILABLE"}
+        if manual_status.get("status") == "OK":
+            inside_id = SETTINGS_ATTENTION.ATTENTION_MANUAL_EXPERIMENTS[0].experiment_id
+            complement_id = SETTINGS_ATTENTION.ATTENTION_MANUAL_EXPERIMENTS[1].experiment_id
+            inside = results[inside_id]
+            outside = results[complement_id]
+            order_inside = np.argsort(inside["patient_ids"].astype(str))
+            order_outside = np.argsort(outside["patient_ids"].astype(str))
+            manual_inside_vs_complement = {
+                "status": "OK",
+                "inside_experiment_id": inside_id,
+                "complement_experiment_id": complement_id,
+                "inside_auc": float(roc_auc_score(
+                    inside["labels"][order_inside],
+                    inside["probabilities"][order_inside],
+                )),
+                "complement_auc": float(roc_auc_score(
+                    outside["labels"][order_outside],
+                    outside["probabilities"][order_outside],
+                )),
+                "inside_minus_complement": ModelingManager.paired_auc_difference_interval(
+                    inside["labels"][order_inside],
+                    outside["probabilities"][order_outside],
+                    inside["probabilities"][order_inside],
+                    random_state=SETTINGS_ATTENTION.ATTENTION_RANDOM_SEED + 92_000,
+                ),
+            }
+
+        manual_mask_quality_comparisons = {"status": "UNAVAILABLE"}
+        if manual_status.get("status") == "OK":
+            manual_inside_id = SETTINGS_ATTENTION.ATTENTION_MANUAL_EXPERIMENTS[0].experiment_id
+            manual_complement_id = SETTINGS_ATTENTION.ATTENTION_MANUAL_EXPERIMENTS[1].experiment_id
+            attention_inside_id = SETTINGS_ATTENTION.ATTENTION_MANUAL_EXPERIMENTS[2].experiment_id
+            attention_complement_id = SETTINGS_ATTENTION.ATTENTION_MANUAL_EXPERIMENTS[3].experiment_id
+
+            def _matched_comparison(baseline_id, comparison_id, random_state):
+                baseline = results[baseline_id]
+                comparison = results[comparison_id]
+                baseline_order = np.argsort(baseline["patient_ids"].astype(str))
+                comparison_order = np.argsort(comparison["patient_ids"].astype(str))
+                baseline_patients = baseline["patient_ids"][baseline_order].astype(str)
+                comparison_patients = comparison["patient_ids"][comparison_order].astype(str)
+                baseline_labels = baseline["labels"][baseline_order]
+                comparison_labels = comparison["labels"][comparison_order]
+                if not np.array_equal(baseline_patients, comparison_patients):
+                    raise RuntimeError(
+                        f"Matched patient mismatch: {baseline_id} versus {comparison_id}."
+                    )
+                if not np.array_equal(baseline_labels, comparison_labels):
+                    raise RuntimeError(
+                        f"Matched label mismatch: {baseline_id} versus {comparison_id}."
+                    )
+                baseline_scores = baseline["probabilities"][baseline_order]
+                comparison_scores = comparison["probabilities"][comparison_order]
+                return {
+                    "baseline_experiment_id": baseline_id,
+                    "comparison_experiment_id": comparison_id,
+                    "baseline_auc": float(
+                        roc_auc_score(baseline_labels, baseline_scores)
+                    ),
+                    "comparison_auc": float(
+                        roc_auc_score(comparison_labels, comparison_scores)
+                    ),
+                    "comparison_minus_baseline": (
+                        ModelingManager.paired_auc_difference_interval(
+                            baseline_labels,
+                            baseline_scores,
+                            comparison_scores,
+                            random_state=random_state,
+                        )
+                    ),
+                }
+
+            manual_mask_quality_comparisons = {
+                "status": "OK",
+                "exact_same_slice_subset": True,
+                "matched_slice_count": int(
+                    bank["metadata"].get("manual_matched_slice_count", 0)
+                ),
+                "matched_subset_signature": bank["metadata"].get(
+                    "manual_matched_subset_signature", ""
+                ),
+                "manual_inside_minus_attention_inside": _matched_comparison(
+                    attention_inside_id,
+                    manual_inside_id,
+                    SETTINGS_ATTENTION.ATTENTION_RANDOM_SEED + 93_000,
+                ),
+                "manual_complement_minus_attention_complement": _matched_comparison(
+                    attention_complement_id,
+                    manual_complement_id,
+                    SETTINGS_ATTENTION.ATTENTION_RANDOM_SEED + 94_000,
+                ),
+                "attention_inside_minus_attention_complement": _matched_comparison(
+                    attention_complement_id,
+                    attention_inside_id,
+                    SETTINGS_ATTENTION.ATTENTION_RANDOM_SEED + 95_000,
+                ),
+                "interpretation": (
+                    "AU6 versus AU8 isolates manual-versus-automatic mask quality "
+                    "because image tokens, patients, series, quality filtering and "
+                    "pooling are identical. AU7 versus AU9 provides the matched "
+                    "complement check."
+                ),
+            }
+            (
+                workspace.comparison_output
+                / "attention_manual_vs_automatic_matched_comparisons.json"
+            ).write_text(
+                json.dumps(
+                    manual_mask_quality_comparisons,
+                    indent=2,
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
             )
 
         monai_comparison = {"status": "UNAVAILABLE"}
@@ -14238,16 +15531,24 @@ class AttentionEvaluationManager:
             "au1_vs_controls": pairwise,
             "au1_patient_label_permutation": permutation,
             "au1_vs_monai_primary": monai_comparison,
+            "manual_clean_experiment": manual_status,
+            "au1_au2_equivalence_diagnostic": au1_au2_equivalence,
+            "au6_manual_inside_vs_au7_manual_complement": manual_inside_vs_complement,
+            "manual_vs_automatic_matched_comparisons": manual_mask_quality_comparisons,
             "methodological_limitation": (
-                "If pseudo masks dominate supervision, Attention U-Net remains a "
-                "cross-fitted distillation of MONAI rather than an independent expert "
-                "segmentation ground truth."
+                "AU1-AU5 use cross-fitted Attention predictions after label-blind "
+                "quality filtering. AU6-AU9 use one exact non-empty, quality-valid "
+                "manual-mask slice set: AU6/AU7 use manual supports and AU8/AU9 "
+                "use cross-fitted Attention supports without validity filtering or "
+                "fallback. These are internal diagnostics on 30 patients, not "
+                "external clinical validation."
             ),
         }
         (workspace.comparison_output / "attention_unet_comparison_summary.json").write_text(
             json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8"
         )
         return summary
+
 
 
 class MaskReviewManager:
@@ -14264,6 +15565,10 @@ class MaskReviewManager:
     @staticmethod
     def attention_prediction_generation_path(workspace):
         return Path(workspace.root) / "attention_unet_prediction_generation.json"
+
+    @staticmethod
+    def attention_invalid_after_retrain_path(workspace):
+        return Path(workspace.root) / "attention_invalid_after_retrain.csv"
 
     @staticmethod
     def _review_atomic_csv(rows, path, fieldnames):
@@ -14321,36 +15626,483 @@ class MaskReviewManager:
             return int(default)
 
     @staticmethod
+    def attention_image_quality_audit_path(workspace):
+        return Path(workspace.root) / "attention_image_quality_audit.csv"
+
+    @staticmethod
+    def _manual_mask_qc(row):
+        """Inspect one manual mask without modifying or deleting the file."""
+
+        path = Path(row["manual_mask_path"])
+        result = {
+            "manual_mask_exists": int(path.is_file()),
+            "manual_mask_area_ratio": "",
+            "manual_mask_usable": 0,
+            "manual_mask_rejection_reason": "",
+        }
+        if not path.is_file():
+            return result
+        mask = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            result["manual_mask_rejection_reason"] = "unreadable_manual_mask"
+            return result
+        mask = cv2.resize(
+            mask,
+            (
+                SETTINGS_ATTENTION.ATTENTION_INPUT_SIZE,
+                SETTINGS_ATTENTION.ATTENTION_INPUT_SIZE,
+            ),
+            interpolation=cv2.INTER_NEAREST,
+        )
+        area = float(np.mean(mask > 127))
+        result["manual_mask_area_ratio"] = area
+        if area < SETTINGS_ATTENTION.ATTENTION_MANUAL_MASK_MIN_AREA_RATIO:
+            result["manual_mask_rejection_reason"] = "empty_or_nearly_empty_manual_mask"
+        elif area > SETTINGS_ATTENTION.ATTENTION_MANUAL_MASK_MAX_AREA_RATIO:
+            result["manual_mask_rejection_reason"] = "nearly_full_manual_mask"
+        else:
+            result["manual_mask_usable"] = 1
+        return result
+
+    @staticmethod
+    def _attention_quality_schema():
+        payload = {
+            "schema": SETTINGS_REVIEW.ATTENTION_REVIEW_QUALITY_SCHEMA,
+            "thumbnail": SETTINGS_ATTENTION.ATTENTION_QUALITY_THUMBNAIL_SIZE,
+            "min_dynamic_range": SETTINGS_ATTENTION.ATTENTION_QUALITY_MIN_DYNAMIC_RANGE,
+            "min_laplacian": SETTINGS_ATTENTION.ATTENTION_QUALITY_MIN_LAPLACIAN_VARIANCE,
+            "max_noise_ratio": SETTINGS_ATTENTION.ATTENTION_QUALITY_MAX_NOISE_RATIO,
+            "blur_quantile": SETTINGS_ATTENTION.ATTENTION_QUALITY_PATIENT_BLUR_QUANTILE,
+            "noise_quantile": SETTINGS_ATTENTION.ATTENTION_QUALITY_PATIENT_NOISE_QUANTILE,
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:16]
+
+    @staticmethod
+    def _compute_attention_image_quality(row):
+        """Compute label-blind pHash, sharpness and robust noise indicators."""
+
+        image_path = Path(row["image_path"])
+        image = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
+        if image is None:
+            return {
+                "decode_valid": 0,
+                "perceptual_hash": "",
+                "image_quality_sharpness": "",
+                "image_quality_noise_ratio": "",
+                "image_quality_dynamic_range": "",
+            }
+        robust, _monai, raw, padding, _features = (
+            ImagePreprocessor.build_label_blind_standardized_image(image)
+        )
+        content = padding < 0.5
+        coordinates = np.argwhere(content)
+        if coordinates.size == 0:
+            return {
+                "decode_valid": 0,
+                "perceptual_hash": "",
+                "image_quality_sharpness": "",
+                "image_quality_noise_ratio": "",
+                "image_quality_dynamic_range": "",
+            }
+        top, left = coordinates.min(axis=0)
+        bottom, right = coordinates.max(axis=0) + 1
+        robust_crop = robust[top:bottom, left:right]
+        raw_crop = raw[top:bottom, left:right]
+        size = int(SETTINGS_ATTENTION.ATTENTION_QUALITY_THUMBNAIL_SIZE)
+        robust_thumb = cv2.resize(
+            robust_crop.astype(np.float32), (size, size), interpolation=cv2.INTER_AREA
+        )
+        raw_thumb = cv2.resize(
+            raw_crop.astype(np.float32), (size, size), interpolation=cv2.INTER_AREA
+        )
+        robust_u8 = np.clip(np.round(robust_thumb * 255.0), 0, 255).astype(np.uint8)
+        raw_255 = np.clip(raw_thumb * 255.0, 0.0, 255.0).astype(np.float32)
+        sharpness = float(cv2.Laplacian(robust_u8, cv2.CV_32F).var())
+        smooth = cv2.GaussianBlur(raw_255, (3, 3), 0)
+        residual = raw_255 - smooth
+        residual_median = float(np.median(residual))
+        noise_sigma = float(
+            np.median(np.abs(residual - residual_median)) / 0.6744897501960817
+        )
+        lower, upper = np.percentile(raw_255, [5.0, 95.0])
+        dynamic_range = float(max(upper - lower, 0.0))
+        noise_ratio = float(noise_sigma / max(dynamic_range, 1.0))
+        return {
+            "decode_valid": 1,
+            "perceptual_hash": ImagePreprocessor.compute_dct_perceptual_hash(robust_u8),
+            "image_quality_sharpness": sharpness,
+            "image_quality_noise_ratio": noise_ratio,
+            "image_quality_dynamic_range": dynamic_range,
+        }
+
+    @staticmethod
+    def build_attention_image_quality_audit(rows, workspace, refresh=False):
+        """Cache label-blind blur/noise/pHash metrics and patient-relative QC.
+
+        Per-patient thresholds use only that patient's images and no CAD label. The
+        rule is deterministic and conservative: absolute corruption limits plus the
+        worst 3% blur/noise tails are excluded. The audit is reusable across editor,
+        training and AU1-AU9 feature extraction, including matched AU6-AU9.
+        """
+
+        rows = [dict(row) for row in rows]
+        path = MaskReviewManager.attention_image_quality_audit_path(workspace)
+        schema = MaskReviewManager._attention_quality_schema()
+        existing = {}
+        if path.is_file() and not refresh:
+            try:
+                with open(path, newline="", encoding="utf-8") as file:
+                    existing = {
+                        str(row.get("image_token", "")): row
+                        for row in csv.DictReader(file)
+                        if str(row.get("image_token", ""))
+                    }
+            except (OSError, csv.Error):
+                existing = {}
+
+        records = []
+        started = time.perf_counter()
+        for index, row in enumerate(rows, start=1):
+            image_path = Path(row["image_path"])
+            file_size = int(image_path.stat().st_size) if image_path.is_file() else -1
+            old = existing.get(row["image_token"], {})
+            reusable = (
+                not refresh
+                and old.get("quality_schema") == schema
+                and str(old.get("image_path", "")) == str(image_path)
+                and MaskReviewManager._review_to_int(old.get("image_size_bytes"), -2)
+                == file_size
+                and str(old.get("perceptual_hash", ""))
+            )
+            if reusable:
+                record = dict(old)
+            else:
+                metrics = MaskReviewManager._compute_attention_image_quality(row)
+                record = {
+                    "quality_schema": schema,
+                    "image_token": row["image_token"],
+                    "image_path": str(image_path),
+                    "patient_id": row["patient_id"],
+                    "series_id": row["series_id"],
+                    "image_size_bytes": file_size,
+                    **metrics,
+                }
+            records.append(record)
+            if index == 1 or index % 5000 == 0 or index == len(rows):
+                print(
+                    f"[ATTENTION][QUALITY] {index}/{len(rows)} images audited; "
+                    f"elapsed={RuntimeManager._format_elapsed_time(time.perf_counter()-started)}",
+                    flush=True,
+                )
+
+        by_patient = defaultdict(list)
+        for record in records:
+            if MaskReviewManager._review_to_int(record.get("decode_valid"), 0) == 1:
+                by_patient[str(record["patient_id"])].append(record)
+
+        for patient_id, patient_rows in by_patient.items():
+            sharpness_values = np.asarray(
+                [MaskReviewManager._review_to_float(r.get("image_quality_sharpness"), np.nan)
+                 for r in patient_rows], dtype=np.float64
+            )
+            noise_values = np.asarray(
+                [MaskReviewManager._review_to_float(r.get("image_quality_noise_ratio"), np.nan)
+                 for r in patient_rows], dtype=np.float64
+            )
+            sharpness_values = sharpness_values[np.isfinite(sharpness_values)]
+            noise_values = noise_values[np.isfinite(noise_values)]
+            blur_threshold = float(SETTINGS_ATTENTION.ATTENTION_QUALITY_MIN_LAPLACIAN_VARIANCE)
+            noise_threshold = float(SETTINGS_ATTENTION.ATTENTION_QUALITY_MAX_NOISE_RATIO)
+            if len(sharpness_values) >= 5:
+                blur_threshold = max(
+                    blur_threshold,
+                    float(np.quantile(
+                        sharpness_values,
+                        SETTINGS_ATTENTION.ATTENTION_QUALITY_PATIENT_BLUR_QUANTILE,
+                    )),
+                )
+            if len(noise_values) >= 5:
+                noise_threshold = min(
+                    noise_threshold,
+                    float(np.quantile(
+                        noise_values,
+                        SETTINGS_ATTENTION.ATTENTION_QUALITY_PATIENT_NOISE_QUANTILE,
+                    )),
+                )
+            for record in patient_rows:
+                sharpness = MaskReviewManager._review_to_float(
+                    record.get("image_quality_sharpness"), np.nan
+                )
+                noise_ratio = MaskReviewManager._review_to_float(
+                    record.get("image_quality_noise_ratio"), np.nan
+                )
+                dynamic_range = MaskReviewManager._review_to_float(
+                    record.get("image_quality_dynamic_range"), np.nan
+                )
+                reasons = []
+                if not np.isfinite(dynamic_range) or dynamic_range < SETTINGS_ATTENTION.ATTENTION_QUALITY_MIN_DYNAMIC_RANGE:
+                    reasons.append("low_dynamic_range")
+                if not np.isfinite(sharpness) or sharpness < blur_threshold:
+                    reasons.append("blurred")
+                if not np.isfinite(noise_ratio) or noise_ratio > noise_threshold:
+                    reasons.append("noisy")
+                record["patient_blur_threshold"] = blur_threshold
+                record["patient_noise_threshold"] = noise_threshold
+                record["image_quality_valid"] = int(not reasons)
+                record["image_quality_reason"] = ";".join(reasons)
+
+        for record in records:
+            if MaskReviewManager._review_to_int(record.get("decode_valid"), 0) != 1:
+                record["patient_blur_threshold"] = ""
+                record["patient_noise_threshold"] = ""
+                record["image_quality_valid"] = 0
+                record["image_quality_reason"] = "unreadable_image"
+
+        fields = (
+            "quality_schema", "image_token", "image_path", "patient_id", "series_id",
+            "image_size_bytes", "decode_valid", "perceptual_hash",
+            "image_quality_sharpness", "image_quality_noise_ratio",
+            "image_quality_dynamic_range", "patient_blur_threshold",
+            "patient_noise_threshold", "image_quality_valid", "image_quality_reason",
+        )
+        MaskReviewManager._review_atomic_csv(records, path, fields)
+        valid_count = sum(
+            MaskReviewManager._review_to_int(r.get("image_quality_valid"), 0) == 1
+            for r in records
+        )
+        print(
+            f"[ATTENTION][QUALITY] valid={valid_count}/{len(records)}; audit={path}",
+            flush=True,
+        )
+        return {str(record["image_token"]): record for record in records}
+
+    @staticmethod
+    def _review_round_robin_novel(rows, limit, source, seed):
+        """Balance novel candidates across patients and folder-defined series."""
+
+        rows = list(rows)
+        per_patient_limit = int(SETTINGS_REVIEW.ATTENTION_REVIEW_NOVEL_PER_PATIENT)
+        if limit <= 0:
+            limit = per_patient_limit * len({row["patient_id"] for row in rows})
+
+        def priority(row):
+            hashed = hashlib.sha256(
+                f"{seed}|{row['image_token']}".encode("utf-8")
+            ).hexdigest()
+            valid = MaskReviewManager._review_to_int(
+                row.get("attention_valid" if source == "attention" else "monai_valid"), -1
+            )
+            dice = MaskReviewManager._review_to_float(
+                row.get("dice_attention_vs_monai"), 1.0
+            )
+            peak = MaskReviewManager._review_to_float(
+                row.get("attention_peak_probability" if source == "attention" else "monai_peak_probability"),
+                1.0,
+            )
+            area = MaskReviewManager._review_to_float(
+                row.get("attention_area_ratio" if source == "attention" else "monai_area_ratio"),
+                0.15,
+            )
+            noise = MaskReviewManager._review_to_float(
+                row.get("image_quality_noise_ratio"), 0.0
+            )
+            sharpness = MaskReviewManager._review_to_float(
+                row.get("image_quality_sharpness"), 0.0
+            )
+            return (
+                0 if valid == 0 else 1,
+                dice,
+                peak,
+                -abs(area - 0.15),
+                noise,
+                -sharpness,
+                hashed,
+            )
+
+        by_patient_series = defaultdict(lambda: defaultdict(list))
+        for row in rows:
+            by_patient_series[row["patient_id"]][row["series_id"]].append(row)
+        patient_queues = {}
+        for patient_id, series_map in by_patient_series.items():
+            series_ids = sorted(series_map)
+            for series_id in series_ids:
+                series_map[series_id].sort(key=priority)
+            queue = []
+            position = 0
+            while len(queue) < per_patient_limit:
+                added = False
+                for series_id in series_ids:
+                    if position < len(series_map[series_id]):
+                        queue.append(series_map[series_id][position])
+                        added = True
+                        if len(queue) >= per_patient_limit:
+                            break
+                if not added:
+                    break
+                position += 1
+            patient_queues[patient_id] = queue
+
+        selected = []
+        position = 0
+        patient_ids = sorted(patient_queues)
+        while len(selected) < limit:
+            added = False
+            for patient_id in patient_ids:
+                queue = patient_queues[patient_id]
+                if position < len(queue):
+                    selected.append(queue[position])
+                    added = True
+                    if len(selected) >= limit:
+                        break
+            if not added:
+                break
+            position += 1
+        return selected
+
+    @staticmethod
+    def _select_novel_per_patient_rows(rows, workspace, source, limit, seed, reviewed):
+        """Select quality-valid rows unlike every image that already has a manual-mask file."""
+
+        quality = MaskReviewManager.build_attention_image_quality_audit(
+            rows, workspace, refresh=False
+        )
+        enriched = []
+        manual_hash_values = []
+        counters = defaultdict(int)
+        for original in rows:
+            row = dict(original)
+            row.update({
+                key: value
+                for key, value in quality.get(row["image_token"], {}).items()
+                if key in {
+                    "perceptual_hash", "image_quality_sharpness",
+                    "image_quality_noise_ratio", "image_quality_dynamic_range",
+                    "image_quality_valid", "image_quality_reason",
+                }
+            })
+            manual_qc = MaskReviewManager._manual_mask_qc(row)
+            row.update(manual_qc)
+            enriched.append(row)
+            # Every existing manual-mask file is a novelty reference, including an
+            # intentionally empty mask used to mark a noisy/non-cardiac image. The
+            # file itself is never reselected, and near-duplicate images are excluded.
+            if manual_qc["manual_mask_exists"] == 1 and row.get("perceptual_hash"):
+                manual_hash_values.append(int(str(row["perceptual_hash"]), 16))
+
+        if not manual_hash_values:
+            raise RuntimeError(
+                "novel_per_patient requires at least one existing manual-mask file."
+            )
+        manual_hash_values = sorted(set(manual_hash_values))
+        tree = _HammingBKTree()
+        for value in manual_hash_values:
+            tree.add(value)
+
+        candidates = []
+        maximum_distance = int(
+            SETTINGS_REVIEW.ATTENTION_REVIEW_MANUAL_PHASH_MAX_DISTANCE
+        )
+        for row in enriched:
+            if Path(row["manual_mask_path"]).is_file():
+                counters["existing_manual_mask"] += 1
+                continue
+            if row["image_token"] in reviewed:
+                counters["already_reviewed"] += 1
+                continue
+            if MaskReviewManager._review_to_int(row.get("image_quality_valid"), 0) != 1:
+                counters["blur_or_noise"] += 1
+                continue
+            phash_text = str(row.get("perceptual_hash", ""))
+            if not phash_text:
+                counters["missing_phash"] += 1
+                continue
+            value = int(phash_text, 16)
+            if tree.query(value, maximum_distance):
+                counters["similar_to_manual"] += 1
+                continue
+            candidates.append(row)
+
+        selected = MaskReviewManager._review_round_robin_novel(
+            candidates, int(limit), source, int(seed)
+        )
+        for row in selected:
+            value = int(str(row["perceptual_hash"]), 16)
+            row["minimum_manual_phash_distance"] = min(
+                int(value ^ manual_value).bit_count()
+                for manual_value in manual_hash_values
+            )
+
+        selected_by_patient = defaultdict(int)
+        for row in selected:
+            selected_by_patient[str(row["patient_id"])] += 1
+        all_patients = sorted({str(row["patient_id"]) for row in rows})
+        missing_patients = [
+            patient_id for patient_id in all_patients
+            if selected_by_patient.get(patient_id, 0) == 0
+        ]
+        summary = {
+            "scope": "novel_per_patient",
+            "source": source,
+            "manual_reference_images": len(manual_hash_values),
+            "phash_max_distance": maximum_distance,
+            "quality_schema": MaskReviewManager._attention_quality_schema(),
+            "candidate_rows_after_filters": len(candidates),
+            "selected_rows": len(selected),
+            "selected_per_patient": dict(sorted(selected_by_patient.items())),
+            "patients_without_eligible_new_rows": missing_patients,
+            "excluded": dict(sorted(counters.items())),
+        }
+        summary_path = Path(workspace.root) / "attention_novel_review_selection_summary.json"
+        summary_path.write_text(
+            json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8"
+        )
+        selected_path = Path(workspace.root) / "attention_novel_review_selection.csv"
+        MaskReviewManager._review_atomic_csv(
+            selected,
+            selected_path,
+            SETTINGS_REVIEW.ATTENTION_REVIEW_MANIFEST_FIELDS,
+        )
+        # Persist newly calculated QC in the full manifest for editor status/audit.
+        full_path = MaskReviewManager.attention_full_review_manifest_path(workspace)
+        MaskReviewManager._review_atomic_csv(
+            enriched,
+            full_path,
+            SETTINGS_REVIEW.ATTENTION_REVIEW_MANIFEST_FIELDS,
+        )
+        print(
+            "[ATTENTION][REVIEW][NOVEL] "
+            f"selected={len(selected)}, candidates={len(candidates)}, "
+            f"patients={len(selected_by_patient)}/{len(all_patients)}, "
+            f"excluded={dict(counters)}; summary={summary_path}",
+            flush=True,
+        )
+        return selected
+
+    @staticmethod
     def build_attention_full_review_manifest(samples, workspace, refresh=False):
         """Build one label-blind review row for every discovered JPEG image.
 
-        This manifest is separate from ``attention_unet_mask_manifest.csv``. The
-        latter remains the compact segmentation-training manifest, while this file
-        can contain all 63,425 images and is used only for inspection/correction.
-        Existing MONAI/Attention QC values and manual-mask state are preserved.
+        The full manifest is separate from the compact segmentation-training
+        manifest. Manual-mask QC is refreshed every time. Existing image-quality
+        values are merged when the cached audit is available; expensive image
+        decoding occurs only when a quality-aware queue/training/feature stage asks
+        for the audit explicitly.
         """
 
         path = MaskReviewManager.attention_full_review_manifest_path(workspace)
         existing = {} if refresh else MaskReviewManager._review_read_csv_by_token(path)
-
-        # Merge QC already known from the compact training manifest.
         compact = MaskReviewManager._review_read_csv_by_token(workspace.manifest_csv)
         for token, row in compact.items():
             existing.setdefault(token, {}).update(
                 {
                     key: row.get(key, "")
-                    for key in (
-                        "monai_valid",
-                        "monai_area_ratio",
-                        "monai_peak_probability",
-                    )
+                    for key in ("monai_valid", "monai_area_ratio", "monai_peak_probability")
                 }
             )
 
-        # Merge QC from the most recent full-cohort Attention feature extraction.
-        slice_qc_path = (
-            Path(workspace.comparison_output) / "attention_unet_slice_qc.csv"
-        )
+        slice_qc_path = Path(workspace.comparison_output) / "attention_unet_slice_qc.csv"
         if slice_qc_path.is_file():
             with open(slice_qc_path, newline="", encoding="utf-8") as file:
                 for qc in csv.DictReader(file):
@@ -14360,78 +16112,97 @@ class MaskReviewManager:
                     existing.setdefault(token, {}).update(
                         {
                             "attention_valid": qc.get("attention_valid", ""),
-                            "attention_area_ratio": qc.get(
-                                "attention_area_ratio", ""
-                            ),
-                            "attention_peak_probability": qc.get(
-                                "attention_peak_probability", ""
-                            ),
+                            "attention_area_ratio": qc.get("attention_area_ratio", ""),
+                            "attention_peak_probability": qc.get("attention_peak_probability", ""),
                             "dice_attention_vs_monai": qc.get(
                                 "dice_vs_monai_pseudo_if_available", ""
                             ),
                         }
                     )
 
+        quality_by_token = {}
+        quality_path = MaskReviewManager.attention_image_quality_audit_path(workspace)
+        if quality_path.is_file():
+            try:
+                with open(quality_path, newline="", encoding="utf-8") as file:
+                    quality_by_token = {
+                        str(row.get("image_token", "")): row
+                        for row in csv.DictReader(file)
+                        if str(row.get("image_token", ""))
+                    }
+            except (OSError, csv.Error):
+                quality_by_token = {}
+
         patient_to_fold = AttentionDataManager.build_attention_patient_folds(samples)
         rows = []
         for image_path, _label, patient_id, series_id in samples:
-            token = AttentionDataManager.attention_image_token(image_path, patient_id, series_id)
+            token = AttentionDataManager.attention_image_token(
+                image_path, patient_id, series_id
+            )
             old = existing.get(token, {})
             manual_path = Path(workspace.manual_masks) / f"{token}.png"
-            rows.append(
-                {
-                    "image_token": token,
-                    "image_path": str(image_path),
-                    "patient_id": str(patient_id),
-                    "series_id": str(series_id),
-                    "segmentation_fold": int(patient_to_fold[str(patient_id)]),
-                    "cached_image_path": str(
-                        Path(workspace.cached_images) / f"{token}.png"
-                    ),
-                    "automatic_mask_path": str(
-                        Path(workspace.automatic_masks) / f"{token}.png"
-                    ),
-                    "manual_mask_path": str(manual_path),
-                    "predicted_attention_mask_path": str(
-                        Path(workspace.predicted_masks) / f"{token}.png"
-                    ),
-                    "monai_valid": old.get("monai_valid", ""),
-                    "monai_area_ratio": old.get("monai_area_ratio", ""),
-                    "monai_peak_probability": old.get(
-                        "monai_peak_probability", ""
-                    ),
-                    "attention_valid": old.get("attention_valid", ""),
-                    "attention_area_ratio": old.get(
-                        "attention_area_ratio", ""
-                    ),
-                    "attention_peak_probability": old.get(
-                        "attention_peak_probability", ""
-                    ),
-                    "dice_attention_vs_monai": old.get(
-                        "dice_attention_vs_monai", ""
-                    ),
-                    "manual_mask_exists": int(manual_path.is_file()),
-                    "attention_checkpoint_fingerprint": old.get(
-                        "attention_checkpoint_fingerprint", ""
-                    ),
-                }
-            )
+            row = {
+                "image_token": token,
+                "image_path": str(image_path),
+                "patient_id": str(patient_id),
+                "series_id": str(series_id),
+                "segmentation_fold": int(patient_to_fold[str(patient_id)]),
+                "cached_image_path": str(Path(workspace.cached_images) / f"{token}.png"),
+                "automatic_mask_path": str(Path(workspace.automatic_masks) / f"{token}.png"),
+                "manual_mask_path": str(manual_path),
+                "predicted_attention_mask_path": str(
+                    Path(workspace.predicted_masks) / f"{token}.png"
+                ),
+                "monai_valid": old.get("monai_valid", ""),
+                "monai_area_ratio": old.get("monai_area_ratio", ""),
+                "monai_peak_probability": old.get("monai_peak_probability", ""),
+                "attention_valid": old.get("attention_valid", ""),
+                "attention_valid_initial": old.get("attention_valid_initial", ""),
+                "attention_valid_final": old.get("attention_valid_final", old.get("attention_valid", "")),
+                "attention_invalid_reason_initial": old.get("attention_invalid_reason_initial", ""),
+                "attention_invalid_reason_final": old.get("attention_invalid_reason_final", ""),
+                "attention_repair_method": old.get("attention_repair_method", ""),
+                "attention_threshold_used": old.get("attention_threshold_used", ""),
+                "attention_tta_variance": old.get("attention_tta_variance", ""),
+                "attention_component_count": old.get("attention_component_count", ""),
+                "attention_boundary_touch_fraction": old.get("attention_boundary_touch_fraction", ""),
+                "attention_centroid_x": old.get("attention_centroid_x", ""),
+                "attention_centroid_y": old.get("attention_centroid_y", ""),
+                "attention_mean_inside_probability": old.get("attention_mean_inside_probability", ""),
+                "attention_repair_score": old.get("attention_repair_score", ""),
+                "attention_series_prior_used": old.get("attention_series_prior_used", ""),
+                "attention_area_ratio": old.get("attention_area_ratio", ""),
+                "attention_peak_probability": old.get("attention_peak_probability", ""),
+                "dice_attention_vs_monai": old.get("dice_attention_vs_monai", ""),
+                "minimum_manual_phash_distance": old.get(
+                    "minimum_manual_phash_distance", ""
+                ),
+                "attention_checkpoint_fingerprint": old.get(
+                    "attention_checkpoint_fingerprint", ""
+                ),
+            }
+            row.update(MaskReviewManager._manual_mask_qc(row))
+            quality = quality_by_token.get(token, {})
+            for key in (
+                "perceptual_hash",
+                "image_quality_sharpness",
+                "image_quality_noise_ratio",
+                "image_quality_dynamic_range",
+                "image_quality_valid",
+                "image_quality_reason",
+            ):
+                row[key] = quality.get(key, old.get(key, ""))
+            rows.append(row)
 
-        rows.sort(
-            key=lambda row: (
-                row["patient_id"],
-                row["series_id"],
-                row["image_token"],
-            )
-        )
+        rows.sort(key=lambda row: (row["patient_id"], row["series_id"], row["image_token"]))
         for index, row in enumerate(rows):
             row["review_index"] = int(index)
-        MaskReviewManager._review_atomic_csv(rows, path, SETTINGS_REVIEW.ATTENTION_REVIEW_MANIFEST_FIELDS)
-        print(
-            f"[ATTENTION][REVIEW] Full manifest: {len(rows)} images -> {path}",
-            flush=True,
+        MaskReviewManager._review_atomic_csv(
+            rows, path, SETTINGS_REVIEW.ATTENTION_REVIEW_MANIFEST_FIELDS
         )
+        print(f"[ATTENTION][REVIEW] Full manifest: {len(rows)} images -> {path}", flush=True)
         return rows
+
 
     @staticmethod
     def read_attention_full_review_manifest(workspace):
@@ -14594,12 +16365,12 @@ class MaskReviewManager:
         rows,
         workspace,
         source="monai",
-        scope="diverse",
-        limit=1200,
+        scope="novel_per_patient",
+        limit=300,
         seed=42,
         review_round=1,
     ):
-        """Build a review queue from the full cohort without class labels."""
+        """Build a label-blind review queue; novel_per_patient is the fast default."""
 
         source = str(source).lower()
         scope = str(scope).lower()
@@ -14616,50 +16387,70 @@ class MaskReviewManager:
             workspace, source=source, review_round=review_round
         )
 
-        if scope == "unreviewed":
-            rows = [row for row in rows if row["image_token"] not in reviewed]
-        elif scope == "reviewed":
-            rows = [row for row in rows if row["image_token"] in reviewed]
-        elif scope == "manual":
-            rows = [
-                row
-                for row in rows
-                if Path(row["manual_mask_path"]).is_file()
-            ]
-        elif scope == "invalid":
-            field = "attention_valid" if source == "attention" else "monai_valid"
-            rows = [row for row in rows if MaskReviewManager._review_to_int(row.get(field), -1) == 0]
-        elif scope == "disagreement":
-            if source != "attention":
-                raise ValueError("disagreement scope is available for Attention only.")
-            rows = [
-                row
-                for row in rows
-                if np.isfinite(
-                    MaskReviewManager._review_to_float(row.get("dice_attention_vs_monai"))
-                )
-            ]
-            rows.sort(
-                key=lambda row: (
-                    MaskReviewManager._review_to_float(row.get("dice_attention_vs_monai"), 1.0),
-                    row["patient_id"],
-                    row["series_id"],
-                    row["image_token"],
-                )
+        if scope == "novel_per_patient":
+            rows = MaskReviewManager._select_novel_per_patient_rows(
+                rows, workspace, source, int(limit), int(seed), reviewed
             )
+        else:
+            if scope == "unreviewed":
+                rows = [row for row in rows if row["image_token"] not in reviewed]
+            elif scope == "reviewed":
+                rows = [row for row in rows if row["image_token"] in reviewed]
+            elif scope == "manual":
+                rows = [row for row in rows if Path(row["manual_mask_path"]).is_file()]
+            elif scope == "invalid":
+                field = "attention_valid" if source == "attention" else "monai_valid"
+                rows = [
+                    row for row in rows
+                    if MaskReviewManager._review_to_int(row.get(field), -1) == 0
+                ]
+            elif scope == "invalid_after_retrain":
+                if source != "attention":
+                    raise ValueError("invalid_after_retrain is available for Attention only.")
+                rows = [
+                    row for row in rows
+                    if MaskReviewManager._review_to_int(
+                        row.get("attention_valid_final", row.get("attention_valid")), -1
+                    ) == 0
+                    and str(row.get("attention_repair_method", "")) == "invalid_unresolved"
+                ]
+                for row in rows:
+                    row["_reviewed_current_round"] = (
+                        row["image_token"] in current_round_reviewed
+                    )
+                rows = MaskReviewManager._review_round_robin_diverse(
+                    rows, int(limit), source, int(seed)
+                )
+            elif scope == "disagreement":
+                if source != "attention":
+                    raise ValueError("disagreement scope is available for Attention only.")
+                rows = [
+                    row for row in rows
+                    if np.isfinite(
+                        MaskReviewManager._review_to_float(
+                            row.get("dice_attention_vs_monai")
+                        )
+                    )
+                ]
+                rows.sort(
+                    key=lambda row: (
+                        MaskReviewManager._review_to_float(
+                            row.get("dice_attention_vs_monai"), 1.0
+                        ),
+                        row["patient_id"], row["series_id"], row["image_token"],
+                    )
+                )
 
-        if scope == "diverse":
-            # Prefer rows not yet reviewed in the current round, then balance across
-            # patients and series while prioritizing difficult segmentations.
-            for row in rows:
-                row["_reviewed_current_round"] = (
-                    row["image_token"] in current_round_reviewed
+            if scope == "diverse":
+                for row in rows:
+                    row["_reviewed_current_round"] = (
+                        row["image_token"] in current_round_reviewed
+                    )
+                rows = MaskReviewManager._review_round_robin_diverse(
+                    rows, int(limit), source, int(seed)
                 )
-            rows = MaskReviewManager._review_round_robin_diverse(
-                rows, int(limit), source, int(seed)
-            )
-        elif int(limit) > 0:
-            rows = rows[: int(limit)]
+            elif int(limit) > 0:
+                rows = rows[: int(limit)]
 
         for index, row in enumerate(rows):
             row["queue_index"] = int(index)
@@ -14669,6 +16460,7 @@ class MaskReviewManager:
             flush=True,
         )
         return rows
+
 
     @staticmethod
     def _review_manifest_image_loader(rows):
@@ -14783,11 +16575,21 @@ class MaskReviewManager:
     @staticmethod
     def _review_checkpoint_fingerprint(checkpoint_map):
         hasher = hashlib.sha256()
+        hasher.update(SETTINGS_ATTENTION.ATTENTION_REPAIR_SCHEMA.encode("utf-8"))
+        hasher.update(json.dumps({
+            "tta": SETTINGS_ATTENTION.ATTENTION_REPAIR_TTA_ENABLED,
+            "rotation": SETTINGS_ATTENTION.ATTENTION_REPAIR_TTA_ROTATION_DEGREES,
+            "threshold_offsets": list(SETTINGS_ATTENTION.ATTENTION_REPAIR_THRESHOLD_OFFSETS),
+            "morphology_kernel": SETTINGS_ATTENTION.ATTENTION_REPAIR_MORPHOLOGY_KERNEL,
+            "series_prior": SETTINGS_ATTENTION.ATTENTION_REPAIR_SERIES_PRIOR_ENABLED,
+            "no_central_fallback": True,
+        }, sort_keys=True).encode("utf-8"))
         for fold in sorted(checkpoint_map):
             path = Path(checkpoint_map[fold])
             hasher.update(str(fold).encode("utf-8"))
             hasher.update(hashlib.sha256(path.read_bytes()).digest())
         return hasher.hexdigest()
+
 
     @staticmethod
     def generate_attention_review_masks(
@@ -14797,7 +16599,7 @@ class MaskReviewManager:
         rows=None,
         force=False,
     ):
-        """Generate/reuse cross-fitted Attention masks for review, without EfficientNet."""
+        """Generate calibrated/repaired cross-fitted masks and unresolved queue."""
 
         full_rows = MaskReviewManager.build_attention_full_review_manifest(samples, workspace)
         full_by_token = {row["image_token"]: row for row in full_rows}
@@ -14827,11 +16629,12 @@ class MaskReviewManager:
                 row["predicted_attention_mask_path"]
             )
             or row.get("attention_checkpoint_fingerprint", "") != fingerprint
+            or not str(row.get("attention_repair_method", ""))
         ]
         if not missing:
             print(
                 f"[ATTENTION][PREDICTION REVIEW] Reusing {len(target_rows)} "
-                f"predictions for checkpoint {fingerprint[:12]}.",
+                f"calibrated predictions for {fingerprint[:12]}.",
                 flush=True,
             )
             return target_rows
@@ -14840,23 +16643,66 @@ class MaskReviewManager:
         for row in missing:
             by_fold[int(row["segmentation_fold"])].append(row)
         print(
-            f"[ATTENTION][PREDICTION REVIEW] Generating {len(missing)} masks "
-            f"for checkpoint {fingerprint[:12]}.",
+            f"[ATTENTION][PREDICTION REVIEW] Generating/repairing {len(missing)} "
+            f"masks for checkpoint {fingerprint[:12]}.",
             flush=True,
         )
+
+        def apply_result(row, mask, metrics):
+            AttentionDataManager._atomic_cv2_write(
+                Path(row["predicted_attention_mask_path"]),
+                np.asarray(mask, dtype=np.uint8) * 255,
+                required=True,
+                purpose="calibrated Attention U-Net mask",
+            )
+            row["attention_valid_initial"] = int(metrics["initial_valid"])
+            row["attention_valid_final"] = int(metrics["final_valid"])
+            row["attention_valid"] = int(metrics["final_valid"])
+            row["attention_invalid_reason_initial"] = metrics["initial_reason"]
+            row["attention_invalid_reason_final"] = metrics["final_reason"]
+            row["attention_repair_method"] = metrics["repair_method"]
+            row["attention_threshold_used"] = float(metrics["threshold"])
+            row["attention_tta_variance"] = float(metrics["tta_variance"])
+            row["attention_component_count"] = int(metrics["component_count"])
+            row["attention_boundary_touch_fraction"] = float(
+                metrics["boundary_touch_fraction"]
+            )
+            row["attention_centroid_x"] = float(metrics["centroid_x"])
+            row["attention_centroid_y"] = float(metrics["centroid_y"])
+            row["attention_mean_inside_probability"] = float(
+                metrics["mean_inside_probability"]
+            )
+            row["attention_repair_score"] = float(metrics["score"])
+            row["attention_series_prior_used"] = int(metrics["series_prior_used"])
+            row["attention_area_ratio"] = float(metrics["area_ratio"])
+            row["attention_peak_probability"] = float(metrics["peak_probability"])
+            row["attention_checkpoint_fingerprint"] = fingerprint
+            monai_path = Path(row["automatic_mask_path"])
+            if monai_path.is_file():
+                monai = cv2.imread(str(monai_path), cv2.IMREAD_GRAYSCALE)
+                if monai is not None:
+                    monai = cv2.resize(
+                        monai,
+                        (
+                            SETTINGS_ATTENTION.ATTENTION_INPUT_SIZE,
+                            SETTINGS_ATTENTION.ATTENTION_INPUT_SIZE,
+                        ),
+                        interpolation=cv2.INTER_NEAREST,
+                    ) > 127
+                    row["dice_attention_vs_monai"] = AttentionEvaluationManager._dice_binary(
+                        mask, monai
+                    )
+
         generated = 0
         for target_fold in sorted(by_fold):
             fold_rows = by_fold[target_fold]
             fold_samples = [
-                (
-                    row["image_path"],
-                    0,
-                    row["patient_id"],
-                    row["series_id"],
-                )
+                (row["image_path"], 0, row["patient_id"], row["series_id"])
                 for row in fold_rows
             ]
-            model, _metadata = AttentionEvaluationManager._load_attention_model(checkpoint_map[target_fold])
+            model, checkpoint_metadata = AttentionEvaluationManager._load_attention_model(
+                checkpoint_map[target_fold]
+            )
             loader = DataLoader(
                 AttentionInferenceDataset(fold_samples),
                 batch_size=SETTINGS_ATTENTION.ATTENTION_INFERENCE_BATCH_SIZE,
@@ -14866,49 +16712,19 @@ class MaskReviewManager:
             )
             with torch.inference_mode():
                 for batch_number, batch in enumerate(
-                    tqdm(loader, desc=f"Attention review fold {target_fold}"),
-                    start=1,
+                    tqdm(loader, desc=f"Attention repair fold {target_fold}"), start=1
                 ):
                     attention_inputs = batch[0].to(DEVICE, non_blocking=True)
-                    image_tokens = list(batch[8])
-                    probability = torch.sigmoid(model(attention_inputs).float())
-                    hard = AttentionTrainingManager._attention_binary_masks(probability)
-                    area = hard.mean(dim=(1, 2, 3))
-                    peak = probability.amax(dim=(1, 2, 3))
-                    valid = (
-                        (area >= SETTINGS_ATTENTION.ATTENTION_MIN_HEART_AREA_RATIO)
-                        & (area <= SETTINGS_ATTENTION.ATTENTION_MAX_HEART_AREA_RATIO)
-                        & (peak >= SETTINGS_ATTENTION.ATTENTION_MIN_PEAK_PROBABILITY)
+                    image_tokens = list(map(str, batch[8]))
+                    hard, results = AttentionEvaluationManager.predict_attention_batch_with_repair(
+                        model,
+                        attention_inputs,
+                        checkpoint_metadata,
+                        series_priors=None,
                     )
-                    hard_np = hard[:, 0].cpu().numpy() > 0.5
+                    hard_np = hard[:, 0].detach().cpu().numpy() > 0.5
                     for position, token in enumerate(image_tokens):
-                        row = full_by_token[str(token)]
-                        AttentionDataManager._atomic_cv2_write(
-                            Path(row["predicted_attention_mask_path"]),
-                            hard_np[position].astype(np.uint8) * 255,
-                            required=True,
-                            purpose="full-review Attention U-Net mask",
-                        )
-                        row["attention_valid"] = int(valid[position].item())
-                        row["attention_area_ratio"] = float(area[position].item())
-                        row["attention_peak_probability"] = float(
-                            peak[position].item()
-                        )
-                        row["attention_checkpoint_fingerprint"] = fingerprint
-                        monai_path = Path(row["automatic_mask_path"])
-                        if monai_path.is_file():
-                            monai = cv2.imread(
-                                str(monai_path), cv2.IMREAD_GRAYSCALE
-                            )
-                            if monai is not None:
-                                monai = cv2.resize(
-                                    monai,
-                                    (SETTINGS_ATTENTION.ATTENTION_INPUT_SIZE, SETTINGS_ATTENTION.ATTENTION_INPUT_SIZE),
-                                    interpolation=cv2.INTER_NEAREST,
-                                ) > 127
-                                row["dice_attention_vs_monai"] = AttentionEvaluationManager._dice_binary(
-                                    hard_np[position], monai
-                                )
+                        apply_result(full_by_token[token], hard_np[position], results[position])
                         generated += 1
                     if batch_number % 50 == 0:
                         MaskReviewManager._review_atomic_csv(
@@ -14920,34 +16736,122 @@ class MaskReviewManager:
             if DEVICE == "cuda":
                 torch.cuda.empty_cache()
 
+        # Second pass: only unresolved masks, using same-series median area/centroid.
+        series_priors = (
+            AttentionEvaluationManager.build_attention_series_priors(full_rows)
+            if SETTINGS_ATTENTION.ATTENTION_REPAIR_SERIES_PRIOR_ENABLED
+            else {}
+        )
+        unresolved = [
+            row for row in target_rows
+            if MaskReviewManager._review_to_int(
+                row.get("attention_valid_final", row.get("attention_valid")), 0
+            ) == 0
+            and str(row.get("series_id")) in series_priors
+        ]
+        if unresolved:
+            unresolved_by_fold = _review_defaultdict(list)
+            for row in unresolved:
+                unresolved_by_fold[int(row["segmentation_fold"])].append(row)
+            print(
+                f"[ATTENTION][SERIES REPAIR] Retrying {len(unresolved)} unresolved "
+                f"masks using {len(series_priors)} same-series priors.",
+                flush=True,
+            )
+            for target_fold in sorted(unresolved_by_fold):
+                fold_rows = unresolved_by_fold[target_fold]
+                fold_samples = [
+                    (row["image_path"], 0, row["patient_id"], row["series_id"])
+                    for row in fold_rows
+                ]
+                model, checkpoint_metadata = AttentionEvaluationManager._load_attention_model(
+                    checkpoint_map[target_fold]
+                )
+                loader = DataLoader(
+                    AttentionInferenceDataset(fold_samples),
+                    batch_size=SETTINGS_ATTENTION.ATTENTION_INFERENCE_BATCH_SIZE,
+                    shuffle=False,
+                    num_workers=0,
+                    pin_memory=(DEVICE == "cuda"),
+                )
+                offset = 0
+                with torch.inference_mode():
+                    for batch in tqdm(loader, desc=f"Series repair fold {target_fold}"):
+                        attention_inputs = batch[0].to(DEVICE, non_blocking=True)
+                        image_tokens = list(map(str, batch[8]))
+                        priors = [
+                            series_priors[str(full_by_token[token]["series_id"])]
+                            for token in image_tokens
+                        ]
+                        hard, results = AttentionEvaluationManager.predict_attention_batch_with_repair(
+                            model,
+                            attention_inputs,
+                            checkpoint_metadata,
+                            series_priors=priors,
+                        )
+                        hard_np = hard[:, 0].detach().cpu().numpy() > 0.5
+                        for position, token in enumerate(image_tokens):
+                            if results[position]["final_valid"]:
+                                results[position]["repair_method"] = (
+                                    "valid_repaired_series_prior"
+                                )
+                                apply_result(
+                                    full_by_token[token], hard_np[position], results[position]
+                                )
+                        offset += len(image_tokens)
+                del model
+                if DEVICE == "cuda":
+                    torch.cuda.empty_cache()
+
+        unresolved_final = [
+            row for row in target_rows
+            if MaskReviewManager._review_to_int(
+                row.get("attention_valid_final", row.get("attention_valid")), 0
+            ) == 0
+        ]
         MaskReviewManager._review_atomic_csv(
             full_rows,
             MaskReviewManager.attention_full_review_manifest_path(workspace),
             SETTINGS_REVIEW.ATTENTION_REVIEW_MANIFEST_FIELDS,
         )
-        metadata_path.write_text(
-            json.dumps(
-                {
-                    "status": "OK",
-                    "version": SETTINGS_REVIEW.ATTENTION_REVIEW_SCHEMA,
-                    "checkpoint_fingerprint": fingerprint,
-                    "generated_masks": int(generated),
-                    "target_rows": int(len(target_rows)),
-                    "timestamp_utc": _review_datetime.now(
-                        _review_timezone.utc
-                    ).isoformat(),
-                },
-                indent=2,
-                sort_keys=True,
+        MaskReviewManager._review_atomic_csv(
+            unresolved_final,
+            MaskReviewManager.attention_invalid_after_retrain_path(workspace),
+            SETTINGS_REVIEW.ATTENTION_REVIEW_MANIFEST_FIELDS,
+        )
+
+        counts = defaultdict(int)
+        for row in target_rows:
+            counts[str(row.get("attention_repair_method", "unknown"))] += 1
+        metadata = {
+            "status": "OK",
+            "version": SETTINGS_REVIEW.ATTENTION_REVIEW_SCHEMA,
+            "repair_schema": SETTINGS_ATTENTION.ATTENTION_REPAIR_SCHEMA,
+            "checkpoint_fingerprint": fingerprint,
+            "generated_masks": int(generated),
+            "target_rows": int(len(target_rows)),
+            "repair_counts": dict(sorted(counts.items())),
+            "series_priors": int(len(series_priors)),
+            "invalid_unresolved": int(len(unresolved_final)),
+            "invalid_queue": str(
+                MaskReviewManager.attention_invalid_after_retrain_path(workspace)
             ),
-            encoding="utf-8",
+            "timestamp_utc": _review_datetime.now(
+                _review_timezone.utc
+            ).isoformat(),
+        }
+        metadata_path.write_text(
+            json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8"
         )
         print(
-            f"[ATTENTION][PREDICTION REVIEW] Completed {generated} masks.",
+            "[ATTENTION][PREDICTION REVIEW] "
+            f"completed={len(target_rows)}, repair_counts={dict(counts)}, "
+            f"invalid_unresolved={len(unresolved_final)}.",
             flush=True,
         )
         refreshed = {row["image_token"]: row for row in full_rows}
         return [refreshed[row["image_token"]] for row in target_rows]
+
 
     @staticmethod
     def select_attention_training_rows(samples, workspace):
@@ -15104,13 +17008,13 @@ class PipelineApplication:
         parser.add_argument(
             "--attention-editor-scope",
             choices=SETTINGS_REVIEW.ATTENTION_REVIEW_SCOPES,
-            default="diverse",
-            help="all/diverse/unreviewed/invalid/disagreement/manual/reviewed",
+            default=SETTINGS_REVIEW.REVIEW_SCOPE,
+            help="all/diverse/novel_per_patient/unreviewed/invalid/invalid_after_retrain/disagreement/manual/reviewed",
         )
         parser.add_argument(
             "--attention-editor-limit",
             type=int,
-            default=1200,
+            default=SETTINGS_REVIEW.REVIEW_LIMIT,
             help="0 means every available image; otherwise queue size cap.",
         )
         parser.add_argument("--attention-editor-seed", type=int, default=42)
@@ -15142,10 +17046,10 @@ class PipelineApplication:
         parser.add_argument(
             "--attention-min-manual-masks",
             type=int,
-            default=1000,
+            default=800,
             help=(
-                "Safety minimum for manual-only Attention training. The default "
-                "matches the existing approximately 1200-mask cohort."
+                "Safety minimum after empty/blur/noise filtering. The default "
+                "retains a substantial multi-patient manual cohort."
             ),
         )
         args, unknown = parser.parse_known_args(argv)
@@ -15167,7 +17071,7 @@ class PipelineApplication:
         samples,
         workspace,
         action,
-        minimum_manual_masks=1000,
+        minimum_manual_masks=800,
     ):
         """Execute one neural or cached Attention/segmentation stage."""
 
