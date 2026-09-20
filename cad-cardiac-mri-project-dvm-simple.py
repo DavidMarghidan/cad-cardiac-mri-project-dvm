@@ -5,11 +5,13 @@ Ideea centrală:
 1. Directory_* este pacientul și nu traversează niciodată foldurile.
 2. Attention U-Net este antrenat numai din măști manuale valide.
 3. Fiecare pacient este prezis de un model care nu a văzut acel pacient.
-4. EfficientNet este folosit doar ca extractor frozen de caracteristici.
-5. Clasificarea și toate metricile sunt calculate la nivel de pacient.
+4. CPU și GPU sunt alese separat pentru fiecare etapă costisitoare.
+5. GPU-ul este folosit numai în interiorul etapei cerute și este eliberat apoi.
+6. Clasificarea și toate metricile sunt calculate la nivel de pacient.
 
-Codul este împărțit în clase mici. Setările care se modifică frecvent sunt
-centralizate mai jos; restul claselor implementează câte o singură etapă.
+Pipeline-ul nu selectează GPU la inițializare. Auditul, editorul, agregarea și
+evaluarea rămân pe CPU. Antrenarea/predicția Attention U-Net pot folosi GPU,
+iar feature bank-ul rulează implicit pe CPU, cu o opțiune GPU separată.
 """
 
 from __future__ import annotations
@@ -106,12 +108,19 @@ class PathSettings:
 
 
 class RuntimeSettings:
-    """Setări generale de rulare și reproducibilitate."""
+    """Dispozitive separate pentru a evita folosirea accidentală a GPU-ului."""
 
-    DEVICE = os.environ.get("CAD_DEVICE", "auto").strip().lower()  # auto/cpu/cuda
+    # Pipeline-ul pornește întotdeauna pe CPU. Aceste valori sunt citite numai
+    # când se apelează explicit o etapă de deep learning.
+    ATTENTION_DEVICE = os.environ.get("CAD_ATTENTION_DEVICE", "cuda").strip().lower()
+    FEATURE_DEVICE = os.environ.get("CAD_FEATURE_DEVICE", "cpu").strip().lower()
+
     RANDOM_SEED = 42
     NUM_WORKERS = 0  # 0 este cel mai robust în notebook/Kaggle
     USE_AMP_ON_CUDA = True
+    USE_CHANNELS_LAST_ON_CUDA = True
+    CUDNN_BENCHMARK_ON_CUDA = True
+    DETERMINISTIC_ALGORITHMS = False
     CPU_THREADS = max(1, min(8, os.cpu_count() or 1))
     PNG_COMPRESSION = 9
     IMAGE_RAM_CACHE_ITEMS = 2048
@@ -199,8 +208,15 @@ class SegmentationSettings:
 class ClassificationSettings:
     """Setările extractorului frozen și ale clasificării la nivel de pacient."""
 
-    FEATURE_BATCH_SIZE_CUDA = 16
+    # Numărul de imagini pregătite de CPU într-un batch.
+    FEATURE_BATCH_SIZE_CUDA = 12
     FEATURE_BATCH_SIZE_CPU = 4
+
+    # Numărul maxim de imagini trimise simultan prin EfficientNet. Pe GPU,
+    # imaginile din mai multe moduri sunt grupate pentru a reduce overhead-ul.
+    FEATURE_FORWARD_BATCH_SIZE_CUDA = 32
+    FEATURE_FORWARD_BATCH_SIZE_CPU = 4
+
     USE_IMAGENET_WEIGHTS = True
     PCA_EXPLAINED_VARIANCE = 0.95
     OUTER_FOLDS = 5
@@ -241,34 +257,102 @@ class Settings:
 
 
 class RuntimeManager:
-    """Alege CPU/GPU, fixează seed-urile și eliberează memoria GPU."""
+    """Pornește un dispozitiv numai pentru etapa care îl solicită explicit.
+
+    Inițializarea pipeline-ului nu apelează CUDA. Astfel, auditul și editorul
+    pot rula într-o sesiune CPU fără să rezerve memorie sau timp GPU.
+    """
 
     @staticmethod
     def resolve_device(requested: str | None = None) -> torch.device:
-        requested = (requested or Settings.Runtime.DEVICE).strip().lower()
+        requested = (requested or "cpu").strip().lower()
         if requested not in {"auto", "cpu", "cuda"}:
             raise ValueError("device trebuie să fie 'auto', 'cpu' sau 'cuda'.")
+        if requested == "cpu":
+            return torch.device("cpu")
         if requested == "cuda":
             if not torch.cuda.is_available():
-                raise RuntimeError("CUDA a fost cerut, dar nu este disponibil.")
+                raise RuntimeError(
+                    "CUDA a fost cerut pentru această etapă, dar nu este disponibil. "
+                    "Folosește device='cpu' sau activează acceleratorul GPU."
+                )
             return torch.device("cuda")
-        if requested == "auto" and torch.cuda.is_available():
-            return torch.device("cuda")
-        return torch.device("cpu")
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     @staticmethod
-    def seed_everything(seed: int | None = None) -> None:
+    def seed_everything(
+        seed: int | None = None,
+        include_cuda: bool = False,
+    ) -> None:
+        """Fixează seed-urile CPU; seed-urile CUDA sunt atinse doar în etapa GPU."""
+
         seed = int(Settings.Runtime.RANDOM_SEED if seed is None else seed)
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
         torch.set_num_threads(Settings.Runtime.CPU_THREADS)
+
         try:
-            torch.use_deterministic_algorithms(True, warn_only=True)
+            torch.use_deterministic_algorithms(
+                bool(Settings.Runtime.DETERMINISTIC_ALGORITHMS), warn_only=True
+            )
         except Exception:
             pass
+
+        if include_cuda:
+            torch.cuda.manual_seed_all(seed)
+            if hasattr(torch.backends, "cudnn"):
+                torch.backends.cudnn.deterministic = bool(
+                    Settings.Runtime.DETERMINISTIC_ALGORITHMS
+                )
+                torch.backends.cudnn.benchmark = bool(
+                    Settings.Runtime.CUDNN_BENCHMARK_ON_CUDA
+                    and not Settings.Runtime.DETERMINISTIC_ALGORITHMS
+                )
+
+    @staticmethod
+    @contextlib.contextmanager
+    def device_scope(requested: str | None, stage_name: str):
+        """Context scurt: pregătește dispozitivul și îl eliberează la final."""
+
+        device = RuntimeManager.resolve_device(requested)
+        RuntimeManager.seed_everything(include_cuda=device.type == "cuda")
+        if device.type == "cuda":
+            RuntimeManager.release(device)
+            try:
+                torch.cuda.reset_peak_memory_stats(device)
+            except Exception:
+                pass
+        print(f"[DEVICE] {stage_name}: {device.type}")
+        try:
+            yield device
+        finally:
+            if device.type == "cuda":
+                try:
+                    peak_gb = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+                    print(f"[DEVICE] {stage_name}: peak GPU={peak_gb:.2f} GB")
+                except Exception:
+                    pass
+            RuntimeManager.release(device)
+            print(f"[DEVICE] {stage_name}: resurse eliberate")
+
+    @staticmethod
+    def prepare_model(model: nn.Module, device: torch.device) -> nn.Module:
+        model = model.to(device)
+        if device.type == "cuda" and Settings.Runtime.USE_CHANNELS_LAST_ON_CUDA:
+            model = model.to(memory_format=torch.channels_last)
+        return model
+
+    @staticmethod
+    def move_tensor(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
+        tensor = tensor.to(device, non_blocking=device.type == "cuda")
+        if (
+            device.type == "cuda"
+            and Settings.Runtime.USE_CHANNELS_LAST_ON_CUDA
+            and tensor.ndim == 4
+        ):
+            tensor = tensor.contiguous(memory_format=torch.channels_last)
+        return tensor
 
     @staticmethod
     def train_batch_size(device: torch.device) -> int:
@@ -295,6 +379,14 @@ class RuntimeManager:
         )
 
     @staticmethod
+    def feature_forward_batch_size(device: torch.device) -> int:
+        return (
+            Settings.Classification.FEATURE_FORWARD_BATCH_SIZE_CUDA
+            if device.type == "cuda"
+            else Settings.Classification.FEATURE_FORWARD_BATCH_SIZE_CPU
+        )
+
+    @staticmethod
     def autocast(device: torch.device):
         """Folosește mixed precision numai pe GPU; pe CPU nu schimbă nimic."""
 
@@ -316,9 +408,14 @@ class RuntimeManager:
 
     @staticmethod
     def release(device: torch.device) -> None:
+        """Eliberează obiectele Python și cache-ul CUDA după fiecare etapă/fold."""
+
         gc.collect()
-        if device.type == "cuda":
-            torch.cuda.synchronize()
+        if device.type == "cuda" and torch.cuda.is_available():
+            try:
+                torch.cuda.synchronize(device)
+            except Exception:
+                pass
             torch.cuda.empty_cache()
 
     @staticmethod
@@ -359,6 +456,7 @@ class Workspace:
     quality_audit: Path
     manual_audit: Path
     prediction_audit: Path
+    prediction_parts_dir: Path
     invalid_predictions: Path
     review_history: Path
     training_summary: Path
@@ -386,6 +484,7 @@ class FileManager:
             quality_audit=root / "simple_image_quality_audit.csv",
             manual_audit=root / "simple_manual_mask_audit.csv",
             prediction_audit=root / "simple_attention_prediction_audit.csv",
+            prediction_parts_dir=root / "simple_pipeline_outputs" / "attention_prediction_parts",
             invalid_predictions=root / "attention_invalid_after_retrain.csv",
             review_history=root / "simple_review_history.csv",
             training_summary=root / "simple_training_summary.json",
@@ -402,6 +501,7 @@ class FileManager:
             workspace.mask_overlays,
             workspace.checkpoints,
             workspace.outputs,
+            workspace.prediction_parts_dir,
             workspace.predictions_dir,
         ):
             directory.mkdir(parents=True, exist_ok=True)
@@ -1372,9 +1472,10 @@ class SegmentationManager:
         model.eval()
         with torch.inference_mode():
             for images, masks, patient_ids in loader:
-                images = images.to(device, non_blocking=True)
-                probability = torch.sigmoid(model(images)).cpu().numpy()[:, 0]
-                probabilities.extend(probability)
+                images = RuntimeManager.move_tensor(images, device)
+                with RuntimeManager.autocast(device):
+                    probability = torch.sigmoid(model(images))
+                probabilities.extend(probability.float().cpu().numpy()[:, 0])
                 targets.extend(masks.numpy()[:, 0])
                 patients.extend(map(str, patient_ids))
 
@@ -1422,7 +1523,7 @@ class SegmentationManager:
     ) -> dict[int, Path]:
         """Pentru foldul k, pacienții din foldul k nu apar în train sau calibrare."""
 
-        RuntimeManager.seed_everything()
+        RuntimeManager.seed_everything(include_cuda=device.type == "cuda")
         checkpoint_map: dict[int, Path] = {}
         fold_summaries = []
         all_patients = sorted({row["patient_id"] for row in accepted_rows})
@@ -1490,7 +1591,7 @@ class SegmentationManager:
                 pin_memory=device.type == "cuda",
             )
 
-            model = AttentionUNet().to(device)
+            model = RuntimeManager.prepare_model(AttentionUNet(), device)
             optimizer = torch.optim.AdamW(
                 model.parameters(),
                 lr=Settings.Segmentation.LEARNING_RATE,
@@ -1508,8 +1609,8 @@ class SegmentationManager:
                 model.train()
                 train_losses = []
                 for images, masks, _ in train_loader:
-                    images = images.to(device, non_blocking=True)
-                    masks = masks.to(device, non_blocking=True)
+                    images = RuntimeManager.move_tensor(images, device)
+                    masks = RuntimeManager.move_tensor(masks, device)
                     optimizer.zero_grad(set_to_none=True)
                     with RuntimeManager.autocast(device):
                         logits = model(images)
@@ -1524,8 +1625,8 @@ class SegmentationManager:
                 validation_dice = []
                 with torch.inference_mode():
                     for images, masks, _ in validation_loader:
-                        images = images.to(device, non_blocking=True)
-                        masks = masks.to(device, non_blocking=True)
+                        images = RuntimeManager.move_tensor(images, device)
+                        masks = RuntimeManager.move_tensor(masks, device)
                         with RuntimeManager.autocast(device):
                             logits = model(images)
                             loss = SegmentationManager._loss(logits, masks)
@@ -1607,6 +1708,10 @@ class SegmentationManager:
                     "elapsed": RuntimeManager.format_seconds(time.perf_counter() - fold_started),
                 }
             )
+            # Obiectele GPU sunt șterse înainte de următorul fold. Fără acest
+            # pas, Python poate păstra încă referințe la model/optimizer.
+            del model, optimizer, scaler, train_loader, validation_loader
+            del train_dataset, validation_dataset, checkpoint, best_state
             RuntimeManager.release(device)
 
         FileManager.write_json(
@@ -1631,6 +1736,37 @@ class SegmentationManager:
                     f"Lipsește checkpointul foldului {fold}: {path}. Rulează train_attention()."
                 )
             result[fold] = path
+        return result
+
+    @staticmethod
+    def compatible_checkpoint_map(
+        accepted_rows: Sequence[dict[str, Any]],
+        workspace: Workspace,
+    ) -> dict[int, Path] | None:
+        """Verifică pe CPU dacă toate checkpointurile pot fi reutilizate.
+
+        Metoda nu mută niciun model pe GPU. Este apelată înainte de
+        `device_scope`, astfel încât o rerulare cu cache valid nu pornește CUDA.
+        """
+
+        result: dict[int, Path] = {}
+        for fold in range(Settings.Segmentation.FOLDS):
+            checkpoint_path = SegmentationManager._checkpoint_path(workspace, fold)
+            if not checkpoint_path.is_file():
+                return None
+            non_test_rows = [
+                row
+                for row in accepted_rows
+                if int(row["segmentation_fold"]) != fold
+            ]
+            expected = SegmentationManager._manual_fingerprint(non_test_rows, fold)
+            try:
+                checkpoint = SegmentationManager._torch_load(checkpoint_path)
+            except Exception:
+                return None
+            if checkpoint.get("fingerprint") != expected:
+                return None
+            result[fold] = checkpoint_path
         return result
 
     @staticmethod
@@ -1715,7 +1851,7 @@ class SegmentationManager:
     def _prediction_fingerprint(rows: Sequence[dict[str, Any]], checkpoint_map: dict[int, Path]) -> str:
         digest = hashlib.sha256()
         settings_payload = {
-            "schema": "simple-predictions-v1",
+            "schema": "simple-predictions-v2",
             "thresholds": Settings.Segmentation.CALIBRATION_THRESHOLDS,
             "area": [
                 Settings.Segmentation.PREDICTION_MIN_AREA_RATIO,
@@ -1738,6 +1874,67 @@ class SegmentationManager:
         return digest.hexdigest()
 
     @staticmethod
+    def load_cached_predictions(
+        rows: Sequence[dict[str, Any]],
+        workspace: Workspace,
+        checkpoint_map: dict[int, Path],
+    ) -> list[dict[str, Any]] | None:
+        """Returnează auditul final numai dacă este complet și compatibil."""
+
+        fingerprint = SegmentationManager._prediction_fingerprint(
+            rows, checkpoint_map
+        )
+        summary = FileManager.read_json(workspace.prediction_summary, {}) or {}
+        audit = FileManager.read_csv(workspace.prediction_audit)
+        masks_complete = bool(audit) and all(
+            Path(row.get("predicted_attention_mask_path", "")).is_file()
+            for row in audit
+        )
+        if (
+            summary.get("fingerprint") == fingerprint
+            and len(audit) == len(rows)
+            and masks_complete
+        ):
+            return audit
+        return None
+
+    @staticmethod
+    def _prediction_part_paths(workspace: Workspace, fold: int) -> tuple[Path, Path]:
+        """Fișiere mici care permit reluarea inferenței de la următorul fold."""
+
+        csv_path = workspace.prediction_parts_dir / f"fold_{int(fold)}.csv"
+        json_path = workspace.prediction_parts_dir / f"fold_{int(fold)}.json"
+        return csv_path, json_path
+
+    @staticmethod
+    def _prediction_part_fingerprint(
+        fold: int,
+        fold_rows: Sequence[dict[str, Any]],
+        checkpoint_path: Path,
+    ) -> str:
+        digest = hashlib.sha256()
+        payload = {
+            "schema": "simple-prediction-part-v2",
+            "fold": int(fold),
+            "thresholds": Settings.Segmentation.CALIBRATION_THRESHOLDS,
+            "area": [
+                Settings.Segmentation.PREDICTION_MIN_AREA_RATIO,
+                Settings.Segmentation.PREDICTION_MAX_AREA_RATIO,
+            ],
+            "repair_offsets": Settings.Segmentation.REPAIR_THRESHOLD_OFFSETS,
+            "morphology": Settings.Segmentation.REPAIR_MORPHOLOGY_KERNEL,
+        }
+        digest.update(json.dumps(payload, sort_keys=True).encode("utf-8"))
+        digest.update(FileManager.sha256_file(checkpoint_path).encode("ascii"))
+        for row in fold_rows:
+            image_path = Path(row["image_path"])
+            image_stat = image_path.stat()
+            digest.update(str(row["image_token"]).encode("utf-8"))
+            digest.update(str(image_stat.st_size).encode("ascii"))
+            digest.update(str(image_stat.st_mtime_ns).encode("ascii"))
+        return digest.hexdigest()
+
+    @staticmethod
     def predict_all(
         rows: Sequence[dict[str, Any]],
         workspace: Workspace,
@@ -1745,39 +1942,88 @@ class SegmentationManager:
         checkpoint_map: dict[int, Path] | None = None,
         force: bool = False,
     ) -> list[dict[str, Any]]:
-        """Generează masca fiecărei imagini cu modelul foldului pacientului."""
+        """Generează măștile fold cu fold și salvează progresul după fiecare fold.
+
+        Dacă o sesiune GPU se oprește după foldul 2, următoarea rulare reutilizează
+        foldurile terminate și pornește direct de la primul fold incomplet.
+        """
 
         checkpoint_map = checkpoint_map or SegmentationManager.load_checkpoint_map(workspace)
         prediction_fingerprint = SegmentationManager._prediction_fingerprint(rows, checkpoint_map)
-        old_summary = FileManager.read_json(workspace.prediction_summary, {}) or {}
         old_audit = FileManager.read_csv(workspace.prediction_audit)
+        if not force:
+            cached = SegmentationManager.load_cached_predictions(
+                rows, workspace, checkpoint_map
+            )
+            if cached is not None:
+                print(
+                    "[ATTENTION] Predicțiile compatibile sunt deja în cache; "
+                    "GPU-ul nu este folosit."
+                )
+                return cached
         cached_masks_complete = bool(old_audit) and all(
             Path(row.get("predicted_attention_mask_path", "")).is_file()
             for row in old_audit
         )
-        if (
-            not force
-            and old_summary.get("fingerprint") == prediction_fingerprint
-            and len(old_audit) == len(rows)
-            and cached_masks_complete
-        ):
-            print("[ATTENTION] Predicțiile compatibile sunt deja în cache.")
-            return old_audit
         if old_audit and not cached_masks_complete:
-            print("[ATTENTION] Cache incomplet: lipsesc măști PNG; predicțiile vor fi refăcute.")
+            print("[ATTENTION] Cache final incomplet; se verifică salvările per fold.")
 
         results: list[dict[str, Any] | None] = [None] * len(rows)
         started = time.perf_counter()
+        reused_folds: list[int] = []
+        computed_folds: list[int] = []
+
         for fold in range(Settings.Segmentation.FOLDS):
             fold_indices = [
                 index for index, row in enumerate(rows)
                 if int(row["segmentation_fold"]) == fold
             ]
             fold_rows = [rows[index] for index in fold_indices]
+            if not fold_rows:
+                continue
+
+            part_csv, part_json = SegmentationManager._prediction_part_paths(workspace, fold)
+            part_fingerprint = SegmentationManager._prediction_part_fingerprint(
+                fold, fold_rows, checkpoint_map[fold]
+            )
+            part_metadata = FileManager.read_json(part_json, {}) or {}
+            cached_part = FileManager.read_csv(part_csv)
+            cached_by_token = {
+                str(row.get("image_token", "")): row for row in cached_part
+            }
+            part_complete = (
+                len(cached_part) == len(fold_rows)
+                and len(cached_by_token) == len(fold_rows)
+                and all(
+                    token in cached_by_token
+                    and Path(
+                        cached_by_token[token].get("predicted_attention_mask_path", "")
+                    ).is_file()
+                    for token in (str(row["image_token"]) for row in fold_rows)
+                )
+            )
+            if (
+                not force
+                and part_metadata.get("fingerprint") == part_fingerprint
+                and part_complete
+            ):
+                for global_index, row in zip(fold_indices, fold_rows):
+                    results[global_index] = cached_by_token[str(row["image_token"])]
+                reused_folds.append(fold)
+                print(
+                    f"[ATTENTION] Fold {fold}: rezultat per-fold reutilizat; "
+                    "nu se încarcă modelul pe GPU."
+                )
+                continue
+
             checkpoint = SegmentationManager._torch_load(checkpoint_map[fold])
-            model = AttentionUNet(base_channels=int(checkpoint.get("base_channels", Settings.Segmentation.BASE_CHANNELS)))
+            model = AttentionUNet(
+                base_channels=int(
+                    checkpoint.get("base_channels", Settings.Segmentation.BASE_CHANNELS)
+                )
+            )
             model.load_state_dict(checkpoint["state_dict"])
-            model.to(device).eval()
+            model = RuntimeManager.prepare_model(model, device).eval()
             threshold = float(
                 checkpoint.get("calibration", {}).get(
                     "threshold", Settings.Segmentation.DEFAULT_THRESHOLD
@@ -1791,13 +2037,18 @@ class SegmentationManager:
                 num_workers=Settings.Runtime.NUM_WORKERS,
                 pin_memory=device.type == "cuda",
             )
-            print(f"[ATTENTION] Predicție fold {fold}: {len(fold_rows)} imagini, device={device.type}")
+            print(
+                f"[ATTENTION] Predicție fold {fold}: {len(fold_rows)} imagini, "
+                f"device={device.type}"
+            )
+            fold_results: list[dict[str, Any]] = []
 
             with torch.inference_mode():
                 for images, local_indices in tqdm(loader, desc=f"Attention fold {fold}"):
-                    images = images.to(device, non_blocking=True)
-                    probability_tensor = torch.sigmoid(model(images))[:, 0]
-                    probabilities = probability_tensor.cpu().numpy()
+                    images = RuntimeManager.move_tensor(images, device)
+                    with RuntimeManager.autocast(device):
+                        probability_tensor = torch.sigmoid(model(images))[:, 0]
+                    probabilities = probability_tensor.float().cpu().numpy()
 
                     initial_masks = [
                         SegmentationManager._candidate_mask(probability, threshold)
@@ -1809,16 +2060,22 @@ class SegmentationManager:
                     ]
 
                     invalid_positions = [
-                        position for position, (valid, _) in enumerate(initial_validity)
+                        position
+                        for position, (valid, _) in enumerate(initial_validity)
                         if not valid
                     ]
                     if invalid_positions:
                         invalid_tensor = images[invalid_positions]
-                        flipped_probability = torch.sigmoid(
-                            model(torch.flip(invalid_tensor, dims=[3]))
-                        )[:, 0]
-                        flipped_probability = torch.flip(flipped_probability, dims=[2]).cpu().numpy()
-                        for destination, tta_probability in zip(invalid_positions, flipped_probability):
+                        with RuntimeManager.autocast(device):
+                            flipped_probability_tensor = torch.sigmoid(
+                                model(torch.flip(invalid_tensor, dims=[3]))
+                            )[:, 0]
+                        flipped_probability = torch.flip(
+                            flipped_probability_tensor, dims=[2]
+                        ).float().cpu().numpy()
+                        for destination, tta_probability in zip(
+                            invalid_positions, flipped_probability
+                        ):
                             probabilities[destination] = (
                                 probabilities[destination] + tta_probability
                             ) / 2.0
@@ -1837,18 +2094,25 @@ class SegmentationManager:
                             used_threshold = threshold
                             final_reason = ""
                         else:
-                            final_mask, final_valid, repair_method, used_threshold, final_reason = (
-                                SegmentationManager._repair_probability(probability, threshold)
+                            (
+                                final_mask,
+                                final_valid,
+                                repair_method,
+                                used_threshold,
+                                final_reason,
+                            ) = SegmentationManager._repair_probability(
+                                probability, threshold
                             )
-                            if invalid_positions:
-                                repair_method = "tta+" + repair_method
+                            repair_method = "tta+" + repair_method
 
                         area, boundary = SegmentationManager._mask_geometry(final_mask)
                         mask_path = Path(row["predicted_attention_mask_path"])
                         if Settings.Segmentation.SAVE_ALL_PREDICTED_MASKS or not final_valid:
-                            FileManager.write_png(mask_path, final_mask.astype(np.uint8) * 255)
+                            FileManager.write_png(
+                                mask_path, final_mask.astype(np.uint8) * 255
+                            )
 
-                        results[global_index] = {
+                        result_row = {
                             **row,
                             "attention_valid_initial": int(initial_valid),
                             "attention_valid_final": int(final_valid),
@@ -1861,27 +2125,62 @@ class SegmentationManager:
                             "attention_boundary_touch_fraction": boundary,
                             "checkpoint_fingerprint": checkpoint_fingerprint,
                         }
-            del model
+                        results[global_index] = result_row
+                        fold_results.append(result_row)
+
+            # Salvarea per fold are loc înainte de eliberarea GPU-ului. Astfel,
+            # progresul rămâne pe disc chiar dacă următoarea sesiune se oprește.
+            FileManager.write_csv(
+                part_csv, fold_results, SegmentationManager.PREDICTION_FIELDS
+            )
+            FileManager.write_json(
+                part_json,
+                {
+                    "fingerprint": part_fingerprint,
+                    "fold": fold,
+                    "images": len(fold_results),
+                    "checkpoint": str(checkpoint_map[fold]),
+                    "device_used": device.type,
+                    "completed": True,
+                },
+            )
+            computed_folds.append(fold)
+
+            del model, loader, checkpoint, fold_results
             RuntimeManager.release(device)
 
         final_results = [result for result in results if result is not None]
         if len(final_results) != len(rows):
             raise RuntimeError("Predicția nu a produs câte un rând pentru fiecare imagine.")
         FileManager.write_csv(
-            workspace.prediction_audit, final_results, SegmentationManager.PREDICTION_FIELDS
+            workspace.prediction_audit,
+            final_results,
+            SegmentationManager.PREDICTION_FIELDS,
         )
         invalid_rows = [
-            row for row in final_results if _as_int(row.get("attention_valid_final"), 0) != 1
+            row
+            for row in final_results
+            if _as_int(row.get("attention_valid_final"), 0) != 1
         ]
         FileManager.write_csv(
-            workspace.invalid_predictions, invalid_rows, SegmentationManager.PREDICTION_FIELDS
+            workspace.invalid_predictions,
+            invalid_rows,
+            SegmentationManager.PREDICTION_FIELDS,
         )
         summary = {
             "fingerprint": prediction_fingerprint,
-            "device": device.type,
+            "device_used_for_computed_folds": device.type,
+            "reused_folds": reused_folds,
+            "computed_folds": computed_folds,
             "images": len(final_results),
-            "valid_initial": sum(_as_int(row.get("attention_valid_initial"), 0) for row in final_results),
-            "valid_final": sum(_as_int(row.get("attention_valid_final"), 0) for row in final_results),
+            "valid_initial": sum(
+                _as_int(row.get("attention_valid_initial"), 0)
+                for row in final_results
+            ),
+            "valid_final": sum(
+                _as_int(row.get("attention_valid_final"), 0)
+                for row in final_results
+            ),
             "invalid_final": len(invalid_rows),
             "prediction_audit": str(workspace.prediction_audit),
             "invalid_queue": str(workspace.invalid_predictions),
@@ -2781,7 +3080,7 @@ class FeatureManager:
         prediction_summary = FileManager.read_json(workspace.prediction_summary, {}) or {}
         digest = hashlib.sha256()
         payload = {
-            "schema": "simple-patient-feature-bank-v1",
+            "schema": "simple-patient-feature-bank-v2",
             "modes": Settings.Classification.MODES,
             "prediction_fingerprint": prediction_summary.get("fingerprint", ""),
             "support_dilation": Settings.Segmentation.SUPPORT_DILATION_KERNEL,
@@ -2836,35 +3135,65 @@ class FeatureManager:
         return bank
 
     @staticmethod
+    def load_compatible_cache(
+        dataset_rows: Sequence[dict[str, Any]],
+        workspace: Workspace,
+        fingerprint: str | None = None,
+    ) -> dict[str, dict[str, Any]] | None:
+        """Verifică feature bank-ul pe CPU, înainte de încărcarea EfficientNet."""
+
+        fingerprint = fingerprint or FeatureManager._feature_fingerprint(
+            dataset_rows, workspace
+        )
+        metadata = FileManager.read_json(workspace.feature_metadata, {}) or {}
+        if (
+            not workspace.feature_bank.is_file()
+            or metadata.get("fingerprint") != fingerprint
+        ):
+            return None
+        try:
+            return FeatureManager.load(workspace)
+        except Exception as error:
+            print(
+                "[FEATURE BANK] Cache-ul nu poate fi citit și va fi refăcut:",
+                f"{type(error).__name__}: {error}",
+            )
+            return None
+
+    @staticmethod
     def build(
         dataset_rows: Sequence[dict[str, Any]],
         workspace: Workspace,
         device: torch.device,
         force: bool = False,
     ) -> dict[str, dict[str, Any]]:
+        """Construiește feature bank-ul fără a ține măștile pe GPU.
+
+        Toată pregătirea ROI/complement rămâne pe CPU. Numai imaginile finale
+        de 3 canale intră în EfficientNet, în micro-batch-uri scurte. Astfel,
+        GPU-ul este folosit doar pentru forward-ul rețelei și poate fi eliberat
+        imediat după această etapă.
+        """
+
         fingerprint = FeatureManager._feature_fingerprint(dataset_rows, workspace)
-        old_metadata = FileManager.read_json(workspace.feature_metadata, {}) or {}
-        if (
-            not force
-            and workspace.feature_bank.is_file()
-            and old_metadata.get("fingerprint") == fingerprint
-        ):
-            try:
-                bank = FeatureManager.load(workspace)
-            except Exception as error:
+        if not force:
+            bank = FeatureManager.load_compatible_cache(
+                dataset_rows, workspace, fingerprint=fingerprint
+            )
+            if bank is not None:
                 print(
-                    "[FEATURE BANK] Cache-ul nu poate fi citit și va fi refăcut:",
-                    f"{type(error).__name__}: {error}",
+                    "[FEATURE BANK] Cache compatibil reutilizat; "
+                    "extractorul nu este încărcat pe GPU."
                 )
-            else:
-                print("[FEATURE BANK] Cache compatibil reutilizat.")
                 return bank
 
         quality = {
-            row["image_token"]: row for row in FileManager.read_csv(workspace.quality_audit)
+            row["image_token"]: row
+            for row in FileManager.read_csv(workspace.quality_audit)
         }
         predictions = {
-            row["image_token"]: row for row in FileManager.read_csv(workspace.prediction_audit)
+            row["image_token"]: row
+            for row in FileManager.read_csv(workspace.prediction_audit)
         }
         accepted_manual = {
             row["image_token"]
@@ -2883,10 +3212,12 @@ class FeatureManager:
                 _as_int(row.get("attention_valid_final"), 0) == 1
                 and _as_int(row.get("quality_valid"), 0) == 1
             )
-            row["keep_manual_matched"] = int(row["image_token"] in accepted_manual)
+            row["keep_manual_matched"] = int(
+                row["image_token"] in accepted_manual
+            )
             rows.append(row)
 
-        extractor = FrozenEfficientNet().to(device).eval()
+        extractor = RuntimeManager.prepare_model(FrozenEfficientNet(), device).eval()
         loader = DataLoader(
             FeatureDataset(rows),
             batch_size=RuntimeManager.feature_batch_size(device),
@@ -2897,91 +3228,172 @@ class FeatureManager:
         pool = StreamingPatientPool(Settings.Classification.MODES)
         started = time.perf_counter()
 
-        def encode(mode: str, images: torch.Tensor, selected_rows: list[dict[str, Any]]) -> None:
-            if not len(selected_rows):
+        def encode_groups(
+            groups: list[tuple[str, torch.Tensor, list[dict[str, Any]]]],
+        ) -> None:
+            """Grupează modurile și trimite numai imaginile finale la extractor."""
+
+            valid_groups = [
+                (mode, images, selected_rows)
+                for mode, images, selected_rows in groups
+                if len(selected_rows) > 0 and images.shape[0] > 0
+            ]
+            if not valid_groups:
                 return
-            embeddings = extractor(images).detach().cpu().numpy().astype(np.float32)
-            pool.add(mode, embeddings, selected_rows)
+
+            combined = torch.cat(
+                [images.contiguous() for _, images, _ in valid_groups], dim=0
+            )
+            forward_batch = RuntimeManager.feature_forward_batch_size(device)
+            embedding_chunks: list[torch.Tensor] = []
+            for begin in range(0, combined.shape[0], forward_batch):
+                images_device = RuntimeManager.move_tensor(
+                    combined[begin : begin + forward_batch], device
+                )
+                with RuntimeManager.autocast(device):
+                    output = extractor(images_device)
+                embedding_chunks.append(output.float().cpu())
+                del images_device, output
+
+            embeddings = torch.cat(embedding_chunks, dim=0).numpy().astype(np.float32)
+            cursor = 0
+            for mode, images, selected_rows in valid_groups:
+                count = int(images.shape[0])
+                pool.add(
+                    mode,
+                    embeddings[cursor : cursor + count],
+                    selected_rows,
+                )
+                cursor += count
+            del combined, embeddings, embedding_chunks
 
         with torch.inference_mode():
             for robust, raw, content, attention, manual, indices in tqdm(
-                loader, desc="EfficientNet feature bank"
+                loader, desc=f"EfficientNet feature bank ({device.type})"
             ):
+                # Aceste tensori rămân pe CPU. GPU-ul nu primește măștile și nu
+                # execută normalizarea percentilelor sau operațiile morfologice.
                 batch_rows = [rows[int(index)] for index in indices]
-                robust = robust.to(device, non_blocking=True)
-                raw = raw.to(device, non_blocking=True)
-                content = content.to(device, non_blocking=True)
-                attention = attention.to(device, non_blocking=True)
-                manual = manual.to(device, non_blocking=True)
-
-                encode("FULL_IMAGE", robust, batch_rows)
+                groups: list[
+                    tuple[str, torch.Tensor, list[dict[str, Any]]]
+                ] = [("FULL_IMAGE", robust, batch_rows)]
 
                 attention_positions = [
-                    position for position, row in enumerate(batch_rows) if row["keep_attention"]
+                    position
+                    for position, row in enumerate(batch_rows)
+                    if row["keep_attention"]
                 ]
                 if attention_positions:
-                    positions = torch.as_tensor(attention_positions, device=device)
+                    positions = torch.as_tensor(
+                        attention_positions, dtype=torch.long
+                    )
                     selected_raw = raw.index_select(0, positions)
                     selected_content = content.index_select(0, positions)
                     selected_mask = attention.index_select(0, positions)
-                    support = FeatureManager._support(selected_mask, selected_content)
-                    roi = FeatureManager._region_normalize(selected_raw, support)
-                    complement = FeatureManager._region_normalize(
-                        selected_raw, (selected_content > 0.5).float() * (1.0 - support)
+                    support = FeatureManager._support(
+                        selected_mask, selected_content
                     )
-                    selected_rows = [batch_rows[position] for position in attention_positions]
-                    encode("AU1_ATTENTION_ROI", roi, selected_rows)
-                    encode("AU5_ATTENTION_COMPLEMENT", complement, selected_rows)
+                    selected_rows = [
+                        batch_rows[position] for position in attention_positions
+                    ]
+                    groups.extend(
+                        [
+                            (
+                                "AU1_ATTENTION_ROI",
+                                FeatureManager._region_normalize(
+                                    selected_raw, support
+                                ),
+                                selected_rows,
+                            ),
+                            (
+                                "AU5_ATTENTION_COMPLEMENT",
+                                FeatureManager._region_normalize(
+                                    selected_raw,
+                                    (selected_content > 0.5).float()
+                                    * (1.0 - support),
+                                ),
+                                selected_rows,
+                            ),
+                        ]
+                    )
 
                 manual_positions = [
-                    position for position, row in enumerate(batch_rows)
+                    position
+                    for position, row in enumerate(batch_rows)
                     if row["keep_manual_matched"]
                 ]
                 if manual_positions:
-                    positions = torch.as_tensor(manual_positions, device=device)
+                    positions = torch.as_tensor(
+                        manual_positions, dtype=torch.long
+                    )
                     selected_raw = raw.index_select(0, positions)
                     selected_content = content.index_select(0, positions)
                     manual_mask = manual.index_select(0, positions)
                     attention_mask = attention.index_select(0, positions)
-                    manual_support = FeatureManager._support(manual_mask, selected_content)
-                    attention_support = FeatureManager._support(attention_mask, selected_content)
-                    selected_rows = [batch_rows[position] for position in manual_positions]
-                    encode(
-                        "AU6_MANUAL_ROI",
-                        FeatureManager._region_normalize(selected_raw, manual_support),
-                        selected_rows,
+                    manual_support = FeatureManager._support(
+                        manual_mask, selected_content
                     )
-                    encode(
-                        "AU7_MANUAL_COMPLEMENT",
-                        FeatureManager._region_normalize(
-                            selected_raw,
-                            (selected_content > 0.5).float() * (1.0 - manual_support),
-                        ),
-                        selected_rows,
+                    attention_support = FeatureManager._support(
+                        attention_mask, selected_content
                     )
-                    encode(
-                        "AU8_ATTENTION_MATCHED_MANUAL_ROI",
-                        FeatureManager._region_normalize(selected_raw, attention_support),
-                        selected_rows,
-                    )
-                    encode(
-                        "AU9_ATTENTION_MATCHED_MANUAL_COMPLEMENT",
-                        FeatureManager._region_normalize(
-                            selected_raw,
-                            (selected_content > 0.5).float() * (1.0 - attention_support),
-                        ),
-                        selected_rows,
+                    selected_rows = [
+                        batch_rows[position] for position in manual_positions
+                    ]
+                    visible_content = (selected_content > 0.5).float()
+                    groups.extend(
+                        [
+                            (
+                                "AU6_MANUAL_ROI",
+                                FeatureManager._region_normalize(
+                                    selected_raw, manual_support
+                                ),
+                                selected_rows,
+                            ),
+                            (
+                                "AU7_MANUAL_COMPLEMENT",
+                                FeatureManager._region_normalize(
+                                    selected_raw,
+                                    visible_content * (1.0 - manual_support),
+                                ),
+                                selected_rows,
+                            ),
+                            (
+                                "AU8_ATTENTION_MATCHED_MANUAL_ROI",
+                                FeatureManager._region_normalize(
+                                    selected_raw, attention_support
+                                ),
+                                selected_rows,
+                            ),
+                            (
+                                "AU9_ATTENTION_MATCHED_MANUAL_COMPLEMENT",
+                                FeatureManager._region_normalize(
+                                    selected_raw,
+                                    visible_content * (1.0 - attention_support),
+                                ),
+                                selected_rows,
+                            ),
+                        ]
                     )
 
-        bank = {mode: pool.finalize(mode) for mode in Settings.Classification.MODES}
+                encode_groups(groups)
+                del groups
+
+        bank = {
+            mode: pool.finalize(mode)
+            for mode in Settings.Classification.MODES
+        }
         arrays = {}
         metadata_modes = {}
         for mode, values in bank.items():
             arrays[f"{mode}__X"] = values["X"]
             arrays[f"{mode}__y"] = values["y"]
             arrays[f"{mode}__patient_ids"] = values["patient_ids"].astype("U")
-            arrays[f"{mode}__source_slices"] = np.asarray([values["source_slices"]], dtype=np.int64)
-            arrays[f"{mode}__series_proxies"] = np.asarray([values["series_proxies"]], dtype=np.int64)
+            arrays[f"{mode}__source_slices"] = np.asarray(
+                [values["source_slices"]], dtype=np.int64
+            )
+            arrays[f"{mode}__series_proxies"] = np.asarray(
+                [values["series_proxies"]], dtype=np.int64
+            )
             metadata_modes[mode] = {
                 "patients": int(len(values["patient_ids"])),
                 "source_slices": int(values["source_slices"]),
@@ -2995,14 +3407,17 @@ class FeatureManager:
         os.replace(temporary, workspace.feature_bank)
         metadata = {
             "fingerprint": fingerprint,
-            "device": device.type,
+            "preprocessing_device": "cpu",
+            "extractor_device": device.type,
             "modes": metadata_modes,
-            "elapsed": RuntimeManager.format_seconds(time.perf_counter() - started),
+            "elapsed": RuntimeManager.format_seconds(
+                time.perf_counter() - started
+            ),
             "feature_bank": str(workspace.feature_bank),
         }
         FileManager.write_json(workspace.feature_metadata, metadata)
         print("[FEATURE BANK] Salvat:", workspace.feature_bank)
-        del extractor
+        del extractor, loader
         RuntimeManager.release(device)
         return bank
 
@@ -3243,25 +3658,50 @@ class EvaluationManager:
 
 # %% [6] FAȚADA PIPELINE-ULUI
 class CADPipeline:
-    """API-ul simplu folosit în celulele de execuție ale notebook-ului."""
+    """Interfață simplă: CPU implicit, dispozitiv explicit pentru deep learning.
+
+    Obiectul nu conține un `torch.device` și nu inițializează CUDA. Același
+    workspace poate fi deschis într-o sesiune CPU, apoi într-o sesiune GPU.
+    Rezultatele intermediare sunt citite de pe disc, nu din memoria GPU.
+    """
 
     def __init__(
         self,
         dataset_path: Path | str | None = None,
         workspace_root: Path | str | None = None,
-        device: str | None = None,
+        attention_device: str | None = None,
+        feature_device: str | None = None,
     ):
-        RuntimeManager.seed_everything()
+        RuntimeManager.seed_everything(include_cuda=False)
         self.dataset_path = Path(dataset_path or Settings.Paths.DATASET_PATH)
         self.workspace = FileManager.create_workspace(workspace_root)
-        self.device = RuntimeManager.resolve_device(device)
+        self.attention_device = (
+            attention_device or Settings.Runtime.ATTENTION_DEVICE
+        ).strip().lower()
+        self.feature_device = (
+            feature_device or Settings.Runtime.FEATURE_DEVICE
+        ).strip().lower()
+        for name, value in (
+            ("attention_device", self.attention_device),
+            ("feature_device", self.feature_device),
+        ):
+            if value not in {"auto", "cpu", "cuda"}:
+                raise ValueError(
+                    f"{name} trebuie să fie 'auto', 'cpu' sau 'cuda'."
+                )
+
         self.samples: list[Sample] | None = None
         self.dataset_rows: list[dict[str, Any]] | None = None
-        print(f"[PIPELINE] device={self.device.type}")
+        print("[PIPELINE] control și etape generale: cpu")
+        print(f"[PIPELINE] Attention U-Net configurat: {self.attention_device}")
+        print(f"[PIPELINE] EfficientNet configurat: {self.feature_device}")
         print(f"[PIPELINE] dataset={self.dataset_path}")
         print(f"[PIPELINE] workspace={self.workspace.root}")
 
+    # ----------------------------- ETAPE CPU -----------------------------
     def prepare(self) -> list[dict[str, Any]]:
+        """CPU: scanează căile și construiește manifestul."""
+
         self.samples = DatasetManager.discover(self.dataset_path, self.workspace)
         self.dataset_rows = DatasetManager.rows(self.samples, self.workspace)
         return self.dataset_rows
@@ -3272,6 +3712,8 @@ class CADPipeline:
         return self.dataset_rows
 
     def audit_quality(self, refresh: bool = False) -> dict[str, dict[str, Any]]:
+        """CPU: blur, zgomot, contrast și pHash."""
+
         return QualityManager.build(self._rows(), self.workspace, refresh=refresh)
 
     def audit_manual_masks(
@@ -3279,61 +3721,91 @@ class CADPipeline:
         refresh_quality: bool = False,
         minimum_masks: int | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """CPU: verifică măștile manuale și exclude țintele nevalide."""
+
         quality = self.audit_quality(refresh=refresh_quality)
         return MaskManager.audit_manual_masks(
             self._rows(), quality, self.workspace, minimum_masks=minimum_masks
         )
 
+    # ------------------------- ETAPE CPU SAU GPU -------------------------
     def train_attention(
         self,
         force: bool = False,
         minimum_masks: int | None = None,
         refresh_quality: bool = False,
+        device: str | None = None,
     ) -> dict[int, Path]:
+        """Antrenează Attention U-Net pe dispozitivul ales doar pentru această etapă."""
+
+        # Auditul se termină pe CPU înainte ca modelul să fie încărcat pe GPU.
         accepted, manual_summary = self.audit_manual_masks(
             refresh_quality=refresh_quality,
             minimum_masks=minimum_masks,
         )
-        checkpoints = SegmentationManager.train_crossfit(
-            accepted, self.workspace, self.device, force=force
-        )
+        if not force:
+            cached_checkpoints = SegmentationManager.compatible_checkpoint_map(
+                accepted, self.workspace
+            )
+            if cached_checkpoints is not None:
+                print(
+                    "[ATTENTION] Toate checkpointurile sunt compatibile; "
+                    "CUDA nu este inițializat."
+                )
+                summary = FileManager.read_json(
+                    self.workspace.training_summary, {}
+                ) or {}
+                summary["manual_mask_audit"] = manual_summary
+                summary["last_call"] = "reused_before_device_initialization"
+                FileManager.write_json(self.workspace.training_summary, summary)
+                return cached_checkpoints
+
+        requested = device or self.attention_device
+        with RuntimeManager.device_scope(
+            requested, "antrenare Attention U-Net"
+        ) as compute_device:
+            checkpoints = SegmentationManager.train_crossfit(
+                accepted, self.workspace, compute_device, force=force
+            )
+
         summary = FileManager.read_json(self.workspace.training_summary, {}) or {}
         summary["manual_mask_audit"] = manual_summary
         FileManager.write_json(self.workspace.training_summary, summary)
         return checkpoints
 
-    def generate_attention_masks(self, force: bool = False) -> list[dict[str, Any]]:
-        return SegmentationManager.predict_all(
-            self._rows(),
-            self.workspace,
-            self.device,
-            checkpoint_map=SegmentationManager.load_checkpoint_map(self.workspace),
-            force=force,
-        )
-
-    def train_and_generate(
+    def generate_attention_masks(
         self,
-        force_training: bool = False,
-        force_predictions: bool = False,
-        minimum_masks: int | None = None,
-    ) -> dict[str, Any]:
-        checkpoints = self.train_attention(
-            force=force_training, minimum_masks=minimum_masks
-        )
-        predictions = SegmentationManager.predict_all(
-            self._rows(),
-            self.workspace,
-            self.device,
-            checkpoint_map=checkpoints,
-            force=force_predictions,
-        )
-        return {
-            "checkpoints": {fold: str(path) for fold, path in checkpoints.items()},
-            "predictions": len(predictions),
-            "training_summary": str(self.workspace.training_summary),
-            "prediction_summary": str(self.workspace.prediction_summary),
-        }
+        force: bool = False,
+        device: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Rulează inferența Attention U-Net și eliberează dispozitivul la final."""
 
+        rows = self._rows()
+        checkpoints = SegmentationManager.load_checkpoint_map(self.workspace)
+        if not force:
+            cached = SegmentationManager.load_cached_predictions(
+                rows, self.workspace, checkpoints
+            )
+            if cached is not None:
+                print(
+                    "[ATTENTION] Predicțiile finale sunt compatibile; "
+                    "CUDA nu este inițializat."
+                )
+                return cached
+
+        requested = device or self.attention_device
+        with RuntimeManager.device_scope(
+            requested, "predicție Attention U-Net"
+        ) as compute_device:
+            return SegmentationManager.predict_all(
+                rows,
+                self.workspace,
+                compute_device,
+                checkpoint_map=checkpoints,
+                force=force,
+            )
+
+    # ----------------------------- ETAPE CPU -----------------------------
     def open_editor(
         self,
         scope: str = "invalid",
@@ -3343,10 +3815,14 @@ class CADPipeline:
         review_round: int = 1,
         seed: int = 42,
     ) -> MaskEditor:
+        """CPU: deschide editorul HTML; nu încarcă niciun model neural."""
+
         if not self.workspace.quality_audit.is_file():
             self.audit_quality(refresh=False)
         if not self.workspace.prediction_audit.is_file():
-            raise FileNotFoundError("Rulează generate_attention_masks() înainte de editor.")
+            raise FileNotFoundError(
+                "Rulează generate_attention_masks() înainte de editor."
+            )
         queue = ReviewManager.select(
             self._rows(),
             self.workspace,
@@ -3365,33 +3841,76 @@ class CADPipeline:
         )
         return editor.show()
 
-    def build_feature_bank(self, force: bool = False) -> dict[str, dict[str, Any]]:
+    # ------------------------- ETAPĂ CPU SAU GPU -------------------------
+    def build_feature_bank(
+        self,
+        force: bool = False,
+        device: str | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Pregătește ROI-urile pe CPU; EfficientNet folosește dispozitivul ales.
+
+        `device="cpu"` economisește complet GPU-ul. `device="cuda"` este mai
+        rapid, dar GPU-ul este folosit numai pentru forward-urile EfficientNet.
+        """
+
         if not self.workspace.prediction_audit.is_file():
-            raise FileNotFoundError("Rulează generate_attention_masks() înainte de feature bank.")
+            raise FileNotFoundError(
+                "Rulează generate_attention_masks() înainte de feature bank."
+            )
         if not self.workspace.manual_audit.is_file():
             self.audit_manual_masks()
-        return FeatureManager.build(
-            self._rows(), self.workspace, self.device, force=force
-        )
+        rows = self._rows()
+        if not force:
+            cached = FeatureManager.load_compatible_cache(rows, self.workspace)
+            if cached is not None:
+                print(
+                    "[FEATURE BANK] Cache compatibil; "
+                    "CUDA nu este inițializat."
+                )
+                return cached
 
+        requested = device or self.feature_device
+        with RuntimeManager.device_scope(
+            requested, "extragere EfficientNet"
+        ) as compute_device:
+            return FeatureManager.build(
+                rows, self.workspace, compute_device, force=force
+            )
+
+    # ----------------------------- ETAPE CPU -----------------------------
     def evaluate(self) -> pd.DataFrame:
+        """CPU: PCA, regresie logistică, metrici și bootstrap."""
+
         bank = FeatureManager.load(self.workspace)
         return EvaluationManager.evaluate(bank, self.workspace)
 
     def backup(self, name: str = "cad_attention_workspace_backup") -> Path:
+        """CPU: arhivează rezultatele persistente, fără datasetul original."""
+
         destination = self.workspace.root.parent / name
         archive = Path(shutil.make_archive(str(destination), "zip", self.workspace.root))
         print("[BACKUP]", archive)
         return archive
 
     def status(self) -> dict[str, Any]:
+        """CPU: arată ce etape sunt deja salvate și pot fi reutilizate."""
+
         status = {
-            "device": self.device.type,
+            "controller_device": "cpu",
+            "attention_device_configured": self.attention_device,
+            "feature_device_configured": self.feature_device,
             "dataset": str(self.dataset_path),
             "workspace": str(self.workspace.root),
             "manual_masks": len(list(self.workspace.manual_masks.glob("*.png"))),
-            "checkpoints": len(list(self.workspace.checkpoints.glob("attention_unet_fold_*.pt"))),
-            "predicted_masks": len(list(self.workspace.predicted_masks.glob("*.png"))),
+            "checkpoints": len(
+                list(self.workspace.checkpoints.glob("attention_unet_fold_*.pt"))
+            ),
+            "prediction_parts": len(
+                list(self.workspace.prediction_parts_dir.glob("fold_*.csv"))
+            ),
+            "predicted_masks": len(
+                list(self.workspace.predicted_masks.glob("*.png"))
+            ),
             "quality_audit": self.workspace.quality_audit.is_file(),
             "manual_audit": self.workspace.manual_audit.is_file(),
             "prediction_audit": self.workspace.prediction_audit.is_file(),
@@ -3402,6 +3921,6 @@ class CADPipeline:
         return status
 
 
-RuntimeManager.seed_everything()
-print("[PIPELINE] Clasele pipeline-ului simplificat au fost încărcate.")
-print("[PIPELINE] Setează device='cpu', 'cuda' sau 'auto' la CADPipeline(...).")
+RuntimeManager.seed_everything(include_cuda=False)
+print("[PIPELINE] Clasele au fost încărcate fără inițializarea CUDA.")
+print("[PIPELINE] CPU este implicit; device='cuda' se dă numai etapei dorite.")
