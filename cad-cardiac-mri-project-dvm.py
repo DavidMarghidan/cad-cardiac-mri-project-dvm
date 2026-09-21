@@ -2877,7 +2877,7 @@ class MaskEditor:
     """Editor HTML5 compatibil Kaggle/JupyterLab, fără jupyter-matplotlib.
 
     Portocaliu = predicția automată. Magenta = masca editabilă. Click stânga
-    desenează, click dreapta șterge. `Save & Next` scrie masca manuală atomic.
+    desenează, click dreapta șterge. `Save+Next` scrie masca manuală atomic.
     """
 
     def __init__(
@@ -2911,17 +2911,65 @@ class MaskEditor:
             placeholder=f"CAD_MASK_SYNC_{self.widget_id}",
             layout=widgets.Layout(width="1px", height="1px", display="none"),
         )
-        self.previous_button = widgets.Button(description="Previous")
-        self.next_button = widgets.Button(description="Next")
-        self.save_next_button = widgets.Button(description="Save & Next", button_style="success")
-        self.accept_button = widgets.Button(description="Auto OK (not training)", button_style="info")
-        self.skip_button = widgets.Button(description="Skip & Next")
-        self.reset_button = widgets.Button(description="Reset to auto")
-        self.raw_button = widgets.Button(description="Reset to image")
-        self.clear_button = widgets.Button(description="Clear")
-        self.delete_button = widgets.Button(description="Delete manual", button_style="warning")
+        button_layout_small = widgets.Layout(width="82px", height="30px")
+        button_layout_medium = widgets.Layout(width="96px", height="30px")
+        button_layout_wide = widgets.Layout(width="108px", height="30px")
+
+        self.previous_button = widgets.Button(
+            description="Prev",
+            tooltip="Shortcut: P",
+            layout=button_layout_small,
+        )
+        self.next_button = widgets.Button(
+            description="Next",
+            tooltip="Shortcut: N",
+            layout=button_layout_small,
+        )
+        self.save_next_button = widgets.Button(
+            description="Save+Next",
+            button_style="success",
+            tooltip="Shortcut: S",
+            layout=button_layout_wide,
+        )
+        self.raw_button = widgets.Button(
+            description="Reset img",
+            tooltip="Shortcut: I",
+            layout=button_layout_medium,
+        )
+        self.reset_button = widgets.Button(
+            description="Reset auto",
+            tooltip="Shortcut: R",
+            layout=button_layout_medium,
+        )
+        self.accept_button = widgets.Button(
+            description="Auto OK",
+            button_style="info",
+            tooltip="Shortcut: A",
+            layout=button_layout_medium,
+        )
+        self.skip_button = widgets.Button(
+            description="Skip",
+            tooltip="Shortcut: K",
+            layout=button_layout_small,
+        )
+        self.clear_button = widgets.Button(
+            description="Clear",
+            tooltip="Shortcut: C",
+            layout=button_layout_small,
+        )
+        self.delete_button = widgets.Button(
+            description="Delete",
+            button_style="warning",
+            tooltip="Shortcut: D",
+            layout=button_layout_small,
+        )
         self.brush_slider = widgets.IntSlider(
-            description="Brush", value=self.brush_radius, min=1, max=30, step=1
+            description="Brush",
+            value=self.brush_radius,
+            min=1,
+            max=30,
+            step=1,
+            layout=widgets.Layout(width="260px"),
         )
         self.status = widgets.HTML()
 
@@ -2944,12 +2992,19 @@ class MaskEditor:
                         self.previous_button,
                         self.next_button,
                         self.save_next_button,
-                        self.reset_button,
                         self.raw_button,
-                    ]
-                ),
-                widgets.HBox(
-                    [self.accept_button, self.skip_button, self.clear_button, self.delete_button]
+                        self.reset_button,
+                        self.accept_button,
+                        self.skip_button,
+                        self.clear_button,
+                        self.delete_button,
+                    ],
+                    layout=widgets.Layout(
+                        flex_flow="row nowrap",
+                        align_items="center",
+                        overflow="auto hidden",
+                        width="100%",
+                    ),
                 ),
                 widgets.HBox([self.brush_slider, self.status]),
                 self.mask_sync,
@@ -3024,8 +3079,9 @@ class MaskEditor:
           <canvas id="{canvas_id}" width="{size * 3}" height="{size * 3}"
                   style="width:768px;height:768px;max-width:100%;border:1px solid #999;
                          cursor:crosshair;touch-action:none;user-select:none"></canvas>
-          <div style="font-size:12px;margin-top:5px">
-            Left drag = draw | Right drag = erase | S = Save & Next | N/P = navigation
+          <div style="font-size:12px;margin-top:5px;line-height:1.35">
+            Left drag = draw | Right drag = erase | S = Save+Next | P = Prev | N = Next |
+            I = Reset image | R = Reset auto | A = Auto OK | K = Skip | C = Clear | D = Delete | [ / ] = Brush -/+
           </div>
         </div>
         """
@@ -3113,12 +3169,86 @@ class MaskEditor:
           canvas.addEventListener('mousedown', begin, true);
           canvas.addEventListener('mousemove', move, true);
           canvas.addEventListener('mouseup', finish, true);
-          window.addEventListener('keydown', e => {{
+
+          window.__cadMaskEditorBindings = window.__cadMaskEditorBindings || {{}};
+          if (window.__cadMaskEditorBindings[{json.dumps(self.widget_id)}]) {{
+            const oldBinding = window.__cadMaskEditorBindings[{json.dumps(self.widget_id)}];
+            if (oldBinding.keydown) window.removeEventListener('keydown', oldBinding.keydown, true);
+            if (oldBinding.keyup) window.removeEventListener('keyup', oldBinding.keyup, true);
+          }}
+
+          const pressedKeys = new Set();
+          function isTypingTarget(target) {{
+            if (!target) return false;
+            const tag = (target.tagName || '').toLowerCase();
+            return tag === 'input' || tag === 'textarea' || tag === 'select' || !!target.isContentEditable;
+          }}
+          function allButtons() {{
+            return Array.from(document.querySelectorAll('button'));
+          }}
+          function buttonByText(labels) {{
+            const normalized = labels.map(x => x.trim().toLowerCase());
+            return allButtons().find(x => normalized.includes((x.innerText || '').trim().toLowerCase()));
+          }}
+          function sliderByDescription(label) {{
+            const containers = Array.from(document.querySelectorAll('.widget-int-slider, .jupyter-widget.widget-slider'));
+            for (const node of containers) {{
+              const text = (node.innerText || '').toLowerCase();
+              if (text.includes(label.toLowerCase())) {{
+                const input = node.querySelector('input[type="range"]');
+                if (input) return input;
+              }}
+            }}
+            return document.querySelector('input[type="range"]');
+          }}
+          function changeBrush(delta) {{
+            const slider = sliderByDescription('brush');
+            if (!slider) return;
+            const step = Number(slider.step || 1) || 1;
+            const minValue = Number(slider.min || 1);
+            const maxValue = Number(slider.max || 30);
+            const currentValue = Number(slider.value || 0);
+            const nextValue = Math.max(minValue, Math.min(maxValue, currentValue + delta * step));
+            if (nextValue === currentValue) return;
+            slider.value = String(nextValue);
+            slider.dispatchEvent(new Event('input', {{bubbles:true}}));
+            slider.dispatchEvent(new Event('change', {{bubbles:true}}));
+          }}
+          const shortcutActions = {{
+            'p': () => buttonByText(['Prev', 'Previous'])?.click(),
+            'n': () => buttonByText(['Next'])?.click(),
+            's': () => buttonByText(['Save+Next', 'Save & Next'])?.click(),
+            'i': () => buttonByText(['Reset img', 'Reset to image'])?.click(),
+            'r': () => buttonByText(['Reset auto', 'Reset to auto'])?.click(),
+            'a': () => buttonByText(['Auto OK', 'Auto OK (not training)'])?.click(),
+            'k': () => buttonByText(['Skip', 'Skip & Next'])?.click(),
+            'c': () => buttonByText(['Clear'])?.click(),
+            'd': () => buttonByText(['Delete', 'Delete manual'])?.click(),
+            '[': () => changeBrush(-1),
+            ']': () => changeBrush(1),
+          }};
+          const onKeyDown = e => {{
             const k = (e.key || '').toLowerCase();
-            if (k === 's') Array.from(document.querySelectorAll('button')).find(x => x.innerText === 'Save & Next')?.click();
-            if (k === 'n') Array.from(document.querySelectorAll('button')).find(x => x.innerText === 'Next')?.click();
-            if (k === 'p') Array.from(document.querySelectorAll('button')).find(x => x.innerText === 'Previous')?.click();
-          }});
+            if (!k || e.ctrlKey || e.metaKey || e.altKey || isTypingTarget(e.target)) return;
+            if (!(k in shortcutActions)) return;
+            if (e.repeat || pressedKeys.has(k)) {{
+              e.preventDefault();
+              return;
+            }}
+            pressedKeys.add(k);
+            e.preventDefault();
+            shortcutActions[k]();
+          }};
+          const onKeyUp = e => {{
+            const k = (e.key || '').toLowerCase();
+            pressedKeys.delete(k);
+          }};
+          window.addEventListener('keydown', onKeyDown, true);
+          window.addEventListener('keyup', onKeyUp, true);
+          window.__cadMaskEditorBindings[{json.dumps(self.widget_id)}] = {{
+            keydown: onKeyDown,
+            keyup: onKeyUp,
+          }};
           function load(target, source) {{
             return new Promise((resolve, reject) => {{ target.onload = resolve; target.onerror = reject; target.src = source; }});
           }}
