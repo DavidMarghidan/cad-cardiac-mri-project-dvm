@@ -3958,10 +3958,16 @@ RuntimeManager.seed_everything(include_cuda=False)
 print("[PIPELINE] Clasele au fost încărcate fără inițializarea CUDA.")
 print("[PIPELINE] CPU este implicit; device='cuda' se dă numai etapei dorite.")
 
+# =============================================================================
+# FUNCȚII DE RULARE GRUPATĂ
+# =============================================================================
+def _execution_banner(title: str) -> None:
+    """Afișează clar trecerea dintre partea CPU și partea GPU."""
 
-# =============================================================================
-# FUNCȚII DE RULARE — ECHIVALENTE CELULELOR SEPARATE DIN NOTEBOOK
-# =============================================================================
+    line = "=" * 88
+    print(f"\n{line}\n{title}\n{line}")
+
+
 def create_pipeline(
     dataset_path: Path | str | None = None,
     workspace_root: Path | str | None = None,
@@ -3978,9 +3984,189 @@ def create_pipeline(
     )
 
 
-def run_prepare(pipeline: CADPipeline) -> list[dict[str, Any]]:
-    """Etapa 0, CPU: construiește manifestul și afișează starea workspace-ului."""
+def run_complete_pipeline(
+    dataset_path: Path | str | None = None,
+    workspace_root: Path | str | None = None,
+    attention_device: str = "cuda",
+    feature_device: str = "cpu",
+    force_attention_training: bool = False,
+    force_attention_prediction: bool = False,
+    force_feature_bank: bool = False,
+    refresh_quality: bool = False,
+    minimum_masks: int | None = None,
+    create_backup: bool = False,
+    backup_name: str = "cad_attention_workspace_backup",
+) -> dict[str, Any]:
+    """Rulează într-un singur apel toate etapele automate.
 
+    Ordinea dispozitivelor este intenționată:
+    1. CPU: manifestul și auditul calității/măștilor;
+    2. GPU sau CPU: antrenarea și inferența Attention U-Net;
+    3. CPU implicit sau GPU opțional: EfficientNet;
+    4. CPU: agregarea, clasificarea, metricile și backup-ul.
+
+    Cache-urile sunt verificate înainte de inițializarea CUDA. Dacă un rezultat
+    compatibil există deja, etapa respectivă este reutilizată fără GPU.
+    """
+
+    _execution_banner("BLOC PRINCIPAL — inițializare și manifest pe CPU")
+    pipeline = create_pipeline(
+        dataset_path=dataset_path,
+        workspace_root=workspace_root,
+        attention_device=attention_device,
+        feature_device=feature_device,
+    )
+    dataset_rows = pipeline.prepare()
+
+    _execution_banner(
+        f"BLOC PRINCIPAL — Attention U-Net pe {str(attention_device).upper()} "
+        "(auditul se execută întâi pe CPU)"
+    )
+    attention_checkpoints = pipeline.train_attention(
+        force=force_attention_training,
+        minimum_masks=minimum_masks,
+        refresh_quality=refresh_quality,
+        device=attention_device,
+    )
+    attention_predictions = pipeline.generate_attention_masks(
+        force=force_attention_prediction,
+        device=attention_device,
+    )
+
+    _execution_banner(
+        f"BLOC PRINCIPAL — feature bank pe {str(feature_device).upper()} și evaluare pe CPU"
+    )
+    feature_bank = pipeline.build_feature_bank(
+        force=force_feature_bank,
+        device=feature_device,
+    )
+    results = pipeline.evaluate()
+    status = pipeline.status()
+
+    training_summary = FileManager.read_json(
+        pipeline.workspace.training_summary, {}
+    ) or {}
+    manual_summary = training_summary.get("manual_mask_audit", {})
+
+    backup_path = None
+    if create_backup:
+        backup_path = pipeline.backup(backup_name)
+
+    return {
+        "pipeline": pipeline,
+        "dataset_rows": dataset_rows,
+        "manual_summary": manual_summary,
+        "attention_checkpoints": attention_checkpoints,
+        "attention_predictions": attention_predictions,
+        "feature_bank": feature_bank,
+        "results": results,
+        "status": status,
+        "backup_path": backup_path,
+    }
+
+
+def run_review_block(
+    pipeline: CADPipeline,
+    scope: str = "invalid",
+    limit: int = 300,
+    start_index: int = 0,
+    review_round: int = 1,
+    seed: int = 42,
+) -> MaskEditor | None:
+    """Deschide pe CPU una dintre cozile editorului manual.
+
+    `scope="invalid"` corectează predicțiile Attention rămase invalide.
+    `scope="novel"` propune imagini clare și diferite de măștile deja create.
+    `scope="manual"` redeschide imaginile cu fișier manual existent.
+    `scope="all"` permite verificarea tuturor măștilor Attention disponibile.
+    """
+
+    scope = str(scope).strip().lower()
+    _execution_banner(f"REVIEW MANUAL PE CPU — scope={scope}")
+    if scope == "invalid":
+        invalid_rows = FileManager.read_csv(pipeline.workspace.invalid_predictions)
+        print("Predicții invalide:", len(invalid_rows))
+        if not invalid_rows:
+            print("Nu există predicții invalide de corectat.")
+            return None
+
+    return pipeline.open_editor(
+        scope=scope,
+        limit=limit,
+        start_index=start_index,
+        review_round=review_round,
+        seed=seed,
+    )
+
+
+def run_after_review_pipeline(
+    pipeline: CADPipeline,
+    attention_device: str | None = None,
+    feature_device: str | None = None,
+    force_all: bool = False,
+    refresh_quality: bool = False,
+    minimum_masks: int | None = None,
+    create_backup: bool = False,
+    backup_name: str = "cad_attention_workspace_after_review",
+) -> dict[str, Any]:
+    """Actualizează întregul rezultat după editarea măștilor manuale.
+
+    Cu `force_all=False`, comportamentul recomandat, fingerprinturile refac numai
+    foldurile Attention afectate de măștile noi. Inferența per fold și feature
+    bank-ul sunt invalidate automat doar când intrările lor s-au schimbat.
+    `force_all=True` recalculează tot și consumă mai mult GPU.
+    """
+
+    attention_device = attention_device or pipeline.attention_device
+    feature_device = feature_device or pipeline.feature_device
+
+    _execution_banner(
+        f"DUPĂ REVIEW — reantrenare incrementală Attention pe {str(attention_device).upper()}"
+    )
+    attention_checkpoints = pipeline.train_attention(
+        force=force_all,
+        minimum_masks=minimum_masks,
+        refresh_quality=refresh_quality,
+        device=attention_device,
+    )
+    attention_predictions = pipeline.generate_attention_masks(
+        force=force_all,
+        device=attention_device,
+    )
+
+    _execution_banner(
+        f"DUPĂ REVIEW — feature bank pe {str(feature_device).upper()} și evaluare pe CPU"
+    )
+    feature_bank = pipeline.build_feature_bank(
+        force=force_all,
+        device=feature_device,
+    )
+    results = pipeline.evaluate()
+    status = pipeline.status()
+
+    training_summary = FileManager.read_json(
+        pipeline.workspace.training_summary, {}
+    ) or {}
+    manual_summary = training_summary.get("manual_mask_audit", {})
+
+    backup_path = None
+    if create_backup:
+        backup_path = pipeline.backup(backup_name)
+
+    return {
+        "pipeline": pipeline,
+        "manual_summary": manual_summary,
+        "attention_checkpoints": attention_checkpoints,
+        "attention_predictions": attention_predictions,
+        "feature_bank": feature_bank,
+        "results": results,
+        "status": status,
+        "backup_path": backup_path,
+    }
+
+
+# Funcții fine-grained păstrate pentru folosire din alte notebook-uri sau CLI.
+def run_prepare(pipeline: CADPipeline) -> list[dict[str, Any]]:
     dataset_rows = pipeline.prepare()
     pipeline.status()
     return dataset_rows
@@ -3991,8 +4177,6 @@ def run_audit(
     refresh: bool = False,
     minimum_masks: int | None = None,
 ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
-    """Etapa 1, CPU: auditul imaginilor și al măștilor manuale."""
-
     quality_by_token = pipeline.audit_quality(refresh=refresh)
     accepted_manual_masks, manual_summary = pipeline.audit_manual_masks(
         refresh_quality=False,
@@ -4009,8 +4193,6 @@ def run_attention_training(
     refresh_quality: bool = False,
     device: str | None = None,
 ) -> dict[int, Path]:
-    """Etapa 2, CPU/GPU: antrenează Attention U-Net pe dispozitivul ales."""
-
     return pipeline.train_attention(
         force=force,
         minimum_masks=minimum_masks,
@@ -4024,59 +4206,9 @@ def run_attention_prediction(
     force: bool = False,
     device: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Etapa 3, CPU/GPU: generează măștile Attention și returnează auditul."""
-
     predictions = pipeline.generate_attention_masks(force=force, device=device)
     print("Predicții Attention:", len(predictions))
     return predictions
-
-
-def run_invalid_review(
-    pipeline: CADPipeline,
-    limit: int = 300,
-    start_index: int = 0,
-    review_round: int = 1,
-) -> MaskEditor | None:
-    """Etapa 4, CPU/Jupyter: deschide editorul pentru predicțiile invalide."""
-
-    invalid_rows = FileManager.read_csv(pipeline.workspace.invalid_predictions)
-    print("Predicții invalide:", len(invalid_rows))
-    if not invalid_rows:
-        print("Nu există predicții invalide de corectat.")
-        return None
-    return pipeline.open_editor(
-        scope="invalid",
-        limit=limit,
-        start_index=start_index,
-        review_round=review_round,
-    )
-
-
-def run_novel_review(
-    pipeline: CADPipeline,
-    limit: int = 300,
-    start_index: int = 0,
-    review_round: int = 2,
-) -> MaskEditor:
-    """Etapa 5, CPU/Jupyter: selectează imagini noi și diverse pentru măști."""
-
-    return pipeline.open_editor(
-        scope="novel",
-        limit=limit,
-        start_index=start_index,
-        review_round=review_round,
-    )
-
-
-def run_retrain_after_review(
-    pipeline: CADPipeline,
-    device: str | None = None,
-) -> tuple[dict[int, Path], list[dict[str, Any]]]:
-    """Etapa opțională: reantrenează Attention și regenerează predicțiile."""
-
-    checkpoints = pipeline.train_attention(force=True, device=device)
-    predictions = pipeline.generate_attention_masks(force=True, device=device)
-    return checkpoints, predictions
 
 
 def run_feature_bank(
@@ -4084,8 +4216,6 @@ def run_feature_bank(
     force: bool = False,
     device: str | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """Etapa 6, CPU/GPU: construiește feature bank-ul; implicit folosește CPU."""
-
     feature_bank = pipeline.build_feature_bank(force=force, device=device)
     summary = {
         mode: {
@@ -4100,33 +4230,22 @@ def run_feature_bank(
 
 
 def run_evaluation(pipeline: CADPipeline) -> pd.DataFrame:
-    """Etapa 7, CPU: evaluează cele șapte reprezentări păstrate."""
-
     results = pipeline.evaluate()
     print(results.to_string(index=False))
     return results
 
-
-def run_status_and_backup(
-    pipeline: CADPipeline,
-    backup_name: str = "cad_attention_workspace_backup",
-) -> Path:
-    """Etapa 8, CPU: afișează statusul și arhivează workspace-ul."""
-
-    pipeline.status()
-    return pipeline.backup(backup_name)
-
-
+# =============================================================================
+# INTERFAȚĂ CLI
+# =============================================================================
 def main() -> None:
-    """Rulează o singură etapă din terminal, păstrând CPU și GPU separate."""
+    """Rulează blocurile grupate sau o etapă individuală din terminal."""
 
     import argparse
 
     parser = argparse.ArgumentParser(
         description=(
-            "Pipeline CAD cardiac MRI. Fiecare apel execută o singură etapă. "
-            "Etapele review-invalid și review-novel trebuie lansate într-un "
-            "frontend Jupyter/Kaggle pentru editorul interactiv."
+            "Pipeline CAD cardiac MRI cu rulare grupată CPU/GPU. "
+            "Etapa review trebuie deschisă într-un frontend Jupyter/Kaggle."
         )
     )
     parser.add_argument(
@@ -4134,13 +4253,13 @@ def main() -> None:
         nargs="?",
         default="status",
         choices=[
+            "full",
+            "review",
+            "after-review",
             "prepare",
             "audit",
             "train",
             "predict",
-            "review-invalid",
-            "review-novel",
-            "retrain",
             "features",
             "evaluate",
             "status",
@@ -4159,11 +4278,34 @@ def main() -> None:
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--refresh-quality", action="store_true")
     parser.add_argument("--minimum-masks", type=int, default=None)
+    parser.add_argument(
+        "--review-scope",
+        default="invalid",
+        choices=["invalid", "novel", "manual", "all"],
+    )
     parser.add_argument("--limit", type=int, default=300)
     parser.add_argument("--start-index", type=int, default=0)
-    parser.add_argument("--review-round", type=int, default=None)
+    parser.add_argument("--review-round", type=int, default=1)
+    parser.add_argument("--create-backup", action="store_true")
     parser.add_argument("--backup-name", default="cad_attention_workspace_backup")
     args = parser.parse_args()
+
+    if args.stage == "full":
+        output = run_complete_pipeline(
+            dataset_path=args.dataset_path,
+            workspace_root=args.workspace_root,
+            attention_device=args.attention_device,
+            feature_device=args.feature_device,
+            force_attention_training=args.force,
+            force_attention_prediction=args.force,
+            force_feature_bank=args.force,
+            refresh_quality=args.refresh_quality,
+            minimum_masks=args.minimum_masks,
+            create_backup=args.create_backup,
+            backup_name=args.backup_name,
+        )
+        print(output["results"].to_string(index=False))
+        return
 
     pipeline = create_pipeline(
         dataset_path=args.dataset_path,
@@ -4172,7 +4314,27 @@ def main() -> None:
         feature_device=args.feature_device,
     )
 
-    if args.stage == "prepare":
+    if args.stage == "review":
+        run_review_block(
+            pipeline,
+            scope=args.review_scope,
+            limit=args.limit,
+            start_index=args.start_index,
+            review_round=args.review_round,
+        )
+    elif args.stage == "after-review":
+        output = run_after_review_pipeline(
+            pipeline,
+            attention_device=args.attention_device,
+            feature_device=args.feature_device,
+            force_all=args.force,
+            refresh_quality=args.refresh_quality,
+            minimum_masks=args.minimum_masks,
+            create_backup=args.create_backup,
+            backup_name=args.backup_name,
+        )
+        print(output["results"].to_string(index=False))
+    elif args.stage == "prepare":
         run_prepare(pipeline)
     elif args.stage == "audit":
         run_audit(
@@ -4190,28 +4352,13 @@ def main() -> None:
         )
     elif args.stage == "predict":
         run_attention_prediction(pipeline, force=args.force, device=args.device)
-    elif args.stage == "review-invalid":
-        run_invalid_review(
-            pipeline,
-            limit=args.limit,
-            start_index=args.start_index,
-            review_round=args.review_round or 1,
-        )
-    elif args.stage == "review-novel":
-        run_novel_review(
-            pipeline,
-            limit=args.limit,
-            start_index=args.start_index,
-            review_round=args.review_round or 2,
-        )
-    elif args.stage == "retrain":
-        run_retrain_after_review(pipeline, device=args.device)
     elif args.stage == "features":
         run_feature_bank(pipeline, force=args.force, device=args.device)
     elif args.stage == "evaluate":
         run_evaluation(pipeline)
     elif args.stage == "backup":
-        run_status_and_backup(pipeline, backup_name=args.backup_name)
+        pipeline.status()
+        pipeline.backup(args.backup_name)
     else:
         pipeline.status()
 
