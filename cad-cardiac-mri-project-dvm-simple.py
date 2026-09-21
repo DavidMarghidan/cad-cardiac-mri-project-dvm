@@ -1,7 +1,4 @@
-# =============================================================================
-# DEFINIȚII 1 — IMPORTURI ȘI SETĂRI
-# =============================================================================
-
+# %% [1] IMPORTURI ȘI SETĂRI
 """Pipeline simplificat pentru clasificarea CAD din imagini cardiac MRI.
 
 Ideea centrală:
@@ -28,7 +25,6 @@ import json
 import math
 import os
 import random
-import re
 import shutil
 import time
 import uuid
@@ -237,24 +233,7 @@ class ClassificationSettings:
         "AU7_MANUAL_COMPLEMENT",
         "AU8_ATTENTION_MATCHED_MANUAL_ROI",
         "AU9_ATTENTION_MATCHED_MANUAL_COMPLEMENT",
-        "AU10_ATTENTION_LABEL_BLIND_SERIES_SELECTED_REGION_NORM",
-        "AU11_ATTENTION_LABEL_BLIND_SERIES_SELECTED_COMPLEMENT_REGION_NORM",
     )
-
-
-class SeriesSelectionSettings:
-    """Selecție label-blind a seriilor; valorile nu se ajustează după AUC."""
-
-    SCHEMA = "label-blind-attention-series-v1"
-    MIN_IMAGES = 4
-    MIN_QUALITY_VALID_FRACTION = 0.50
-    MIN_ATTENTION_VALID_FRACTION = 0.50
-    MIN_JOINT_VALID_FRACTION = 0.40
-    MIN_LONGEST_VALID_RUN_FRACTION = 0.25
-    MAX_MEDIAN_CENTROID_JUMP = 0.30
-    MAX_MEDIAN_LOG_AREA_JUMP = 1.10
-    MAX_SELECTED_PER_PATIENT = 5
-    ALLOW_PATIENT_FALLBACK = True
 
 
 class ReviewSettings:
@@ -275,12 +254,7 @@ class Settings:
     Segmentation = SegmentationSettings
     Classification = ClassificationSettings
     Review = ReviewSettings
-    Series = SeriesSelectionSettings
 
-
-# =============================================================================
-# DEFINIȚII 2 — RUNTIME, TIPURI DE DATE ȘI FIȘIERE
-# =============================================================================
 
 class RuntimeManager:
     """Pornește un dispozitiv numai pentru etapa care îl solicită explicit.
@@ -489,8 +463,6 @@ class Workspace:
     prediction_summary: Path
     feature_bank: Path
     feature_metadata: Path
-    series_selection_audit: Path
-    series_selection_summary: Path
     results_csv: Path
     predictions_dir: Path
 
@@ -519,8 +491,6 @@ class FileManager:
             prediction_summary=root / "simple_prediction_summary.json",
             feature_bank=root / "simple_pipeline_outputs" / "patient_feature_bank.npz",
             feature_metadata=root / "simple_pipeline_outputs" / "patient_feature_bank.json",
-            series_selection_audit=root / "simple_pipeline_outputs" / "series_selection_audit.csv",
-            series_selection_summary=root / "simple_pipeline_outputs" / "series_selection_summary.json",
             results_csv=root / "simple_pipeline_outputs" / "evaluation_summary.csv",
             predictions_dir=root / "simple_pipeline_outputs" / "oof_predictions",
         )
@@ -603,10 +573,6 @@ class FileManager:
                 digest.update(chunk)
         return digest.hexdigest()
 
-
-# =============================================================================
-# DEFINIȚII 3 — DESCOPERIREA DATASETULUI
-# =============================================================================
 
 class DatasetManager:
     """Descoperă imaginile și păstrează pacientul ca unitate statistică."""
@@ -756,10 +722,7 @@ class DatasetManager:
         ]
 
 
-# =============================================================================
-# DEFINIȚII 4 — PREPROCESAREA IMAGINILOR
-# =============================================================================
-
+# %% [2] PREPROCESAREA IMAGINILOR, CALITATE ȘI MĂȘTI MANUALE
 class ImageProcessor:
     """Transformări fără etichetă, identice pentru train, validare și test.
 
@@ -962,10 +925,6 @@ class ImageCache:
     def clear(cls) -> None:
         cls._cache.clear()
 
-
-# =============================================================================
-# DEFINIȚII 5 — AUDITUL CALITĂȚII ȘI AL MĂȘTILOR MANUALE
-# =============================================================================
 
 class QualityManager:
     """Calculează blur, zgomot și pHash fără a folosi eticheta CAD."""
@@ -1260,10 +1219,7 @@ class MaskManager:
         return accepted, summary
 
 
-# =============================================================================
-# DEFINIȚII 6 — ARHITECTURA ATTENTION U-NET
-# =============================================================================
-
+# %% [3] ATTENTION U-NET: ANTRENARE CROSS-FIT ȘI PREDICȚIA MĂȘTILOR
 class AttentionConvBlock(nn.Module):
     """Două convoluții. GroupNorm funcționează stabil și la batch-uri mici pe CPU."""
 
@@ -1421,10 +1377,6 @@ class SegmentationInferenceDataset(Dataset):
         image = ImageCache.get(self.rows[index]["image_path"]).astype(np.float32) / 255.0
         return torch.from_numpy(image).unsqueeze(0).float(), int(index)
 
-
-# =============================================================================
-# DEFINIȚII 7 — ANTRENAREA ȘI PREDICȚIA ATTENTION
-# =============================================================================
 
 class SegmentationManager:
     """Antrenează câte un model per fold și generează măști fără leakage."""
@@ -2244,10 +2196,7 @@ class SegmentationManager:
         return final_results
 
 
-# =============================================================================
-# DEFINIȚII 8 — ALEGEREA IMAGINILOR PENTRU REVIEW
-# =============================================================================
-
+# %% [4] SELECTAREA ȘI EDITAREA MANUALĂ A MĂȘTILOR
 class HammingBKTree:
     """Structură mică pentru a găsi rapid imagini cu pHash foarte apropiat."""
 
@@ -2521,10 +2470,6 @@ class ReviewManager:
         )
         FileManager.write_csv(workspace.review_history, history, ReviewManager.HISTORY_FIELDS)
 
-
-# =============================================================================
-# DEFINIȚII 9 — EDITORUL MANUAL
-# =============================================================================
 
 class MaskEditor:
     """Editor HTML5 compatibil Kaggle/JupyterLab, fără jupyter-matplotlib.
@@ -2943,10 +2888,7 @@ class MaskEditor:
         return self
 
 
-# =============================================================================
-# DEFINIȚII 10 — EXTRACTORUL FROZEN ȘI AGREGAREA PER PACIENT
-# =============================================================================
-
+# %% [5] FEATURE BANK ȘI CLASIFICAREA LA NIVEL DE PACIENT
 class FeatureDataset(Dataset):
     """Pregătește o singură dată imaginile și măștile necesare tuturor modurilor."""
 
@@ -3074,12 +3016,8 @@ class StreamingPatientPool:
         }
 
 
-# =============================================================================
-# DEFINIȚII 11 — CONSTRUIREA FEATURE BANK-ULUI
-# =============================================================================
-
 class FeatureManager:
-    """Extrage nouă reprezentări, inclusiv perechea series-selected AU10/AU11."""
+    """Extrage doar cele șapte reprezentări necesare și salvează vectori per pacient."""
 
     @staticmethod
     def _region_normalize(images: torch.Tensor, masks: torch.Tensor) -> torch.Tensor:
@@ -3136,245 +3074,18 @@ class FeatureManager:
         return (support > 0.5).float() * (content > 0.5).float()
 
     @staticmethod
-    def _natural_order_key(row: dict[str, Any]) -> tuple:
-        name = Path(row["image_path"]).name.lower()
-        return tuple(
-            (0, int(part)) if part.isdigit() else (1, part)
-            for part in re.split(r"(\d+)", name)
-            if part != ""
-        )
-
-    @staticmethod
-    def _longest_true_run(values: Sequence[bool]) -> int:
-        best = current = 0
-        for value in values:
-            if bool(value):
-                current += 1
-                best = max(best, current)
-            else:
-                current = 0
-        return int(best)
-
-    @staticmethod
-    def _mask_geometry(path: str | Path) -> tuple[float, float, float]:
-        mask = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
-        if mask is None:
-            return 0.0, np.nan, np.nan
-        mask = mask > 127
-        area = float(mask.mean())
-        if not mask.any():
-            return area, np.nan, np.nan
-        y, x = np.nonzero(mask)
-        return (
-            area,
-            float((x.mean() + 0.5) / mask.shape[1]),
-            float((y.mean() + 0.5) / mask.shape[0]),
-        )
-
-    @staticmethod
-    def build_series_selection(
-        rows: Sequence[dict[str, Any]], workspace: Workspace
-    ) -> dict[str, Any]:
-        """Selectează seriile fără etichete și salvează auditul complet."""
-
-        grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
-        for row in rows:
-            grouped[(str(row["patient_id"]), str(row["series_id"]))].append(row)
-
-        audit_rows = []
-        for (patient_id, series_id), series_rows in sorted(grouped.items()):
-            series_rows = sorted(series_rows, key=FeatureManager._natural_order_key)
-            quality = np.asarray([
-                _as_int(row.get("quality_valid"), 0) == 1 for row in series_rows
-            ], dtype=bool)
-            attention = np.asarray([
-                _as_int(row.get("attention_valid_final"), 0) == 1
-                for row in series_rows
-            ], dtype=bool)
-            joint = quality & attention
-            geometry = [
-                FeatureManager._mask_geometry(row["predicted_attention_mask_path"])
-                for row in series_rows
-            ]
-            areas = np.asarray([value[0] for value in geometry], dtype=np.float64)
-            centroids = np.asarray(
-                [[value[1], value[2]] for value in geometry], dtype=np.float64
-            )
-            centroid_jumps = []
-            log_area_jumps = []
-            for index in range(1, len(series_rows)):
-                if not (joint[index - 1] and joint[index]):
-                    continue
-                if np.all(np.isfinite(centroids[index - 1])) and np.all(
-                    np.isfinite(centroids[index])
-                ):
-                    centroid_jumps.append(
-                        float(np.linalg.norm(centroids[index] - centroids[index - 1]))
-                    )
-                if areas[index - 1] > 0 and areas[index] > 0:
-                    log_area_jumps.append(
-                        float(abs(math.log(areas[index] / areas[index - 1])))
-                    )
-
-            n_images = len(series_rows)
-            n_quality = int(quality.sum())
-            n_attention = int(attention.sum())
-            n_joint = int(joint.sum())
-            quality_fraction = n_quality / max(n_images, 1)
-            attention_fraction = n_attention / max(n_images, 1)
-            joint_fraction = n_joint / max(n_images, 1)
-            longest = FeatureManager._longest_true_run(joint)
-            longest_fraction = longest / max(n_images, 1)
-            centroid_jump = float(np.median(centroid_jumps)) if centroid_jumps else np.nan
-            log_area_jump = float(np.median(log_area_jumps)) if log_area_jumps else np.nan
-            centroid_score = math.exp(-centroid_jump / 0.15) if np.isfinite(centroid_jump) else 0.0
-            area_score = math.exp(-log_area_jump / 0.50) if np.isfinite(log_area_jump) else 0.0
-            score = float(
-                0.35 * joint_fraction
-                + 0.20 * quality_fraction
-                + 0.15 * attention_fraction
-                + 0.15 * longest_fraction
-                + 0.10 * centroid_score
-                + 0.05 * area_score
-            )
-
-            reasons = []
-            if n_images < Settings.Series.MIN_IMAGES:
-                reasons.append("too_few_images")
-            if quality_fraction < Settings.Series.MIN_QUALITY_VALID_FRACTION:
-                reasons.append("low_quality_valid_fraction")
-            if attention_fraction < Settings.Series.MIN_ATTENTION_VALID_FRACTION:
-                reasons.append("low_attention_valid_fraction")
-            if joint_fraction < Settings.Series.MIN_JOINT_VALID_FRACTION:
-                reasons.append("low_joint_valid_fraction")
-            if longest_fraction < Settings.Series.MIN_LONGEST_VALID_RUN_FRACTION:
-                reasons.append("short_contiguous_valid_run")
-            if np.isfinite(centroid_jump) and centroid_jump > Settings.Series.MAX_MEDIAN_CENTROID_JUMP:
-                reasons.append("centroid_discontinuity")
-            if np.isfinite(log_area_jump) and log_area_jump > Settings.Series.MAX_MEDIAN_LOG_AREA_JUMP:
-                reasons.append("area_discontinuity")
-
-            audit_rows.append({
-                "patient_id": patient_id,
-                "series_id": series_id,
-                "n_images": n_images,
-                "n_quality_valid": n_quality,
-                "n_attention_valid_final": n_attention,
-                "n_joint_valid": n_joint,
-                "quality_valid_fraction": quality_fraction,
-                "attention_valid_fraction": attention_fraction,
-                "joint_valid_fraction": joint_fraction,
-                "longest_joint_valid_run": longest,
-                "longest_joint_valid_run_fraction": longest_fraction,
-                "median_centroid_jump": centroid_jump,
-                "median_log_area_jump": log_area_jump,
-                "series_score": score,
-                "eligible": int(not reasons),
-                "selected": 0,
-                "selection_rank": "",
-                "patient_fallback": 0,
-                "rejection_reasons": ";".join(reasons),
-            })
-
-        by_patient: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        for row in audit_rows:
-            by_patient[row["patient_id"]].append(row)
-        selected_keys: set[tuple[str, str]] = set()
-        fallback_patients = []
-        for patient_id, patient_rows in sorted(by_patient.items()):
-            ordered = sorted(
-                patient_rows,
-                key=lambda row: (
-                    -int(row["eligible"]),
-                    -float(row["series_score"]),
-                    -int(row["n_joint_valid"]),
-                    -int(row["n_images"]),
-                    str(row["series_id"]),
-                ),
-            )
-            selected = [row for row in ordered if int(row["eligible"]) == 1][
-                : Settings.Series.MAX_SELECTED_PER_PATIENT
-            ]
-            if not selected and Settings.Series.ALLOW_PATIENT_FALLBACK:
-                candidates = [row for row in ordered if int(row["n_joint_valid"]) > 0]
-                if candidates:
-                    selected = candidates[:1]
-                    selected[0]["patient_fallback"] = 1
-                    fallback_patients.append(patient_id)
-            for rank, row in enumerate(selected, start=1):
-                row["selected"] = 1
-                row["selection_rank"] = rank
-                selected_keys.add((patient_id, str(row["series_id"])))
-
-        missing = sorted(set(by_patient) - {patient for patient, _series in selected_keys})
-        fields = (
-            "patient_id", "series_id", "n_images", "n_quality_valid",
-            "n_attention_valid_final", "n_joint_valid", "quality_valid_fraction",
-            "attention_valid_fraction", "joint_valid_fraction",
-            "longest_joint_valid_run", "longest_joint_valid_run_fraction",
-            "median_centroid_jump", "median_log_area_jump", "series_score",
-            "eligible", "selected", "selection_rank", "patient_fallback",
-            "rejection_reasons",
-        )
-        FileManager.write_csv(workspace.series_selection_audit, audit_rows, fields)
-        selected_slice_count = sum(
-            (str(row["patient_id"]), str(row["series_id"])) in selected_keys
-            and _as_int(row.get("quality_valid"), 0) == 1
-            and _as_int(row.get("attention_valid_final"), 0) == 1
-            for row in rows
-        )
-        summary = {
-            "status": "OK" if not missing else "INCOMPLETE_PATIENT_COVERAGE",
-            "schema": Settings.Series.SCHEMA,
-            "series_total": len(audit_rows),
-            "series_eligible": sum(int(row["eligible"]) for row in audit_rows),
-            "series_selected": len(selected_keys),
-            "selected_slice_count": int(selected_slice_count),
-            "patients_total": len(by_patient),
-            "patients_selected": len({patient for patient, _series in selected_keys}),
-            "fallback_patients": fallback_patients,
-            "missing_patients": missing,
-            "audit_csv": str(workspace.series_selection_audit),
-            "uses_labels": False,
-            "shared_inside_complement_rows": True,
-        }
-        FileManager.write_json(workspace.series_selection_summary, summary)
-        print(
-            "[SERII] selectate:", len(selected_keys), "/", len(audit_rows),
-            "serii; slice-uri:", selected_slice_count,
-            "fallback pacienți:", len(fallback_patients),
-        )
-        if missing:
-            raise RuntimeError(
-                "Selecția de serii a lăsat pacienți fără nicio serie utilizabilă: "
-                f"{missing}. Vezi {workspace.series_selection_audit}."
-            )
-        return {"selected_keys": selected_keys, "summary": summary}
-
-    @staticmethod
     def _feature_fingerprint(
         rows: Sequence[dict[str, Any]], workspace: Workspace
     ) -> str:
         prediction_summary = FileManager.read_json(workspace.prediction_summary, {}) or {}
         digest = hashlib.sha256()
         payload = {
-            "schema": "simple-patient-feature-bank-v3-series-selected",
+            "schema": "simple-patient-feature-bank-v2",
             "modes": Settings.Classification.MODES,
             "prediction_fingerprint": prediction_summary.get("fingerprint", ""),
             "support_dilation": Settings.Segmentation.SUPPORT_DILATION_KERNEL,
             "imagenet_weights": Settings.Classification.USE_IMAGENET_WEIGHTS,
             "classification_size": Settings.Image.CLASSIFICATION_SIZE,
-            "series_selection": {
-                "schema": Settings.Series.SCHEMA,
-                "min_images": Settings.Series.MIN_IMAGES,
-                "min_quality_valid_fraction": Settings.Series.MIN_QUALITY_VALID_FRACTION,
-                "min_attention_valid_fraction": Settings.Series.MIN_ATTENTION_VALID_FRACTION,
-                "min_joint_valid_fraction": Settings.Series.MIN_JOINT_VALID_FRACTION,
-                "min_longest_valid_run_fraction": Settings.Series.MIN_LONGEST_VALID_RUN_FRACTION,
-                "max_median_centroid_jump": Settings.Series.MAX_MEDIAN_CENTROID_JUMP,
-                "max_median_log_area_jump": Settings.Series.MAX_MEDIAN_LOG_AREA_JUMP,
-                "max_selected_per_patient": Settings.Series.MAX_SELECTED_PER_PATIENT,
-            },
             "quality_thresholds": {
                 "dynamic_range": Settings.Image.QUALITY_MIN_DYNAMIC_RANGE,
                 "laplacian_variance": Settings.Image.QUALITY_MIN_LAPLACIAN_VARIANCE,
@@ -3506,15 +3217,6 @@ class FeatureManager:
             )
             rows.append(row)
 
-        series_selection = FeatureManager.build_series_selection(rows, workspace)
-        selected_series_keys = set(series_selection["selected_keys"])
-        for row in rows:
-            row["keep_series_selected"] = int(
-                row["keep_attention"] == 1
-                and (str(row["patient_id"]), str(row["series_id"]))
-                in selected_series_keys
-            )
-
         extractor = RuntimeManager.prepare_model(FrozenEfficientNet(), device).eval()
         loader = DataLoader(
             FeatureDataset(rows),
@@ -3594,50 +3296,26 @@ class FeatureManager:
                     selected_rows = [
                         batch_rows[position] for position in attention_positions
                     ]
-                    attention_roi = FeatureManager._region_normalize(
-                        selected_raw, support
-                    )
-                    attention_complement = FeatureManager._region_normalize(
-                        selected_raw,
-                        (selected_content > 0.5).float() * (1.0 - support),
-                    )
                     groups.extend(
                         [
-                            ("AU1_ATTENTION_ROI", attention_roi, selected_rows),
+                            (
+                                "AU1_ATTENTION_ROI",
+                                FeatureManager._region_normalize(
+                                    selected_raw, support
+                                ),
+                                selected_rows,
+                            ),
                             (
                                 "AU5_ATTENTION_COMPLEMENT",
-                                attention_complement,
+                                FeatureManager._region_normalize(
+                                    selected_raw,
+                                    (selected_content > 0.5).float()
+                                    * (1.0 - support),
+                                ),
                                 selected_rows,
                             ),
                         ]
                     )
-                    selected_local = [
-                        local_index
-                        for local_index, row in enumerate(selected_rows)
-                        if row["keep_series_selected"] == 1
-                    ]
-                    if selected_local:
-                        local_tensor = torch.as_tensor(
-                            selected_local, dtype=torch.long
-                        )
-                        selected_series_rows = [
-                            selected_rows[local_index]
-                            for local_index in selected_local
-                        ]
-                        groups.extend(
-                            [
-                                (
-                                    "AU10_ATTENTION_LABEL_BLIND_SERIES_SELECTED_REGION_NORM",
-                                    attention_roi.index_select(0, local_tensor),
-                                    selected_series_rows,
-                                ),
-                                (
-                                    "AU11_ATTENTION_LABEL_BLIND_SERIES_SELECTED_COMPLEMENT_REGION_NORM",
-                                    attention_complement.index_select(0, local_tensor),
-                                    selected_series_rows,
-                                ),
-                            ]
-                        )
 
                 manual_positions = [
                     position
@@ -3732,7 +3410,6 @@ class FeatureManager:
             "preprocessing_device": "cpu",
             "extractor_device": device.type,
             "modes": metadata_modes,
-            "series_selection": series_selection["summary"],
             "elapsed": RuntimeManager.format_seconds(
                 time.perf_counter() - started
             ),
@@ -3744,10 +3421,6 @@ class FeatureManager:
         RuntimeManager.release(device)
         return bank
 
-
-# =============================================================================
-# DEFINIȚII 12 — EVALUAREA LA NIVEL DE PACIENT
-# =============================================================================
 
 class EvaluationManager:
     """Nested CV simplificat: toate transformările sunt învățate numai pe train."""
@@ -3961,21 +3634,6 @@ class EvaluationManager:
             ("AU1_ATTENTION_ROI", "AU5_ATTENTION_COMPLEMENT", "heart_roi_vs_outside"),
             ("AU6_MANUAL_ROI", "AU8_ATTENTION_MATCHED_MANUAL_ROI", "manual_vs_attention_same_images"),
             ("AU7_MANUAL_COMPLEMENT", "AU9_ATTENTION_MATCHED_MANUAL_COMPLEMENT", "manual_vs_attention_complement_same_images"),
-            (
-                "AU10_ATTENTION_LABEL_BLIND_SERIES_SELECTED_REGION_NORM",
-                "AU11_ATTENTION_LABEL_BLIND_SERIES_SELECTED_COMPLEMENT_REGION_NORM",
-                "series_selected_inside_vs_complement",
-            ),
-            (
-                "AU10_ATTENTION_LABEL_BLIND_SERIES_SELECTED_REGION_NORM",
-                "AU1_ATTENTION_ROI",
-                "series_selection_effect_on_inside",
-            ),
-            (
-                "AU11_ATTENTION_LABEL_BLIND_SERIES_SELECTED_COMPLEMENT_REGION_NORM",
-                "AU5_ATTENTION_COMPLEMENT",
-                "series_selection_effect_on_complement",
-            ),
         ):
             comparison = EvaluationManager._paired_auc_difference(
                 prediction_tables[first_mode],
@@ -3998,10 +3656,7 @@ class EvaluationManager:
         return summary
 
 
-# =============================================================================
-# DEFINIȚII 13 — INTERFAȚA PIPELINE-ULUI
-# =============================================================================
-
+# %% [6] FAȚADA PIPELINE-ULUI
 class CADPipeline:
     """Interfață simplă: CPU implicit, dispozitiv explicit pentru deep learning.
 
@@ -4269,260 +3924,3 @@ class CADPipeline:
 RuntimeManager.seed_everything(include_cuda=False)
 print("[PIPELINE] Clasele au fost încărcate fără inițializarea CUDA.")
 print("[PIPELINE] CPU este implicit; device='cuda' se dă numai etapei dorite.")
-
-
-# =============================================================================
-# FUNCȚII DE RULARE — ECHIVALENTE CELULELOR DIN NOTEBOOK
-# =============================================================================
-
-def create_pipeline(
-    dataset_path: Path | str | None = None,
-    workspace_root: Path | str | None = None,
-    attention_device: str = "cuda",
-    feature_device: str = "cpu",
-) -> CADPipeline:
-    """Creează pipeline-ul fără să inițializeze CUDA."""
-
-    return CADPipeline(
-        dataset_path=dataset_path,
-        workspace_root=workspace_root,
-        attention_device=attention_device,
-        feature_device=feature_device,
-    )
-
-
-def run_prepare(pipeline: CADPipeline) -> list[dict[str, Any]]:
-    """CPU: construiește manifestul și afișează starea workspace-ului."""
-
-    dataset_rows = pipeline.prepare()
-    pipeline.status()
-    return dataset_rows
-
-
-def run_audit(
-    pipeline: CADPipeline,
-    refresh: bool = False,
-    minimum_masks: int | None = None,
-) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
-    """CPU: auditul imaginilor și al măștilor manuale."""
-
-    quality_by_token = pipeline.audit_quality(refresh=refresh)
-    accepted_manual_masks, manual_summary = pipeline.audit_manual_masks(
-        refresh_quality=False,
-        minimum_masks=minimum_masks,
-    )
-    print(json.dumps(manual_summary, indent=2, ensure_ascii=False))
-    return quality_by_token, accepted_manual_masks, manual_summary
-
-
-def run_attention_training(
-    pipeline: CADPipeline,
-    force: bool = False,
-    minimum_masks: int | None = None,
-    refresh_quality: bool = False,
-    device: str | None = None,
-) -> dict[int, Path]:
-    """CPU/GPU: antrenează Attention U-Net pe dispozitivul ales."""
-
-    return pipeline.train_attention(
-        force=force,
-        minimum_masks=minimum_masks,
-        refresh_quality=refresh_quality,
-        device=device,
-    )
-
-
-def run_attention_prediction(
-    pipeline: CADPipeline,
-    force: bool = False,
-    device: str | None = None,
-) -> list[dict[str, Any]]:
-    """CPU/GPU: generează măștile Attention și returnează auditul predicțiilor."""
-
-    predictions = pipeline.generate_attention_masks(force=force, device=device)
-    print("Predicții Attention:", len(predictions))
-    return predictions
-
-
-def run_invalid_review(
-    pipeline: CADPipeline,
-    limit: int = 300,
-    start_index: int = 0,
-    review_round: int = 1,
-) -> MaskEditor | None:
-    """CPU/Jupyter: deschide editorul pentru predicțiile invalide."""
-
-    invalid_rows = FileManager.read_csv(pipeline.workspace.invalid_predictions)
-    print("Predicții invalide:", len(invalid_rows))
-    if not invalid_rows:
-        print("Nu există predicții invalide de corectat.")
-        return None
-    return pipeline.open_editor(
-        scope="invalid",
-        limit=limit,
-        start_index=start_index,
-        review_round=review_round,
-    )
-
-
-def run_novel_review(
-    pipeline: CADPipeline,
-    limit: int = 300,
-    start_index: int = 0,
-    review_round: int = 2,
-) -> MaskEditor:
-    """CPU/Jupyter: alege imagini noi și diverse pentru măști manuale."""
-
-    return pipeline.open_editor(
-        scope="novel",
-        limit=limit,
-        start_index=start_index,
-        review_round=review_round,
-    )
-
-
-def run_retrain_after_review(
-    pipeline: CADPipeline,
-    device: str | None = None,
-) -> tuple[dict[int, Path], list[dict[str, Any]]]:
-    """CPU/GPU: reantrenează Attention și regenerează toate predicțiile."""
-
-    checkpoints = pipeline.train_attention(force=True, device=device)
-    predictions = pipeline.generate_attention_masks(force=True, device=device)
-    return checkpoints, predictions
-
-
-def run_feature_bank(
-    pipeline: CADPipeline,
-    force: bool = False,
-    device: str | None = None,
-) -> dict[str, dict[str, Any]]:
-    """CPU/GPU: construiește feature bank-ul; implicit folosește CPU."""
-
-    feature_bank = pipeline.build_feature_bank(force=force, device=device)
-    summary = {
-        mode: {
-            "patients": len(values["patient_ids"]),
-            "source_slices": values["source_slices"],
-            "series_proxies": values["series_proxies"],
-        }
-        for mode, values in feature_bank.items()
-    }
-    print(json.dumps(summary, indent=2, ensure_ascii=False))
-    return feature_bank
-
-
-def run_evaluation(pipeline: CADPipeline) -> pd.DataFrame:
-    """CPU: rulează evaluarea finală AU1–AU11."""
-
-    results = pipeline.evaluate()
-    print(results.to_string(index=False))
-    return results
-
-
-def run_status_and_backup(
-    pipeline: CADPipeline,
-    backup_name: str = "cad_attention_workspace_backup",
-) -> Path:
-    """CPU: afișează statusul și creează arhiva workspace-ului."""
-
-    pipeline.status()
-    return pipeline.backup(backup_name)
-
-
-def main() -> None:
-    """Interfață simplă pentru rularea unei singure etape din terminal."""
-
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description=(
-            "Pipeline CAD cardiac MRI. Fiecare apel execută o singură etapă, "
-            "pentru a păstra CPU și GPU separate."
-        )
-    )
-    parser.add_argument(
-        "stage",
-        nargs="?",
-        default="status",
-        choices=[
-            "prepare",
-            "audit",
-            "train",
-            "predict",
-            "review-invalid",
-            "review-novel",
-            "retrain",
-            "features",
-            "evaluate",
-            "status",
-            "backup",
-        ],
-    )
-    parser.add_argument("--dataset-path", default=None)
-    parser.add_argument("--workspace-root", default=None)
-    parser.add_argument("--attention-device", default="cuda", choices=["auto", "cpu", "cuda"])
-    parser.add_argument("--feature-device", default="cpu", choices=["auto", "cpu", "cuda"])
-    parser.add_argument("--device", default=None, choices=["auto", "cpu", "cuda"])
-    parser.add_argument("--force", action="store_true")
-    parser.add_argument("--refresh-quality", action="store_true")
-    parser.add_argument("--minimum-masks", type=int, default=None)
-    parser.add_argument("--limit", type=int, default=300)
-    parser.add_argument("--start-index", type=int, default=0)
-    parser.add_argument("--review-round", type=int, default=None)
-    parser.add_argument("--backup-name", default="cad_attention_workspace_backup")
-    args = parser.parse_args()
-
-    pipeline = create_pipeline(
-        dataset_path=args.dataset_path,
-        workspace_root=args.workspace_root,
-        attention_device=args.attention_device,
-        feature_device=args.feature_device,
-    )
-
-    if args.stage == "prepare":
-        run_prepare(pipeline)
-    elif args.stage == "audit":
-        run_audit(
-            pipeline,
-            refresh=args.refresh_quality,
-            minimum_masks=args.minimum_masks,
-        )
-    elif args.stage == "train":
-        run_attention_training(
-            pipeline,
-            force=args.force,
-            minimum_masks=args.minimum_masks,
-            refresh_quality=args.refresh_quality,
-            device=args.device,
-        )
-    elif args.stage == "predict":
-        run_attention_prediction(pipeline, force=args.force, device=args.device)
-    elif args.stage == "review-invalid":
-        run_invalid_review(
-            pipeline,
-            limit=args.limit,
-            start_index=args.start_index,
-            review_round=args.review_round or 1,
-        )
-    elif args.stage == "review-novel":
-        run_novel_review(
-            pipeline,
-            limit=args.limit,
-            start_index=args.start_index,
-            review_round=args.review_round or 2,
-        )
-    elif args.stage == "retrain":
-        run_retrain_after_review(pipeline, device=args.device)
-    elif args.stage == "features":
-        run_feature_bank(pipeline, force=args.force, device=args.device)
-    elif args.stage == "evaluate":
-        run_evaluation(pipeline)
-    elif args.stage == "backup":
-        run_status_and_backup(pipeline, backup_name=args.backup_name)
-    else:
-        pipeline.status()
-
-
-if __name__ == "__main__":
-    main()
