@@ -2877,7 +2877,8 @@ class MaskEditor:
     """Editor HTML5 compatibil Kaggle/JupyterLab, fără jupyter-matplotlib.
 
     Portocaliu = predicția automată. Magenta = masca editabilă. Click stânga
-    desenează, click dreapta șterge. `Save+Next` scrie masca manuală atomic.
+    desenează, click dreapta șterge. `Save & Next` scrie masca manuală atomic.
+    Shortcut-urile sunt instalate o singură dată, nu la fiecare imagine.
     """
 
     def __init__(
@@ -2904,6 +2905,9 @@ class MaskEditor:
         self.base_mask: np.ndarray | None = None
         self.mask: np.ndarray | None = None
         self.widget_id = uuid.uuid4().hex[:12]
+        self._shortcut_busy = False
+        self._last_shortcut_payload = ""
+        self._last_shortcut_at = 0.0
 
         self.output = widgets.Output()
         self.mask_sync = widgets.Textarea(
@@ -2911,57 +2915,47 @@ class MaskEditor:
             placeholder=f"CAD_MASK_SYNC_{self.widget_id}",
             layout=widgets.Layout(width="1px", height="1px", display="none"),
         )
-        button_layout_small = widgets.Layout(width="82px", height="30px")
-        button_layout_medium = widgets.Layout(width="96px", height="30px")
-        button_layout_wide = widgets.Layout(width="108px", height="30px")
+        self.shortcut_sync = widgets.Textarea(
+            value="",
+            placeholder=f"CAD_SHORTCUT_SYNC_{self.widget_id}",
+            layout=widgets.Layout(width="1px", height="1px", display="none"),
+        )
 
-        self.previous_button = widgets.Button(
-            description="Prev",
-            tooltip="Shortcut: P",
-            layout=button_layout_small,
+        def compact_button(
+            description: str,
+            width: str,
+            tooltip: str,
+            button_style: str = "",
+        ):
+            return widgets.Button(
+                description=description,
+                tooltip=tooltip,
+                button_style=button_style,
+                layout=widgets.Layout(width=width, height="29px"),
+                style={"font_weight": "500"},
+            )
+
+        # Etichetele includ shortcut-ul. În plus, ele sunt intenționat diferite
+        # de vechile "Next"/"Previous", astfel încât listener-ele anonime rămase
+        # dintr-o versiune veche a notebook-ului nu mai pot apăsa aceste butoane.
+        self.previous_button = compact_button("← Prev [P]", "78px", "Previous — P")
+        self.next_button = compact_button("Next [N] →", "82px", "Next — N")
+        self.save_next_button = compact_button(
+            "Save & Next [S]", "112px", "Save manual mask and go next — S", "success"
         )
-        self.next_button = widgets.Button(
-            description="Next",
-            tooltip="Shortcut: N",
-            layout=button_layout_small,
+        self.raw_button = compact_button(
+            "Reset to image [I]", "120px", "Hide overlays and start from the image — I"
         )
-        self.save_next_button = widgets.Button(
-            description="Save+Next",
-            button_style="success",
-            tooltip="Shortcut: S",
-            layout=button_layout_wide,
+        self.reset_button = compact_button(
+            "Reset to auto [R]", "114px", "Restore the automatic mask — R"
         )
-        self.raw_button = widgets.Button(
-            description="Reset img",
-            tooltip="Shortcut: I",
-            layout=button_layout_medium,
+        self.accept_button = compact_button(
+            "Auto OK [A]", "92px", "Accept auto for review only — A", "info"
         )
-        self.reset_button = widgets.Button(
-            description="Reset auto",
-            tooltip="Shortcut: R",
-            layout=button_layout_medium,
-        )
-        self.accept_button = widgets.Button(
-            description="Auto OK",
-            button_style="info",
-            tooltip="Shortcut: A",
-            layout=button_layout_medium,
-        )
-        self.skip_button = widgets.Button(
-            description="Skip",
-            tooltip="Shortcut: K",
-            layout=button_layout_small,
-        )
-        self.clear_button = widgets.Button(
-            description="Clear",
-            tooltip="Shortcut: C",
-            layout=button_layout_small,
-        )
-        self.delete_button = widgets.Button(
-            description="Delete",
-            button_style="warning",
-            tooltip="Shortcut: D",
-            layout=button_layout_small,
+        self.skip_button = compact_button("Skip [K]", "76px", "Skip and go next — K")
+        self.clear_button = compact_button("Clear [C]", "78px", "Clear editable mask — C")
+        self.delete_button = compact_button(
+            "Delete [D]", "84px", "Delete existing manual mask — D", "warning"
         )
         self.brush_slider = widgets.IntSlider(
             description="Brush",
@@ -2969,6 +2963,7 @@ class MaskEditor:
             min=1,
             max=30,
             step=1,
+            continuous_update=False,
             layout=widgets.Layout(width="260px"),
         )
         self.status = widgets.HTML()
@@ -2984,6 +2979,7 @@ class MaskEditor:
         self.delete_button.on_click(lambda _: self._safe("Delete manual", self.delete_manual))
         self.brush_slider.observe(self._brush_changed, names="value")
         self.mask_sync.observe(self._mask_sync_changed, names="value")
+        self.shortcut_sync.observe(self._shortcut_sync_changed, names="value")
 
         self.controls = widgets.VBox(
             [
@@ -3008,6 +3004,7 @@ class MaskEditor:
                 ),
                 widgets.HBox([self.brush_slider, self.status]),
                 self.mask_sync,
+                self.shortcut_sync,
                 self.output,
             ]
         )
@@ -3079,9 +3076,10 @@ class MaskEditor:
           <canvas id="{canvas_id}" width="{size * 3}" height="{size * 3}"
                   style="width:768px;height:768px;max-width:100%;border:1px solid #999;
                          cursor:crosshair;touch-action:none;user-select:none"></canvas>
-          <div style="font-size:12px;margin-top:5px;line-height:1.35">
-            Left drag = draw | Right drag = erase | S = Save+Next | P = Prev | N = Next |
-            I = Reset image | R = Reset auto | A = Auto OK | K = Skip | C = Clear | D = Delete | [ / ] = Brush -/+
+          <div style="font-size:12px;margin-top:5px;line-height:1.4">
+            Left drag = draw | Right drag = erase | S = Save & Next | P/N = Prev/Next |
+            I = Reset to image | R = Reset to auto | A = Auto OK | K = Skip |
+            C = Clear | D = Delete | [ / ] = Brush −/+
           </div>
         </div>
         """
@@ -3169,86 +3167,6 @@ class MaskEditor:
           canvas.addEventListener('mousedown', begin, true);
           canvas.addEventListener('mousemove', move, true);
           canvas.addEventListener('mouseup', finish, true);
-
-          window.__cadMaskEditorBindings = window.__cadMaskEditorBindings || {{}};
-          if (window.__cadMaskEditorBindings[{json.dumps(self.widget_id)}]) {{
-            const oldBinding = window.__cadMaskEditorBindings[{json.dumps(self.widget_id)}];
-            if (oldBinding.keydown) window.removeEventListener('keydown', oldBinding.keydown, true);
-            if (oldBinding.keyup) window.removeEventListener('keyup', oldBinding.keyup, true);
-          }}
-
-          const pressedKeys = new Set();
-          function isTypingTarget(target) {{
-            if (!target) return false;
-            const tag = (target.tagName || '').toLowerCase();
-            return tag === 'input' || tag === 'textarea' || tag === 'select' || !!target.isContentEditable;
-          }}
-          function allButtons() {{
-            return Array.from(document.querySelectorAll('button'));
-          }}
-          function buttonByText(labels) {{
-            const normalized = labels.map(x => x.trim().toLowerCase());
-            return allButtons().find(x => normalized.includes((x.innerText || '').trim().toLowerCase()));
-          }}
-          function sliderByDescription(label) {{
-            const containers = Array.from(document.querySelectorAll('.widget-int-slider, .jupyter-widget.widget-slider'));
-            for (const node of containers) {{
-              const text = (node.innerText || '').toLowerCase();
-              if (text.includes(label.toLowerCase())) {{
-                const input = node.querySelector('input[type="range"]');
-                if (input) return input;
-              }}
-            }}
-            return document.querySelector('input[type="range"]');
-          }}
-          function changeBrush(delta) {{
-            const slider = sliderByDescription('brush');
-            if (!slider) return;
-            const step = Number(slider.step || 1) || 1;
-            const minValue = Number(slider.min || 1);
-            const maxValue = Number(slider.max || 30);
-            const currentValue = Number(slider.value || 0);
-            const nextValue = Math.max(minValue, Math.min(maxValue, currentValue + delta * step));
-            if (nextValue === currentValue) return;
-            slider.value = String(nextValue);
-            slider.dispatchEvent(new Event('input', {{bubbles:true}}));
-            slider.dispatchEvent(new Event('change', {{bubbles:true}}));
-          }}
-          const shortcutActions = {{
-            'p': () => buttonByText(['Prev', 'Previous'])?.click(),
-            'n': () => buttonByText(['Next'])?.click(),
-            's': () => buttonByText(['Save+Next', 'Save & Next'])?.click(),
-            'i': () => buttonByText(['Reset img', 'Reset to image'])?.click(),
-            'r': () => buttonByText(['Reset auto', 'Reset to auto'])?.click(),
-            'a': () => buttonByText(['Auto OK', 'Auto OK (not training)'])?.click(),
-            'k': () => buttonByText(['Skip', 'Skip & Next'])?.click(),
-            'c': () => buttonByText(['Clear'])?.click(),
-            'd': () => buttonByText(['Delete', 'Delete manual'])?.click(),
-            '[': () => changeBrush(-1),
-            ']': () => changeBrush(1),
-          }};
-          const onKeyDown = e => {{
-            const k = (e.key || '').toLowerCase();
-            if (!k || e.ctrlKey || e.metaKey || e.altKey || isTypingTarget(e.target)) return;
-            if (!(k in shortcutActions)) return;
-            if (e.repeat || pressedKeys.has(k)) {{
-              e.preventDefault();
-              return;
-            }}
-            pressedKeys.add(k);
-            e.preventDefault();
-            shortcutActions[k]();
-          }};
-          const onKeyUp = e => {{
-            const k = (e.key || '').toLowerCase();
-            pressedKeys.delete(k);
-          }};
-          window.addEventListener('keydown', onKeyDown, true);
-          window.addEventListener('keyup', onKeyUp, true);
-          window.__cadMaskEditorBindings[{json.dumps(self.widget_id)}] = {{
-            keydown: onKeyDown,
-            keyup: onKeyUp,
-          }};
           function load(target, source) {{
             return new Promise((resolve, reject) => {{ target.onload = resolve; target.onerror = reject; target.src = source; }});
           }}
@@ -3263,6 +3181,185 @@ class MaskEditor:
             clear_output(wait=True)
             display(HTML(html))
             display(Javascript(js))
+
+    def _shortcut_script(self) -> str:
+        """Instalează un singur handler global pentru editorul activ.
+
+        Handlerul este separat de ``render()``. Navigarea poate reda canvasul de
+        sute de ori fără să mai adauge listeners. Evenimentele sunt trimise
+        Python-ului printr-un textarea ascuns, nu prin căutarea butoanelor după
+        text. Capture + stopImmediatePropagation neutralizează și listeners
+        anonimi rămași din versiuni vechi în aceeași sesiune Kaggle.
+        """
+
+        placeholder = f"CAD_SHORTCUT_SYNC_{self.widget_id}"
+        controller_key = "__cadMaskEditorKeyboardController"
+        return f"""
+        (() => {{
+          const controllerKey = {json.dumps(controller_key)};
+          const editorId = {json.dumps(self.widget_id)};
+          const placeholder = {json.dumps(placeholder)};
+
+          const oldController = window[controllerKey];
+          if (oldController && typeof oldController.dispose === 'function') {{
+            try {{ oldController.dispose(); }} catch (_) {{}}
+          }}
+
+          const held = new Set();
+          const lastFire = new Map();
+          let serial = 0;
+          const minimumGapMs = 220;
+
+          function commandTarget() {{
+            return Array.from(document.querySelectorAll('textarea'))
+              .find(node => node.placeholder === placeholder) || null;
+          }}
+
+          function isTypingTarget(target) {{
+            if (!target) return false;
+            const tag = String(target.tagName || '').toLowerCase();
+            return tag === 'input' || tag === 'textarea' || tag === 'select' ||
+                   target.isContentEditable === true;
+          }}
+
+          function normalizeCode(event) {{
+            const code = String(event.code || '');
+            if (code) return code;
+            const key = String(event.key || '').toLowerCase();
+            const fallback = {{
+              p: 'KeyP', n: 'KeyN', s: 'KeyS', i: 'KeyI', r: 'KeyR',
+              a: 'KeyA', k: 'KeyK', c: 'KeyC', d: 'KeyD',
+              '[': 'BracketLeft', ']': 'BracketRight'
+            }};
+            return fallback[key] || '';
+          }}
+
+          const actions = {{
+            KeyP: 'previous',
+            KeyN: 'next',
+            KeyS: 'save_next',
+            KeyI: 'reset_image',
+            KeyR: 'reset_auto',
+            KeyA: 'accept_auto',
+            KeyK: 'skip',
+            KeyC: 'clear',
+            KeyD: 'delete',
+            BracketLeft: 'brush_down',
+            BracketRight: 'brush_up',
+          }};
+
+          function blockEvent(event) {{
+            event.preventDefault();
+            event.stopPropagation();
+            if (typeof event.stopImmediatePropagation === 'function') {{
+              event.stopImmediatePropagation();
+            }}
+          }}
+
+          function onKeyDown(event) {{
+            const code = normalizeCode(event);
+            const action = actions[code];
+            if (!action || event.ctrlKey || event.metaKey || event.altKey ||
+                isTypingTarget(event.target)) return;
+
+            // Blochează listeners vechi chiar și atunci când browserul trimite
+            // auto-repeat. O apăsare fizică poate produce cel mult o comandă.
+            blockEvent(event);
+            if (event.repeat || held.has(code)) return;
+
+            const now = performance.now();
+            const previous = lastFire.get(code) || -Infinity;
+            if (now - previous < minimumGapMs) return;
+
+            const target = commandTarget();
+            if (!target) return;
+            held.add(code);
+            lastFire.set(code, now);
+            serial += 1;
+            target.value = `${{action}}|${{Date.now()}}|${{serial}}`;
+            target.dispatchEvent(new Event('input', {{bubbles: true}}));
+            target.dispatchEvent(new Event('change', {{bubbles: true}}));
+          }}
+
+          function onKeyUp(event) {{
+            const code = normalizeCode(event);
+            if (code in actions) held.delete(code);
+          }}
+
+          function releaseAll() {{ held.clear(); }}
+
+          // Capture pe document rulează înaintea vechilor listeners de tip
+          // window/bubble și le împiedică să apese Next/Previous de mai multe ori.
+          document.addEventListener('keydown', onKeyDown, true);
+          document.addEventListener('keyup', onKeyUp, true);
+          window.addEventListener('blur', releaseAll, true);
+          document.addEventListener('visibilitychange', releaseAll, true);
+
+          window[controllerKey] = {{
+            editorId,
+            dispose: () => {{
+              document.removeEventListener('keydown', onKeyDown, true);
+              document.removeEventListener('keyup', onKeyUp, true);
+              window.removeEventListener('blur', releaseAll, true);
+              document.removeEventListener('visibilitychange', releaseAll, true);
+              held.clear();
+            }}
+          }};
+        }})();
+        """
+
+    def _shortcut_sync_changed(self, change: dict[str, Any]) -> None:
+        """Execută cel mult o acțiune Python pentru fiecare comandă JS."""
+
+        payload = str(change.get("new", "") or "").strip()
+        if not payload or payload == self._last_shortcut_payload:
+            return
+        self._last_shortcut_payload = payload
+        action = payload.split("|", 1)[0].strip().lower()
+
+        # A doua protecție, în Python, pentru mesaje duplicate livrate de frontend.
+        now = time.monotonic()
+        if self._shortcut_busy or now - self._last_shortcut_at < 0.12:
+            return
+
+        actions = {
+            "previous": ("Previous", self.previous),
+            "next": ("Next", self.next),
+            "save_next": ("Save & Next", self.save_next),
+            "reset_image": ("Reset to image", self.reset_to_image),
+            "reset_auto": ("Reset to auto", self.reset_to_auto),
+            "accept_auto": ("Auto OK", self.accept_auto),
+            "skip": ("Skip", self.skip),
+            "clear": ("Clear", self.clear_editable),
+            "delete": ("Delete manual", self.delete_manual),
+            "brush_down": (
+                "Brush -",
+                lambda: setattr(
+                    self.brush_slider,
+                    "value",
+                    max(self.brush_slider.min, self.brush_slider.value - self.brush_slider.step),
+                ),
+            ),
+            "brush_up": (
+                "Brush +",
+                lambda: setattr(
+                    self.brush_slider,
+                    "value",
+                    min(self.brush_slider.max, self.brush_slider.value + self.brush_slider.step),
+                ),
+            ),
+        }
+        selected = actions.get(action)
+        if selected is None:
+            return
+
+        self._shortcut_busy = True
+        self._last_shortcut_at = now
+        try:
+            label, function = selected
+            self._safe(label, function)
+        finally:
+            self._shortcut_busy = False
 
     def _mask_sync_changed(self, change: dict[str, Any]) -> None:
         value = change.get("new", "")
@@ -3417,6 +3514,7 @@ class MaskEditor:
 
     def show(self):
         display(self.controls)
+        display(Javascript(self._shortcut_script()))
         return self
 
 
