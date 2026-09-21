@@ -1,4 +1,6 @@
-# %% [1] IMPORTURI ȘI SETĂRI
+# =============================================================================
+# DEFINIȚII 1 — IMPORTURI ȘI SETĂRI
+# =============================================================================
 """Pipeline simplificat pentru clasificarea CAD din imagini cardiac MRI.
 
 Ideea centrală:
@@ -256,6 +258,9 @@ class Settings:
     Review = ReviewSettings
 
 
+# =============================================================================
+# DEFINIȚII 2 — RUNTIME, TIPURI DE DATE ȘI FIȘIERE
+# =============================================================================
 class RuntimeManager:
     """Pornește un dispozitiv numai pentru etapa care îl solicită explicit.
 
@@ -574,6 +579,9 @@ class FileManager:
         return digest.hexdigest()
 
 
+# =============================================================================
+# DEFINIȚII 3 — DESCOPERIREA DATASETULUI
+# =============================================================================
 class DatasetManager:
     """Descoperă imaginile și păstrează pacientul ca unitate statistică."""
 
@@ -722,7 +730,9 @@ class DatasetManager:
         ]
 
 
-# %% [2] PREPROCESAREA IMAGINILOR, CALITATE ȘI MĂȘTI MANUALE
+# =============================================================================
+# DEFINIȚII 4 — PREPROCESAREA IMAGINILOR
+# =============================================================================
 class ImageProcessor:
     """Transformări fără etichetă, identice pentru train, validare și test.
 
@@ -926,6 +936,9 @@ class ImageCache:
         cls._cache.clear()
 
 
+# =============================================================================
+# DEFINIȚII 5 — AUDITUL CALITĂȚII ȘI AL MĂȘTILOR MANUALE
+# =============================================================================
 class QualityManager:
     """Calculează blur, zgomot și pHash fără a folosi eticheta CAD."""
 
@@ -1219,7 +1232,9 @@ class MaskManager:
         return accepted, summary
 
 
-# %% [3] ATTENTION U-NET: ANTRENARE CROSS-FIT ȘI PREDICȚIA MĂȘTILOR
+# =============================================================================
+# DEFINIȚII 6 — ARHITECTURA ATTENTION U-NET
+# =============================================================================
 class AttentionConvBlock(nn.Module):
     """Două convoluții. GroupNorm funcționează stabil și la batch-uri mici pe CPU."""
 
@@ -1378,6 +1393,9 @@ class SegmentationInferenceDataset(Dataset):
         return torch.from_numpy(image).unsqueeze(0).float(), int(index)
 
 
+# =============================================================================
+# DEFINIȚII 7 — ANTRENAREA ȘI PREDICȚIA ATTENTION
+# =============================================================================
 class SegmentationManager:
     """Antrenează câte un model per fold și generează măști fără leakage."""
 
@@ -2196,7 +2214,9 @@ class SegmentationManager:
         return final_results
 
 
-# %% [4] SELECTAREA ȘI EDITAREA MANUALĂ A MĂȘTILOR
+# =============================================================================
+# DEFINIȚII 8 — ALEGEREA IMAGINILOR PENTRU REVIEW
+# =============================================================================
 class HammingBKTree:
     """Structură mică pentru a găsi rapid imagini cu pHash foarte apropiat."""
 
@@ -2471,6 +2491,9 @@ class ReviewManager:
         FileManager.write_csv(workspace.review_history, history, ReviewManager.HISTORY_FIELDS)
 
 
+# =============================================================================
+# DEFINIȚII 9 — EDITORUL MANUAL
+# =============================================================================
 class MaskEditor:
     """Editor HTML5 compatibil Kaggle/JupyterLab, fără jupyter-matplotlib.
 
@@ -2888,7 +2911,9 @@ class MaskEditor:
         return self
 
 
-# %% [5] FEATURE BANK ȘI CLASIFICAREA LA NIVEL DE PACIENT
+# =============================================================================
+# DEFINIȚII 10 — EXTRACTORUL FROZEN ȘI AGREGAREA PER PACIENT
+# =============================================================================
 class FeatureDataset(Dataset):
     """Pregătește o singură dată imaginile și măștile necesare tuturor modurilor."""
 
@@ -3016,6 +3041,9 @@ class StreamingPatientPool:
         }
 
 
+# =============================================================================
+# DEFINIȚII 11 — CONSTRUIREA FEATURE BANK-ULUI
+# =============================================================================
 class FeatureManager:
     """Extrage doar cele șapte reprezentări necesare și salvează vectori per pacient."""
 
@@ -3422,6 +3450,9 @@ class FeatureManager:
         return bank
 
 
+# =============================================================================
+# DEFINIȚII 12 — EVALUAREA LA NIVEL DE PACIENT
+# =============================================================================
 class EvaluationManager:
     """Nested CV simplificat: toate transformările sunt învățate numai pe train."""
 
@@ -3656,7 +3687,9 @@ class EvaluationManager:
         return summary
 
 
-# %% [6] FAȚADA PIPELINE-ULUI
+# =============================================================================
+# DEFINIȚII 13 — INTERFAȚA PIPELINE-ULUI
+# =============================================================================
 class CADPipeline:
     """Interfață simplă: CPU implicit, dispozitiv explicit pentru deep learning.
 
@@ -3924,3 +3957,264 @@ class CADPipeline:
 RuntimeManager.seed_everything(include_cuda=False)
 print("[PIPELINE] Clasele au fost încărcate fără inițializarea CUDA.")
 print("[PIPELINE] CPU este implicit; device='cuda' se dă numai etapei dorite.")
+
+
+# =============================================================================
+# FUNCȚII DE RULARE — ECHIVALENTE CELULELOR SEPARATE DIN NOTEBOOK
+# =============================================================================
+def create_pipeline(
+    dataset_path: Path | str | None = None,
+    workspace_root: Path | str | None = None,
+    attention_device: str = "cuda",
+    feature_device: str = "cpu",
+) -> CADPipeline:
+    """Creează pipeline-ul fără să inițializeze CUDA."""
+
+    return CADPipeline(
+        dataset_path=dataset_path,
+        workspace_root=workspace_root,
+        attention_device=attention_device,
+        feature_device=feature_device,
+    )
+
+
+def run_prepare(pipeline: CADPipeline) -> list[dict[str, Any]]:
+    """Etapa 0, CPU: construiește manifestul și afișează starea workspace-ului."""
+
+    dataset_rows = pipeline.prepare()
+    pipeline.status()
+    return dataset_rows
+
+
+def run_audit(
+    pipeline: CADPipeline,
+    refresh: bool = False,
+    minimum_masks: int | None = None,
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    """Etapa 1, CPU: auditul imaginilor și al măștilor manuale."""
+
+    quality_by_token = pipeline.audit_quality(refresh=refresh)
+    accepted_manual_masks, manual_summary = pipeline.audit_manual_masks(
+        refresh_quality=False,
+        minimum_masks=minimum_masks,
+    )
+    print(json.dumps(manual_summary, indent=2, ensure_ascii=False, default=str))
+    return quality_by_token, accepted_manual_masks, manual_summary
+
+
+def run_attention_training(
+    pipeline: CADPipeline,
+    force: bool = False,
+    minimum_masks: int | None = None,
+    refresh_quality: bool = False,
+    device: str | None = None,
+) -> dict[int, Path]:
+    """Etapa 2, CPU/GPU: antrenează Attention U-Net pe dispozitivul ales."""
+
+    return pipeline.train_attention(
+        force=force,
+        minimum_masks=minimum_masks,
+        refresh_quality=refresh_quality,
+        device=device,
+    )
+
+
+def run_attention_prediction(
+    pipeline: CADPipeline,
+    force: bool = False,
+    device: str | None = None,
+) -> list[dict[str, Any]]:
+    """Etapa 3, CPU/GPU: generează măștile Attention și returnează auditul."""
+
+    predictions = pipeline.generate_attention_masks(force=force, device=device)
+    print("Predicții Attention:", len(predictions))
+    return predictions
+
+
+def run_invalid_review(
+    pipeline: CADPipeline,
+    limit: int = 300,
+    start_index: int = 0,
+    review_round: int = 1,
+) -> MaskEditor | None:
+    """Etapa 4, CPU/Jupyter: deschide editorul pentru predicțiile invalide."""
+
+    invalid_rows = FileManager.read_csv(pipeline.workspace.invalid_predictions)
+    print("Predicții invalide:", len(invalid_rows))
+    if not invalid_rows:
+        print("Nu există predicții invalide de corectat.")
+        return None
+    return pipeline.open_editor(
+        scope="invalid",
+        limit=limit,
+        start_index=start_index,
+        review_round=review_round,
+    )
+
+
+def run_novel_review(
+    pipeline: CADPipeline,
+    limit: int = 300,
+    start_index: int = 0,
+    review_round: int = 2,
+) -> MaskEditor:
+    """Etapa 5, CPU/Jupyter: selectează imagini noi și diverse pentru măști."""
+
+    return pipeline.open_editor(
+        scope="novel",
+        limit=limit,
+        start_index=start_index,
+        review_round=review_round,
+    )
+
+
+def run_retrain_after_review(
+    pipeline: CADPipeline,
+    device: str | None = None,
+) -> tuple[dict[int, Path], list[dict[str, Any]]]:
+    """Etapa opțională: reantrenează Attention și regenerează predicțiile."""
+
+    checkpoints = pipeline.train_attention(force=True, device=device)
+    predictions = pipeline.generate_attention_masks(force=True, device=device)
+    return checkpoints, predictions
+
+
+def run_feature_bank(
+    pipeline: CADPipeline,
+    force: bool = False,
+    device: str | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Etapa 6, CPU/GPU: construiește feature bank-ul; implicit folosește CPU."""
+
+    feature_bank = pipeline.build_feature_bank(force=force, device=device)
+    summary = {
+        mode: {
+            "patients": len(values["patient_ids"]),
+            "source_slices": values["source_slices"],
+            "series_proxies": values["series_proxies"],
+        }
+        for mode, values in feature_bank.items()
+    }
+    print(json.dumps(summary, indent=2, ensure_ascii=False, default=str))
+    return feature_bank
+
+
+def run_evaluation(pipeline: CADPipeline) -> pd.DataFrame:
+    """Etapa 7, CPU: evaluează cele șapte reprezentări păstrate."""
+
+    results = pipeline.evaluate()
+    print(results.to_string(index=False))
+    return results
+
+
+def run_status_and_backup(
+    pipeline: CADPipeline,
+    backup_name: str = "cad_attention_workspace_backup",
+) -> Path:
+    """Etapa 8, CPU: afișează statusul și arhivează workspace-ul."""
+
+    pipeline.status()
+    return pipeline.backup(backup_name)
+
+
+def main() -> None:
+    """Rulează o singură etapă din terminal, păstrând CPU și GPU separate."""
+
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Pipeline CAD cardiac MRI. Fiecare apel execută o singură etapă. "
+            "Etapele review-invalid și review-novel trebuie lansate într-un "
+            "frontend Jupyter/Kaggle pentru editorul interactiv."
+        )
+    )
+    parser.add_argument(
+        "stage",
+        nargs="?",
+        default="status",
+        choices=[
+            "prepare",
+            "audit",
+            "train",
+            "predict",
+            "review-invalid",
+            "review-novel",
+            "retrain",
+            "features",
+            "evaluate",
+            "status",
+            "backup",
+        ],
+    )
+    parser.add_argument("--dataset-path", default=None)
+    parser.add_argument("--workspace-root", default=None)
+    parser.add_argument(
+        "--attention-device", default="cuda", choices=["auto", "cpu", "cuda"]
+    )
+    parser.add_argument(
+        "--feature-device", default="cpu", choices=["auto", "cpu", "cuda"]
+    )
+    parser.add_argument("--device", default=None, choices=["auto", "cpu", "cuda"])
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--refresh-quality", action="store_true")
+    parser.add_argument("--minimum-masks", type=int, default=None)
+    parser.add_argument("--limit", type=int, default=300)
+    parser.add_argument("--start-index", type=int, default=0)
+    parser.add_argument("--review-round", type=int, default=None)
+    parser.add_argument("--backup-name", default="cad_attention_workspace_backup")
+    args = parser.parse_args()
+
+    pipeline = create_pipeline(
+        dataset_path=args.dataset_path,
+        workspace_root=args.workspace_root,
+        attention_device=args.attention_device,
+        feature_device=args.feature_device,
+    )
+
+    if args.stage == "prepare":
+        run_prepare(pipeline)
+    elif args.stage == "audit":
+        run_audit(
+            pipeline,
+            refresh=args.refresh_quality,
+            minimum_masks=args.minimum_masks,
+        )
+    elif args.stage == "train":
+        run_attention_training(
+            pipeline,
+            force=args.force,
+            minimum_masks=args.minimum_masks,
+            refresh_quality=args.refresh_quality,
+            device=args.device,
+        )
+    elif args.stage == "predict":
+        run_attention_prediction(pipeline, force=args.force, device=args.device)
+    elif args.stage == "review-invalid":
+        run_invalid_review(
+            pipeline,
+            limit=args.limit,
+            start_index=args.start_index,
+            review_round=args.review_round or 1,
+        )
+    elif args.stage == "review-novel":
+        run_novel_review(
+            pipeline,
+            limit=args.limit,
+            start_index=args.start_index,
+            review_round=args.review_round or 2,
+        )
+    elif args.stage == "retrain":
+        run_retrain_after_review(pipeline, device=args.device)
+    elif args.stage == "features":
+        run_feature_bank(pipeline, force=args.force, device=args.device)
+    elif args.stage == "evaluate":
+        run_evaluation(pipeline)
+    elif args.stage == "backup":
+        run_status_and_backup(pipeline, backup_name=args.backup_name)
+    else:
+        pipeline.status()
+
+
+if __name__ == "__main__":
+    main()
