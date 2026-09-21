@@ -18,6 +18,34 @@ iar feature bank-ul rulează implicit pe CPU, cu o opțiune GPU separată.
 
 from __future__ import annotations
 
+# În Kaggle, kernelul principal este ținut intenționat CPU-only. Etapele CUDA
+# sunt lansate în procese Python separate; la închiderea procesului, contextul
+# CUDA dispare complet și memoria GPU este returnată sistemului.
+import os
+from pathlib import Path
+
+_KAGGLE_RUNTIME = bool(
+    Path("/kaggle/working").exists()
+    or os.environ.get("KAGGLE_KERNEL_RUN_TYPE")
+    or os.environ.get("KAGGLE_URL_BASE")
+)
+_KAGGLE_GPU_CHILD = os.environ.get("CAD_KAGGLE_GPU_CHILD", "0") == "1"
+_KAGGLE_ISOLATE_GPU = os.environ.get("CAD_KAGGLE_ISOLATE_GPU", "1").strip().lower() not in {
+    "0", "false", "no", "off"
+}
+_KAGGLE_ORIGINAL_CUDA_VISIBLE_DEVICES = os.environ.get("CUDA_VISIBLE_DEVICES")
+_KAGGLE_GPU_VISIBLE_DEVICES = (
+    (_KAGGLE_ORIGINAL_CUDA_VISIBLE_DEVICES or "0").strip() or "0"
+)
+_KAGGLE_PARENT_CPU_ONLY = bool(
+    _KAGGLE_RUNTIME and _KAGGLE_ISOLATE_GPU and not _KAGGLE_GPU_CHILD
+)
+if _KAGGLE_PARENT_CPU_ONLY:
+    # Trebuie setat înainte de importul torch. Chiar dacă o funcție CPU apelează
+    # accidental torch.cuda, acceleratorul nu este vizibil în kernelul principal.
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
+import atexit
 import base64
 import contextlib
 import csv
@@ -25,14 +53,15 @@ import gc
 import hashlib
 import json
 import math
-import os
 import random
 import shutil
+import signal
+import subprocess
+import sys
 import time
 import uuid
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 import cv2
@@ -76,18 +105,43 @@ def _as_int(value: Any, default: int = 0) -> int:
 
 
 def _default_dataset_path() -> Path:
-    """Alege automat calea Kaggle; în afara Kaggle folosește CAD_DATASET_PATH."""
+    """Găsește automat datasetul în structura reală `/kaggle/input`.
+
+    Kaggle poate monta același dataset sub un slug diferit sau într-un subfolder.
+    Este acceptat primul director care conține simultan folderele `Normal` și
+    `Sick`. Variabila CAD_DATASET_PATH are întotdeauna prioritate.
+    """
 
     env_value = os.environ.get("CAD_DATASET_PATH", "").strip()
-    candidates = []
+    candidates: list[Path] = []
     if env_value:
         candidates.append(Path(env_value))
     candidates.extend(
         [
+            Path("/kaggle/input/cad-cardiac-mri-dataset"),
             Path("/kaggle/input/datasets/danialsharifrazi/cad-cardiac-mri-dataset"),
             Path(r"C:\F\_Develop\AI\Datasets\CAD Cardiac MRI Dataset"),
         ]
     )
+
+    def is_dataset_root(path: Path) -> bool:
+        return path.is_dir() and (path / "Normal").is_dir() and (path / "Sick").is_dir()
+
+    for candidate in candidates:
+        if is_dataset_root(candidate):
+            return candidate
+
+    kaggle_input = Path("/kaggle/input")
+    if kaggle_input.is_dir():
+        # Căutare limitată ca adâncime, fără citirea imaginilor.
+        for current_root, directory_names, _ in os.walk(kaggle_input):
+            current = Path(current_root)
+            relative_depth = len(current.relative_to(kaggle_input).parts)
+            if {"Normal", "Sick"}.issubset(set(directory_names)):
+                return current
+            if relative_depth >= 4:
+                directory_names[:] = []
+
     for candidate in candidates:
         if candidate.exists():
             return candidate
@@ -413,7 +467,11 @@ class RuntimeManager:
 
     @staticmethod
     def release(device: torch.device) -> None:
-        """Eliberează obiectele Python și cache-ul CUDA după fiecare etapă/fold."""
+        """Eliberează referințele și cache-urile etapei curente.
+
+        În procesul GPU Kaggle acesta este ultimul nivel de curățare. Eliberarea
+        completă a contextului CUDA are loc când procesul worker se închide.
+        """
 
         gc.collect()
         if device.type == "cuda" and torch.cuda.is_available():
@@ -421,7 +479,14 @@ class RuntimeManager:
                 torch.cuda.synchronize(device)
             except Exception:
                 pass
-            torch.cuda.empty_cache()
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
 
     @staticmethod
     def format_seconds(seconds: float) -> str:
@@ -433,6 +498,334 @@ class RuntimeManager:
         if minutes:
             return f"{minutes}m {seconds:02d}s"
         return f"{seconds}s"
+
+
+class KaggleGPUProcessManager:
+    """Rulează etapele CUDA într-un proces izolat și îl închide după etapă.
+
+    De ce este necesar în Kaggle:
+    `torch.cuda.empty_cache()` eliberează blocurile nefolosite, dar procesul
+    notebook-ului poate păstra contextul CUDA. Un proces worker separat dispare
+    la final, deci și contextul lui CUDA dispare. Kernelul principal continuă pe
+    CPU și poate rula editorul, evaluarea sau alte notebook-uri fără VRAM ocupat.
+    """
+
+    _active_process: Any = None
+    _worker_script: Path | None = None
+
+    @staticmethod
+    def is_kaggle() -> bool:
+        return bool(_KAGGLE_RUNTIME)
+
+    @staticmethod
+    def parent_is_cpu_only() -> bool:
+        return bool(_KAGGLE_PARENT_CPU_ONLY)
+
+    @staticmethod
+    def gpu_available() -> bool:
+        """Detectează acceleratorul cu nvidia-smi, fără inițializarea torch CUDA."""
+
+        executable = shutil.which("nvidia-smi")
+        if not executable:
+            return False
+        try:
+            completed = subprocess.run(
+                [executable, "-L"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+        except Exception:
+            return False
+        return completed.returncode == 0 and "GPU " in (completed.stdout or "")
+
+    @classmethod
+    def materialize_worker_script(cls, target: Path | str | None = None) -> Path:
+        """Scrie celula mare de definiții ca modul Python în `/kaggle/working`.
+
+        În varianta `.py`, fișierul curent este folosit direct. În notebook,
+        sursa celulei cu toate clasele este găsită în istoricul IPython. Astfel,
+        notebook-ul rămâne autonom: nu depinde de un al doilea fișier încărcat.
+        """
+
+        required_markers = (
+            "class CADPipeline:",
+            "class KaggleGPUProcessManager:",
+            "def main() -> None:",
+        )
+
+        def is_valid_worker(path: Path) -> bool:
+            if not path.is_file() or path.suffix.lower() != ".py":
+                return False
+            try:
+                text = path.read_text(encoding="utf-8")
+            except Exception:
+                return False
+            return all(marker in text for marker in required_markers)
+
+        if cls._worker_script is not None and is_valid_worker(cls._worker_script):
+            return cls._worker_script
+
+        explicit = os.environ.get("CAD_PIPELINE_WORKER_SCRIPT", "").strip()
+        if explicit:
+            explicit_path = Path(explicit)
+            if is_valid_worker(explicit_path):
+                cls._worker_script = explicit_path
+                return explicit_path
+
+        module_file = globals().get("__file__")
+        if module_file:
+            module_path = Path(str(module_file)).resolve()
+            if is_valid_worker(module_path):
+                cls._worker_script = module_path
+                return module_path
+
+        target_path = Path(
+            target
+            or (
+                "/kaggle/working/cad_cardiac_mri_kaggle_worker.py"
+                if Path("/kaggle/working").exists()
+                else Path.cwd() / "cad_cardiac_mri_kaggle_worker.py"
+            )
+        )
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            ipython = get_ipython()  # type: ignore[name-defined]
+        except Exception:
+            ipython = None
+        history = []
+        if ipython is not None:
+            history = list(
+                getattr(
+                    getattr(ipython, "history_manager", None),
+                    "input_hist_raw",
+                    [],
+                )
+            )
+
+        cell_source = None
+        for candidate in reversed(history):
+            if candidate and all(marker in candidate for marker in required_markers):
+                cell_source = candidate
+                break
+
+        if cell_source is None:
+            # Fallback util când utilizatorul a încărcat și fișierul companion.
+            search_roots = [Path.cwd(), Path("/kaggle/working")]
+            for root in search_roots:
+                if not root.is_dir():
+                    continue
+                for candidate_path in sorted(root.glob("*kaggle*gpu*.py")):
+                    try:
+                        text = candidate_path.read_text(encoding="utf-8")
+                    except Exception:
+                        continue
+                    if all(marker in text for marker in required_markers):
+                        cls._worker_script = candidate_path
+                        return candidate_path
+            raise RuntimeError(
+                "Nu am putut exporta workerul GPU. Rulează din nou celula mare "
+                "cu definițiile, apoi Blocul 1."
+            )
+
+        temporary = target_path.with_name(
+            f".{target_path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+        )
+        temporary.write_text(cell_source.rstrip() + "\n", encoding="utf-8")
+        os.replace(temporary, target_path)
+        cls._worker_script = target_path
+        print(f"[KAGGLE][GPU] Worker Python pregătit: {target_path}")
+        return target_path
+
+    @staticmethod
+    def _gpu_process_contains_pid(pid: int) -> bool | None:
+        executable = shutil.which("nvidia-smi")
+        if not executable:
+            return None
+        try:
+            completed = subprocess.run(
+                [
+                    executable,
+                    "--query-compute-apps=pid,used_memory",
+                    "--format=csv,noheader,nounits",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+        except Exception:
+            return None
+        if completed.returncode != 0:
+            return None
+        pids = set()
+        for line in (completed.stdout or "").splitlines():
+            first = line.split(",", 1)[0].strip()
+            if first.isdigit():
+                pids.add(int(first))
+        return int(pid) in pids
+
+    @classmethod
+    def stop_active_worker(cls, wait_seconds: float = 10.0) -> None:
+        """Oprește workerul rămas după Interrupt și eliberează GPU-ul."""
+
+        process = cls._active_process
+        if process is None or process.poll() is not None:
+            cls._active_process = None
+            return
+        print(f"[KAGGLE][GPU] Oprire worker PID={process.pid} ...")
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except Exception:
+            try:
+                process.terminate()
+            except Exception:
+                pass
+        try:
+            process.wait(timeout=float(wait_seconds))
+        except Exception:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except Exception:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+            try:
+                process.wait(timeout=5)
+            except Exception:
+                pass
+        cls._active_process = None
+        print("[KAGGLE][GPU] Worker oprit.")
+
+    @classmethod
+    def run_gpu_stage(
+        cls,
+        stage: str,
+        dataset_path: Path | str,
+        workspace_root: Path | str,
+        force_attention_training: bool = False,
+        force_attention_prediction: bool = False,
+        force_feature_bank: bool = False,
+        refresh_quality: bool = False,
+        minimum_masks: int | None = None,
+    ) -> None:
+        """Lansează o etapă GPU sincron și închide garantat procesul la final."""
+
+        if stage not in {"attention-worker", "features-worker"}:
+            raise ValueError("stage GPU necunoscut")
+        if not cls.gpu_available():
+            raise RuntimeError(
+                "Kaggle nu expune momentan un GPU. Activează Accelerator = GPU "
+                "sau rulează etapa pe CPU."
+            )
+        script = cls.materialize_worker_script()
+        command = [
+            sys.executable,
+            "-u",
+            str(script),
+            stage,
+            "--dataset-path",
+            str(dataset_path),
+            "--workspace-root",
+            str(workspace_root),
+            "--attention-device",
+            "cuda",
+            "--feature-device",
+            "cuda",
+        ]
+        if force_attention_training:
+            command.append("--force-attention-training")
+        if force_attention_prediction:
+            command.append("--force-attention-prediction")
+        if force_feature_bank:
+            command.append("--force-feature-bank")
+        if refresh_quality:
+            command.append("--refresh-quality")
+        if minimum_masks is not None:
+            command.extend(["--minimum-masks", str(int(minimum_masks))])
+
+        environment = os.environ.copy()
+        environment["CAD_KAGGLE_GPU_CHILD"] = "1"
+        environment["CAD_KAGGLE_ISOLATE_GPU"] = "1"
+        environment["CUDA_VISIBLE_DEVICES"] = _KAGGLE_GPU_VISIBLE_DEVICES
+        environment["PYTHONUNBUFFERED"] = "1"
+        environment.setdefault("OMP_NUM_THREADS", str(Settings.Runtime.CPU_THREADS))
+        environment.setdefault("MKL_NUM_THREADS", str(Settings.Runtime.CPU_THREADS))
+        environment.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128")
+
+        working_directory = (
+            Path("/kaggle/working")
+            if Path("/kaggle/working").is_dir()
+            else Path.cwd()
+        )
+        print("[KAGGLE][GPU] Pornire proces izolat:", " ".join(command))
+        process = subprocess.Popen(
+            command,
+            cwd=str(working_directory),
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            start_new_session=True,
+        )
+        cls._active_process = process
+        worker_pid = int(process.pid)
+        try:
+            if process.stdout is not None:
+                for line in iter(process.stdout.readline, ""):
+                    if not line and process.poll() is not None:
+                        break
+                    print(line, end="", flush=True)
+            return_code = process.wait()
+        except KeyboardInterrupt:
+            cls.stop_active_worker()
+            raise
+        finally:
+            if process.stdout is not None:
+                try:
+                    process.stdout.close()
+                except Exception:
+                    pass
+            cls._active_process = None
+
+        if return_code != 0:
+            raise RuntimeError(
+                f"Workerul GPU `{stage}` s-a închis cu codul {return_code}. "
+                "Rezultatele complete ale foldurilor terminate rămân în workspace."
+            )
+
+        time.sleep(0.5)
+        still_visible = cls._gpu_process_contains_pid(worker_pid)
+        if still_visible is False:
+            print(
+                f"[KAGGLE][GPU] Worker PID={worker_pid} s-a închis; "
+                "contextul CUDA și VRAM-ul lui au fost eliberate."
+            )
+        elif still_visible is True:
+            print(
+                f"[KAGGLE][GPU][WARNING] PID={worker_pid} apare încă în nvidia-smi; "
+                "apelează stop_gpu_worker()."
+            )
+        else:
+            print(
+                f"[KAGGLE][GPU] Worker PID={worker_pid} s-a închis. "
+                "Nu s-a putut interoga nvidia-smi pentru confirmare."
+            )
+
+
+def stop_gpu_worker() -> None:
+    """Funcție publică pentru oprirea manuală a unui worker după întrerupere."""
+
+    KaggleGPUProcessManager.stop_active_worker()
+
+
+atexit.register(KaggleGPUProcessManager.stop_active_worker)
 
 
 @dataclass(frozen=True)
@@ -3954,18 +4347,32 @@ class CADPipeline:
         return status
 
 
-RuntimeManager.seed_everything(include_cuda=False)
-print("[PIPELINE] Clasele au fost încărcate fără inițializarea CUDA.")
-print("[PIPELINE] CPU este implicit; device='cuda' se dă numai etapei dorite.")
-
 # =============================================================================
-# FUNCȚII DE RULARE GRUPATĂ
+# FUNCȚII DE RULARE GRUPATĂ — KAGGLE CPU + GPU IZOLAT
 # =============================================================================
 def _execution_banner(title: str) -> None:
-    """Afișează clar trecerea dintre partea CPU și partea GPU."""
-
     line = "=" * 88
     print(f"\n{line}\n{title}\n{line}")
+
+
+def _resolve_requested_device(requested: str | None) -> str:
+    """Rezolvă auto/cuda fără ca kernelul Kaggle CPU să inițializeze CUDA."""
+
+    value = str(requested or "cpu").strip().lower()
+    if value not in {"auto", "cpu", "cuda"}:
+        raise ValueError("device trebuie să fie auto/cpu/cuda")
+    if value == "cpu":
+        return "cpu"
+    if KaggleGPUProcessManager.is_kaggle():
+        available = KaggleGPUProcessManager.gpu_available()
+    else:
+        available = bool(torch.cuda.is_available())
+    if value == "cuda" and not available:
+        print("[DEVICE] GPU indisponibil; etapa va rula pe CPU.")
+        return "cpu"
+    if value == "auto":
+        return "cuda" if available else "cpu"
+    return "cuda"
 
 
 def create_pipeline(
@@ -3974,13 +4381,124 @@ def create_pipeline(
     attention_device: str = "cuda",
     feature_device: str = "cpu",
 ) -> CADPipeline:
-    """Creează pipeline-ul fără să inițializeze CUDA."""
+    """Creează pipeline-ul fără să inițializeze CUDA în kernelul principal."""
 
     return CADPipeline(
         dataset_path=dataset_path,
         workspace_root=workspace_root,
         attention_device=attention_device,
         feature_device=feature_device,
+    )
+
+
+def _attention_stage(
+    pipeline: CADPipeline,
+    attention_device: str,
+    force_training: bool,
+    force_prediction: bool,
+    refresh_quality: bool,
+    minimum_masks: int | None,
+    isolate_kaggle_gpu: bool,
+) -> tuple[dict[int, Path], list[dict[str, Any]], dict[str, Any]]:
+    """Rulează Attention direct pe CPU sau într-un worker CUDA Kaggle."""
+
+    accepted, manual_summary = pipeline.audit_manual_masks(
+        refresh_quality=refresh_quality,
+        minimum_masks=minimum_masks,
+    )
+    checkpoints = None
+    predictions = None
+    if not force_training:
+        checkpoints = SegmentationManager.compatible_checkpoint_map(
+            accepted, pipeline.workspace
+        )
+    if checkpoints is not None and not force_prediction:
+        predictions = SegmentationManager.load_cached_predictions(
+            pipeline._rows(), pipeline.workspace, checkpoints
+        )
+    if checkpoints is not None and predictions is not None:
+        print(
+            "[ATTENTION] Checkpointurile și predicțiile sunt compatibile; "
+            "nu se pornește niciun proces GPU."
+        )
+        summary = FileManager.read_json(pipeline.workspace.training_summary, {}) or {}
+        summary["manual_mask_audit"] = manual_summary
+        summary["last_call"] = "reused_without_gpu_worker"
+        FileManager.write_json(pipeline.workspace.training_summary, summary)
+        return checkpoints, predictions, manual_summary
+
+    use_isolated_worker = bool(
+        attention_device == "cuda"
+        and isolate_kaggle_gpu
+        and KaggleGPUProcessManager.is_kaggle()
+        and not _KAGGLE_GPU_CHILD
+    )
+    if use_isolated_worker:
+        KaggleGPUProcessManager.run_gpu_stage(
+            "attention-worker",
+            dataset_path=pipeline.dataset_path,
+            workspace_root=pipeline.workspace.root,
+            force_attention_training=force_training,
+            force_attention_prediction=force_prediction,
+            refresh_quality=refresh_quality,
+            minimum_masks=minimum_masks,
+        )
+        checkpoints = SegmentationManager.load_checkpoint_map(pipeline.workspace)
+        predictions = SegmentationManager.load_cached_predictions(
+            pipeline._rows(), pipeline.workspace, checkpoints
+        )
+        if predictions is None:
+            raise RuntimeError(
+                "Workerul s-a închis, dar auditul predicțiilor nu este complet/compatibil."
+            )
+    else:
+        checkpoints = pipeline.train_attention(
+            force=force_training,
+            minimum_masks=minimum_masks,
+            refresh_quality=False,
+            device=attention_device,
+        )
+        predictions = pipeline.generate_attention_masks(
+            force=force_prediction,
+            device=attention_device,
+        )
+    return checkpoints, predictions, manual_summary
+
+
+def _feature_stage(
+    pipeline: CADPipeline,
+    feature_device: str,
+    force_feature_bank: bool,
+    isolate_kaggle_gpu: bool,
+) -> dict[str, dict[str, Any]]:
+    """Rulează EfficientNet pe CPU sau într-un al doilea worker CUDA scurt."""
+
+    rows = pipeline._rows()
+    if not force_feature_bank:
+        cached = FeatureManager.load_compatible_cache(rows, pipeline.workspace)
+        if cached is not None:
+            print(
+                "[FEATURE BANK] Cache compatibil; nu se pornește niciun proces GPU."
+            )
+            return cached
+
+    use_isolated_worker = bool(
+        feature_device == "cuda"
+        and isolate_kaggle_gpu
+        and KaggleGPUProcessManager.is_kaggle()
+        and not _KAGGLE_GPU_CHILD
+    )
+    if use_isolated_worker:
+        KaggleGPUProcessManager.run_gpu_stage(
+            "features-worker",
+            dataset_path=pipeline.dataset_path,
+            workspace_root=pipeline.workspace.root,
+            force_feature_bank=force_feature_bank,
+        )
+        return FeatureManager.load(pipeline.workspace)
+    return pipeline.build_feature_bank(
+        force=force_feature_bank,
+        device=feature_device,
     )
 
 
@@ -3996,20 +4514,25 @@ def run_complete_pipeline(
     minimum_masks: int | None = None,
     create_backup: bool = False,
     backup_name: str = "cad_attention_workspace_backup",
+    isolate_kaggle_gpu: bool = True,
 ) -> dict[str, Any]:
-    """Rulează într-un singur apel toate etapele automate.
+    """Rulează fluxul complet și oprește automat procesele GPU după utilizare.
 
-    Ordinea dispozitivelor este intenționată:
-    1. CPU: manifestul și auditul calității/măștilor;
-    2. GPU sau CPU: antrenarea și inferența Attention U-Net;
-    3. CPU implicit sau GPU opțional: EfficientNet;
-    4. CPU: agregarea, clasificarea, metricile și backup-ul.
+    În Kaggle, configurația implicită este:
+    - kernel principal: CPU-only;
+    - Attention U-Net: proces CUDA separat;
+    - feature bank: CPU;
+    - evaluare/editor/backup: CPU.
 
-    Cache-urile sunt verificate înainte de inițializarea CUDA. Dacă un rezultat
-    compatibil există deja, etapa respectivă este reutilizată fără GPU.
+    Acceleratorul rămâne atașat notebook-ului în interfața Kaggle, dar după
+    ieșirea workerului nu mai există un proces Python al pipeline-ului care să
+    păstreze context CUDA sau VRAM.
     """
 
-    _execution_banner("BLOC PRINCIPAL — inițializare și manifest pe CPU")
+    attention_device = _resolve_requested_device(attention_device)
+    feature_device = _resolve_requested_device(feature_device)
+
+    _execution_banner("BLOC PRINCIPAL — manifest și audit pe CPU")
     pipeline = create_pipeline(
         dataset_path=dataset_path,
         workspace_root=workspace_root,
@@ -4019,34 +4542,36 @@ def run_complete_pipeline(
     dataset_rows = pipeline.prepare()
 
     _execution_banner(
-        f"BLOC PRINCIPAL — Attention U-Net pe {str(attention_device).upper()} "
-        "(auditul se execută întâi pe CPU)"
+        f"BLOC PRINCIPAL — Attention U-Net pe {attention_device.upper()}"
+        + (
+            " într-un proces Kaggle izolat"
+            if attention_device == "cuda"
+            and isolate_kaggle_gpu
+            and KaggleGPUProcessManager.is_kaggle()
+            else ""
+        )
     )
-    attention_checkpoints = pipeline.train_attention(
-        force=force_attention_training,
-        minimum_masks=minimum_masks,
+    attention_checkpoints, attention_predictions, manual_summary = _attention_stage(
+        pipeline=pipeline,
+        attention_device=attention_device,
+        force_training=force_attention_training,
+        force_prediction=force_attention_prediction,
         refresh_quality=refresh_quality,
-        device=attention_device,
-    )
-    attention_predictions = pipeline.generate_attention_masks(
-        force=force_attention_prediction,
-        device=attention_device,
+        minimum_masks=minimum_masks,
+        isolate_kaggle_gpu=isolate_kaggle_gpu,
     )
 
     _execution_banner(
-        f"BLOC PRINCIPAL — feature bank pe {str(feature_device).upper()} și evaluare pe CPU"
+        f"BLOC PRINCIPAL — feature bank pe {feature_device.upper()} și evaluare pe CPU"
     )
-    feature_bank = pipeline.build_feature_bank(
-        force=force_feature_bank,
-        device=feature_device,
+    feature_bank = _feature_stage(
+        pipeline=pipeline,
+        feature_device=feature_device,
+        force_feature_bank=force_feature_bank,
+        isolate_kaggle_gpu=isolate_kaggle_gpu,
     )
     results = pipeline.evaluate()
     status = pipeline.status()
-
-    training_summary = FileManager.read_json(
-        pipeline.workspace.training_summary, {}
-    ) or {}
-    manual_summary = training_summary.get("manual_mask_audit", {})
 
     backup_path = None
     if create_backup:
@@ -4073,13 +4598,7 @@ def run_review_block(
     review_round: int = 1,
     seed: int = 42,
 ) -> MaskEditor | None:
-    """Deschide pe CPU una dintre cozile editorului manual.
-
-    `scope="invalid"` corectează predicțiile Attention rămase invalide.
-    `scope="novel"` propune imagini clare și diferite de măștile deja create.
-    `scope="manual"` redeschide imaginile cu fișier manual existent.
-    `scope="all"` permite verificarea tuturor măștilor Attention disponibile.
-    """
+    """Deschide editorul exclusiv pe CPU."""
 
     scope = str(scope).strip().lower()
     _execution_banner(f"REVIEW MANUAL PE CPU — scope={scope}")
@@ -4089,7 +4608,6 @@ def run_review_block(
         if not invalid_rows:
             print("Nu există predicții invalide de corectat.")
             return None
-
     return pipeline.open_editor(
         scope=scope,
         limit=limit,
@@ -4108,51 +4626,45 @@ def run_after_review_pipeline(
     minimum_masks: int | None = None,
     create_backup: bool = False,
     backup_name: str = "cad_attention_workspace_after_review",
+    isolate_kaggle_gpu: bool = True,
 ) -> dict[str, Any]:
-    """Actualizează întregul rezultat după editarea măștilor manuale.
+    """Reantrenează incremental și închide workerul GPU înainte de evaluare."""
 
-    Cu `force_all=False`, comportamentul recomandat, fingerprinturile refac numai
-    foldurile Attention afectate de măștile noi. Inferența per fold și feature
-    bank-ul sunt invalidate automat doar când intrările lor s-au schimbat.
-    `force_all=True` recalculează tot și consumă mai mult GPU.
-    """
-
-    attention_device = attention_device or pipeline.attention_device
-    feature_device = feature_device or pipeline.feature_device
+    attention_device = _resolve_requested_device(
+        attention_device or pipeline.attention_device
+    )
+    feature_device = _resolve_requested_device(
+        feature_device or pipeline.feature_device
+    )
 
     _execution_banner(
-        f"DUPĂ REVIEW — reantrenare incrementală Attention pe {str(attention_device).upper()}"
+        f"DUPĂ REVIEW — Attention pe {attention_device.upper()} cu cache per fold"
     )
-    attention_checkpoints = pipeline.train_attention(
-        force=force_all,
-        minimum_masks=minimum_masks,
+    attention_checkpoints, attention_predictions, manual_summary = _attention_stage(
+        pipeline=pipeline,
+        attention_device=attention_device,
+        force_training=force_all,
+        force_prediction=force_all,
         refresh_quality=refresh_quality,
-        device=attention_device,
-    )
-    attention_predictions = pipeline.generate_attention_masks(
-        force=force_all,
-        device=attention_device,
+        minimum_masks=minimum_masks,
+        isolate_kaggle_gpu=isolate_kaggle_gpu,
     )
 
     _execution_banner(
-        f"DUPĂ REVIEW — feature bank pe {str(feature_device).upper()} și evaluare pe CPU"
+        f"DUPĂ REVIEW — feature bank pe {feature_device.upper()} și evaluare pe CPU"
     )
-    feature_bank = pipeline.build_feature_bank(
-        force=force_all,
-        device=feature_device,
+    feature_bank = _feature_stage(
+        pipeline=pipeline,
+        feature_device=feature_device,
+        force_feature_bank=force_all,
+        isolate_kaggle_gpu=isolate_kaggle_gpu,
     )
     results = pipeline.evaluate()
     status = pipeline.status()
 
-    training_summary = FileManager.read_json(
-        pipeline.workspace.training_summary, {}
-    ) or {}
-    manual_summary = training_summary.get("manual_mask_audit", {})
-
     backup_path = None
     if create_backup:
         backup_path = pipeline.backup(backup_name)
-
     return {
         "pipeline": pipeline,
         "manual_summary": manual_summary,
@@ -4165,7 +4677,7 @@ def run_after_review_pipeline(
     }
 
 
-# Funcții fine-grained păstrate pentru folosire din alte notebook-uri sau CLI.
+# Funcții fine-grained pentru folosire din alte notebook-uri sau CLI.
 def run_prepare(pipeline: CADPipeline) -> list[dict[str, Any]]:
     dataset_rows = pipeline.prepare()
     pipeline.status()
@@ -4234,18 +4746,25 @@ def run_evaluation(pipeline: CADPipeline) -> pd.DataFrame:
     print(results.to_string(index=False))
     return results
 
-# =============================================================================
-# INTERFAȚĂ CLI
-# =============================================================================
-def main() -> None:
-    """Rulează blocurile grupate sau o etapă individuală din terminal."""
 
+# =============================================================================
+# INTERFAȚĂ CLI ȘI WORKERI KAGGLE
+# =============================================================================
+def _running_in_notebook() -> bool:
+    try:
+        shell = get_ipython()  # type: ignore[name-defined]
+    except Exception:
+        return False
+    return shell is not None and shell.__class__.__name__ != "TerminalInteractiveShell"
+
+
+def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(
         description=(
-            "Pipeline CAD cardiac MRI cu rulare grupată CPU/GPU. "
-            "Etapa review trebuie deschisă într-un frontend Jupyter/Kaggle."
+            "Pipeline CAD cardiac MRI pentru Kaggle, cu procese CUDA izolate. "
+            "Review-ul interactiv se deschide din notebook."
         )
     )
     parser.add_argument(
@@ -4264,6 +4783,8 @@ def main() -> None:
             "evaluate",
             "status",
             "backup",
+            "attention-worker",
+            "features-worker",
         ],
     )
     parser.add_argument("--dataset-path", default=None)
@@ -4276,6 +4797,9 @@ def main() -> None:
     )
     parser.add_argument("--device", default=None, choices=["auto", "cpu", "cuda"])
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--force-attention-training", action="store_true")
+    parser.add_argument("--force-attention-prediction", action="store_true")
+    parser.add_argument("--force-feature-bank", action="store_true")
     parser.add_argument("--refresh-quality", action="store_true")
     parser.add_argument("--minimum-masks", type=int, default=None)
     parser.add_argument(
@@ -4288,7 +4812,44 @@ def main() -> None:
     parser.add_argument("--review-round", type=int, default=1)
     parser.add_argument("--create-backup", action="store_true")
     parser.add_argument("--backup-name", default="cad_attention_workspace_backup")
+    parser.add_argument("--no-isolated-kaggle-gpu", action="store_true")
     args = parser.parse_args()
+
+    if args.stage == "attention-worker":
+        pipeline = create_pipeline(
+            dataset_path=args.dataset_path,
+            workspace_root=args.workspace_root,
+            attention_device="cuda",
+            feature_device="cpu",
+        )
+        pipeline.prepare()
+        pipeline.train_attention(
+            force=args.force or args.force_attention_training,
+            minimum_masks=args.minimum_masks,
+            refresh_quality=args.refresh_quality,
+            device="cuda",
+        )
+        pipeline.generate_attention_masks(
+            force=args.force or args.force_attention_prediction,
+            device="cuda",
+        )
+        pipeline.status()
+        return
+
+    if args.stage == "features-worker":
+        pipeline = create_pipeline(
+            dataset_path=args.dataset_path,
+            workspace_root=args.workspace_root,
+            attention_device="cpu",
+            feature_device="cuda",
+        )
+        pipeline.prepare()
+        pipeline.build_feature_bank(
+            force=args.force or args.force_feature_bank,
+            device="cuda",
+        )
+        pipeline.status()
+        return
 
     if args.stage == "full":
         output = run_complete_pipeline(
@@ -4296,13 +4857,14 @@ def main() -> None:
             workspace_root=args.workspace_root,
             attention_device=args.attention_device,
             feature_device=args.feature_device,
-            force_attention_training=args.force,
-            force_attention_prediction=args.force,
-            force_feature_bank=args.force,
+            force_attention_training=args.force or args.force_attention_training,
+            force_attention_prediction=args.force or args.force_attention_prediction,
+            force_feature_bank=args.force or args.force_feature_bank,
             refresh_quality=args.refresh_quality,
             minimum_masks=args.minimum_masks,
             create_backup=args.create_backup,
             backup_name=args.backup_name,
+            isolate_kaggle_gpu=not args.no_isolated_kaggle_gpu,
         )
         print(output["results"].to_string(index=False))
         return
@@ -4332,6 +4894,7 @@ def main() -> None:
             minimum_masks=args.minimum_masks,
             create_backup=args.create_backup,
             backup_name=args.backup_name,
+            isolate_kaggle_gpu=not args.no_isolated_kaggle_gpu,
         )
         print(output["results"].to_string(index=False))
     elif args.stage == "prepare":
@@ -4363,5 +4926,15 @@ def main() -> None:
         pipeline.status()
 
 
-if __name__ == "__main__":
+RuntimeManager.seed_everything(include_cuda=False)
+if _KAGGLE_PARENT_CPU_ONLY:
+    print("[KAGGLE] Kernelul principal este CPU-only.")
+    print("[KAGGLE] Etapele CUDA vor rula în procese separate și se vor închide automat.")
+elif _KAGGLE_GPU_CHILD:
+    print("[KAGGLE][GPU WORKER] Proces CUDA izolat pornit.")
+else:
+    print("[PIPELINE] Clasele au fost încărcate fără inițializarea CUDA.")
+print("[PIPELINE] CPU este implicit; GPU este folosit numai de etapa solicitată.")
+
+if __name__ == "__main__" and not _running_in_notebook():
     main()
