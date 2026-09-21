@@ -10,6 +10,7 @@ Ideea centrală:
 4. CPU și GPU sunt alese separat pentru fiecare etapă costisitoare.
 5. GPU-ul este folosit numai în interiorul etapei cerute și este eliberat apoi.
 6. Clasificarea și toate metricile sunt calculate la nivel de pacient.
+7. Workspace-urile notebook-ului full sunt importate automat pentru review.
 
 Pipeline-ul nu selectează GPU la inițializare. Auditul, editorul, agregarea și
 evaluarea rămân pe CPU. Antrenarea/predicția Attention U-Net pot folosi GPU,
@@ -605,6 +606,361 @@ class FileManager:
 # =============================================================================
 # DEFINIȚII 3 — DESCOPERIREA DATASETULUI
 # =============================================================================
+
+
+class WorkspaceCompatibilityManager:
+    """Importă sigur rezultatele notebook-ului full în schema simplificată.
+
+    Notebook-ul full salvează metadatele predicțiilor în
+    ``attention_unet_full_review_manifest.csv``. Notebook-ul simplificat citește
+    ``simple_attention_prediction_audit.csv``. Măștile PNG și token-urile sunt
+    compatibile, deci această clasă convertește doar metadatele CSV; nu rulează
+    modelul, nu modifică măștile și nu pornește GPU-ul.
+    """
+
+    LEGACY_FULL_REVIEW_MANIFEST = "attention_unet_full_review_manifest.csv"
+    LEGACY_QUALITY_AUDIT = "attention_image_quality_audit.csv"
+    LEGACY_REVIEW_HISTORY = "attention_unet_review_history.csv"
+    IMPORT_SUMMARY = "workspace_compatibility_import.json"
+
+    @staticmethod
+    def _first_nonempty(row: dict[str, Any], *keys: str, default: Any = "") -> Any:
+        for key in keys:
+            value = row.get(key, "")
+            if value is not None and str(value).strip() != "":
+                return value
+        return default
+
+    @staticmethod
+    def _prediction_path(
+        base_row: dict[str, Any],
+        source_row: dict[str, Any],
+        workspace: Workspace,
+    ) -> Path:
+        """Preferă masca din workspace-ul curent, apoi calea din CSV-ul vechi."""
+
+        token = str(base_row["image_token"])
+        expected = workspace.predicted_masks / f"{token}.png"
+        source_value = str(source_row.get("predicted_attention_mask_path", "")).strip()
+        source_path = Path(source_value) if source_value else None
+        if expected.is_file():
+            return expected
+        if source_path is not None and source_path.is_file():
+            return source_path
+        return expected
+
+    @classmethod
+    def _normalize_prediction_rows(
+        cls,
+        source_rows: Sequence[dict[str, Any]],
+        dataset_rows: Sequence[dict[str, Any]],
+        workspace: Workspace,
+    ) -> list[dict[str, Any]]:
+        """Convertește un audit simplu sau manifestul full în aceeași schemă."""
+
+        source_by_token = {
+            str(row.get("image_token", "")).strip(): dict(row)
+            for row in source_rows
+            if str(row.get("image_token", "")).strip()
+        }
+        normalized: list[dict[str, Any]] = []
+        for base in dataset_rows:
+            token = str(base["image_token"])
+            source = source_by_token.get(token)
+            if source is None:
+                continue
+            mask_path = cls._prediction_path(base, source, workspace)
+            if not mask_path.is_file():
+                continue
+
+            final_valid = cls._first_nonempty(
+                source, "attention_valid_final", "attention_valid", default=""
+            )
+            initial_valid = cls._first_nonempty(
+                source,
+                "attention_valid_initial",
+                "attention_valid",
+                default=final_valid,
+            )
+            normalized.append(
+                {
+                    "image_token": token,
+                    "image_path": str(base["image_path"]),
+                    "patient_id": str(base["patient_id"]),
+                    "series_id": str(base["series_id"]),
+                    # Foldul notebook-ului simplificat rămâne autoritar. Acest
+                    # import este pentru review/feature extraction, nu pentru a
+                    # pretinde compatibilitatea checkpointurilor full.
+                    "segmentation_fold": int(base["segmentation_fold"]),
+                    "predicted_attention_mask_path": str(mask_path),
+                    "attention_valid_initial": initial_valid,
+                    "attention_valid_final": final_valid,
+                    "attention_invalid_reason_initial": cls._first_nonempty(
+                        source, "attention_invalid_reason_initial", default=""
+                    ),
+                    "attention_invalid_reason_final": cls._first_nonempty(
+                        source, "attention_invalid_reason_final", default=""
+                    ),
+                    "attention_repair_method": cls._first_nonempty(
+                        source, "attention_repair_method", default="legacy_import"
+                    ),
+                    "attention_threshold_used": cls._first_nonempty(
+                        source, "attention_threshold_used", default=""
+                    ),
+                    "attention_area_ratio": cls._first_nonempty(
+                        source, "attention_area_ratio", default=""
+                    ),
+                    "attention_peak_probability": cls._first_nonempty(
+                        source, "attention_peak_probability", default=""
+                    ),
+                    "attention_boundary_touch_fraction": cls._first_nonempty(
+                        source, "attention_boundary_touch_fraction", default=""
+                    ),
+                    "checkpoint_fingerprint": cls._first_nonempty(
+                        source,
+                        "checkpoint_fingerprint",
+                        "attention_checkpoint_fingerprint",
+                        default="",
+                    ),
+                }
+            )
+        return normalized
+
+    @classmethod
+    def _derive_prediction_rows_from_masks(
+        cls,
+        dataset_rows: Sequence[dict[str, Any]],
+        workspace: Workspace,
+    ) -> list[dict[str, Any]]:
+        """Fallback: construiește un audit minim din PNG-urile deja existente."""
+
+        invalid_tokens = {
+            str(row.get("image_token", "")).strip()
+            for row in FileManager.read_csv(workspace.invalid_predictions)
+            if str(row.get("image_token", "")).strip()
+        }
+        rows: list[dict[str, Any]] = []
+        for base in dataset_rows:
+            token = str(base["image_token"])
+            mask_path = workspace.predicted_masks / f"{token}.png"
+            if not mask_path.is_file():
+                continue
+            is_known_invalid = token in invalid_tokens
+            rows.append(
+                {
+                    "image_token": token,
+                    "image_path": str(base["image_path"]),
+                    "patient_id": str(base["patient_id"]),
+                    "series_id": str(base["series_id"]),
+                    "segmentation_fold": int(base["segmentation_fold"]),
+                    "predicted_attention_mask_path": str(mask_path),
+                    "attention_valid_initial": 0 if is_known_invalid else "",
+                    "attention_valid_final": 0 if is_known_invalid else "",
+                    "attention_invalid_reason_initial": (
+                        "listed_in_attention_invalid_after_retrain"
+                        if is_known_invalid
+                        else ""
+                    ),
+                    "attention_invalid_reason_final": (
+                        "listed_in_attention_invalid_after_retrain"
+                        if is_known_invalid
+                        else ""
+                    ),
+                    "attention_repair_method": "legacy_mask_without_manifest",
+                    "attention_threshold_used": "",
+                    "attention_area_ratio": "",
+                    "attention_peak_probability": "",
+                    "attention_boundary_touch_fraction": "",
+                    "checkpoint_fingerprint": "",
+                }
+            )
+        return rows
+
+    @classmethod
+    def ensure_prediction_audit(
+        cls,
+        dataset_rows: Sequence[dict[str, Any]],
+        workspace: Workspace,
+        require_complete: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Găsește cea mai completă sursă de predicții și creează auditul simplu.
+
+        Ordinea practică este: audit simplu existent, manifest full, apoi PNG-uri.
+        Este aleasă sursa care acoperă cele mai multe imagini cu mască lizibilă.
+        """
+
+        current_raw = FileManager.read_csv(workspace.prediction_audit)
+        current = cls._normalize_prediction_rows(current_raw, dataset_rows, workspace)
+
+        legacy_path = workspace.root / cls.LEGACY_FULL_REVIEW_MANIFEST
+        legacy_raw = FileManager.read_csv(legacy_path)
+        legacy = cls._normalize_prediction_rows(legacy_raw, dataset_rows, workspace)
+
+        derived = cls._derive_prediction_rows_from_masks(dataset_rows, workspace)
+        # La egalitate se păstrează auditul simplu, apoi manifestul full.
+        candidates = [
+            (len(current), 3, "simple", current),
+            (len(legacy), 2, "full_manifest", legacy),
+            (len(derived), 1, "mask_directory", derived),
+        ]
+        _count, _priority, source, selected = max(candidates, key=lambda item: (item[0], item[1]))
+
+        if not selected:
+            raise FileNotFoundError(
+                "Nu există metadate sau măști Attention reutilizabile. Au fost "
+                f"căutate {workspace.prediction_audit}, {legacy_path} și "
+                f"{workspace.predicted_masks}. Rulează blocul GPU de antrenare/"
+                "predicție numai dacă aceste rezultate nu au fost generate deja."
+            )
+
+        total = len(dataset_rows)
+        if require_complete and len(selected) != total:
+            raise RuntimeError(
+                "Feature bank-ul necesită câte o mască Attention pentru fiecare "
+                f"imagine, dar au fost găsite {len(selected)}/{total}. Sursa aleasă: "
+                f"{source}. Pentru review poți continua cu subsetul existent; pentru "
+                "evaluare trebuie completată inferența Attention."
+            )
+
+        should_write = (
+            not workspace.prediction_audit.is_file()
+            or source != "simple"
+            or len(current) != len(selected)
+        )
+        if should_write:
+            FileManager.write_csv(
+                workspace.prediction_audit,
+                selected,
+                SegmentationManager.PREDICTION_FIELDS,
+            )
+            FileManager.write_json(
+                workspace.outputs / cls.IMPORT_SUMMARY,
+                {
+                    "schema": "simple-full-workspace-compat-v1",
+                    "source": source,
+                    "dataset_images": total,
+                    "imported_prediction_rows": len(selected),
+                    "simple_prediction_audit": str(workspace.prediction_audit),
+                    "legacy_full_review_manifest": str(legacy_path),
+                    "prediction_masks_directory": str(workspace.predicted_masks),
+                    "note": (
+                        "Metadatele au fost convertite pentru review/feature extraction; "
+                        "simple_prediction_summary.json nu a fost falsificat, deci cache-ul "
+                        "de inferență al modelului simplificat rămâne separat."
+                    ),
+                },
+            )
+            print(
+                "[COMPATIBILITATE] Auditul de predicții a fost construit din "
+                f"{source}: {len(selected)}/{total} imagini -> "
+                f"{workspace.prediction_audit}"
+            )
+        else:
+            print(
+                "[COMPATIBILITATE] Audit simplu existent reutilizat: "
+                f"{len(selected)}/{total} imagini."
+            )
+        return selected
+
+    @classmethod
+    def ensure_quality_audit(
+        cls,
+        dataset_rows: Sequence[dict[str, Any]],
+        workspace: Workspace,
+    ) -> list[dict[str, Any]]:
+        """Importă auditul de calitate full când auditul simplu lipsește."""
+
+        current = FileManager.read_csv(workspace.quality_audit)
+        current_tokens = {
+            str(row.get("image_token", "")).strip()
+            for row in current
+            if str(row.get("image_token", "")).strip()
+        }
+        if len(current_tokens) == len(dataset_rows):
+            return current
+
+        legacy_path = workspace.root / cls.LEGACY_QUALITY_AUDIT
+        legacy = FileManager.read_csv(legacy_path)
+        legacy_by_token = {
+            str(row.get("image_token", "")).strip(): row
+            for row in legacy
+            if str(row.get("image_token", "")).strip()
+        }
+        if not legacy_by_token:
+            return current
+
+        normalized: list[dict[str, Any]] = []
+        for base in dataset_rows:
+            token = str(base["image_token"])
+            source = legacy_by_token.get(token)
+            if source is None:
+                continue
+            image_path = Path(base["image_path"])
+            stat = image_path.stat() if image_path.is_file() else None
+            normalized.append(
+                {
+                    "image_token": token,
+                    "image_path": str(image_path),
+                    "patient_id": str(base["patient_id"]),
+                    "series_id": str(base["series_id"]),
+                    "image_size_bytes": int(stat.st_size) if stat else -1,
+                    "image_mtime_ns": int(stat.st_mtime_ns) if stat else -1,
+                    "perceptual_hash": cls._first_nonempty(
+                        source, "perceptual_hash", default=""
+                    ),
+                    "sharpness": cls._first_nonempty(
+                        source, "sharpness", "image_quality_sharpness", default=""
+                    ),
+                    "noise_ratio": cls._first_nonempty(
+                        source, "noise_ratio", "image_quality_noise_ratio", default=""
+                    ),
+                    "dynamic_range": cls._first_nonempty(
+                        source, "dynamic_range", "image_quality_dynamic_range", default=""
+                    ),
+                    "patient_blur_threshold": cls._first_nonempty(
+                        source, "patient_blur_threshold", default=""
+                    ),
+                    "patient_noise_threshold": cls._first_nonempty(
+                        source, "patient_noise_threshold", default=""
+                    ),
+                    "quality_valid": cls._first_nonempty(
+                        source, "quality_valid", "image_quality_valid", default=0
+                    ),
+                    "quality_reason": cls._first_nonempty(
+                        source, "quality_reason", "image_quality_reason", default=""
+                    ),
+                }
+            )
+
+        if len(normalized) > len(current_tokens):
+            FileManager.write_csv(
+                workspace.quality_audit,
+                normalized,
+                QualityManager.FIELDS,
+            )
+            print(
+                "[COMPATIBILITATE] Auditul de calitate full a fost importat: "
+                f"{len(normalized)}/{len(dataset_rows)} imagini -> "
+                f"{workspace.quality_audit}"
+            )
+            return normalized
+        return current
+
+    @classmethod
+    def legacy_status(cls, workspace: Workspace) -> dict[str, Any]:
+        return {
+            "legacy_full_review_manifest": (
+                workspace.root / cls.LEGACY_FULL_REVIEW_MANIFEST
+            ).is_file(),
+            "legacy_quality_audit": (
+                workspace.root / cls.LEGACY_QUALITY_AUDIT
+            ).is_file(),
+            "legacy_prediction_generation": (
+                workspace.root / "attention_unet_prediction_generation.json"
+            ).is_file(),
+        }
+
+
 class DatasetManager:
     """Descoperă imaginile și păstrează pacientul ca unitate statistică."""
 
@@ -3873,14 +4229,22 @@ class CADPipeline:
     ) -> MaskEditor:
         """CPU: deschide editorul HTML; nu încarcă niciun model neural."""
 
-        if not self.workspace.quality_audit.is_file():
+        rows = self._rows()
+        # Într-un workspace creat de notebook-ul full, predicțiile există în
+        # attention_unet_full_review_manifest.csv, nu în fișierul simplificat.
+        # Conversia de mai jos este doar CSV -> CSV și nu folosește GPU-ul.
+        imported_quality = WorkspaceCompatibilityManager.ensure_quality_audit(
+            rows, self.workspace
+        )
+        if scope == "novel" and len(imported_quality) != len(rows):
             self.audit_quality(refresh=False)
-        if not self.workspace.prediction_audit.is_file():
-            raise FileNotFoundError(
-                "Rulează generate_attention_masks() înainte de editor."
-            )
+        WorkspaceCompatibilityManager.ensure_prediction_audit(
+            rows,
+            self.workspace,
+            require_complete=False,
+        )
         queue = ReviewManager.select(
-            self._rows(),
+            rows,
             self.workspace,
             scope=scope,
             limit=limit,
@@ -3909,13 +4273,16 @@ class CADPipeline:
         rapid, dar GPU-ul este folosit numai pentru forward-urile EfficientNet.
         """
 
-        if not self.workspace.prediction_audit.is_file():
-            raise FileNotFoundError(
-                "Rulează generate_attention_masks() înainte de feature bank."
-            )
+        rows = self._rows()
+        # Acceptă atât auditul simplificat, cât și manifestul complet produs de
+        # notebook-ul full. Pentru feature bank este obligatorie acoperirea 100%.
+        WorkspaceCompatibilityManager.ensure_prediction_audit(
+            rows,
+            self.workspace,
+            require_complete=True,
+        )
         if not self.workspace.manual_audit.is_file():
             self.audit_manual_masks()
-        rows = self._rows()
         if not force:
             cached = FeatureManager.load_compatible_cache(rows, self.workspace)
             if cached is not None:
@@ -3972,6 +4339,7 @@ class CADPipeline:
             "prediction_audit": self.workspace.prediction_audit.is_file(),
             "feature_bank": self.workspace.feature_bank.is_file(),
             "results": self.workspace.results_csv.is_file(),
+            **WorkspaceCompatibilityManager.legacy_status(self.workspace),
         }
         print(json.dumps(status, indent=2))
         return status
@@ -4107,7 +4475,17 @@ def run_review_block(
     scope = str(scope).strip().lower()
     _execution_banner(f"REVIEW MANUAL PE CPU — scope={scope}")
     if scope == "invalid":
-        invalid_rows = FileManager.read_csv(pipeline.workspace.invalid_predictions)
+        prediction_rows = WorkspaceCompatibilityManager.ensure_prediction_audit(
+            pipeline._rows(),
+            pipeline.workspace,
+            require_complete=False,
+        )
+        invalid_rows = [
+            row
+            for row in prediction_rows
+            if _as_int(row.get("attention_valid_final"), 1) == 0
+            and Path(row.get("predicted_attention_mask_path", "")).is_file()
+        ]
         print("Predicții invalide:", len(invalid_rows))
         if not invalid_rows:
             print("Nu există predicții invalide de corectat.")
