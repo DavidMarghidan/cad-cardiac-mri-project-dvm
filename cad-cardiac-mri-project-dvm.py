@@ -5,12 +5,15 @@
 
 Ideea centrală:
 1. Directory_* este pacientul și nu traversează niciodată foldurile.
-2. Attention U-Net este antrenat numai din măști manuale valide.
-3. Fiecare pacient este prezis de un model care nu a văzut acel pacient.
-4. CPU și GPU sunt alese separat pentru fiecare etapă costisitoare.
-5. GPU-ul este folosit numai în interiorul etapei cerute și este eliberat apoi.
-6. Clasificarea și toate metricile sunt calculate la nivel de pacient.
-7. Workspace-urile notebook-ului full sunt importate automat pentru review.
+2. Attention U-Net folosește ținte HEART_PRESENT și NO_HEART_VISIBLE explicite.
+3. Intrarea este 2.5D (cadrul anterior, curent și următor), cu un cap separat
+   care estimează dacă inima este vizibilă.
+4. Fiecare pacient este prezis de un model care nu a văzut acel pacient.
+5. Sampling-ul este echilibrat pe pacient, serie, pHash și tip de țintă.
+6. CPU și GPU sunt alese separat pentru fiecare etapă costisitoare.
+7. Clasificarea și toate metricile sunt calculate la nivel de pacient.
+8. Review-ul poate selecta predicții invalide, noi sau incerte.
+9. Workspace-urile notebook-ului full sunt importate automat pentru review.
 
 Pipeline-ul nu selectează GPU la inițializare. Auditul, editorul, agregarea și
 evaluarea rămân pe CPU. Antrenarea/predicția Attention U-Net pot folosi GPU,
@@ -28,6 +31,7 @@ import json
 import math
 import os
 import random
+import re
 import shutil
 import time
 import uuid
@@ -55,11 +59,13 @@ from sklearn.metrics import (
 from sklearn.model_selection import StratifiedKFold
 from sklearn.pipeline import Pipeline as SklearnPipeline
 from sklearn.preprocessing import StandardScaler
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torchvision.models import EfficientNet_B0_Weights, efficientnet_b0
 from tqdm.auto import tqdm
 
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
+PIPELINE_VERSION = "2026-09-22-attention-2p5d-presence-v3"
 
 
 def _as_float(value: Any, default: float = 0.0) -> float:
@@ -187,27 +193,59 @@ class ImageSettings:
 
 
 class SegmentationSettings:
-    """Setările Attention U-Net și regulile fixe de validare a măștilor."""
+    """Setările Attention U-Net, țintele explicite și validarea măștilor."""
 
     FOLDS = 5
     BASE_CHANNELS = 24
-    EPOCHS = 12
-    EARLY_STOPPING_PATIENCE = 4
-    LEARNING_RATE = 1e-3
+    INPUT_CHANNELS = 3  # 2.5D: cadrul anterior, curent și următor
+    USE_2_5D = True
+
+    EPOCHS = 36
+    EARLY_STOPPING_PATIENCE = 8
+    LEARNING_RATE = 8e-4
     WEIGHT_DECAY = 1e-4
-    BCE_WEIGHT = 0.50
+    LR_REDUCE_PATIENCE = 3
+    LR_REDUCE_FACTOR = 0.5
+    MIN_LEARNING_RATE = 1e-6
 
-    BATCH_SIZE_CUDA = 12
-    BATCH_SIZE_CPU = 4
-    INFERENCE_BATCH_SIZE_CUDA = 12
-    INFERENCE_BATCH_SIZE_CPU = 4
+    # Loss: focal BCE + Tversky pentru segmentare, plus capul heart-present.
+    FOCAL_WEIGHT = 0.40
+    TVERSKY_WEIGHT = 0.60
+    FOCAL_GAMMA = 2.0
+    TVERSKY_ALPHA_FP = 0.65
+    TVERSKY_BETA_FN = 0.35
+    PRESENCE_LOSS_WEIGHT = 0.30
 
+    # Greutăți diferite pentru proveniența țintelor.
+    MANUAL_DRAWN_WEIGHT = 1.00
+    AUTO_CONFIRMED_WEIGHT = 0.72
+    NO_HEART_WEIGHT = 0.90
+    NEGATIVE_TARGET_FRACTION = 0.30
+
+    BATCH_SIZE_CUDA = 10
+    BATCH_SIZE_CPU = 3
+    INFERENCE_BATCH_SIZE_CUDA = 10
+    INFERENCE_BATCH_SIZE_CPU = 3
+
+    # Minimul se aplică țintelor HEART_PRESENT, nu exemplelor negative suplimentare.
     MIN_MANUAL_MASKS = 800
     MANUAL_MIN_AREA_RATIO = 0.0005
     MANUAL_MAX_AREA_RATIO = 0.98
     VALIDATION_PATIENT_FRACTION = 0.20
 
+    # Augmentări realiste; flip-ul stânga-dreapta este dezactivat implicit.
+    AUGMENT_HORIZONTAL_FLIP = False
+    AUGMENT_ROTATION_DEGREES = 7.0
+    AUGMENT_TRANSLATION_FRACTION = 0.06
+    AUGMENT_SCALE_MIN = 0.92
+    AUGMENT_SCALE_MAX = 1.08
+    AUGMENT_GAMMA_MIN = 0.85
+    AUGMENT_GAMMA_MAX = 1.15
+    AUGMENT_NOISE_STD_MAX = 0.025
+    AUGMENT_BLUR_PROBABILITY = 0.15
+
     CALIBRATION_THRESHOLDS = (
+        0.20,
         0.25,
         0.30,
         0.35,
@@ -218,14 +256,37 @@ class SegmentationSettings:
         0.60,
         0.65,
         0.70,
+        0.75,
+    )
+    PRESENCE_CALIBRATION_THRESHOLDS = (
+        0.20,
+        0.25,
+        0.30,
+        0.35,
+        0.40,
+        0.45,
+        0.50,
+        0.55,
+        0.60,
+        0.65,
+        0.70,
+        0.75,
+        0.80,
     )
     DEFAULT_THRESHOLD = 0.50
+    DEFAULT_PRESENCE_THRESHOLD = 0.50
+    PRESENCE_SEGMENTATION_OVERRIDE_PEAK = 0.80
     PREDICTION_MIN_AREA_RATIO = 0.003
     PREDICTION_MAX_AREA_RATIO = 0.65
     PREDICTION_MIN_PEAK_PROBABILITY = 0.50
-    REPAIR_THRESHOLD_OFFSETS = (-0.15, -0.10, -0.05, 0.05, 0.10, 0.15)
+    REPAIR_THRESHOLD_OFFSETS = (-0.20, -0.15, -0.10, -0.05, 0.05, 0.10, 0.15, 0.20)
     REPAIR_MAX_BOUNDARY_TOUCH = 0.35
     REPAIR_MORPHOLOGY_KERNEL = 5
+    PRIOR_MAX_ROBUST_Z = 5.5
+
+    # TTA fotometric pentru toate imaginile; nu schimbă orientarea anatomică.
+    TTA_CONTRAST_FACTOR = 1.10
+    UNCERTAINTY_DISAGREEMENT_SCALE = 0.08
 
     SUPPORT_DILATION_KERNEL = 15
     SAVE_ALL_PREDICTED_MASKS = True
@@ -269,6 +330,8 @@ class ReviewSettings:
     PHASH_MAX_DISTANCE = 6
     DEFAULT_LIMIT = 300
     BRUSH_RADIUS = 8
+    UNCERTAINTY_MIN_SCORE = 0.18
+    PRESENCE_MARGIN = 0.15
 
 
 class Settings:
@@ -484,12 +547,15 @@ class Workspace:
     dataset_manifest: Path
     quality_audit: Path
     manual_audit: Path
+    manual_annotations: Path
     prediction_audit: Path
     prediction_parts_dir: Path
     invalid_predictions: Path
     review_history: Path
     training_summary: Path
     prediction_summary: Path
+    segmentation_metrics: Path
+    segmentation_metrics_summary: Path
     feature_bank: Path
     feature_metadata: Path
     results_csv: Path
@@ -512,12 +578,15 @@ class FileManager:
             dataset_manifest=root / "simple_dataset_manifest.csv",
             quality_audit=root / "simple_image_quality_audit.csv",
             manual_audit=root / "simple_manual_mask_audit.csv",
+            manual_annotations=root / "manual_annotation_labels.csv",
             prediction_audit=root / "simple_attention_prediction_audit.csv",
             prediction_parts_dir=root / "simple_pipeline_outputs" / "attention_prediction_parts",
             invalid_predictions=root / "attention_invalid_after_retrain.csv",
             review_history=root / "simple_review_history.csv",
             training_summary=root / "simple_training_summary.json",
             prediction_summary=root / "simple_prediction_summary.json",
+            segmentation_metrics=root / "simple_pipeline_outputs" / "attention_oof_segmentation_metrics.csv",
+            segmentation_metrics_summary=root / "simple_pipeline_outputs" / "attention_oof_segmentation_summary.json",
             feature_bank=root / "simple_pipeline_outputs" / "patient_feature_bank.npz",
             feature_metadata=root / "simple_pipeline_outputs" / "patient_feature_bank.json",
             results_csv=root / "simple_pipeline_outputs" / "evaluation_summary.csv",
@@ -716,6 +785,36 @@ class WorkspaceCompatibilityManager:
                     "attention_boundary_touch_fraction": cls._first_nonempty(
                         source, "attention_boundary_touch_fraction", default=""
                     ),
+                    "attention_heart_present": cls._first_nonempty(
+                        source, "attention_heart_present", default=""
+                    ),
+                    "attention_presence_probability": cls._first_nonempty(
+                        source, "attention_presence_probability", default=""
+                    ),
+                    "attention_presence_threshold": cls._first_nonempty(
+                        source, "attention_presence_threshold", default=""
+                    ),
+                    "attention_tta_disagreement": cls._first_nonempty(
+                        source, "attention_tta_disagreement", default=""
+                    ),
+                    "attention_mean_entropy": cls._first_nonempty(
+                        source, "attention_mean_entropy", default=""
+                    ),
+                    "attention_uncertainty_score": cls._first_nonempty(
+                        source, "attention_uncertainty_score", default=""
+                    ),
+                    "attention_sequence_inconsistency": cls._first_nonempty(
+                        source, "attention_sequence_inconsistency", default=""
+                    ),
+                    "attention_centroid_x": cls._first_nonempty(
+                        source, "attention_centroid_x", default=""
+                    ),
+                    "attention_centroid_y": cls._first_nonempty(
+                        source, "attention_centroid_y", default=""
+                    ),
+                    "attention_prior_deviation": cls._first_nonempty(
+                        source, "attention_prior_deviation", default=""
+                    ),
                     "checkpoint_fingerprint": cls._first_nonempty(
                         source,
                         "checkpoint_fingerprint",
@@ -771,6 +870,16 @@ class WorkspaceCompatibilityManager:
                     "attention_area_ratio": "",
                     "attention_peak_probability": "",
                     "attention_boundary_touch_fraction": "",
+                    "attention_heart_present": "",
+                    "attention_presence_probability": "",
+                    "attention_presence_threshold": "",
+                    "attention_tta_disagreement": "",
+                    "attention_mean_entropy": "",
+                    "attention_uncertainty_score": "",
+                    "attention_sequence_inconsistency": "",
+                    "attention_centroid_x": "",
+                    "attention_centroid_y": "",
+                    "attention_prior_deviation": "",
                     "checkpoint_fingerprint": "",
                 }
             )
@@ -1092,8 +1201,17 @@ class DatasetManager:
         return samples
 
     @staticmethod
+    def _natural_path_key(path: str) -> tuple[Any, ...]:
+        """Sortează img2 înainte de img10, păstrând ordinea secvenței."""
+
+        return tuple(
+            int(part) if part.isdigit() else part.lower()
+            for part in re.split(r"(\d+)", str(path))
+        )
+
+    @staticmethod
     def rows(samples: Sequence[Sample], workspace: Workspace) -> list[dict[str, Any]]:
-        return [
+        rows = [
             {
                 "manifest_index": index,
                 "image_token": sample.image_token,
@@ -1107,6 +1225,33 @@ class DatasetManager:
             }
             for index, sample in enumerate(samples)
         ]
+
+        # Context 2.5D fără a traversa seria sau pacientul. La capete se repetă
+        # cadrul curent, deci geometria rămâne definită pentru fiecare imagine.
+        by_sequence_group: dict[str, list[int]] = defaultdict(list)
+        for index, row in enumerate(rows):
+            # Nu traversăm între două subfoldere-leaf diferite din același proxy
+            # de serie (important pentru structura Sick/SR_*/...).
+            parent = str(Path(row["image_path"]).parent)
+            sequence_group = f"{row['series_id']}::{parent}"
+            row["sequence_group_id"] = sequence_group
+            by_sequence_group[sequence_group].append(index)
+        for indices in by_sequence_group.values():
+            ordered = sorted(
+                indices,
+                key=lambda index: DatasetManager._natural_path_key(rows[index]["image_path"]),
+            )
+            for position, row_index in enumerate(ordered):
+                previous_index = ordered[max(0, position - 1)]
+                next_index = ordered[min(len(ordered) - 1, position + 1)]
+                rows[row_index]["sequence_index"] = int(position)
+                rows[row_index]["sequence_length"] = int(len(ordered))
+                rows[row_index]["previous_image_path"] = rows[previous_index]["image_path"]
+                rows[row_index]["next_image_path"] = rows[next_index]["image_path"]
+
+        if rows:
+            FileManager.write_csv(workspace.dataset_manifest, rows, rows[0].keys())
+        return rows
 
 
 # =============================================================================
@@ -1263,9 +1408,11 @@ class ImageProcessor:
 
     @staticmethod
     def standardized_uint8(path: Path | str) -> np.ndarray:
+        """Imagine robust-normalizată pentru segmentare și editor."""
+
         image = ImageProcessor.read_gray(path)
-        _, minmax, _, _ = ImageProcessor.standardize(image)
-        return np.clip(np.round(minmax * 255.0), 0, 255).astype(np.uint8)
+        robust, _, _, _ = ImageProcessor.standardize(image)
+        return np.clip(np.round(robust * 255.0), 0, 255).astype(np.uint8)
 
     @staticmethod
     def classifier_views(path: Path | str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -1460,7 +1607,30 @@ class QualityManager:
 
 
 class MaskManager:
-    """Validează măștile manuale și construiește cohorta de antrenare."""
+    """Gestionează trei tipuri explicite de adnotări pentru segmentare.
+
+    ``HEART_PRESENT`` este o țintă non-goală. ``NO_HEART_VISIBLE`` este o
+    imagine validă cu țintă goală și este folosită ca exemplu negativ.
+    ``UNUSABLE`` marchează blur/zgomot/localizer neinterpretabil și este exclusă.
+    Măștile goale vechi, fără etichetă explicită, rămân excluse pentru a nu
+    transforma accidental o salvare greșită într-un exemplu negativ.
+    """
+
+    HEART_PRESENT = "HEART_PRESENT"
+    NO_HEART_VISIBLE = "NO_HEART_VISIBLE"
+    UNUSABLE = "UNUSABLE"
+    VALID_TARGET_TYPES = {HEART_PRESENT, NO_HEART_VISIBLE, UNUSABLE}
+
+    ANNOTATION_FIELDS = (
+        "timestamp_utc",
+        "image_token",
+        "patient_id",
+        "series_id",
+        "target_type",
+        "source",
+        "sample_weight",
+        "note",
+    )
 
     MANUAL_AUDIT_FIELDS = (
         "image_token",
@@ -1468,6 +1638,10 @@ class MaskManager:
         "series_id",
         "manual_mask_path",
         "status",
+        "target_type",
+        "heart_present",
+        "annotation_source",
+        "sample_weight",
         "area_ratio",
         "quality_valid",
         "quality_reason",
@@ -1503,111 +1677,265 @@ class MaskManager:
         return {"exists": 1, "usable": int(not reason), "area_ratio": area, "reason": reason}
 
     @staticmethod
+    def annotation_map(workspace: Workspace) -> dict[str, dict[str, Any]]:
+        """Returnează ultima etichetă explicită pentru fiecare imagine."""
+
+        result: dict[str, dict[str, Any]] = {}
+        for row in FileManager.read_csv(workspace.manual_annotations):
+            token = str(row.get("image_token", "")).strip()
+            if token:
+                result[token] = dict(row)
+        return result
+
+    @staticmethod
+    def _default_weight(target_type: str, source: str) -> float:
+        target_type = str(target_type).upper()
+        source = str(source).lower()
+        if target_type == MaskManager.NO_HEART_VISIBLE:
+            return float(Settings.Segmentation.NO_HEART_WEIGHT)
+        if "auto" in source:
+            return float(Settings.Segmentation.AUTO_CONFIRMED_WEIGHT)
+        return float(Settings.Segmentation.MANUAL_DRAWN_WEIGHT)
+
+    @staticmethod
+    def set_annotation(
+        workspace: Workspace,
+        row: dict[str, Any],
+        target_type: str,
+        source: str,
+        sample_weight: float | None = None,
+        note: str = "",
+    ) -> None:
+        target_type = str(target_type).strip().upper()
+        if target_type not in MaskManager.VALID_TARGET_TYPES:
+            raise ValueError(f"Tip de adnotare necunoscut: {target_type}")
+        records = MaskManager.annotation_map(workspace)
+        weight = (
+            MaskManager._default_weight(target_type, source)
+            if sample_weight is None
+            else float(sample_weight)
+        )
+        records[str(row["image_token"])] = {
+            "timestamp_utc": pd.Timestamp.utcnow().isoformat(),
+            "image_token": str(row["image_token"]),
+            "patient_id": str(row.get("patient_id", "")),
+            "series_id": str(row.get("series_id", "")),
+            "target_type": target_type,
+            "source": str(source),
+            "sample_weight": float(weight),
+            "note": str(note),
+        }
+        FileManager.write_csv(
+            workspace.manual_annotations,
+            [records[token] for token in sorted(records)],
+            MaskManager.ANNOTATION_FIELDS,
+        )
+
+    @staticmethod
+    def remove_annotation(workspace: Workspace, image_token: str) -> None:
+        records = MaskManager.annotation_map(workspace)
+        records.pop(str(image_token), None)
+        FileManager.write_csv(
+            workspace.manual_annotations,
+            [records[token] for token in sorted(records)],
+            MaskManager.ANNOTATION_FIELDS,
+        )
+
+    @staticmethod
     def audit_manual_masks(
         rows: Sequence[dict[str, Any]],
         quality: dict[str, dict[str, Any]],
         workspace: Workspace,
         minimum_masks: int | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        """Păstrează numai măști non-goale pe imagini suficient de clare.
-
-        Măștile goale NU sunt folosite ca ținte de antrenare. Fișierul lor rămâne
-        însă în `manual_masks`, deci imaginea și vecinii ei apropiați pot fi
-        excluși ulterior din coada `novel`.
-        """
+        """Construiește cohorta cu ținte pozitive și negative explicite."""
 
         minimum_masks = int(minimum_masks or Settings.Segmentation.MIN_MANUAL_MASKS)
-        by_token = {row["image_token"]: dict(row) for row in rows}
-        manual_files = sorted(workspace.manual_masks.glob("*.png"))
+        by_token = {str(row["image_token"]): dict(row) for row in rows}
+        manual_files = {path.stem: path for path in workspace.manual_masks.glob("*.png")}
+        annotations = MaskManager.annotation_map(workspace)
+        candidate_tokens = sorted(set(manual_files) | set(annotations))
+
         accepted: list[dict[str, Any]] = []
         audit: list[dict[str, Any]] = []
         patient_counts: dict[str, int] = defaultdict(int)
-        fold_counts: dict[int, int] = defaultdict(int)
+        positive_patient_counts: dict[str, int] = defaultdict(int)
+        fold_positive_counts: dict[int, int] = defaultdict(int)
+        fold_negative_counts: dict[int, int] = defaultdict(int)
+        positive_count = 0
+        negative_count = 0
+        unusable_count = 0
 
-        for path in manual_files:
-            row = by_token.get(path.stem)
+        for token in candidate_tokens:
+            row = by_token.get(token)
+            path = manual_files.get(token, workspace.manual_masks / f"{token}.png")
+            annotation = annotations.get(token, {})
             if row is None:
                 audit.append(
                     {
-                        "image_token": path.stem,
+                        "image_token": token,
                         "manual_mask_path": str(path),
                         "status": "REJECTED",
+                        "target_type": annotation.get("target_type", ""),
                         "reason": "token_absent_from_dataset",
                     }
                 )
                 continue
+
             mask_qc = MaskManager.manual_qc(path)
-            quality_row = quality.get(path.stem, {})
-            reasons = []
-            if not mask_qc["usable"]:
-                reasons.append(mask_qc["reason"])
-            if _as_int(quality_row.get("quality_valid"), 0) != 1:
-                reasons.append(quality_row.get("quality_reason", "quality_invalid"))
-            status = "ACCEPTED" if not reasons else "REJECTED"
+            target_type = str(annotation.get("target_type", "")).strip().upper()
+            source = str(annotation.get("source", "")).strip()
+            if not target_type:
+                if mask_qc["usable"]:
+                    target_type = MaskManager.HEART_PRESENT
+                    source = "legacy_nonempty_manual"
+                else:
+                    target_type = "UNLABELED_EMPTY"
+                    source = "legacy_unlabeled"
+
+            quality_row = quality.get(token, {})
+            quality_valid = _as_int(quality_row.get("quality_valid"), 0) == 1
+            reasons: list[str] = []
+            heart_present = ""
+
+            if target_type == MaskManager.HEART_PRESENT:
+                heart_present = 1
+                if not mask_qc["usable"]:
+                    reasons.append(mask_qc["reason"] or "missing_positive_mask")
+            elif target_type == MaskManager.NO_HEART_VISIBLE:
+                heart_present = 0
+                if not path.is_file():
+                    FileManager.write_png(
+                        path,
+                        np.zeros(
+                            (Settings.Image.SEGMENTATION_SIZE, Settings.Image.SEGMENTATION_SIZE),
+                            dtype=np.uint8,
+                        ),
+                    )
+                    mask_qc = MaskManager.manual_qc(path)
+                if not np.isfinite(_as_float(mask_qc.get("area_ratio"), np.nan)):
+                    reasons.append("unreadable_negative_mask")
+                elif _as_float(mask_qc.get("area_ratio"), 1.0) >= Settings.Segmentation.MANUAL_MIN_AREA_RATIO:
+                    reasons.append("no_heart_annotation_has_nonempty_mask")
+            elif target_type == MaskManager.UNUSABLE:
+                unusable_count += 1
+                reasons.append("explicitly_unusable")
+            else:
+                reasons.append("empty_mask_without_explicit_no_heart_label")
+
+            if target_type != MaskManager.UNUSABLE and not quality_valid:
+                reasons.append(str(quality_row.get("quality_reason", "quality_invalid")))
+
+            if target_type == MaskManager.UNUSABLE:
+                status = "EXCLUDED"
+            else:
+                status = "ACCEPTED" if not reasons else "REJECTED"
+
+            sample_weight = _as_float(
+                annotation.get("sample_weight"),
+                MaskManager._default_weight(target_type, source),
+            )
             audit.append(
                 {
-                    "image_token": row["image_token"],
+                    "image_token": token,
                     "patient_id": row["patient_id"],
                     "series_id": row["series_id"],
                     "manual_mask_path": str(path),
                     "status": status,
-                    "area_ratio": mask_qc["area_ratio"],
+                    "target_type": target_type,
+                    "heart_present": heart_present,
+                    "annotation_source": source,
+                    "sample_weight": sample_weight,
+                    "area_ratio": mask_qc.get("area_ratio", np.nan),
                     "quality_valid": quality_row.get("quality_valid", 0),
                     "quality_reason": quality_row.get("quality_reason", ""),
                     "reason": ";".join(filter(None, reasons)),
                 }
             )
-            if status == "ACCEPTED":
-                row.update(
-                    {
-                        "manual_mask_path": str(path),
-                        "manual_mask_area_ratio": float(mask_qc["area_ratio"]),
-                        "quality_valid": 1,
-                        "perceptual_hash": quality_row.get("perceptual_hash", ""),
-                    }
-                )
-                accepted.append(row)
-                patient_counts[row["patient_id"]] += 1
-                fold_counts[int(row["segmentation_fold"])] += 1
+
+            if status != "ACCEPTED":
+                continue
+            row.update(
+                {
+                    "manual_mask_path": str(path),
+                    "manual_mask_area_ratio": float(_as_float(mask_qc.get("area_ratio"), 0.0)),
+                    "quality_valid": 1,
+                    "perceptual_hash": quality_row.get("perceptual_hash", ""),
+                    "segmentation_target_type": target_type,
+                    "heart_present": int(heart_present),
+                    "sample_weight": float(sample_weight),
+                    "annotation_source": source,
+                }
+            )
+            accepted.append(row)
+            patient_counts[str(row["patient_id"])] += 1
+            fold = int(row["segmentation_fold"])
+            if int(heart_present) == 1:
+                positive_count += 1
+                positive_patient_counts[str(row["patient_id"])] += 1
+                fold_positive_counts[fold] += 1
+            else:
+                negative_count += 1
+                fold_negative_counts[fold] += 1
 
         FileManager.write_csv(workspace.manual_audit, audit, MaskManager.MANUAL_AUDIT_FIELDS)
-        rejected = sum(row["status"] == "REJECTED" for row in audit)
-        empty = sum("empty" in str(row.get("reason", "")) for row in audit)
+        rejected = sum(row.get("status") == "REJECTED" for row in audit)
+        excluded = sum(row.get("status") == "EXCLUDED" for row in audit)
+        unlabeled_empty = sum(
+            "without_explicit_no_heart" in str(row.get("reason", "")) for row in audit
+        )
         blur_or_noise = sum(
-            row["status"] == "REJECTED" and bool(row.get("quality_reason")) for row in audit
+            row.get("status") == "REJECTED" and bool(row.get("quality_reason"))
+            for row in audit
         )
         summary = {
             "manual_png_files": len(manual_files),
-            "accepted_manual_masks": len(accepted),
-            "rejected_manual_masks": rejected,
-            "rejected_empty_manual_masks": empty,
+            "explicit_annotations": len(annotations),
+            "accepted_training_targets": len(accepted),
+            "accepted_heart_present": positive_count,
+            "accepted_no_heart_visible": negative_count,
+            "explicit_unusable": unusable_count,
+            "rejected_targets": rejected,
+            "excluded_targets": excluded,
+            "rejected_unlabeled_empty_masks": unlabeled_empty,
             "rejected_blur_or_noise": blur_or_noise,
-            "patients_with_accepted_masks": len(patient_counts),
-            "masks_per_patient": dict(sorted(patient_counts.items())),
-            "masks_per_fold": {
-                str(fold): int(fold_counts.get(fold, 0))
+            "patients_with_training_targets": len(patient_counts),
+            "patients_with_positive_masks": len(positive_patient_counts),
+            "targets_per_patient": dict(sorted(patient_counts.items())),
+            "positive_masks_per_fold": {
+                str(fold): int(fold_positive_counts.get(fold, 0))
+                for fold in range(Settings.Segmentation.FOLDS)
+            },
+            "negative_masks_per_fold": {
+                str(fold): int(fold_negative_counts.get(fold, 0))
                 for fold in range(Settings.Segmentation.FOLDS)
             },
             "audit": str(workspace.manual_audit),
+            "annotations": str(workspace.manual_annotations),
         }
         print(
             "[MĂȘTI MANUALE] "
-            f"accepted={len(accepted)}, rejected={rejected}, empty={empty}, "
-            f"blur_or_noise={blur_or_noise}, patients={len(patient_counts)}"
+            f"heart_present={positive_count}, no_heart={negative_count}, "
+            f"rejected={rejected}, unusable={unusable_count}, "
+            f"patients={len(patient_counts)}"
         )
 
-        if len(accepted) < minimum_masks:
+        if positive_count < minimum_masks:
             raise RuntimeError(
-                f"Au rămas {len(accepted)} măști valide, sub minimul {minimum_masks}. "
-                f"Vezi {workspace.manual_audit}"
+                f"Au rămas {positive_count} măști HEART_PRESENT valide, sub minimul "
+                f"{minimum_masks}. Vezi {workspace.manual_audit}"
             )
         missing_folds = [
-            fold for fold in range(Settings.Segmentation.FOLDS) if fold_counts.get(fold, 0) == 0
+            fold
+            for fold in range(Settings.Segmentation.FOLDS)
+            if fold_positive_counts.get(fold, 0) == 0
         ]
         if missing_folds:
-            raise RuntimeError(f"Nu există măști manuale valide în foldurile {missing_folds}.")
-        if len(patient_counts) < Settings.Segmentation.FOLDS + 1:
-            raise RuntimeError("Prea puțini pacienți au măști valide pentru cross-fitting.")
+            raise RuntimeError(
+                f"Nu există măști HEART_PRESENT valide în foldurile {missing_folds}."
+            )
+        if len(positive_patient_counts) < Settings.Segmentation.FOLDS + 1:
+            raise RuntimeError("Prea puțini pacienți au măști pozitive pentru cross-fitting.")
         return accepted, summary
 
 
@@ -1672,12 +2000,18 @@ class AttentionUpBlock(nn.Module):
 
 
 class AttentionUNet(nn.Module):
-    """Attention U-Net binar pentru regiunea cardiacă."""
+    """Attention U-Net 2.5D cu segmentare și clasificare ``heart_present``."""
 
-    def __init__(self, base_channels: int | None = None):
+    def __init__(
+        self,
+        base_channels: int | None = None,
+        input_channels: int | None = None,
+    ):
         super().__init__()
         base = int(base_channels or Settings.Segmentation.BASE_CHANNELS)
-        self.encoder1 = AttentionConvBlock(1, base)
+        input_channels = int(input_channels or Settings.Segmentation.INPUT_CHANNELS)
+        self.input_channels = input_channels
+        self.encoder1 = AttentionConvBlock(input_channels, base)
         self.encoder2 = AttentionConvBlock(base, base * 2)
         self.encoder3 = AttentionConvBlock(base * 2, base * 4)
         self.encoder4 = AttentionConvBlock(base * 4, base * 8)
@@ -1688,22 +2022,31 @@ class AttentionUNet(nn.Module):
         self.decoder2 = AttentionUpBlock(base * 4, base * 2, base * 2)
         self.decoder1 = AttentionUpBlock(base * 2, base, base)
         self.output = nn.Conv2d(base, 1, 1)
+        self.presence_head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(base * 16, base * 4),
+            nn.SiLU(inplace=True),
+            nn.Dropout(p=0.20),
+            nn.Linear(base * 4, 1),
+        )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         e1 = self.encoder1(x)
         e2 = self.encoder2(self.pool(e1))
         e3 = self.encoder3(self.pool(e2))
         e4 = self.encoder4(self.pool(e3))
         bottleneck = self.bottleneck(self.pool(e4))
+        presence_logits = self.presence_head(bottleneck).squeeze(1)
         d4 = self.decoder4(bottleneck, e4)
         d3 = self.decoder3(d4, e3)
         d2 = self.decoder2(d3, e2)
         d1 = self.decoder1(d2, e1)
-        return self.output(d1)
+        return self.output(d1), presence_logits
 
 
 class SegmentationDataset(Dataset):
-    """Imagini 256x256 și măști manuale; augmentările păstrează alinierea."""
+    """Ținte pozitive/negative și context 2.5D cu augmentări aliniate."""
 
     def __init__(self, rows: Sequence[dict[str, Any]], augment: bool, seed: int):
         self.rows = list(rows)
@@ -1717,45 +2060,103 @@ class SegmentationDataset(Dataset):
     def __len__(self) -> int:
         return len(self.rows)
 
+    @staticmethod
+    def _image_stack(row: dict[str, Any]) -> np.ndarray:
+        current = str(row["image_path"])
+        if Settings.Segmentation.USE_2_5D:
+            paths = (
+                str(row.get("previous_image_path") or current),
+                current,
+                str(row.get("next_image_path") or current),
+            )
+        else:
+            paths = (current,)
+        return np.stack(
+            [ImageCache.get(path).astype(np.float32) / 255.0 for path in paths],
+            axis=0,
+        )
+
     def __getitem__(self, index: int):
         row = self.rows[index]
-        image = ImageCache.get(row["image_path"]).astype(np.float32) / 255.0
+        image = self._image_stack(row)
         mask = MaskManager.read_binary(row["manual_mask_path"]).astype(np.float32)
+        heart_present = float(_as_int(row.get("heart_present"), int(mask.any())))
+        sample_weight = float(_as_float(row.get("sample_weight"), 1.0))
 
         if self.augment:
             rng = np.random.default_rng(self.seed + self.epoch * 1_000_003 + index)
-            if rng.random() < 0.5:
-                image = np.fliplr(image).copy()
+            if Settings.Segmentation.AUGMENT_HORIZONTAL_FLIP and rng.random() < 0.5:
+                image = np.flip(image, axis=2).copy()
                 mask = np.fliplr(mask).copy()
-            angle = float(rng.uniform(-7.0, 7.0))
-            matrix = cv2.getRotationMatrix2D(
-                (Settings.Image.SEGMENTATION_SIZE / 2, Settings.Image.SEGMENTATION_SIZE / 2),
-                angle,
-                1.0,
+
+            size = Settings.Image.SEGMENTATION_SIZE
+            angle = float(
+                rng.uniform(
+                    -Settings.Segmentation.AUGMENT_ROTATION_DEGREES,
+                    Settings.Segmentation.AUGMENT_ROTATION_DEGREES,
+                )
             )
-            image = cv2.warpAffine(
-                image,
-                matrix,
-                (Settings.Image.SEGMENTATION_SIZE, Settings.Image.SEGMENTATION_SIZE),
-                flags=cv2.INTER_LINEAR,
-                borderMode=cv2.BORDER_CONSTANT,
-                borderValue=0,
+            scale = float(
+                rng.uniform(
+                    Settings.Segmentation.AUGMENT_SCALE_MIN,
+                    Settings.Segmentation.AUGMENT_SCALE_MAX,
+                )
+            )
+            shift = Settings.Segmentation.AUGMENT_TRANSLATION_FRACTION * size
+            tx, ty = map(float, rng.uniform(-shift, shift, size=2))
+            matrix = cv2.getRotationMatrix2D((size / 2, size / 2), angle, scale)
+            matrix[:, 2] += (tx, ty)
+            image = np.stack(
+                [
+                    cv2.warpAffine(
+                        channel,
+                        matrix,
+                        (size, size),
+                        flags=cv2.INTER_LINEAR,
+                        borderMode=cv2.BORDER_CONSTANT,
+                        borderValue=0,
+                    )
+                    for channel in image
+                ],
+                axis=0,
             )
             mask = cv2.warpAffine(
                 mask,
                 matrix,
-                (Settings.Image.SEGMENTATION_SIZE, Settings.Image.SEGMENTATION_SIZE),
+                (size, size),
                 flags=cv2.INTER_NEAREST,
                 borderMode=cv2.BORDER_CONSTANT,
                 borderValue=0,
             )
+
+            gamma = float(
+                rng.uniform(
+                    Settings.Segmentation.AUGMENT_GAMMA_MIN,
+                    Settings.Segmentation.AUGMENT_GAMMA_MAX,
+                )
+            )
             contrast = float(rng.uniform(0.90, 1.10))
-            brightness = float(rng.uniform(-0.05, 0.05))
+            brightness = float(rng.uniform(-0.04, 0.04))
+            image = np.power(np.clip(image, 0.0, 1.0), gamma)
             image = np.clip(image * contrast + brightness, 0.0, 1.0)
+            if rng.random() < Settings.Segmentation.AUGMENT_BLUR_PROBABILITY:
+                image = np.stack(
+                    [cv2.GaussianBlur(channel, (3, 3), 0) for channel in image],
+                    axis=0,
+                )
+            noise_std = float(rng.uniform(0.0, Settings.Segmentation.AUGMENT_NOISE_STD_MAX))
+            if noise_std > 0:
+                image = np.clip(
+                    image + rng.normal(0.0, noise_std, size=image.shape).astype(np.float32),
+                    0.0,
+                    1.0,
+                )
 
         return (
-            torch.from_numpy(np.ascontiguousarray(image)).unsqueeze(0).float(),
+            torch.from_numpy(np.ascontiguousarray(image)).float(),
             torch.from_numpy(np.ascontiguousarray(mask > 0.5)).unsqueeze(0).float(),
+            torch.tensor(heart_present, dtype=torch.float32),
+            torch.tensor(sample_weight, dtype=torch.float32),
             str(row["patient_id"]),
         )
 
@@ -1768,15 +2169,15 @@ class SegmentationInferenceDataset(Dataset):
         return len(self.rows)
 
     def __getitem__(self, index: int):
-        image = ImageCache.get(self.rows[index]["image_path"]).astype(np.float32) / 255.0
-        return torch.from_numpy(image).unsqueeze(0).float(), int(index)
+        image = SegmentationDataset._image_stack(self.rows[index])
+        return torch.from_numpy(np.ascontiguousarray(image)).float(), int(index)
 
 
 # =============================================================================
 # DEFINIȚII 7 — ANTRENAREA ȘI PREDICȚIA ATTENTION
 # =============================================================================
 class SegmentationManager:
-    """Antrenează câte un model per fold și generează măști fără leakage."""
+    """Antrenează cross-fitted Attention U-Net și auditează incertitudinea OOF."""
 
     PREDICTION_FIELDS = (
         "image_token",
@@ -1794,6 +2195,16 @@ class SegmentationManager:
         "attention_area_ratio",
         "attention_peak_probability",
         "attention_boundary_touch_fraction",
+        "attention_heart_present",
+        "attention_presence_probability",
+        "attention_presence_threshold",
+        "attention_tta_disagreement",
+        "attention_mean_entropy",
+        "attention_uncertainty_score",
+        "attention_sequence_inconsistency",
+        "attention_centroid_x",
+        "attention_centroid_y",
+        "attention_prior_deviation",
         "checkpoint_fingerprint",
     )
 
@@ -1813,25 +2224,68 @@ class SegmentationManager:
         probability = torch.sigmoid(logits)
         intersection = (probability * targets).sum(dim=(1, 2, 3))
         denominator = probability.sum(dim=(1, 2, 3)) + targets.sum(dim=(1, 2, 3))
-        return ((2.0 * intersection + 1e-6) / (denominator + 1e-6)).mean()
+        return (2.0 * intersection + 1e-6) / (denominator + 1e-6)
 
     @staticmethod
-    def _loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        bce = F.binary_cross_entropy_with_logits(logits, targets)
-        dice_loss = 1.0 - SegmentationManager._dice_from_logits(logits, targets)
-        weight = float(Settings.Segmentation.BCE_WEIGHT)
-        return weight * bce + (1.0 - weight) * dice_loss
+    def _loss(
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        presence_logits: torch.Tensor,
+        presence_targets: torch.Tensor,
+        sample_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Focal + Tversky, cu penalizare explicită pentru false-positive-uri."""
+
+        probability = torch.sigmoid(logits)
+        bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+        pt = probability * targets + (1.0 - probability) * (1.0 - targets)
+        focal = ((1.0 - pt).pow(Settings.Segmentation.FOCAL_GAMMA) * bce).mean(
+            dim=(1, 2, 3)
+        )
+
+        tp = (probability * targets).sum(dim=(1, 2, 3))
+        fp = (probability * (1.0 - targets)).sum(dim=(1, 2, 3))
+        fn = ((1.0 - probability) * targets).sum(dim=(1, 2, 3))
+        tversky = (tp + 1e-6) / (
+            tp
+            + Settings.Segmentation.TVERSKY_ALPHA_FP * fp
+            + Settings.Segmentation.TVERSKY_BETA_FN * fn
+            + 1e-6
+        )
+        segmentation_per_sample = (
+            Settings.Segmentation.FOCAL_WEIGHT * focal
+            + Settings.Segmentation.TVERSKY_WEIGHT * (1.0 - tversky)
+        )
+
+        sample_weights = sample_weights.float().clamp_min(1e-3)
+        segmentation_loss = (
+            segmentation_per_sample * sample_weights
+        ).sum() / sample_weights.sum().clamp_min(1e-6)
+        presence_loss = F.binary_cross_entropy_with_logits(
+            presence_logits.float(), presence_targets.float(), reduction="none"
+        )
+        presence_loss = (presence_loss * sample_weights).sum() / sample_weights.sum().clamp_min(1e-6)
+        return segmentation_loss + Settings.Segmentation.PRESENCE_LOSS_WEIGHT * presence_loss
 
     @staticmethod
     def _manual_fingerprint(rows: Sequence[dict[str, Any]], fold: int) -> str:
         payload = {
-            "schema": "simple-attention-manual-only-v1",
+            "schema": "simple-attention-2p5d-presence-v3",
             "fold": int(fold),
             "size": Settings.Image.SEGMENTATION_SIZE,
+            "input_channels": Settings.Segmentation.INPUT_CHANNELS,
+            "use_2_5d": Settings.Segmentation.USE_2_5D,
             "base_channels": Settings.Segmentation.BASE_CHANNELS,
             "epochs": Settings.Segmentation.EPOCHS,
             "learning_rate": Settings.Segmentation.LEARNING_RATE,
             "weight_decay": Settings.Segmentation.WEIGHT_DECAY,
+            "loss": {
+                "focal": Settings.Segmentation.FOCAL_WEIGHT,
+                "tversky": Settings.Segmentation.TVERSKY_WEIGHT,
+                "presence": Settings.Segmentation.PRESENCE_LOSS_WEIGHT,
+                "alpha_fp": Settings.Segmentation.TVERSKY_ALPHA_FP,
+                "beta_fn": Settings.Segmentation.TVERSKY_BETA_FN,
+            },
             "seed": Settings.Runtime.RANDOM_SEED,
         }
         digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8"))
@@ -1839,7 +2293,10 @@ class SegmentationManager:
             mask_path = Path(row["manual_mask_path"])
             image_path = Path(row["image_path"])
             image_stat = image_path.stat()
-            digest.update(row["image_token"].encode("utf-8"))
+            digest.update(str(row["image_token"]).encode("utf-8"))
+            digest.update(str(row.get("segmentation_target_type", "")).encode("utf-8"))
+            digest.update(str(row.get("annotation_source", "")).encode("utf-8"))
+            digest.update(str(row.get("sample_weight", 1.0)).encode("ascii"))
             digest.update(str(image_stat.st_size).encode("ascii"))
             digest.update(str(image_stat.st_mtime_ns).encode("ascii"))
             digest.update(FileManager.sha256_file(mask_path).encode("ascii"))
@@ -1850,66 +2307,323 @@ class SegmentationManager:
         ordered = sorted(
             set(map(str, patient_ids)),
             key=lambda patient_id: hashlib.sha256(
-                f"{Settings.Runtime.RANDOM_SEED}|validation|{target_fold}|{patient_id}".encode("utf-8")
+                f"{Settings.Runtime.RANDOM_SEED}|validation|{target_fold}|{patient_id}".encode(
+                    "utf-8"
+                )
             ).hexdigest(),
         )
-        count = max(1, int(round(len(ordered) * Settings.Segmentation.VALIDATION_PATIENT_FRACTION)))
+        count = max(
+            1,
+            int(
+                round(
+                    len(ordered)
+                    * Settings.Segmentation.VALIDATION_PATIENT_FRACTION
+                )
+            ),
+        )
         count = min(count, max(1, len(ordered) - 1))
         return set(ordered[:count])
+
+    @staticmethod
+    def _ensure_presence_coverage(
+        rows: Sequence[dict[str, Any]],
+        validation_patients: set[str],
+        target_fold: int,
+    ) -> set[str]:
+        """Păstrează pozitive/negative în train și validation când este posibil."""
+
+        patients = sorted({str(row["patient_id"]) for row in rows})
+        has_label: dict[int, set[str]] = {0: set(), 1: set()}
+        for row in rows:
+            has_label[_as_int(row.get("heart_present"), 1)].add(
+                str(row["patient_id"])
+            )
+        validation = set(validation_patients)
+
+        def ordered(values: set[str], salt: str) -> list[str]:
+            return sorted(
+                values,
+                key=lambda patient: hashlib.sha256(
+                    f"{Settings.Runtime.RANDOM_SEED}|{target_fold}|{salt}|{patient}".encode(
+                        "utf-8"
+                    )
+                ).hexdigest(),
+            )
+
+        for label in (0, 1):
+            labelled = has_label[label]
+            if len(labelled) < 2:
+                continue
+            if not (validation & labelled):
+                incoming = ordered(labelled - validation, f"incoming-{label}")[0]
+                removable = [
+                    patient
+                    for patient in validation
+                    if patient not in labelled
+                    and all(
+                        len((validation - {patient}) & has_label[other]) > 0
+                        for other in (0, 1)
+                        if len(has_label[other]) >= 2
+                        and (validation & has_label[other])
+                    )
+                ]
+                if removable:
+                    validation.remove(ordered(set(removable), f"remove-{label}")[0])
+                validation.add(incoming)
+            if not (labelled - validation):
+                # Toți pacienții cu acest label au ajuns în validation; mută unul în train.
+                outgoing = ordered(validation & labelled, f"outgoing-{label}")[-1]
+                validation.remove(outgoing)
+                replacement_candidates = set(patients) - validation - {outgoing}
+                if replacement_candidates:
+                    validation.add(
+                        ordered(replacement_candidates, f"replacement-{label}")[0]
+                    )
+        if not validation or len(validation) >= len(patients):
+            return set(validation_patients)
+        return validation
+
+    @staticmethod
+    def _training_sampler(
+        rows: Sequence[dict[str, Any]],
+        seed: int,
+    ) -> WeightedRandomSampler:
+        """Uniformizează pacientul, seria, clusterul pHash și tipul de țintă."""
+
+        rows = list(rows)
+        series_by_patient: dict[str, set[str]] = defaultdict(set)
+        clusters_by_series: dict[tuple[str, str], set[str]] = defaultdict(set)
+        cluster_counts: dict[tuple[str, str, str], int] = defaultdict(int)
+        for row in rows:
+            patient = str(row["patient_id"])
+            series = str(row.get("sequence_group_id") or row["series_id"])
+            cluster = str(row.get("perceptual_hash") or row["image_token"])
+            series_by_patient[patient].add(series)
+            clusters_by_series[(patient, series)].add(cluster)
+            cluster_counts[(patient, series, cluster)] += 1
+
+        base_weights: list[float] = []
+        labels: list[int] = []
+        for row in rows:
+            patient = str(row["patient_id"])
+            series = str(row.get("sequence_group_id") or row["series_id"])
+            cluster = str(row.get("perceptual_hash") or row["image_token"])
+            weight = 1.0
+            weight /= max(1, len(series_by_patient[patient]))
+            weight /= max(1, len(clusters_by_series[(patient, series)]))
+            weight /= max(1, cluster_counts[(patient, series, cluster)])
+            base_weights.append(weight)
+            labels.append(_as_int(row.get("heart_present"), 1))
+
+        base = np.asarray(base_weights, dtype=np.float64)
+        labels_array = np.asarray(labels, dtype=np.int64)
+        positive = labels_array == 1
+        negative = labels_array == 0
+        if positive.any() and negative.any():
+            target_negative = float(Settings.Segmentation.NEGATIVE_TARGET_FRACTION)
+            target_positive = 1.0 - target_negative
+            base[positive] *= target_positive / max(base[positive].sum(), 1e-12)
+            base[negative] *= target_negative / max(base[negative].sum(), 1e-12)
+        else:
+            base /= max(base.sum(), 1e-12)
+
+        generator = torch.Generator().manual_seed(int(seed))
+        return WeightedRandomSampler(
+            weights=torch.as_tensor(base, dtype=torch.double),
+            num_samples=len(rows),
+            replacement=True,
+            generator=generator,
+        )
+
+    @staticmethod
+    def _mask_features(mask: np.ndarray) -> dict[str, float]:
+        mask = (np.asarray(mask) > 0).astype(np.uint8)
+        area, boundary = SegmentationManager._mask_geometry(mask)
+        if not mask.any():
+            return {
+                "area": area,
+                "boundary": boundary,
+                "centroid_x": np.nan,
+                "centroid_y": np.nan,
+                "aspect_ratio": np.nan,
+            }
+        ys, xs = np.nonzero(mask)
+        width = float(xs.max() - xs.min() + 1)
+        height = float(ys.max() - ys.min() + 1)
+        size = float(mask.shape[0])
+        return {
+            "area": area,
+            "boundary": boundary,
+            "centroid_x": float(xs.mean() / max(1.0, mask.shape[1] - 1)),
+            "centroid_y": float(ys.mean() / max(1.0, mask.shape[0] - 1)),
+            "aspect_ratio": float(width / max(height, 1.0)),
+        }
+
+    @staticmethod
+    def _geometry_prior(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
+        features = []
+        for row in rows:
+            if _as_int(row.get("heart_present"), 1) != 1:
+                continue
+            try:
+                features.append(
+                    SegmentationManager._mask_features(
+                        MaskManager.read_binary(row["manual_mask_path"])
+                    )
+                )
+            except Exception:
+                continue
+        keys = ("area", "centroid_x", "centroid_y", "aspect_ratio")
+        if not features:
+            return {"count": 0, "median": {}, "scale": {}}
+        median: dict[str, float] = {}
+        scale: dict[str, float] = {}
+        for key in keys:
+            values = np.asarray([item[key] for item in features], dtype=np.float64)
+            values = values[np.isfinite(values)]
+            if not len(values):
+                continue
+            center = float(np.median(values))
+            mad = float(np.median(np.abs(values - center)))
+            median[key] = center
+            scale[key] = max(1e-3, 1.4826 * mad)
+        return {"count": len(features), "median": median, "scale": scale}
+
+    @staticmethod
+    def _prior_deviation(mask: np.ndarray, prior: dict[str, Any] | None) -> float:
+        if not prior or _as_int(prior.get("count"), 0) < 5 or not np.asarray(mask).any():
+            return 0.0
+        features = SegmentationManager._mask_features(mask)
+        deviations = []
+        for key, center in dict(prior.get("median", {})).items():
+            value = features.get(key, np.nan)
+            scale = _as_float(dict(prior.get("scale", {})).get(key), 0.0)
+            if np.isfinite(value) and scale > 0:
+                deviations.append(abs(float(value) - float(center)) / scale)
+        return float(max(deviations)) if deviations else 0.0
+
+    @staticmethod
+    def _balanced_accuracy(labels: np.ndarray, predictions: np.ndarray) -> float:
+        labels = np.asarray(labels, dtype=np.int64)
+        predictions = np.asarray(predictions, dtype=np.int64)
+        values = []
+        for label in (0, 1):
+            selector = labels == label
+            if selector.any():
+                values.append(float(np.mean(predictions[selector] == label)))
+        return float(np.mean(values)) if values else 0.0
 
     @staticmethod
     def _calibrate_threshold(
         model: nn.Module,
         loader: DataLoader,
         device: torch.device,
+        geometry_prior: dict[str, Any],
     ) -> dict[str, Any]:
         probabilities: list[np.ndarray] = []
         targets: list[np.ndarray] = []
+        presence_probabilities: list[float] = []
+        presence_targets: list[int] = []
         patients: list[str] = []
         model.eval()
         with torch.inference_mode():
-            for images, masks, patient_ids in loader:
+            for images, masks, target_presence, _weights, patient_ids in loader:
                 images = RuntimeManager.move_tensor(images, device)
                 with RuntimeManager.autocast(device):
-                    probability = torch.sigmoid(model(images))
+                    logits, presence_logits = model(images)
+                    probability = torch.sigmoid(logits)
+                    presence_probability = torch.sigmoid(presence_logits)
                 probabilities.extend(probability.float().cpu().numpy()[:, 0])
                 targets.extend(masks.numpy()[:, 0])
+                presence_probabilities.extend(
+                    presence_probability.float().cpu().numpy().tolist()
+                )
+                presence_targets.extend(target_presence.numpy().astype(int).tolist())
                 patients.extend(map(str, patient_ids))
+
+        labels_array = np.asarray(presence_targets, dtype=np.int64)
+        presence_array = np.asarray(presence_probabilities, dtype=np.float64)
+        best_presence = {
+            "threshold": Settings.Segmentation.DEFAULT_PRESENCE_THRESHOLD,
+            "balanced_accuracy": 0.0,
+        }
+        if len(np.unique(labels_array)) >= 2:
+            for threshold in Settings.Segmentation.PRESENCE_CALIBRATION_THRESHOLDS:
+                prediction = (presence_array >= threshold).astype(np.int64)
+                balanced = SegmentationManager._balanced_accuracy(
+                    labels_array, prediction
+                )
+                candidate = {
+                    "threshold": float(threshold),
+                    "balanced_accuracy": balanced,
+                }
+                if (
+                    candidate["balanced_accuracy"],
+                    -abs(candidate["threshold"] - 0.5),
+                ) > (
+                    best_presence["balanced_accuracy"],
+                    -abs(best_presence["threshold"] - 0.5),
+                ):
+                    best_presence = candidate
+        elif len(labels_array):
+            best_presence["balanced_accuracy"] = 1.0
 
         best = None
         for threshold in Settings.Segmentation.CALIBRATION_THRESHOLDS:
             by_patient: dict[str, list[float]] = defaultdict(list)
             invalid = 0
-            for probability, target, patient_id in zip(probabilities, targets, patients):
-                prediction = (probability >= threshold).astype(np.uint8)
-                prediction = SegmentationManager._largest_component(prediction)
-                intersection = float(np.logical_and(prediction, target > 0.5).sum())
-                denominator = float(prediction.sum() + (target > 0.5).sum())
-                dice = (2.0 * intersection + 1e-6) / (denominator + 1e-6)
-                by_patient[patient_id].append(dice)
-                valid, _ = SegmentationManager._validate_mask(prediction, probability)
-                invalid += int(not valid)
-            patient_dice = [float(np.mean(values)) for values in by_patient.values()]
-            mean_dice = float(np.mean(patient_dice)) if patient_dice else 0.0
-            invalid_rate = float(invalid / max(1, len(probabilities)))
-            score = mean_dice - 0.25 * invalid_rate
+            for probability, target, target_presence, patient_id in zip(
+                probabilities, targets, presence_targets, patients
+            ):
+                prediction = SegmentationManager._candidate_mask(
+                    probability, threshold
+                )
+                if int(target_presence) == 1:
+                    intersection = float(
+                        np.logical_and(prediction, target > 0.5).sum()
+                    )
+                    denominator = float(
+                        prediction.sum() + (target > 0.5).sum()
+                    )
+                    quality = (2.0 * intersection + 1e-6) / (
+                        denominator + 1e-6
+                    )
+                    valid, _ = SegmentationManager._validate_mask(
+                        prediction, probability, geometry_prior
+                    )
+                    invalid += int(not valid)
+                else:
+                    # Pentru un negativ corect, masca trebuie să rămână goală.
+                    quality = 1.0 - min(1.0, float(prediction.mean()) / 0.10)
+                by_patient[patient_id].append(float(quality))
+            patient_scores = [
+                float(np.mean(values)) for values in by_patient.values()
+            ]
+            mean_score = float(np.mean(patient_scores)) if patient_scores else 0.0
+            invalid_rate = float(invalid / max(1, sum(presence_targets)))
+            score = mean_score - 0.20 * invalid_rate
             candidate = {
                 "threshold": float(threshold),
-                "patient_balanced_dice": mean_dice,
-                "invalid_rate": invalid_rate,
+                "patient_balanced_segmentation_score": mean_score,
+                "invalid_rate_positive": invalid_rate,
                 "score": score,
             }
-            if best is None or (candidate["score"], -abs(threshold - 0.5)) > (
-                best["score"],
-                -abs(best["threshold"] - 0.5),
-            ):
+            if best is None or (
+                candidate["score"], -abs(threshold - 0.5)
+            ) > (best["score"], -abs(best["threshold"] - 0.5)):
                 best = candidate
-        return best or {
+
+        result = best or {
             "threshold": Settings.Segmentation.DEFAULT_THRESHOLD,
-            "patient_balanced_dice": 0.0,
-            "invalid_rate": 1.0,
+            "patient_balanced_segmentation_score": 0.0,
+            "invalid_rate_positive": 1.0,
             "score": -1.0,
         }
+        result["presence_threshold"] = float(best_presence["threshold"])
+        result["presence_balanced_accuracy"] = float(
+            best_presence["balanced_accuracy"]
+        )
+        return result
 
     @staticmethod
     def train_crossfit(
@@ -1923,29 +2637,42 @@ class SegmentationManager:
         RuntimeManager.seed_everything(include_cuda=device.type == "cuda")
         checkpoint_map: dict[int, Path] = {}
         fold_summaries = []
-        all_patients = sorted({row["patient_id"] for row in accepted_rows})
+        all_patients = sorted({str(row["patient_id"]) for row in accepted_rows})
 
         for fold in range(Settings.Segmentation.FOLDS):
             fold_started = time.perf_counter()
             checkpoint_path = SegmentationManager._checkpoint_path(workspace, fold)
             non_test_rows = [
-                row for row in accepted_rows if int(row["segmentation_fold"]) != fold
+                row
+                for row in accepted_rows
+                if int(row["segmentation_fold"]) != fold
             ]
             validation_patients = SegmentationManager._validation_patients(
                 (row["patient_id"] for row in non_test_rows), fold
             )
+            validation_patients = SegmentationManager._ensure_presence_coverage(
+                non_test_rows, validation_patients, fold
+            )
             train_rows = [
-                row for row in non_test_rows if row["patient_id"] not in validation_patients
+                row
+                for row in non_test_rows
+                if row["patient_id"] not in validation_patients
             ]
             validation_rows = [
-                row for row in non_test_rows if row["patient_id"] in validation_patients
+                row
+                for row in non_test_rows
+                if row["patient_id"] in validation_patients
             ]
-            fingerprint = SegmentationManager._manual_fingerprint(non_test_rows, fold)
+            fingerprint = SegmentationManager._manual_fingerprint(
+                non_test_rows, fold
+            )
 
             if checkpoint_path.is_file() and not force:
                 checkpoint = SegmentationManager._torch_load(checkpoint_path)
                 if checkpoint.get("fingerprint") == fingerprint:
-                    print(f"[ATTENTION] Fold {fold}: checkpoint compatibil reutilizat.")
+                    print(
+                        f"[ATTENTION] Fold {fold}: checkpoint 2.5D compatibil reutilizat."
+                    )
                     checkpoint_map[fold] = checkpoint_path
                     fold_summaries.append(
                         {
@@ -1961,22 +2688,39 @@ class SegmentationManager:
             if not train_rows or not validation_rows:
                 raise RuntimeError(f"Fold {fold}: train/validation este gol.")
 
-            print(
-                f"[ATTENTION] Fold {fold}: train={len(train_rows)}, "
-                f"validation={len(validation_rows)}, device={device.type}"
+            train_positive = sum(
+                _as_int(row.get("heart_present"), 1) == 1 for row in train_rows
             )
+            train_negative = len(train_rows) - train_positive
+            validation_positive = sum(
+                _as_int(row.get("heart_present"), 1) == 1
+                for row in validation_rows
+            )
+            validation_negative = len(validation_rows) - validation_positive
+            print(
+                f"[ATTENTION] Fold {fold}: train={len(train_rows)} "
+                f"(+{train_positive}/-{train_negative}), validation={len(validation_rows)} "
+                f"(+{validation_positive}/-{validation_negative}), device={device.type}"
+            )
+
             train_dataset = SegmentationDataset(
-                train_rows, augment=True, seed=Settings.Runtime.RANDOM_SEED + fold * 1000
+                train_rows,
+                augment=True,
+                seed=Settings.Runtime.RANDOM_SEED + fold * 1000,
             )
             validation_dataset = SegmentationDataset(
-                validation_rows, augment=False, seed=Settings.Runtime.RANDOM_SEED
+                validation_rows,
+                augment=False,
+                seed=Settings.Runtime.RANDOM_SEED,
             )
-            generator = torch.Generator().manual_seed(Settings.Runtime.RANDOM_SEED + fold)
+            train_sampler = SegmentationManager._training_sampler(
+                train_rows, Settings.Runtime.RANDOM_SEED + fold
+            )
             train_loader = DataLoader(
                 train_dataset,
                 batch_size=RuntimeManager.train_batch_size(device),
-                shuffle=True,
-                generator=generator,
+                sampler=train_sampler,
+                shuffle=False,
                 num_workers=Settings.Runtime.NUM_WORKERS,
                 pin_memory=device.type == "cuda",
             )
@@ -1994,9 +2738,16 @@ class SegmentationManager:
                 lr=Settings.Segmentation.LEARNING_RATE,
                 weight_decay=Settings.Segmentation.WEIGHT_DECAY,
             )
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode="max",
+                factor=Settings.Segmentation.LR_REDUCE_FACTOR,
+                patience=Settings.Segmentation.LR_REDUCE_PATIENCE,
+                min_lr=Settings.Segmentation.MIN_LEARNING_RATE,
+            )
             scaler = RuntimeManager.grad_scaler(device)
             best_state = None
-            best_dice = -1.0
+            best_metric = -1.0
             best_epoch = 0
             patience = 0
             history = []
@@ -2005,13 +2756,31 @@ class SegmentationManager:
                 train_dataset.set_epoch(epoch)
                 model.train()
                 train_losses = []
-                for images, masks, _ in train_loader:
+                for (
+                    images,
+                    masks,
+                    presence_targets,
+                    sample_weights,
+                    _patient_ids,
+                ) in train_loader:
                     images = RuntimeManager.move_tensor(images, device)
                     masks = RuntimeManager.move_tensor(masks, device)
+                    presence_targets = RuntimeManager.move_tensor(
+                        presence_targets, device
+                    )
+                    sample_weights = RuntimeManager.move_tensor(
+                        sample_weights, device
+                    )
                     optimizer.zero_grad(set_to_none=True)
                     with RuntimeManager.autocast(device):
-                        logits = model(images)
-                        loss = SegmentationManager._loss(logits, masks)
+                        logits, presence_logits = model(images)
+                        loss = SegmentationManager._loss(
+                            logits,
+                            masks,
+                            presence_logits,
+                            presence_targets,
+                            sample_weights,
+                        )
                     scaler.scale(loss).backward()
                     scaler.step(optimizer)
                     scaler.update()
@@ -2019,42 +2788,96 @@ class SegmentationManager:
 
                 model.eval()
                 validation_losses = []
-                validation_dice = []
+                by_patient_scores: dict[str, list[float]] = defaultdict(list)
+                presence_labels: list[int] = []
+                presence_predictions: list[int] = []
                 with torch.inference_mode():
-                    for images, masks, _ in validation_loader:
+                    for (
+                        images,
+                        masks,
+                        presence_targets,
+                        sample_weights,
+                        patient_ids,
+                    ) in validation_loader:
                         images = RuntimeManager.move_tensor(images, device)
                         masks = RuntimeManager.move_tensor(masks, device)
+                        presence_targets_device = RuntimeManager.move_tensor(
+                            presence_targets, device
+                        )
+                        sample_weights = RuntimeManager.move_tensor(
+                            sample_weights, device
+                        )
                         with RuntimeManager.autocast(device):
-                            logits = model(images)
-                            loss = SegmentationManager._loss(logits, masks)
+                            logits, presence_logits = model(images)
+                            loss = SegmentationManager._loss(
+                                logits,
+                                masks,
+                                presence_logits,
+                                presence_targets_device,
+                                sample_weights,
+                            )
                         validation_losses.append(float(loss.cpu()))
                         binary = (torch.sigmoid(logits) >= 0.5).float()
                         intersection = (binary * masks).sum(dim=(1, 2, 3))
-                        denominator = binary.sum(dim=(1, 2, 3)) + masks.sum(dim=(1, 2, 3))
-                        validation_dice.extend(
-                            ((2 * intersection + 1e-6) / (denominator + 1e-6)).cpu().tolist()
+                        denominator = binary.sum(dim=(1, 2, 3)) + masks.sum(
+                            dim=(1, 2, 3)
+                        )
+                        dice = (2 * intersection + 1e-6) / (
+                            denominator + 1e-6
+                        )
+                        negative_quality = 1.0 - binary.mean(dim=(1, 2, 3))
+                        target_presence_cpu = presence_targets.numpy().astype(int)
+                        sample_scores = torch.where(
+                            presence_targets_device > 0.5,
+                            dice,
+                            negative_quality,
+                        ).float().cpu().numpy()
+                        for patient_id, score in zip(patient_ids, sample_scores):
+                            by_patient_scores[str(patient_id)].append(float(score))
+                        presence_labels.extend(target_presence_cpu.tolist())
+                        presence_predictions.extend(
+                            (
+                                torch.sigmoid(presence_logits) >= 0.5
+                            ).long().cpu().numpy().tolist()
                         )
 
                 mean_train = float(np.mean(train_losses))
                 mean_val = float(np.mean(validation_losses))
-                mean_dice = float(np.mean(validation_dice))
+                patient_balanced = float(
+                    np.mean(
+                        [np.mean(values) for values in by_patient_scores.values()]
+                    )
+                )
+                presence_balanced = SegmentationManager._balanced_accuracy(
+                    np.asarray(presence_labels),
+                    np.asarray(presence_predictions),
+                )
+                selection_metric = 0.80 * patient_balanced + 0.20 * presence_balanced
+                scheduler.step(selection_metric)
+                current_lr = float(optimizer.param_groups[0]["lr"])
                 history.append(
                     {
                         "epoch": epoch,
                         "train_loss": mean_train,
                         "validation_loss": mean_val,
-                        "validation_dice_0_5": mean_dice,
+                        "patient_balanced_segmentation_score_0_5": patient_balanced,
+                        "presence_balanced_accuracy_0_5": presence_balanced,
+                        "selection_metric": selection_metric,
+                        "learning_rate": current_lr,
                     }
                 )
                 print(
                     f"  epoch={epoch:02d} train_loss={mean_train:.4f} "
-                    f"val_loss={mean_val:.4f} val_dice={mean_dice:.4f}"
+                    f"val_loss={mean_val:.4f} seg={patient_balanced:.4f} "
+                    f"presence={presence_balanced:.4f} metric={selection_metric:.4f} "
+                    f"lr={current_lr:.2e}"
                 )
-                if mean_dice > best_dice + 1e-5:
-                    best_dice = mean_dice
+                if selection_metric > best_metric + 1e-5:
+                    best_metric = selection_metric
                     best_epoch = epoch
                     best_state = {
-                        key: value.detach().cpu().clone() for key, value in model.state_dict().items()
+                        key: value.detach().cpu().clone()
+                        for key, value in model.state_dict().items()
                     }
                     patience = 0
                 else:
@@ -2066,22 +2889,33 @@ class SegmentationManager:
             if best_state is None:
                 raise RuntimeError(f"Fold {fold}: nu s-a salvat niciun model.")
             model.load_state_dict(best_state)
-            calibration = SegmentationManager._calibrate_threshold(model, validation_loader, device)
+            geometry_prior = SegmentationManager._geometry_prior(train_rows)
+            calibration = SegmentationManager._calibrate_threshold(
+                model, validation_loader, device, geometry_prior
+            )
             checkpoint = {
-                "schema": "simple-attention-manual-only-v1",
+                "schema": "simple-attention-2p5d-presence-v3",
                 "state_dict": best_state,
                 "fingerprint": fingerprint,
                 "fold": fold,
                 "base_channels": Settings.Segmentation.BASE_CHANNELS,
+                "input_channels": Settings.Segmentation.INPUT_CHANNELS,
                 "best_epoch": best_epoch,
-                "best_validation_dice_0_5": best_dice,
+                "best_selection_metric": best_metric,
                 "calibration": calibration,
-                "train_patients": sorted({row["patient_id"] for row in train_rows}),
+                "geometry_prior": geometry_prior,
+                "train_positive_targets": train_positive,
+                "train_negative_targets": train_negative,
+                "train_patients": sorted(
+                    {str(row["patient_id"]) for row in train_rows}
+                ),
                 "validation_patients": sorted(validation_patients),
                 "excluded_test_patients": sorted(
-                    patient for patient in all_patients
+                    patient
+                    for patient in all_patients
                     if any(
-                        row["patient_id"] == patient and int(row["segmentation_fold"]) == fold
+                        str(row["patient_id"]) == patient
+                        and int(row["segmentation_fold"]) == fold
                         for row in accepted_rows
                     )
                 ),
@@ -2100,23 +2934,32 @@ class SegmentationManager:
                     "checkpoint": str(checkpoint_path),
                     "fingerprint": fingerprint,
                     "best_epoch": best_epoch,
-                    "best_validation_dice_0_5": best_dice,
+                    "best_selection_metric": best_metric,
                     "calibration": calibration,
-                    "elapsed": RuntimeManager.format_seconds(time.perf_counter() - fold_started),
+                    "geometry_prior_count": geometry_prior.get("count", 0),
+                    "elapsed": RuntimeManager.format_seconds(
+                        time.perf_counter() - fold_started
+                    ),
                 }
             )
-            # Obiectele GPU sunt șterse înainte de următorul fold. Fără acest
-            # pas, Python poate păstra încă referințe la model/optimizer.
-            del model, optimizer, scaler, train_loader, validation_loader
-            del train_dataset, validation_dataset, checkpoint, best_state
+            del model, optimizer, scheduler, scaler, train_loader, validation_loader
+            del train_dataset, validation_dataset, checkpoint, best_state, train_sampler
             RuntimeManager.release(device)
 
         FileManager.write_json(
             workspace.training_summary,
             {
-                "training_mode": "manual_only_crossfit",
+                "training_mode": "manual_positive_and_explicit_negative_crossfit_2p5d",
                 "device": device.type,
-                "accepted_manual_masks": len(accepted_rows),
+                "accepted_training_targets": len(accepted_rows),
+                "heart_present_targets": sum(
+                    _as_int(row.get("heart_present"), 1) == 1
+                    for row in accepted_rows
+                ),
+                "no_heart_targets": sum(
+                    _as_int(row.get("heart_present"), 1) == 0
+                    for row in accepted_rows
+                ),
                 "folds": fold_summaries,
             },
         )
@@ -2140,12 +2983,6 @@ class SegmentationManager:
         accepted_rows: Sequence[dict[str, Any]],
         workspace: Workspace,
     ) -> dict[int, Path] | None:
-        """Verifică pe CPU dacă toate checkpointurile pot fi reutilizate.
-
-        Metoda nu mută niciun model pe GPU. Este apelată înainte de
-        `device_scope`, astfel încât o rerulare cu cache valid nu pornește CUDA.
-        """
-
         result: dict[int, Path] = {}
         for fold in range(Settings.Segmentation.FOLDS):
             checkpoint_path = SegmentationManager._checkpoint_path(workspace, fold)
@@ -2163,6 +3000,8 @@ class SegmentationManager:
                 return None
             if checkpoint.get("fingerprint") != expected:
                 return None
+            if checkpoint.get("schema") != "simple-attention-2p5d-presence-v3":
+                return None
             result[fold] = checkpoint_path
         return result
 
@@ -2171,7 +3010,9 @@ class SegmentationManager:
         binary = (np.asarray(mask) > 0).astype(np.uint8)
         if not binary.any():
             return binary
-        count, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(
+            binary, connectivity=8
+        )
         if count <= 1:
             return binary
         label = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
@@ -2182,13 +3023,15 @@ class SegmentationManager:
         mask = (np.asarray(mask) > 0).astype(np.uint8)
         area = float(mask.mean())
         if not mask.any():
-            return area, 1.0
+            return area, 0.0
         border = np.zeros_like(mask, dtype=bool)
         border[:2, :] = True
         border[-2:, :] = True
         border[:, :2] = True
         border[:, -2:] = True
-        boundary_touch = float(np.logical_and(mask > 0, border).sum() / max(1, mask.sum()))
+        boundary_touch = float(
+            np.logical_and(mask > 0, border).sum() / max(1, mask.sum())
+        )
         return area, boundary_touch
 
     @staticmethod
@@ -2201,7 +3044,11 @@ class SegmentationManager:
         return SegmentationManager._largest_component(mask)
 
     @staticmethod
-    def _validate_mask(mask: np.ndarray, probability: np.ndarray) -> tuple[bool, str]:
+    def _validate_mask(
+        mask: np.ndarray,
+        probability: np.ndarray,
+        geometry_prior: dict[str, Any] | None = None,
+    ) -> tuple[bool, str]:
         area, boundary = SegmentationManager._mask_geometry(mask)
         peak = float(np.max(probability))
         reasons = []
@@ -2213,14 +3060,18 @@ class SegmentationManager:
             reasons.append("low_peak_probability")
         if boundary > Settings.Segmentation.REPAIR_MAX_BOUNDARY_TOUCH:
             reasons.append("touches_boundary")
+        prior_deviation = SegmentationManager._prior_deviation(mask, geometry_prior)
+        if prior_deviation > Settings.Segmentation.PRIOR_MAX_ROBUST_Z:
+            reasons.append("geometry_outlier")
         return not reasons, ";".join(reasons)
 
     @staticmethod
     def _repair_probability(
         probability: np.ndarray,
         threshold: float,
-    ) -> tuple[np.ndarray, bool, str, float, str]:
-        """Încearcă praguri vecine; nu introduce niciodată un pătrat central fallback."""
+        geometry_prior: dict[str, Any] | None = None,
+    ) -> tuple[np.ndarray, bool, str, float, str, float]:
+        """Alege pragul după probabilitate, margine și prior OOF, fără arie fixă 0.15."""
 
         candidates = []
         thresholds = [threshold] + [
@@ -2228,33 +3079,76 @@ class SegmentationManager:
             for offset in Settings.Segmentation.REPAIR_THRESHOLD_OFFSETS
         ]
         for candidate_threshold in sorted(set(thresholds)):
-            mask = SegmentationManager._candidate_mask(probability, candidate_threshold)
-            valid, reason = SegmentationManager._validate_mask(mask, probability)
-            area, boundary = SegmentationManager._mask_geometry(mask)
-            if mask.any():
-                mean_inside = float(probability[mask > 0].mean())
-            else:
-                mean_inside = 0.0
-            score = mean_inside - 0.50 * boundary - 0.20 * abs(area - 0.15)
-            candidates.append((valid, score, mask, candidate_threshold, reason))
+            mask = SegmentationManager._candidate_mask(
+                probability, candidate_threshold
+            )
+            valid, reason = SegmentationManager._validate_mask(
+                mask, probability, geometry_prior
+            )
+            _area, boundary = SegmentationManager._mask_geometry(mask)
+            prior_deviation = SegmentationManager._prior_deviation(
+                mask, geometry_prior
+            )
+            mean_inside = (
+                float(probability[mask > 0].mean()) if mask.any() else 0.0
+            )
+            score = (
+                mean_inside
+                - 0.50 * boundary
+                - 0.06 * min(prior_deviation, 10.0)
+            )
+            candidates.append(
+                (
+                    valid,
+                    score,
+                    mask,
+                    candidate_threshold,
+                    reason,
+                    prior_deviation,
+                )
+            )
         valid_candidates = [candidate for candidate in candidates if candidate[0]]
         if valid_candidates:
-            _, _, mask, used_threshold, _ = max(valid_candidates, key=lambda item: item[1])
-            return mask, True, "adaptive_threshold", float(used_threshold), ""
-        _, _, mask, used_threshold, reason = max(candidates, key=lambda item: item[1])
-        return mask, False, "unresolved", float(used_threshold), reason
+            _, _, mask, used_threshold, _, prior_deviation = max(
+                valid_candidates, key=lambda item: item[1]
+            )
+            return (
+                mask,
+                True,
+                "adaptive_threshold_with_fold_prior",
+                float(used_threshold),
+                "",
+                float(prior_deviation),
+            )
+        _, _, mask, used_threshold, reason, prior_deviation = max(
+            candidates, key=lambda item: item[1]
+        )
+        return (
+            mask,
+            False,
+            "unresolved",
+            float(used_threshold),
+            reason,
+            float(prior_deviation),
+        )
 
     @staticmethod
-    def _prediction_fingerprint(rows: Sequence[dict[str, Any]], checkpoint_map: dict[int, Path]) -> str:
+    def _prediction_fingerprint(
+        rows: Sequence[dict[str, Any]], checkpoint_map: dict[int, Path]
+    ) -> str:
         digest = hashlib.sha256()
         settings_payload = {
-            "schema": "simple-predictions-v2",
+            "schema": "simple-predictions-2p5d-presence-v5",
             "thresholds": Settings.Segmentation.CALIBRATION_THRESHOLDS,
+            "presence_thresholds": Settings.Segmentation.PRESENCE_CALIBRATION_THRESHOLDS,
             "area": [
                 Settings.Segmentation.PREDICTION_MIN_AREA_RATIO,
                 Settings.Segmentation.PREDICTION_MAX_AREA_RATIO,
             ],
             "repair_offsets": Settings.Segmentation.REPAIR_THRESHOLD_OFFSETS,
+            "tta_contrast": Settings.Segmentation.TTA_CONTRAST_FACTOR,
+            "presence_override_peak": Settings.Segmentation.PRESENCE_SEGMENTATION_OVERRIDE_PEAK,
+            "prior_z": Settings.Segmentation.PRIOR_MAX_ROBUST_Z,
         }
         digest.update(json.dumps(settings_payload, sort_keys=True).encode("utf-8"))
         digest.update(str(len(rows)).encode("ascii"))
@@ -2263,6 +3157,8 @@ class SegmentationManager:
             image_stat = image_path.stat()
             digest.update(str(row["image_token"]).encode("utf-8"))
             digest.update(str(row["segmentation_fold"]).encode("ascii"))
+            digest.update(str(row.get("previous_image_path", "")).encode("utf-8"))
+            digest.update(str(row.get("next_image_path", "")).encode("utf-8"))
             digest.update(str(image_stat.st_size).encode("ascii"))
             digest.update(str(image_stat.st_mtime_ns).encode("ascii"))
         for fold, path in sorted(checkpoint_map.items()):
@@ -2276,8 +3172,6 @@ class SegmentationManager:
         workspace: Workspace,
         checkpoint_map: dict[int, Path],
     ) -> list[dict[str, Any]] | None:
-        """Returnează auditul final numai dacă este complet și compatibil."""
-
         fingerprint = SegmentationManager._prediction_fingerprint(
             rows, checkpoint_map
         )
@@ -2287,18 +3181,28 @@ class SegmentationManager:
             Path(row.get("predicted_attention_mask_path", "")).is_file()
             for row in audit
         )
+        required_fields = {
+            "attention_presence_probability",
+            "attention_uncertainty_score",
+            "attention_sequence_inconsistency",
+            "attention_centroid_x",
+            "attention_centroid_y",
+            "attention_heart_present",
+        }
+        schema_complete = bool(audit) and required_fields.issubset(audit[0].keys())
         if (
             summary.get("fingerprint") == fingerprint
             and len(audit) == len(rows)
             and masks_complete
+            and schema_complete
         ):
             return audit
         return None
 
     @staticmethod
-    def _prediction_part_paths(workspace: Workspace, fold: int) -> tuple[Path, Path]:
-        """Fișiere mici care permit reluarea inferenței de la următorul fold."""
-
+    def _prediction_part_paths(
+        workspace: Workspace, fold: int
+    ) -> tuple[Path, Path]:
         csv_path = workspace.prediction_parts_dir / f"fold_{int(fold)}.csv"
         json_path = workspace.prediction_parts_dir / f"fold_{int(fold)}.json"
         return csv_path, json_path
@@ -2311,15 +3215,14 @@ class SegmentationManager:
     ) -> str:
         digest = hashlib.sha256()
         payload = {
-            "schema": "simple-prediction-part-v2",
+            "schema": "simple-prediction-part-2p5d-presence-v5",
             "fold": int(fold),
             "thresholds": Settings.Segmentation.CALIBRATION_THRESHOLDS,
-            "area": [
-                Settings.Segmentation.PREDICTION_MIN_AREA_RATIO,
-                Settings.Segmentation.PREDICTION_MAX_AREA_RATIO,
-            ],
+            "presence_thresholds": Settings.Segmentation.PRESENCE_CALIBRATION_THRESHOLDS,
             "repair_offsets": Settings.Segmentation.REPAIR_THRESHOLD_OFFSETS,
             "morphology": Settings.Segmentation.REPAIR_MORPHOLOGY_KERNEL,
+            "tta_contrast": Settings.Segmentation.TTA_CONTRAST_FACTOR,
+            "presence_override_peak": Settings.Segmentation.PRESENCE_SEGMENTATION_OVERRIDE_PEAK,
         }
         digest.update(json.dumps(payload, sort_keys=True).encode("utf-8"))
         digest.update(FileManager.sha256_file(checkpoint_path).encode("ascii"))
@@ -2329,7 +3232,289 @@ class SegmentationManager:
             digest.update(str(row["image_token"]).encode("utf-8"))
             digest.update(str(image_stat.st_size).encode("ascii"))
             digest.update(str(image_stat.st_mtime_ns).encode("ascii"))
+            digest.update(str(row.get("previous_image_path", "")).encode("utf-8"))
+            digest.update(str(row.get("next_image_path", "")).encode("utf-8"))
         return digest.hexdigest()
+
+    @staticmethod
+    def _uncertainty_metrics(
+        probability: np.ndarray,
+        alternate_probability: np.ndarray,
+        presence_probability: float,
+        presence_threshold: float,
+        prior_deviation: float,
+        final_valid: bool,
+    ) -> tuple[float, float, float]:
+        probability = np.clip(probability.astype(np.float64), 1e-6, 1.0 - 1e-6)
+        entropy = -(
+            probability * np.log(probability)
+            + (1.0 - probability) * np.log(1.0 - probability)
+        ) / math.log(2.0)
+        entropy_flat = entropy.reshape(-1)
+        top_count = max(1, int(round(0.10 * entropy_flat.size)))
+        mean_entropy = float(
+            np.partition(entropy_flat, entropy_flat.size - top_count)[-top_count:].mean()
+        )
+        disagreement = float(
+            np.mean(np.abs(probability - alternate_probability))
+        )
+        disagreement_normalized = min(
+            1.0,
+            disagreement
+            / max(Settings.Segmentation.UNCERTAINTY_DISAGREEMENT_SCALE, 1e-6),
+        )
+        presence_ambiguity = max(
+            0.0,
+            1.0
+            - abs(float(presence_probability) - float(presence_threshold)) / 0.50,
+        )
+        prior_normalized = min(
+            1.0,
+            float(prior_deviation)
+            / max(Settings.Segmentation.PRIOR_MAX_ROBUST_Z, 1e-6),
+        )
+        uncertainty = (
+            0.35 * mean_entropy
+            + 0.35 * disagreement_normalized
+            + 0.20 * presence_ambiguity
+            + 0.10 * prior_normalized
+            + (0.15 if not final_valid else 0.0)
+        )
+        return disagreement, mean_entropy, float(min(1.0, uncertainty))
+
+    @staticmethod
+    def _apply_sequence_consistency(
+        prediction_rows: Sequence[dict[str, Any]],
+        dataset_rows: Sequence[dict[str, Any]],
+    ) -> None:
+        """Adaugă inconsistența față de cadrele vecine din aceeași secvență-leaf."""
+
+        base_by_token = {
+            str(row["image_token"]): row for row in dataset_rows
+        }
+        groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for prediction in prediction_rows:
+            token = str(prediction.get("image_token", ""))
+            base = base_by_token.get(token, {})
+            group = str(
+                base.get("sequence_group_id")
+                or f"{prediction.get('series_id', '')}::{Path(str(prediction.get('image_path', ''))).parent}"
+            )
+            prediction["_sequence_index"] = _as_int(
+                base.get("sequence_index"), 0
+            )
+            groups[group].append(prediction)
+
+        def pair_inconsistency(first: dict[str, Any], second: dict[str, Any]) -> float:
+            first_present = _as_int(first.get("attention_heart_present"), 1)
+            second_present = _as_int(second.get("attention_heart_present"), 1)
+            if first_present != second_present:
+                return 1.0
+            if first_present == 0:
+                return 0.0
+            first_area = _as_float(first.get("attention_area_ratio"), 0.0)
+            second_area = _as_float(second.get("attention_area_ratio"), 0.0)
+            area_change = min(
+                1.0,
+                abs(first_area - second_area)
+                / max(0.01, 0.5 * (first_area + second_area)),
+            )
+            first_x = _as_float(first.get("attention_centroid_x"), np.nan)
+            first_y = _as_float(first.get("attention_centroid_y"), np.nan)
+            second_x = _as_float(second.get("attention_centroid_x"), np.nan)
+            second_y = _as_float(second.get("attention_centroid_y"), np.nan)
+            if all(np.isfinite(value) for value in (first_x, first_y, second_x, second_y)):
+                centroid_change = min(
+                    1.0,
+                    math.hypot(first_x - second_x, first_y - second_y) / 0.25,
+                )
+            else:
+                centroid_change = 1.0
+            return float(0.55 * area_change + 0.45 * centroid_change)
+
+        for group_rows in groups.values():
+            group_rows.sort(key=lambda row: _as_int(row.get("_sequence_index"), 0))
+            for index, row in enumerate(group_rows):
+                comparisons = []
+                if index > 0:
+                    comparisons.append(pair_inconsistency(row, group_rows[index - 1]))
+                if index + 1 < len(group_rows):
+                    comparisons.append(pair_inconsistency(row, group_rows[index + 1]))
+                inconsistency = float(np.mean(comparisons)) if comparisons else 0.0
+                previous_inconsistency = _as_float(
+                    row.get("attention_sequence_inconsistency"), 0.0
+                )
+                base_uncertainty = max(
+                    0.0,
+                    _as_float(row.get("attention_uncertainty_score"), 0.0)
+                    - 0.20 * previous_inconsistency,
+                )
+                row["attention_sequence_inconsistency"] = inconsistency
+                row["attention_uncertainty_score"] = min(
+                    1.0, base_uncertainty + 0.20 * inconsistency
+                )
+                row.pop("_sequence_index", None)
+
+    @staticmethod
+    def evaluate_oof_segmentation(
+        workspace: Workspace,
+        prediction_rows: Sequence[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Compară predicțiile OOF cu toate țintele manuale acceptate."""
+
+        predictions = {
+            str(row.get("image_token", "")): row for row in prediction_rows
+        }
+        audit_rows = [
+            row
+            for row in FileManager.read_csv(workspace.manual_audit)
+            if row.get("status") == "ACCEPTED"
+        ]
+        metrics: list[dict[str, Any]] = []
+        for target_row in audit_rows:
+            token = str(target_row.get("image_token", ""))
+            prediction_row = predictions.get(token)
+            if prediction_row is None:
+                continue
+            predicted_path = Path(
+                prediction_row.get("predicted_attention_mask_path", "")
+            )
+            target_path = Path(target_row.get("manual_mask_path", ""))
+            if not predicted_path.is_file() or not target_path.is_file():
+                continue
+            predicted = MaskManager.read_binary(predicted_path)
+            target = MaskManager.read_binary(target_path)
+            predicted_bool = predicted > 0
+            target_bool = target > 0
+            tp = float(np.logical_and(predicted_bool, target_bool).sum())
+            fp = float(np.logical_and(predicted_bool, ~target_bool).sum())
+            fn = float(np.logical_and(~predicted_bool, target_bool).sum())
+            union = tp + fp + fn
+            denominator = 2.0 * tp + fp + fn
+            dice = 1.0 if denominator == 0 else 2.0 * tp / denominator
+            iou = 1.0 if union == 0 else tp / union
+            precision = 1.0 if tp + fp == 0 and not target_bool.any() else tp / max(1.0, tp + fp)
+            recall = 1.0 if tp + fn == 0 else tp / max(1.0, tp + fn)
+            target_features = SegmentationManager._mask_features(target)
+            predicted_features = SegmentationManager._mask_features(predicted)
+            if target_bool.any() and predicted_bool.any():
+                centroid_distance = float(
+                    math.hypot(
+                        predicted_features["centroid_x"] - target_features["centroid_x"],
+                        predicted_features["centroid_y"] - target_features["centroid_y"],
+                    )
+                )
+            else:
+                centroid_distance = np.nan
+            metrics.append(
+                {
+                    "image_token": token,
+                    "patient_id": target_row.get("patient_id", ""),
+                    "series_id": target_row.get("series_id", ""),
+                    "target_type": target_row.get("target_type", ""),
+                    "heart_present": _as_int(target_row.get("heart_present"), 1),
+                    "dice": dice,
+                    "iou": iou,
+                    "precision": precision,
+                    "recall": recall,
+                    "target_area_ratio": float(target_bool.mean()),
+                    "predicted_area_ratio": float(predicted_bool.mean()),
+                    "absolute_area_error": abs(
+                        float(predicted_bool.mean()) - float(target_bool.mean())
+                    ),
+                    "false_positive_area_ratio": float(fp / predicted_bool.size),
+                    "centroid_distance_normalized": centroid_distance,
+                    "presence_probability": _as_float(
+                        prediction_row.get("attention_presence_probability"), np.nan
+                    ),
+                    "predicted_heart_present": _as_int(
+                        prediction_row.get("attention_heart_present"), 1
+                    ),
+                    "uncertainty_score": _as_float(
+                        prediction_row.get("attention_uncertainty_score"), np.nan
+                    ),
+                    "sequence_inconsistency": _as_float(
+                        prediction_row.get("attention_sequence_inconsistency"), np.nan
+                    ),
+                }
+            )
+
+        fields = (
+            "image_token",
+            "patient_id",
+            "series_id",
+            "target_type",
+            "heart_present",
+            "dice",
+            "iou",
+            "precision",
+            "recall",
+            "target_area_ratio",
+            "predicted_area_ratio",
+            "absolute_area_error",
+            "false_positive_area_ratio",
+            "centroid_distance_normalized",
+            "presence_probability",
+            "predicted_heart_present",
+            "uncertainty_score",
+            "sequence_inconsistency",
+        )
+        FileManager.write_csv(workspace.segmentation_metrics, metrics, fields)
+
+        positive = [row for row in metrics if _as_int(row["heart_present"], 1) == 1]
+        negative = [row for row in metrics if _as_int(row["heart_present"], 1) == 0]
+
+        def patient_balanced(rows: Sequence[dict[str, Any]], key: str) -> float:
+            by_patient: dict[str, list[float]] = defaultdict(list)
+            for row in rows:
+                value = _as_float(row.get(key), np.nan)
+                if np.isfinite(value):
+                    by_patient[str(row.get("patient_id", ""))].append(value)
+            values = [np.mean(items) for items in by_patient.values() if items]
+            return float(np.mean(values)) if values else np.nan
+
+        summary = {
+            "evaluated_targets": len(metrics),
+            "positive_targets": len(positive),
+            "negative_targets": len(negative),
+            "patient_balanced_dice_all": patient_balanced(metrics, "dice"),
+            "patient_balanced_dice_positive": patient_balanced(positive, "dice"),
+            "patient_balanced_iou_positive": patient_balanced(positive, "iou"),
+            "patient_balanced_precision_positive": patient_balanced(
+                positive, "precision"
+            ),
+            "patient_balanced_recall_positive": patient_balanced(
+                positive, "recall"
+            ),
+            "no_heart_empty_prediction_rate": (
+                float(
+                    np.mean(
+                        [
+                            row["predicted_area_ratio"]
+                            < Settings.Segmentation.PREDICTION_MIN_AREA_RATIO
+                            for row in negative
+                        ]
+                    )
+                )
+                if negative
+                else np.nan
+            ),
+            "no_heart_mean_false_positive_area_ratio": (
+                float(np.mean([row["false_positive_area_ratio"] for row in negative]))
+                if negative
+                else np.nan
+            ),
+            "metrics_csv": str(workspace.segmentation_metrics),
+        }
+        FileManager.write_json(workspace.segmentation_metrics_summary, summary)
+        if metrics:
+            print(
+                "[ATTENTION OOF] "
+                f"targets={len(metrics)}, positive_dice_patient="
+                f"{summary['patient_balanced_dice_positive']:.4f}, "
+                f"negative_empty_rate={summary['no_heart_empty_prediction_rate']}"
+            )
+        return summary
 
     @staticmethod
     def predict_all(
@@ -2339,31 +3524,25 @@ class SegmentationManager:
         checkpoint_map: dict[int, Path] | None = None,
         force: bool = False,
     ) -> list[dict[str, Any]]:
-        """Generează măștile fold cu fold și salvează progresul după fiecare fold.
+        """Generează măști OOF, presence score și incertitudine pentru fiecare imagine."""
 
-        Dacă o sesiune GPU se oprește după foldul 2, următoarea rulare reutilizează
-        foldurile terminate și pornește direct de la primul fold incomplet.
-        """
-
-        checkpoint_map = checkpoint_map or SegmentationManager.load_checkpoint_map(workspace)
-        prediction_fingerprint = SegmentationManager._prediction_fingerprint(rows, checkpoint_map)
-        old_audit = FileManager.read_csv(workspace.prediction_audit)
+        checkpoint_map = checkpoint_map or SegmentationManager.load_checkpoint_map(
+            workspace
+        )
+        prediction_fingerprint = SegmentationManager._prediction_fingerprint(
+            rows, checkpoint_map
+        )
         if not force:
             cached = SegmentationManager.load_cached_predictions(
                 rows, workspace, checkpoint_map
             )
             if cached is not None:
                 print(
-                    "[ATTENTION] Predicțiile compatibile sunt deja în cache; "
+                    "[ATTENTION] Predicțiile 2.5D compatibile sunt deja în cache; "
                     "GPU-ul nu este folosit."
                 )
+                SegmentationManager.evaluate_oof_segmentation(workspace, cached)
                 return cached
-        cached_masks_complete = bool(old_audit) and all(
-            Path(row.get("predicted_attention_mask_path", "")).is_file()
-            for row in old_audit
-        )
-        if old_audit and not cached_masks_complete:
-            print("[ATTENTION] Cache final incomplet; se verifică salvările per fold.")
 
         results: list[dict[str, Any] | None] = [None] * len(rows)
         started = time.perf_counter()
@@ -2372,14 +3551,17 @@ class SegmentationManager:
 
         for fold in range(Settings.Segmentation.FOLDS):
             fold_indices = [
-                index for index, row in enumerate(rows)
+                index
+                for index, row in enumerate(rows)
                 if int(row["segmentation_fold"]) == fold
             ]
             fold_rows = [rows[index] for index in fold_indices]
             if not fold_rows:
                 continue
 
-            part_csv, part_json = SegmentationManager._prediction_part_paths(workspace, fold)
+            part_csv, part_json = SegmentationManager._prediction_part_paths(
+                workspace, fold
+            )
             part_fingerprint = SegmentationManager._prediction_part_fingerprint(
                 fold, fold_rows, checkpoint_map[fold]
             )
@@ -2388,15 +3570,28 @@ class SegmentationManager:
             cached_by_token = {
                 str(row.get("image_token", "")): row for row in cached_part
             }
+            required = {
+                "attention_presence_probability",
+                "attention_uncertainty_score",
+                "attention_sequence_inconsistency",
+                "attention_centroid_x",
+                "attention_centroid_y",
+                "attention_heart_present",
+            }
             part_complete = (
                 len(cached_part) == len(fold_rows)
                 and len(cached_by_token) == len(fold_rows)
+                and (not cached_part or required.issubset(cached_part[0].keys()))
                 and all(
                     token in cached_by_token
                     and Path(
-                        cached_by_token[token].get("predicted_attention_mask_path", "")
+                        cached_by_token[token].get(
+                            "predicted_attention_mask_path", ""
+                        )
                     ).is_file()
-                    for token in (str(row["image_token"]) for row in fold_rows)
+                    for token in (
+                        str(row["image_token"]) for row in fold_rows
+                    )
                 )
             )
             if (
@@ -2405,27 +3600,43 @@ class SegmentationManager:
                 and part_complete
             ):
                 for global_index, row in zip(fold_indices, fold_rows):
-                    results[global_index] = cached_by_token[str(row["image_token"])]
+                    results[global_index] = cached_by_token[
+                        str(row["image_token"])
+                    ]
                 reused_folds.append(fold)
                 print(
-                    f"[ATTENTION] Fold {fold}: rezultat per-fold reutilizat; "
-                    "nu se încarcă modelul pe GPU."
+                    f"[ATTENTION] Fold {fold}: rezultat per-fold 2.5D reutilizat."
                 )
                 continue
 
             checkpoint = SegmentationManager._torch_load(checkpoint_map[fold])
             model = AttentionUNet(
                 base_channels=int(
-                    checkpoint.get("base_channels", Settings.Segmentation.BASE_CHANNELS)
-                )
+                    checkpoint.get(
+                        "base_channels", Settings.Segmentation.BASE_CHANNELS
+                    )
+                ),
+                input_channels=int(
+                    checkpoint.get(
+                        "input_channels", Settings.Segmentation.INPUT_CHANNELS
+                    )
+                ),
             )
             model.load_state_dict(checkpoint["state_dict"])
             model = RuntimeManager.prepare_model(model, device).eval()
+            calibration = checkpoint.get("calibration", {}) or {}
             threshold = float(
-                checkpoint.get("calibration", {}).get(
+                calibration.get(
                     "threshold", Settings.Segmentation.DEFAULT_THRESHOLD
                 )
             )
+            presence_threshold = float(
+                calibration.get(
+                    "presence_threshold",
+                    Settings.Segmentation.DEFAULT_PRESENCE_THRESHOLD,
+                )
+            )
+            geometry_prior = checkpoint.get("geometry_prior", {}) or {}
             checkpoint_fingerprint = str(checkpoint.get("fingerprint", ""))
             loader = DataLoader(
                 SegmentationInferenceDataset(fold_rows),
@@ -2435,61 +3646,85 @@ class SegmentationManager:
                 pin_memory=device.type == "cuda",
             )
             print(
-                f"[ATTENTION] Predicție fold {fold}: {len(fold_rows)} imagini, "
-                f"device={device.type}"
+                f"[ATTENTION] Predicție 2.5D fold {fold}: {len(fold_rows)} "
+                f"imagini, device={device.type}"
             )
             fold_results: list[dict[str, Any]] = []
 
             with torch.inference_mode():
-                for images, local_indices in tqdm(loader, desc=f"Attention fold {fold}"):
+                for images, local_indices in tqdm(
+                    loader, desc=f"Attention 2.5D fold {fold}"
+                ):
                     images = RuntimeManager.move_tensor(images, device)
                     with RuntimeManager.autocast(device):
-                        probability_tensor = torch.sigmoid(model(images))[:, 0]
-                    probabilities = probability_tensor.float().cpu().numpy()
+                        logits, presence_logits = model(images)
+                    original_probability = torch.sigmoid(logits)[:, 0]
+                    original_presence = torch.sigmoid(presence_logits)
 
-                    initial_masks = [
-                        SegmentationManager._candidate_mask(probability, threshold)
-                        for probability in probabilities
-                    ]
-                    initial_validity = [
-                        SegmentationManager._validate_mask(mask, probability)
-                        for mask, probability in zip(initial_masks, probabilities)
-                    ]
+                    factor = float(Settings.Segmentation.TTA_CONTRAST_FACTOR)
+                    tta_images = torch.clamp(
+                        (images - 0.5) * factor + 0.5, 0.0, 1.0
+                    )
+                    with RuntimeManager.autocast(device):
+                        tta_logits, tta_presence_logits = model(tta_images)
+                    tta_probability = torch.sigmoid(tta_logits)[:, 0]
+                    tta_presence = torch.sigmoid(tta_presence_logits)
 
-                    invalid_positions = [
-                        position
-                        for position, (valid, _) in enumerate(initial_validity)
-                        if not valid
-                    ]
-                    if invalid_positions:
-                        invalid_tensor = images[invalid_positions]
-                        with RuntimeManager.autocast(device):
-                            flipped_probability_tensor = torch.sigmoid(
-                                model(torch.flip(invalid_tensor, dims=[3]))
-                            )[:, 0]
-                        flipped_probability = torch.flip(
-                            flipped_probability_tensor, dims=[2]
-                        ).float().cpu().numpy()
-                        for destination, tta_probability in zip(
-                            invalid_positions, flipped_probability
-                        ):
-                            probabilities[destination] = (
-                                probabilities[destination] + tta_probability
-                            ) / 2.0
+                    averaged_probability = (
+                        original_probability + tta_probability
+                    ) / 2.0
+                    averaged_presence = (
+                        original_presence + tta_presence
+                    ) / 2.0
+                    probabilities = averaged_probability.float().cpu().numpy()
+                    alternate_probabilities = tta_probability.float().cpu().numpy()
+                    presence_probabilities = (
+                        averaged_presence.float().cpu().numpy()
+                    )
 
-                    for batch_position, local_index_tensor in enumerate(local_indices):
+                    for batch_position, local_index_tensor in enumerate(
+                        local_indices
+                    ):
                         local_index = int(local_index_tensor)
                         global_index = fold_indices[local_index]
                         row = rows[global_index]
                         probability = probabilities[batch_position]
-                        initial_mask = initial_masks[batch_position]
-                        initial_valid, initial_reason = initial_validity[batch_position]
-                        if initial_valid:
+                        alternate_probability = alternate_probabilities[
+                            batch_position
+                        ]
+                        presence_probability = float(
+                            presence_probabilities[batch_position]
+                        )
+                        heart_present = bool(
+                            presence_probability >= presence_threshold
+                            or float(probability.max())
+                            >= Settings.Segmentation.PRESENCE_SEGMENTATION_OVERRIDE_PEAK
+                        )
+                        initial_mask = SegmentationManager._candidate_mask(
+                            probability, threshold
+                        )
+                        initial_valid, initial_reason = (
+                            SegmentationManager._validate_mask(
+                                initial_mask, probability, geometry_prior
+                            )
+                        )
+
+                        if not heart_present:
+                            final_mask = np.zeros_like(initial_mask, dtype=np.uint8)
+                            final_valid = True
+                            repair_method = "presence_head_empty"
+                            used_threshold = threshold
+                            final_reason = ""
+                            prior_deviation = 0.0
+                        elif initial_valid:
                             final_mask = initial_mask
                             final_valid = True
                             repair_method = "none"
                             used_threshold = threshold
                             final_reason = ""
+                            prior_deviation = SegmentationManager._prior_deviation(
+                                final_mask, geometry_prior
+                            )
                         else:
                             (
                                 final_mask,
@@ -2497,16 +3732,35 @@ class SegmentationManager:
                                 repair_method,
                                 used_threshold,
                                 final_reason,
+                                prior_deviation,
                             ) = SegmentationManager._repair_probability(
-                                probability, threshold
+                                probability, threshold, geometry_prior
                             )
-                            repair_method = "tta+" + repair_method
+                            repair_method = "photometric_tta+" + repair_method
 
-                        area, boundary = SegmentationManager._mask_geometry(final_mask)
+                        geometry = SegmentationManager._mask_features(final_mask)
+                        area = float(geometry["area"])
+                        boundary = float(geometry["boundary"])
+                        centroid_x = geometry["centroid_x"]
+                        centroid_y = geometry["centroid_y"]
+                        disagreement, entropy, uncertainty = (
+                            SegmentationManager._uncertainty_metrics(
+                                probability,
+                                alternate_probability,
+                                presence_probability,
+                                presence_threshold,
+                                prior_deviation,
+                                final_valid,
+                            )
+                        )
                         mask_path = Path(row["predicted_attention_mask_path"])
-                        if Settings.Segmentation.SAVE_ALL_PREDICTED_MASKS or not final_valid:
+                        if (
+                            Settings.Segmentation.SAVE_ALL_PREDICTED_MASKS
+                            or not final_valid
+                        ):
                             FileManager.write_png(
-                                mask_path, final_mask.astype(np.uint8) * 255
+                                mask_path,
+                                final_mask.astype(np.uint8) * 255,
                             )
 
                         result_row = {
@@ -2518,15 +3772,28 @@ class SegmentationManager:
                             "attention_repair_method": repair_method,
                             "attention_threshold_used": float(used_threshold),
                             "attention_area_ratio": area,
-                            "attention_peak_probability": float(probability.max()),
+                            "attention_peak_probability": float(
+                                probability.max()
+                            ),
                             "attention_boundary_touch_fraction": boundary,
+                            "attention_heart_present": int(heart_present),
+                            "attention_presence_probability": presence_probability,
+                            "attention_presence_threshold": presence_threshold,
+                            "attention_tta_disagreement": disagreement,
+                            "attention_mean_entropy": entropy,
+                            "attention_uncertainty_score": uncertainty,
+                            "attention_sequence_inconsistency": 0.0,
+                            "attention_centroid_x": centroid_x,
+                            "attention_centroid_y": centroid_y,
+                            "attention_prior_deviation": float(prior_deviation),
                             "checkpoint_fingerprint": checkpoint_fingerprint,
                         }
                         results[global_index] = result_row
                         fold_results.append(result_row)
 
-            # Salvarea per fold are loc înainte de eliberarea GPU-ului. Astfel,
-            # progresul rămâne pe disc chiar dacă următoarea sesiune se oprește.
+            SegmentationManager._apply_sequence_consistency(
+                fold_results, fold_rows
+            )
             FileManager.write_csv(
                 part_csv, fold_results, SegmentationManager.PREDICTION_FIELDS
             )
@@ -2542,13 +3809,15 @@ class SegmentationManager:
                 },
             )
             computed_folds.append(fold)
-
             del model, loader, checkpoint, fold_results
             RuntimeManager.release(device)
 
         final_results = [result for result in results if result is not None]
         if len(final_results) != len(rows):
-            raise RuntimeError("Predicția nu a produs câte un rând pentru fiecare imagine.")
+            raise RuntimeError(
+                "Predicția nu a produs câte un rând pentru fiecare imagine."
+            )
+        SegmentationManager._apply_sequence_consistency(final_results, rows)
         FileManager.write_csv(
             workspace.prediction_audit,
             final_results,
@@ -2564,8 +3833,12 @@ class SegmentationManager:
             invalid_rows,
             SegmentationManager.PREDICTION_FIELDS,
         )
+        segmentation_summary = SegmentationManager.evaluate_oof_segmentation(
+            workspace, final_results
+        )
         summary = {
             "fingerprint": prediction_fingerprint,
+            "schema": "simple-predictions-2p5d-presence-v5",
             "device_used_for_computed_folds": device.type,
             "reused_folds": reused_folds,
             "computed_folds": computed_folds,
@@ -2578,20 +3851,36 @@ class SegmentationManager:
                 _as_int(row.get("attention_valid_final"), 0)
                 for row in final_results
             ),
+            "predicted_heart_present": sum(
+                _as_int(row.get("attention_heart_present"), 0)
+                for row in final_results
+            ),
+            "predicted_no_heart": sum(
+                _as_int(row.get("attention_heart_present"), 0) == 0
+                for row in final_results
+            ),
+            "uncertain_above_review_threshold": sum(
+                _as_float(row.get("attention_uncertainty_score"), 0.0)
+                >= Settings.Review.UNCERTAINTY_MIN_SCORE
+                for row in final_results
+            ),
             "invalid_final": len(invalid_rows),
             "prediction_audit": str(workspace.prediction_audit),
             "invalid_queue": str(workspace.invalid_predictions),
-            "elapsed": RuntimeManager.format_seconds(time.perf_counter() - started),
+            "segmentation_oof": segmentation_summary,
+            "elapsed": RuntimeManager.format_seconds(
+                time.perf_counter() - started
+            ),
         }
         FileManager.write_json(workspace.prediction_summary, summary)
         print(
             "[ATTENTION] "
             f"valid_final={summary['valid_final']}/{summary['images']}, "
+            f"heart_present={summary['predicted_heart_present']}, "
             f"invalid={summary['invalid_final']} | {workspace.prediction_audit}"
         )
         ImageCache.clear()
         return final_results
-
 
 # =============================================================================
 # DEFINIȚII 8 — ALEGEREA IMAGINILOR PENTRU REVIEW
@@ -2636,7 +3925,7 @@ class HammingBKTree:
 
 
 class ReviewManager:
-    """Construiește cozi compacte: invalide, noi/diverse, manuale sau toate."""
+    """Construiește cozi pe pacient/serie pentru invalid, uncertain și novel."""
 
     HISTORY_FIELDS = (
         "timestamp_utc",
@@ -2657,16 +3946,22 @@ class ReviewManager:
         workspace: Workspace,
     ) -> list[dict[str, Any]]:
         quality = {
-            row["image_token"]: row for row in FileManager.read_csv(workspace.quality_audit)
+            row["image_token"]: row
+            for row in FileManager.read_csv(workspace.quality_audit)
         }
         predictions = {
-            row["image_token"]: row for row in FileManager.read_csv(workspace.prediction_audit)
+            row["image_token"]: row
+            for row in FileManager.read_csv(workspace.prediction_audit)
         }
+        annotations = MaskManager.annotation_map(workspace)
         merged = []
         for original in dataset_rows:
             row = dict(original)
             row.update(quality.get(row["image_token"], {}))
             row.update(predictions.get(row["image_token"], {}))
+            annotation = annotations.get(str(row["image_token"]), {})
+            row["manual_annotation_type"] = annotation.get("target_type", "")
+            row["manual_annotation_source"] = annotation.get("source", "")
             mask_qc = MaskManager.manual_qc(row["manual_mask_path"])
             row.update(
                 {
@@ -2695,17 +3990,29 @@ class ReviewManager:
         seed: int,
     ) -> list[dict[str, Any]]:
         def priority(row: dict[str, Any]):
-            valid = _as_int(row.get("attention_valid_final"), 0)
+            explicit_priority = row.get("review_priority", "")
+            if str(explicit_priority).strip() != "":
+                primary = _as_float(explicit_priority, 0.0)
+            else:
+                uncertainty = _as_float(
+                    row.get("attention_uncertainty_score"), 0.0
+                )
+                valid = _as_int(row.get("attention_valid_final"), 0)
+                primary = -uncertainty if uncertainty > 0 else float(valid)
             peak = _as_float(row.get("attention_peak_probability"), 0.0)
-            area = _as_float(row.get("attention_area_ratio"), 0.0)
-            tie = hashlib.sha256(f"{seed}|{row['image_token']}".encode("utf-8")).hexdigest()
-            return (valid, peak, abs(area - 0.15), tie)
+            tie = hashlib.sha256(
+                f"{seed}|{row['image_token']}".encode("utf-8")
+            ).hexdigest()
+            return (primary, peak, tie)
 
         by_patient_series: dict[str, dict[str, list[dict[str, Any]]]] = defaultdict(
             lambda: defaultdict(list)
         )
         for row in rows:
-            by_patient_series[row["patient_id"]][row["series_id"]].append(row)
+            sequence_group = str(
+                row.get("sequence_group_id") or row["series_id"]
+            )
+            by_patient_series[str(row["patient_id"])][sequence_group].append(row)
 
         patient_queues: dict[str, list[dict[str, Any]]] = {}
         for patient_id, series_map in by_patient_series.items():
@@ -2752,51 +4059,164 @@ class ReviewManager:
         seed: int = 42,
         review_round: int = 1,
     ) -> list[dict[str, Any]]:
-        """Scope-uri păstrate intenționat puține și clare.
+        """Selectează imagini fără să supra-reprezinte un singur pacient.
 
-        - invalid: numai predicțiile rămase invalide după reparare;
-        - novel: imagini clare, fără mască manuală și diferite de cele deja marcate;
-        - manual: imagini care au deja un fișier în manual_masks;
-        - all: toate imaginile cu mască Attention existentă.
+        - ``invalid``: măști care nu au putut fi reparate;
+        - ``uncertain``: măști formal valide, dar cu entropie/disagreement mare
+          sau presence score apropiat de prag;
+        - ``empty``: măști goale vechi încă neclasificate ca no-heart/unusable;
+        - ``novel``: imagini clare și diferite de orice imagine deja etichetată;
+        - ``manual``: toate imaginile deja etichetate explicit sau cu PNG manual;
+        - ``all``: toate imaginile cu predicție Attention.
         """
 
         scope = str(scope).lower()
-        if scope not in {"invalid", "novel", "manual", "all"}:
-            raise ValueError("scope trebuie să fie invalid/novel/manual/all.")
+        allowed = {"invalid", "uncertain", "empty", "novel", "manual", "all"}
+        if scope not in allowed:
+            raise ValueError(
+                "scope trebuie să fie invalid/uncertain/empty/novel/manual/all."
+            )
         limit = int(Settings.Review.DEFAULT_LIMIT if limit is None else limit)
         rows = ReviewManager._merge_rows(dataset_rows, workspace)
         reviewed = ReviewManager._reviewed_tokens(workspace, review_round)
 
         if scope == "invalid":
             candidates = [
-                row for row in rows
+                row
+                for row in rows
                 if _as_int(row.get("attention_valid_final"), 1) == 0
+                and Path(row["predicted_attention_mask_path"]).is_file()
+                and row["image_token"] not in reviewed
+            ]
+            for row in candidates:
+                row["review_priority"] = _as_float(
+                    row.get("attention_peak_probability"), 0.0
+                )
+            candidates = ReviewManager._round_robin(
+                candidates,
+                limit=max(1, limit),
+                per_patient=max(
+                    Settings.Review.NEW_IMAGES_PER_PATIENT,
+                    int(math.ceil(limit / max(1, len({r['patient_id'] for r in candidates}))))
+                    if candidates
+                    else Settings.Review.NEW_IMAGES_PER_PATIENT,
+                ),
+                seed=seed,
+            )
+        elif scope == "uncertain":
+            candidates = []
+            for row in rows:
+                if row["image_token"] in reviewed:
+                    continue
+                if _as_int(row.get("quality_valid"), 0) != 1:
+                    continue
+                if not Path(row["predicted_attention_mask_path"]).is_file():
+                    continue
+                uncertainty = _as_float(
+                    row.get("attention_uncertainty_score"), 0.0
+                )
+                presence = _as_float(
+                    row.get("attention_presence_probability"), np.nan
+                )
+                presence_threshold = _as_float(
+                    row.get("attention_presence_threshold"),
+                    Settings.Segmentation.DEFAULT_PRESENCE_THRESHOLD,
+                )
+                near_presence_boundary = bool(
+                    np.isfinite(presence)
+                    and abs(presence - presence_threshold)
+                    <= Settings.Review.PRESENCE_MARGIN
+                )
+                if (
+                    uncertainty < Settings.Review.UNCERTAINTY_MIN_SCORE
+                    and not near_presence_boundary
+                    and _as_int(row.get("attention_valid_final"), 1) == 1
+                ):
+                    continue
+                # Valoare negativă: sortarea crescătoare pune incertitudinea mare prima.
+                row["review_priority"] = -uncertainty
+                candidates.append(row)
+            candidates = ReviewManager._round_robin(
+                candidates,
+                limit=max(1, limit),
+                per_patient=max(
+                    Settings.Review.NEW_IMAGES_PER_PATIENT,
+                    int(math.ceil(limit / max(1, len({r['patient_id'] for r in candidates}))))
+                    if candidates
+                    else Settings.Review.NEW_IMAGES_PER_PATIENT,
+                ),
+                seed=seed,
+            )
+        elif scope == "empty":
+            candidates = [
+                row
+                for row in rows
+                if Path(row["manual_mask_path"]).is_file()
+                and not bool(row.get("manual_annotation_type"))
+                and str(row.get("manual_mask_reason", ""))
+                == "empty_or_nearly_empty"
+                and Path(row["predicted_attention_mask_path"]).is_file()
+                and row["image_token"] not in reviewed
+            ]
+            for row in candidates:
+                row["review_priority"] = -_as_float(
+                    row.get("attention_uncertainty_score"), 0.0
+                )
+            candidates = ReviewManager._round_robin(
+                candidates,
+                limit=max(1, limit),
+                per_patient=max(
+                    Settings.Review.NEW_IMAGES_PER_PATIENT,
+                    int(math.ceil(limit / max(1, len({r['patient_id'] for r in candidates}))))
+                    if candidates
+                    else Settings.Review.NEW_IMAGES_PER_PATIENT,
+                ),
+                seed=seed,
+            )
+        elif scope == "manual":
+            candidates = [
+                row
+                for row in rows
+                if (
+                    Path(row["manual_mask_path"]).is_file()
+                    or bool(row.get("manual_annotation_type"))
+                )
                 and Path(row["predicted_attention_mask_path"]).is_file()
             ]
             candidates.sort(
                 key=lambda row: (
                     row["patient_id"],
                     row["series_id"],
-                    _as_float(row.get("attention_peak_probability"), 0.0),
+                    row["image_token"],
                 )
             )
-        elif scope == "manual":
-            candidates = [row for row in rows if Path(row["manual_mask_path"]).is_file()]
-            candidates.sort(key=lambda row: (row["patient_id"], row["series_id"], row["image_token"]))
         elif scope == "all":
             candidates = [
-                row for row in rows if Path(row["predicted_attention_mask_path"]).is_file()
+                row
+                for row in rows
+                if Path(row["predicted_attention_mask_path"]).is_file()
             ]
-            candidates.sort(key=lambda row: (row["patient_id"], row["series_id"], row["image_token"]))
+            candidates.sort(
+                key=lambda row: (
+                    row["patient_id"],
+                    row["series_id"],
+                    row["image_token"],
+                )
+            )
         else:
-            # Orice fișier manual, inclusiv o mască intenționat goală, devine
-            # referință de noutate și blochează imagini aproape identice.
+            # Orice adnotare explicită, inclusiv UNUSABLE, devine referință de
+            # noutate și blochează cadre aproape identice.
             manual_hashes = []
             for row in rows:
-                if Path(row["manual_mask_path"]).is_file() and row.get("perceptual_hash"):
+                is_annotated = bool(row.get("manual_annotation_type")) or Path(
+                    row["manual_mask_path"]
+                ).is_file()
+                if is_annotated and row.get("perceptual_hash"):
                     manual_hashes.append(int(str(row["perceptual_hash"]), 16))
             if not manual_hashes:
-                raise RuntimeError("Scope-ul novel necesită cel puțin o mască manuală existentă.")
+                raise RuntimeError(
+                    "Scope-ul novel necesită cel puțin o imagine etichetată."
+                )
             tree = HammingBKTree()
             for value in sorted(set(manual_hashes)):
                 tree.add(value)
@@ -2804,8 +4224,10 @@ class ReviewManager:
             candidates = []
             excluded = defaultdict(int)
             for row in rows:
-                if Path(row["manual_mask_path"]).is_file():
-                    excluded["already_manual"] += 1
+                if bool(row.get("manual_annotation_type")) or Path(
+                    row["manual_mask_path"]
+                ).is_file():
+                    excluded["already_annotated"] += 1
                     continue
                 if row["image_token"] in reviewed:
                     excluded["already_reviewed_this_round"] += 1
@@ -2820,9 +4242,14 @@ class ReviewManager:
                 if not phash:
                     excluded["missing_phash"] += 1
                     continue
-                if tree.has_near(int(phash, 16), Settings.Review.PHASH_MAX_DISTANCE):
-                    excluded["similar_to_manual"] += 1
+                if tree.has_near(
+                    int(phash, 16), Settings.Review.PHASH_MAX_DISTANCE
+                ):
+                    excluded["similar_to_annotated"] += 1
                     continue
+                row["review_priority"] = -_as_float(
+                    row.get("attention_uncertainty_score"), 0.0
+                )
                 candidates.append(row)
             candidates = ReviewManager._round_robin(
                 candidates,
@@ -2832,14 +4259,18 @@ class ReviewManager:
             )
             print(f"[REVIEW novel] excluse={dict(excluded)}")
 
-        if limit > 0 and scope != "novel":
+        if limit > 0 and scope in {"manual", "all"}:
             candidates = candidates[:limit]
         if not candidates:
             raise RuntimeError(f"Nu există imagini eligibile pentru scope={scope!r}.")
-        queue_path = workspace.outputs / f"review_queue_{scope}_round_{review_round}.csv"
+        queue_path = (
+            workspace.outputs / f"review_queue_{scope}_round_{review_round}.csv"
+        )
         fields = sorted({key for row in candidates for key in row.keys()})
         FileManager.write_csv(queue_path, candidates, fields)
-        print(f"[REVIEW] scope={scope}, imagini={len(candidates)}, coadă={queue_path}")
+        print(
+            f"[REVIEW] scope={scope}, imagini={len(candidates)}, coadă={queue_path}"
+        )
         return candidates
 
     @staticmethod
@@ -2863,11 +4294,15 @@ class ReviewManager:
                 "series_id": row["series_id"],
                 "queue_position": int(position),
                 "queue_size": int(queue_size),
-                "mask_area_ratio": "" if mask is None else float((mask > 0).mean()),
+                "mask_area_ratio": ""
+                if mask is None
+                else float((mask > 0).mean()),
                 "manual_mask_path": row["manual_mask_path"],
             }
         )
-        FileManager.write_csv(workspace.review_history, history, ReviewManager.HISTORY_FIELDS)
+        FileManager.write_csv(
+            workspace.review_history, history, ReviewManager.HISTORY_FIELDS
+        )
 
 
 # =============================================================================
@@ -2938,24 +4373,30 @@ class MaskEditor:
         # Etichetele includ shortcut-ul. În plus, ele sunt intenționat diferite
         # de vechile "Next"/"Previous", astfel încât listener-ele anonime rămase
         # dintr-o versiune veche a notebook-ului nu mai pot apăsa aceste butoane.
-        self.previous_button = compact_button("← Prev [P]", "78px", "Previous — P")
-        self.next_button = compact_button("Next [N] →", "82px", "Next — N")
+        self.previous_button = compact_button("← Prev [P]", "68px", "Previous — P")
+        self.next_button = compact_button("Next [N] →", "72px", "Next — N")
         self.save_next_button = compact_button(
-            "Save & Next [S]", "112px", "Save manual mask and go next — S", "success"
+            "Save + Next [S]", "102px", "Save HEART_PRESENT mask and go next — S", "success"
         )
         self.raw_button = compact_button(
-            "Reset to image [I]", "120px", "Hide overlays and start from the image — I"
+            "Image [I]", "74px", "Hide overlays and start from the image — I"
         )
         self.reset_button = compact_button(
-            "Reset to auto [R]", "114px", "Restore the automatic mask — R"
+            "Auto reset [R]", "94px", "Restore the automatic mask — R"
         )
         self.accept_button = compact_button(
-            "Auto OK [A]", "92px", "Accept auto for review only — A", "info"
+            "Auto OK [A]", "84px", "Save confirmed auto mask for training — A", "info"
         )
-        self.skip_button = compact_button("Skip [K]", "76px", "Skip and go next — K")
-        self.clear_button = compact_button("Clear [C]", "78px", "Clear editable mask — C")
+        self.no_heart_button = compact_button(
+            "No heart [H]", "92px", "Valid image, but no heart is visible — H", "info"
+        )
+        self.unusable_button = compact_button(
+            "Unusable [U]", "92px", "Blur/noise/localizer: exclude from training — U", "warning"
+        )
+        self.skip_button = compact_button("Skip [K]", "66px", "Skip and go next — K")
+        self.clear_button = compact_button("Clear [C]", "68px", "Clear editable mask — C")
         self.delete_button = compact_button(
-            "Delete [D]", "84px", "Delete existing manual mask — D", "warning"
+            "Delete [D]", "76px", "Delete manual target and label — D", "danger"
         )
         self.brush_slider = widgets.IntSlider(
             description="Brush",
@@ -2972,6 +4413,8 @@ class MaskEditor:
         self.next_button.on_click(lambda _: self._safe("Next", self.next))
         self.save_next_button.on_click(lambda _: self._safe("Save & Next", self.save_next))
         self.accept_button.on_click(lambda _: self._safe("Auto OK", self.accept_auto))
+        self.no_heart_button.on_click(lambda _: self._safe("No heart", self.mark_no_heart))
+        self.unusable_button.on_click(lambda _: self._safe("Unusable", self.mark_unusable))
         self.skip_button.on_click(lambda _: self._safe("Skip", self.skip))
         self.reset_button.on_click(lambda _: self._safe("Reset", self.reset_to_auto))
         self.raw_button.on_click(lambda _: self._safe("Reset to image", self.reset_to_image))
@@ -2991,6 +4434,8 @@ class MaskEditor:
                         self.raw_button,
                         self.reset_button,
                         self.accept_button,
+                        self.no_heart_button,
+                        self.unusable_button,
                         self.skip_button,
                         self.clear_button,
                         self.delete_button,
@@ -3078,8 +4523,8 @@ class MaskEditor:
                          cursor:crosshair;touch-action:none;user-select:none"></canvas>
           <div style="font-size:12px;margin-top:5px;line-height:1.4">
             Left drag = draw | Right drag = erase | S = Save & Next | P/N = Prev/Next |
-            I = Reset to image | R = Reset to auto | A = Auto OK | K = Skip |
-            C = Clear | D = Delete | [ / ] = Brush −/+
+            I = image | R = auto reset | A = Auto OK | H = no heart | U = unusable |
+            K = Skip | C = Clear | D = Delete | [ / ] = Brush −/+
           </div>
         </div>
         """
@@ -3228,7 +4673,7 @@ class MaskEditor:
             const key = String(event.key || '').toLowerCase();
             const fallback = {{
               p: 'KeyP', n: 'KeyN', s: 'KeyS', i: 'KeyI', r: 'KeyR',
-              a: 'KeyA', k: 'KeyK', c: 'KeyC', d: 'KeyD',
+              a: 'KeyA', h: 'KeyH', u: 'KeyU', k: 'KeyK', c: 'KeyC', d: 'KeyD',
               '[': 'BracketLeft', ']': 'BracketRight'
             }};
             return fallback[key] || '';
@@ -3241,6 +4686,8 @@ class MaskEditor:
             KeyI: 'reset_image',
             KeyR: 'reset_auto',
             KeyA: 'accept_auto',
+            KeyH: 'no_heart',
+            KeyU: 'unusable',
             KeyK: 'skip',
             KeyC: 'clear',
             KeyD: 'delete',
@@ -3329,6 +4776,8 @@ class MaskEditor:
             "reset_image": ("Reset to image", self.reset_to_image),
             "reset_auto": ("Reset to auto", self.reset_to_auto),
             "accept_auto": ("Auto OK", self.accept_auto),
+            "no_heart": ("No heart", self.mark_no_heart),
+            "unusable": ("Unusable", self.mark_unusable),
             "skip": ("Skip", self.skip),
             "clear": ("Clear", self.clear_editable),
             "delete": ("Delete manual", self.delete_manual),
@@ -3395,23 +4844,46 @@ class MaskEditor:
     def update_status(self, prefix: str = "") -> None:
         row = self.rows[self.index]
         manual = MaskManager.manual_qc(row["manual_mask_path"])
+        annotation = MaskManager.annotation_map(self.workspace).get(
+            str(row["image_token"]), {}
+        )
+        target_type = annotation.get("target_type", "unlabeled")
         self.status.value = (
             "<span style='margin-left:12px'>"
             f"<b>{prefix}</b> index={self.index + 1}/{len(self.rows)}; "
-            f"manual={'yes' if manual['exists'] else 'no'}; usable={manual['usable']}; "
-            f"attention_valid={row.get('attention_valid_final', '')}; "
-            f"reason={row.get('attention_invalid_reason_final', '')}; "
-            f"quality={row.get('quality_valid', '')}</span>"
+            f"target={target_type}; manual={'yes' if manual['exists'] else 'no'}; "
+            f"usable={manual['usable']}; attention_valid={row.get('attention_valid_final', '')}; "
+            f"presence={_as_float(row.get('attention_presence_probability'), np.nan):.3f}; "
+            f"uncertainty={_as_float(row.get('attention_uncertainty_score'), np.nan):.3f}; "
+            f"reason={row.get('attention_invalid_reason_final', '')}</span>"
         )
 
-    def save(self) -> None:
+    def _write_target(
+        self,
+        mask: np.ndarray,
+        target_type: str,
+        source: str,
+        action: str,
+        sample_weight: float | None = None,
+    ) -> None:
         row = self.rows[self.index]
+        binary = (np.asarray(mask) > 0).astype(np.uint8)
         path = Path(row["manual_mask_path"])
-        FileManager.write_png(path, self.mask.astype(np.uint8) * 255)
+        FileManager.write_png(path, binary * 255)
+        MaskManager.set_annotation(
+            self.workspace,
+            row,
+            target_type=target_type,
+            source=source,
+            sample_weight=sample_weight,
+        )
+        row["manual_annotation_type"] = target_type
+        row["manual_annotation_source"] = source
+
         overlay = np.stack([self.image] * 3, axis=-1)
-        overlay[..., 0] = np.maximum(overlay[..., 0], self.mask * 0.90)
-        overlay[..., 1] *= 1.0 - 0.45 * self.mask
-        overlay[..., 2] *= 1.0 - 0.45 * self.mask
+        overlay[..., 0] = np.maximum(overlay[..., 0], binary * 0.90)
+        overlay[..., 1] *= 1.0 - 0.45 * binary
+        overlay[..., 2] *= 1.0 - 0.45 * binary
         FileManager.write_png(
             self.workspace.mask_overlays / f"{row['image_token']}.png",
             cv2.cvtColor(
@@ -3423,30 +4895,83 @@ class MaskEditor:
             self.workspace,
             row,
             self.review_round,
-            "save_manual",
-            self.mask,
+            action,
+            binary,
             self.index,
             len(self.rows),
         )
-        qc = MaskManager.manual_qc(path)
-        prefix = "Saved; valid for training." if qc["usable"] else f"Saved; excluded: {qc['reason']}."
-        self.update_status(prefix)
-        print("[EDITOR]", path, "|", prefix)
+        self.mask = binary.copy()
+
+    def save(self) -> None:
+        if float((self.mask > 0).mean()) < Settings.Segmentation.MANUAL_MIN_AREA_RATIO:
+            raise ValueError(
+                "Masca este goală. Folosește No heart [H] pentru o imagine validă "
+                "fără inimă sau Unusable [U] pentru blur/zgomot."
+            )
+        self._write_target(
+            self.mask,
+            MaskManager.HEART_PRESENT,
+            source="human_drawn_or_corrected",
+            action="save_manual_heart_present",
+            sample_weight=Settings.Segmentation.MANUAL_DRAWN_WEIGHT,
+        )
+        self.update_status("Saved HEART_PRESENT; weight=1.00.")
+        print("[EDITOR]", self.rows[self.index]["manual_mask_path"], "| HEART_PRESENT")
 
     def save_next(self) -> None:
         self.save()
         self.next()
 
     def accept_auto(self) -> None:
+        if float((self.auto_mask > 0).mean()) < Settings.Segmentation.MANUAL_MIN_AREA_RATIO:
+            raise ValueError(
+                "Masca automată este goală; folosește No heart [H], nu Auto OK."
+            )
+        self._write_target(
+            self.auto_mask,
+            MaskManager.HEART_PRESENT,
+            source="human_confirmed_auto",
+            action="accept_auto_and_save",
+            sample_weight=Settings.Segmentation.AUTO_CONFIRMED_WEIGHT,
+        )
+        self.update_status(
+            f"Auto saved for training; weight={Settings.Segmentation.AUTO_CONFIRMED_WEIGHT:.2f}."
+        )
+        self.next()
+
+    def mark_no_heart(self) -> None:
+        empty = np.zeros_like(self.auto_mask, dtype=np.uint8)
+        self._write_target(
+            empty,
+            MaskManager.NO_HEART_VISIBLE,
+            source="human_no_heart_visible",
+            action="mark_no_heart_visible",
+            sample_weight=Settings.Segmentation.NO_HEART_WEIGHT,
+        )
+        self.update_status("Saved NO_HEART_VISIBLE negative target.")
+        self.next()
+
+    def mark_unusable(self) -> None:
+        row = self.rows[self.index]
+        Path(row["manual_mask_path"]).unlink(missing_ok=True)
+        MaskManager.set_annotation(
+            self.workspace,
+            row,
+            target_type=MaskManager.UNUSABLE,
+            source="human_unusable",
+            sample_weight=0.0,
+        )
+        row["manual_annotation_type"] = MaskManager.UNUSABLE
         ReviewManager.log(
             self.workspace,
-            self.rows[self.index],
+            row,
             self.review_round,
-            "accept_auto",
-            self.auto_mask,
+            "mark_unusable",
+            None,
             self.index,
             len(self.rows),
         )
+        self.update_status("Marked UNUSABLE; excluded from training.")
         self.next()
 
     def skip(self) -> None:
@@ -3485,11 +5010,14 @@ class MaskEditor:
     def delete_manual(self) -> None:
         row = self.rows[self.index]
         Path(row["manual_mask_path"]).unlink(missing_ok=True)
+        MaskManager.remove_annotation(self.workspace, str(row["image_token"]))
+        row["manual_annotation_type"] = ""
+        row["manual_annotation_source"] = ""
         ReviewManager.log(
             self.workspace,
             row,
             self.review_round,
-            "delete_manual",
+            "delete_manual_and_annotation",
             None,
             self.index,
             len(self.rows),
@@ -3498,7 +5026,7 @@ class MaskEditor:
         self.base_mask = self.auto_mask.copy()
         self._sync_python_mask()
         self.render()
-        self.update_status("Manual mask deleted.")
+        self.update_status("Manual target and annotation deleted.")
 
     def next(self) -> None:
         if self.index < len(self.rows) - 1:
@@ -3736,6 +5264,7 @@ class FeatureManager:
         for audit_path in (
             workspace.quality_audit,
             workspace.manual_audit,
+            workspace.manual_annotations,
             workspace.prediction_audit,
         ):
             if audit_path.is_file():
@@ -3834,6 +5363,7 @@ class FeatureManager:
             row["image_token"]
             for row in FileManager.read_csv(workspace.manual_audit)
             if row.get("status") == "ACCEPTED"
+            and row.get("target_type") == MaskManager.HEART_PRESENT
         }
         if len(predictions) != len(dataset_rows):
             raise RuntimeError("Prediction audit nu acoperă întregul dataset.")
@@ -3845,7 +5375,10 @@ class FeatureManager:
             row.update(quality.get(row["image_token"], {}))
             row["keep_attention"] = int(
                 _as_int(row.get("attention_valid_final"), 0) == 1
+                and _as_int(row.get("attention_heart_present"), 1) == 1
                 and _as_int(row.get("quality_valid"), 0) == 1
+                and _as_float(row.get("attention_area_ratio"), 0.0)
+                >= Settings.Segmentation.PREDICTION_MIN_AREA_RATIO
             )
             row["keep_manual_matched"] = int(
                 row["image_token"] in accepted_manual
@@ -4431,6 +5964,9 @@ class CADPipeline:
                     "[ATTENTION] Predicțiile finale sunt compatibile; "
                     "CUDA nu este inițializat."
                 )
+                SegmentationManager.evaluate_oof_segmentation(
+                    self.workspace, cached
+                )
                 return cached
 
         requested = device or self.attention_device
@@ -4464,7 +6000,7 @@ class CADPipeline:
         imported_quality = WorkspaceCompatibilityManager.ensure_quality_audit(
             rows, self.workspace
         )
-        if scope == "novel" and len(imported_quality) != len(rows):
+        if scope in {"novel", "uncertain"} and len(imported_quality) != len(rows):
             self.audit_quality(refresh=False)
         WorkspaceCompatibilityManager.ensure_prediction_audit(
             rows,
@@ -4509,7 +6045,15 @@ class CADPipeline:
             self.workspace,
             require_complete=True,
         )
-        if not self.workspace.manual_audit.is_file():
+        annotations_newer = (
+            self.workspace.manual_annotations.is_file()
+            and (
+                not self.workspace.manual_audit.is_file()
+                or self.workspace.manual_annotations.stat().st_mtime_ns
+                > self.workspace.manual_audit.stat().st_mtime_ns
+            )
+        )
+        if not self.workspace.manual_audit.is_file() or annotations_newer:
             self.audit_manual_masks()
         if not force:
             cached = FeatureManager.load_compatible_cache(rows, self.workspace)
@@ -4547,6 +6091,7 @@ class CADPipeline:
         """CPU: arată ce etape sunt deja salvate și pot fi reutilizate."""
 
         status = {
+            "pipeline_version": PIPELINE_VERSION,
             "controller_device": "cpu",
             "attention_device_configured": self.attention_device,
             "feature_device_configured": self.feature_device,
@@ -4564,7 +6109,9 @@ class CADPipeline:
             ),
             "quality_audit": self.workspace.quality_audit.is_file(),
             "manual_audit": self.workspace.manual_audit.is_file(),
+            "manual_annotations": self.workspace.manual_annotations.is_file(),
             "prediction_audit": self.workspace.prediction_audit.is_file(),
+            "segmentation_oof_metrics": self.workspace.segmentation_metrics.is_file(),
             "feature_bank": self.workspace.feature_bank.is_file(),
             "results": self.workspace.results_csv.is_file(),
             **WorkspaceCompatibilityManager.legacy_status(self.workspace),
@@ -4574,7 +6121,9 @@ class CADPipeline:
 
 
 RuntimeManager.seed_everything(include_cuda=False)
+print(f"[PIPELINE] Versiune: {PIPELINE_VERSION}")
 print("[PIPELINE] Clasele au fost încărcate fără inițializarea CUDA.")
+print("[PIPELINE] 2.5D + heart-present + negative explicite sunt active.")
 print("[PIPELINE] CPU este implicit; device='cuda' se dă numai etapei dorite.")
 
 # =============================================================================
@@ -4695,8 +6244,10 @@ def run_review_block(
     """Deschide pe CPU una dintre cozile editorului manual.
 
     `scope="invalid"` corectează predicțiile Attention rămase invalide.
-    `scope="novel"` propune imagini clare și diferite de măștile deja create.
-    `scope="manual"` redeschide imaginile cu fișier manual existent.
+    `scope="uncertain"` prioritizează predicțiile formal valide, dar instabile.
+    `scope="empty"` clasifică măștile goale vechi în no-heart sau unusable.
+    `scope="novel"` propune imagini clare și diferite de cele deja etichetate.
+    `scope="manual"` redeschide imaginile deja etichetate.
     `scope="all"` permite verificarea tuturor măștilor Attention disponibile.
     """
 
@@ -5089,7 +6640,7 @@ def main() -> None:
     parser.add_argument(
         "--review-scope",
         default="invalid",
-        choices=["invalid", "novel", "manual", "all"],
+        choices=["invalid", "uncertain", "empty", "novel", "manual", "all"],
     )
     parser.add_argument("--limit", type=int, default=300)
     parser.add_argument("--start-index", type=int, default=0)
