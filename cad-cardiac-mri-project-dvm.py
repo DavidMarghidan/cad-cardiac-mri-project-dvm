@@ -69,7 +69,7 @@ from tqdm.auto import tqdm
 
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
-PIPELINE_VERSION = "2026-09-22-attention-2p5d-presence-cross-class-matching-v4"
+PIPELINE_VERSION = "2026-09-22-attention-2p5d-presence-cross-class-matching-v5-manual-audit-fix"
 
 
 def _as_float(value: Any, default: float = 0.0) -> float:
@@ -1716,6 +1716,58 @@ class MaskManager:
         else:
             reason = ""
         return {"exists": 1, "usable": int(not reason), "area_ratio": area, "reason": reason}
+
+    @staticmethod
+    def manual_audit_refresh_reason(workspace: Workspace) -> str:
+        """Spune de ce auditul manual trebuie reconstruit înainte de feature bank.
+
+        Versiunile vechi ale pipeline-ului scriau un CSV fără ``target_type``,
+        ``heart_present`` și ``sample_weight``. Un asemenea fișier nu este
+        compatibil cu modurile AU6--AU9: toate măștile manuale ar fi interpretate
+        accidental ca absente. Sunt detectate și măștile/adnotările modificate
+        după ultima generare a auditului.
+        """
+
+        path = workspace.manual_audit
+        if not path.is_file():
+            return "missing_manual_audit"
+        try:
+            with path.open(newline="", encoding="utf-8") as handle:
+                reader = csv.DictReader(handle)
+                fields = set(reader.fieldnames or [])
+        except Exception as error:
+            return f"unreadable_manual_audit:{type(error).__name__}"
+
+        required = {
+            "image_token",
+            "manual_mask_path",
+            "status",
+            "target_type",
+            "heart_present",
+            "annotation_source",
+            "sample_weight",
+        }
+        missing = sorted(required - fields)
+        if missing:
+            return "legacy_schema_missing_columns:" + ",".join(missing)
+
+        audit_mtime = path.stat().st_mtime_ns
+        if (
+            workspace.manual_annotations.is_file()
+            and workspace.manual_annotations.stat().st_mtime_ns > audit_mtime
+        ):
+            return "manual_annotations_newer_than_audit"
+
+        try:
+            newest_mask_mtime = max(
+                (mask_path.stat().st_mtime_ns for mask_path in workspace.manual_masks.glob("*.png")),
+                default=0,
+            )
+        except OSError:
+            newest_mask_mtime = audit_mtime + 1
+        if newest_mask_mtime > audit_mtime:
+            return "manual_mask_files_newer_than_audit"
+        return ""
 
     @staticmethod
     def annotation_map(workspace: Workspace) -> dict[str, dict[str, Any]]:
@@ -5203,7 +5255,11 @@ class StreamingPatientPool:
             patient_labels[patient_id] = int(label)
         patients = sorted(patient_series)
         if not patients:
-            raise RuntimeError(f"Modul {mode} nu conține niciun pacient.")
+            raise RuntimeError(
+                f"Modul {mode} nu conține niciun pacient. Pentru AU6--AU9, "
+                "verifică mesajul [FEATURE BANK][MANUAL] și schema auditului "
+                "manual; pipeline-ul v5 reconstruiește automat auditurile vechi."
+            )
         X = np.stack(
             [np.mean(np.stack(patient_series[patient]), axis=0) for patient in patients]
         ).astype(np.float32)
@@ -5944,13 +6000,79 @@ class FeatureManager:
         return (support > 0.5).float() * (content > 0.5).float()
 
     @staticmethod
+    def _accepted_manual_tokens(
+        workspace: Workspace,
+        verbose: bool = False,
+    ) -> set[str]:
+        """Returnează numai țintele manuale pozitive utilizabile.
+
+        Compatibilitatea cu auditul vechi este intenționată: un rând
+        ``ACCEPTED`` fără ``target_type`` este considerat HEART_PRESENT numai
+        dacă PNG-ul lui este efectiv non-gol și trece ``manual_qc``. Astfel nu
+        confundăm măștile goale/NO_HEART_VISIBLE cu ROI-uri manuale.
+        """
+
+        audit_rows = FileManager.read_csv(workspace.manual_audit)
+        accepted: set[str] = set()
+        explicit_positive = 0
+        legacy_inferred = 0
+        skipped_nonpositive = 0
+        skipped_unusable = 0
+
+        for row in audit_rows:
+            if str(row.get("status", "")).strip().upper() != "ACCEPTED":
+                continue
+            token = str(row.get("image_token", "")).strip()
+            if not token:
+                continue
+            target_type = str(row.get("target_type", "")).strip().upper()
+            heart_present_raw = str(row.get("heart_present", "")).strip()
+
+            if target_type in {MaskManager.NO_HEART_VISIBLE, MaskManager.UNUSABLE, "UNLABELED_EMPTY"}:
+                skipped_nonpositive += 1
+                continue
+
+            path_value = str(row.get("manual_mask_path", "")).strip()
+            path = Path(path_value) if path_value else workspace.manual_masks / f"{token}.png"
+
+            if target_type == MaskManager.HEART_PRESENT or heart_present_raw == "1":
+                qc = MaskManager.manual_qc(path)
+                if qc.get("usable"):
+                    accepted.add(token)
+                    explicit_positive += 1
+                else:
+                    skipped_unusable += 1
+                continue
+
+            # Schema veche: status=ACCEPTED, dar fără target_type/heart_present.
+            if not target_type and not heart_present_raw:
+                qc = MaskManager.manual_qc(path)
+                if qc.get("usable"):
+                    accepted.add(token)
+                    legacy_inferred += 1
+                else:
+                    skipped_unusable += 1
+            else:
+                skipped_nonpositive += 1
+
+        if verbose:
+            print(
+                "[FEATURE BANK][MANUAL] "
+                f"audit_rows={len(audit_rows)}, accepted_heart={len(accepted)}, "
+                f"explicit={explicit_positive}, legacy_inferred={legacy_inferred}, "
+                f"skipped_nonpositive={skipped_nonpositive}, "
+                f"skipped_unusable={skipped_unusable}"
+            )
+        return accepted
+
+    @staticmethod
     def _feature_fingerprint(
         rows: Sequence[dict[str, Any]], workspace: Workspace
     ) -> str:
         prediction_summary = FileManager.read_json(workspace.prediction_summary, {}) or {}
         digest = hashlib.sha256()
         payload = {
-            "schema": "simple-patient-feature-bank-cross-class-v3",
+            "schema": "simple-patient-feature-bank-cross-class-v4-manual-audit-compatible",
             "modes": Settings.Classification.MODES,
             "prediction_fingerprint": prediction_summary.get("fingerprint", ""),
             "support_dilation": Settings.Segmentation.SUPPORT_DILATION_KERNEL,
@@ -5978,11 +6100,9 @@ class FeatureManager:
             if audit_path.is_file():
                 digest.update(audit_path.name.encode("utf-8"))
                 digest.update(FileManager.sha256_file(audit_path).encode("ascii"))
-        accepted_tokens = {
-            row["image_token"]
-            for row in FileManager.read_csv(workspace.manual_audit)
-            if row.get("status") == "ACCEPTED"
-        }
+        accepted_tokens = FeatureManager._accepted_manual_tokens(
+            workspace, verbose=False
+        )
         for token in sorted(accepted_tokens):
             path = workspace.manual_masks / f"{token}.png"
             if path.is_file():
@@ -6067,12 +6187,16 @@ class FeatureManager:
             row["image_token"]: row
             for row in FileManager.read_csv(workspace.prediction_audit)
         }
-        accepted_manual = {
-            row["image_token"]
-            for row in FileManager.read_csv(workspace.manual_audit)
-            if row.get("status") == "ACCEPTED"
-            and row.get("target_type") == MaskManager.HEART_PRESENT
-        }
+        accepted_manual = FeatureManager._accepted_manual_tokens(
+            workspace, verbose=True
+        )
+        if not accepted_manual:
+            raise RuntimeError(
+                "Nu există nicio mască manuală HEART_PRESENT utilizabilă pentru "
+                "AU6--AU9. Auditul a fost verificat/migrat, dar nu a rezultat "
+                "niciun PNG non-gol acceptat. Verifică simple_manual_mask_audit.csv "
+                "și manual_masks/. Modurile FULL/Attention nu sunt cauza acestei erori."
+            )
         matching_manifest = FileManager.read_csv(
             workspace.cross_class_matching_manifest
         )
@@ -6851,16 +6975,15 @@ class CADPipeline:
             self.workspace,
             require_complete=True,
         )
-        annotations_newer = (
-            self.workspace.manual_annotations.is_file()
-            and (
-                not self.workspace.manual_audit.is_file()
-                or self.workspace.manual_annotations.stat().st_mtime_ns
-                > self.workspace.manual_audit.stat().st_mtime_ns
-            )
+        manual_audit_refresh_reason = MaskManager.manual_audit_refresh_reason(
+            self.workspace
         )
-        if not self.workspace.manual_audit.is_file() or annotations_newer:
-            self.audit_manual_masks()
+        if manual_audit_refresh_reason:
+            print(
+                "[MĂȘTI MANUALE] Audit incompatibil sau vechi; se reconstruiește "
+                f"automat ({manual_audit_refresh_reason})."
+            )
+            self.audit_manual_masks(refresh_quality=False)
         # Matching-ul rulează integral pe CPU înainte de verificarea cache-ului
         # și înainte de inițializarea EfficientNet/GPU.
         self.build_cross_class_matching(force=force)
@@ -6935,6 +7058,7 @@ RuntimeManager.seed_everything(include_cuda=False)
 print(f"[PIPELINE] Versiune: {PIPELINE_VERSION}")
 print("[PIPELINE] Clasele au fost încărcate fără inițializarea CUDA.")
 print("[PIPELINE] 2.5D + heart-present + negative explicite + Sick↔Normal matching sunt active.")
+print("[PIPELINE] Migrarea automată a auditului manual vechi pentru AU6--AU9 este activă.")
 print("[PIPELINE] CPU este implicit; device='cuda' se dă numai etapei dorite.")
 
 # =============================================================================
