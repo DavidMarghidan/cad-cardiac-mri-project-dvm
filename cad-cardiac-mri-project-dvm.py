@@ -13,7 +13,9 @@ Ideea centrală:
 6. CPU și GPU sunt alese separat pentru fiecare etapă costisitoare.
 7. Clasificarea și toate metricile sunt calculate la nivel de pacient.
 8. Review-ul poate selecta predicții invalide, noi sau incerte.
-9. Workspace-urile notebook-ului full sunt importate automat pentru review.
+9. Imaginile Sick și Normal pot fi potrivite într-o cohortă cross-class
+   comparabilă, pe familii de achiziție și mutual nearest neighbours.
+10. Workspace-urile notebook-ului full sunt importate automat pentru review.
 
 Pipeline-ul nu selectează GPU la inițializare. Auditul, editorul, agregarea și
 evaluarea rămân pe CPU. Antrenarea/predicția Attention U-Net pot folosi GPU,
@@ -47,6 +49,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from IPython.display import HTML, Javascript, clear_output, display
+from sklearn.cluster import MiniBatchKMeans
 from sklearn.decomposition import PCA
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
@@ -57,6 +60,7 @@ from sklearn.metrics import (
     roc_curve,
 )
 from sklearn.model_selection import StratifiedKFold
+from sklearn.neighbors import NearestNeighbors
 from sklearn.pipeline import Pipeline as SklearnPipeline
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
@@ -65,7 +69,7 @@ from tqdm.auto import tqdm
 
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
-PIPELINE_VERSION = "2026-09-22-attention-2p5d-presence-v3"
+PIPELINE_VERSION = "2026-09-22-attention-2p5d-presence-cross-class-matching-v4"
 
 
 def _as_float(value: Any, default: float = 0.0) -> float:
@@ -311,16 +315,48 @@ class ClassificationSettings:
     C_GRID = (0.01, 0.1, 1.0, 10.0)
     BOOTSTRAP_REPEATS = 2000
 
-    # Au rămas doar experimentele care răspund direct întrebării proiectului.
+    # Modurile CROSS_CLASS_MATCHED folosesc exact aceleași perechi Sick/Normal
+    # pentru full image, ROI și complement; modurile complete rămân neschimbate.
     MODES = (
         "FULL_IMAGE",
         "AU1_ATTENTION_ROI",
         "AU5_ATTENTION_COMPLEMENT",
+        "CROSS_CLASS_MATCHED_FULL_IMAGE",
+        "CROSS_CLASS_MATCHED_AU1_ATTENTION_ROI",
+        "CROSS_CLASS_MATCHED_AU5_ATTENTION_COMPLEMENT",
         "AU6_MANUAL_ROI",
         "AU7_MANUAL_COMPLEMENT",
         "AU8_ATTENTION_MATCHED_MANUAL_ROI",
         "AU9_ATTENTION_MATCHED_MANUAL_COMPLEMENT",
     )
+
+
+class MatchingSettings:
+    """Matching Sick ↔ Normal după achiziție/anatomie, nu după scorul CAD."""
+
+    ENABLED = True
+    MIN_FAMILIES = 8
+    MAX_FAMILIES = 32
+    TARGET_IMAGES_PER_FAMILY = 1800
+    MIN_IMAGES_PER_CLASS_PER_FAMILY = 12
+    MIN_PATIENTS_PER_CLASS_PER_FAMILY = 2
+
+    # Mutual kNN reduce relațiile unilaterale; fiecare imagine intră în cel mult
+    # o pereche, iar limitele de mai jos împiedică dominarea unui pacient/serii.
+    MUTUAL_NEIGHBORS = 5
+    CALIPER_MAD_MULTIPLIER = 2.5
+    CALIPER_QUANTILE = 0.90
+    MAX_SEQUENCE_POSITION_DIFFERENCE = 0.25
+    MAX_AREA_RATIO_DIFFERENCE = 0.20
+    MAX_MATCHES_PER_PATIENT_PER_FAMILY = 20
+    MAX_MATCHES_PER_SEQUENCE_GROUP = 5
+
+    # Distanța este calculată din pHash low-frequency + geometria măștii +
+    # poziția în secvență + indicatorii de calitate. Ponderile însumează 1.
+    PHASH_BLOCK_WEIGHT = 0.45
+    GEOMETRY_BLOCK_WEIGHT = 0.25
+    SEQUENCE_BLOCK_WEIGHT = 0.15
+    QUALITY_BLOCK_WEIGHT = 0.15
 
 
 class ReviewSettings:
@@ -342,6 +378,7 @@ class Settings:
     Image = ImageSettings
     Segmentation = SegmentationSettings
     Classification = ClassificationSettings
+    Matching = MatchingSettings
     Review = ReviewSettings
 
 
@@ -556,6 +593,8 @@ class Workspace:
     prediction_summary: Path
     segmentation_metrics: Path
     segmentation_metrics_summary: Path
+    cross_class_matching_manifest: Path
+    cross_class_matching_summary: Path
     feature_bank: Path
     feature_metadata: Path
     results_csv: Path
@@ -587,6 +626,8 @@ class FileManager:
             prediction_summary=root / "simple_prediction_summary.json",
             segmentation_metrics=root / "simple_pipeline_outputs" / "attention_oof_segmentation_metrics.csv",
             segmentation_metrics_summary=root / "simple_pipeline_outputs" / "attention_oof_segmentation_summary.json",
+            cross_class_matching_manifest=root / "simple_pipeline_outputs" / "cross_class_matching_manifest.csv",
+            cross_class_matching_summary=root / "simple_pipeline_outputs" / "cross_class_matching_summary.json",
             feature_bank=root / "simple_pipeline_outputs" / "patient_feature_bank.npz",
             feature_metadata=root / "simple_pipeline_outputs" / "patient_feature_bank.json",
             results_csv=root / "simple_pipeline_outputs" / "evaluation_summary.csv",
@@ -5177,10 +5218,676 @@ class StreamingPatientPool:
 
 
 # =============================================================================
-# DEFINIȚII 11 — CONSTRUIREA FEATURE BANK-ULUI
+# DEFINIȚII 11 — MATCHING CROSS-CLASS SICK ↔ NORMAL
+# =============================================================================
+class CrossClassMatchingManager:
+    """Construiește o cohortă comparabilă Sick/Normal înainte de clasificare.
+
+    Matching-ul este o analiză de sensibilitate separată. Nu modifică setul de
+    antrenare Attention U-Net și nu înlocuiește experimentele pe toate imaginile.
+    Sunt eligibile numai imagini clare, cu mască Attention validă și inimă
+    prezisă ca vizibilă. Familiile de achiziție sunt învățate nesupravegheat,
+    apoi se păstrează perechi mutual-kNN între clase, cu caliper și limite per
+    pacient/serie. Clasificatorul CAD nu este folosit la selecție.
+    """
+
+    MANIFEST_FIELDS = (
+        "image_token",
+        "image_path",
+        "patient_id",
+        "series_id",
+        "sequence_group_id",
+        "label",
+        "class_name",
+        "eligible_for_matching",
+        "acquisition_family",
+        "shared_family",
+        "selected_for_matched_cohort",
+        "pair_id",
+        "matched_partner_token",
+        "matched_partner_patient",
+        "matched_partner_series",
+        "match_distance",
+        "mutual_rank_from_sick",
+        "mutual_rank_from_normal",
+        "family_caliper",
+        "sequence_position",
+        "attention_area_ratio",
+        "exclusion_reason",
+    )
+
+    @staticmethod
+    def _settings_payload() -> dict[str, Any]:
+        return {
+            "schema": "cross-class-matching-v1",
+            "min_families": Settings.Matching.MIN_FAMILIES,
+            "max_families": Settings.Matching.MAX_FAMILIES,
+            "target_images_per_family": Settings.Matching.TARGET_IMAGES_PER_FAMILY,
+            "minimum_images_per_class_per_family": Settings.Matching.MIN_IMAGES_PER_CLASS_PER_FAMILY,
+            "minimum_patients_per_class_per_family": Settings.Matching.MIN_PATIENTS_PER_CLASS_PER_FAMILY,
+            "mutual_neighbors": Settings.Matching.MUTUAL_NEIGHBORS,
+            "caliper_mad_multiplier": Settings.Matching.CALIPER_MAD_MULTIPLIER,
+            "caliper_quantile": Settings.Matching.CALIPER_QUANTILE,
+            "maximum_sequence_position_difference": Settings.Matching.MAX_SEQUENCE_POSITION_DIFFERENCE,
+            "maximum_area_ratio_difference": Settings.Matching.MAX_AREA_RATIO_DIFFERENCE,
+            "maximum_matches_per_patient_per_family": Settings.Matching.MAX_MATCHES_PER_PATIENT_PER_FAMILY,
+            "maximum_matches_per_sequence_group": Settings.Matching.MAX_MATCHES_PER_SEQUENCE_GROUP,
+            "block_weights": {
+                "phash": Settings.Matching.PHASH_BLOCK_WEIGHT,
+                "geometry": Settings.Matching.GEOMETRY_BLOCK_WEIGHT,
+                "sequence": Settings.Matching.SEQUENCE_BLOCK_WEIGHT,
+                "quality": Settings.Matching.QUALITY_BLOCK_WEIGHT,
+            },
+            "random_seed": Settings.Runtime.RANDOM_SEED,
+        }
+
+    @staticmethod
+    def _fingerprint(
+        dataset_rows: Sequence[dict[str, Any]], workspace: Workspace
+    ) -> str:
+        digest = hashlib.sha256(
+            json.dumps(
+                CrossClassMatchingManager._settings_payload(), sort_keys=True
+            ).encode("utf-8")
+        )
+        for row in dataset_rows:
+            digest.update(str(row.get("image_token", "")).encode("utf-8"))
+            digest.update(str(row.get("label", "")).encode("ascii"))
+            digest.update(str(row.get("patient_id", "")).encode("utf-8"))
+            digest.update(str(row.get("sequence_group_id", "")).encode("utf-8"))
+            digest.update(str(row.get("sequence_index", "")).encode("ascii"))
+            digest.update(str(row.get("sequence_length", "")).encode("ascii"))
+        for path in (workspace.quality_audit, workspace.prediction_audit):
+            if path.is_file():
+                digest.update(path.name.encode("utf-8"))
+                digest.update(FileManager.sha256_file(path).encode("ascii"))
+        return digest.hexdigest()
+
+    @staticmethod
+    def _sequence_position(row: dict[str, Any]) -> float:
+        length = max(1, _as_int(row.get("sequence_length"), 1))
+        index = int(np.clip(_as_int(row.get("sequence_index"), 0), 0, length - 1))
+        if length <= 1:
+            return 0.5
+        return float(index / (length - 1))
+
+    @staticmethod
+    def _phash_bits(value: str) -> np.ndarray:
+        number = int(str(value), 16)
+        return np.asarray(
+            [(number >> shift) & 1 for shift in range(63, -1, -1)],
+            dtype=np.float32,
+        )
+
+    @staticmethod
+    def _robust_standardize(values: np.ndarray) -> np.ndarray:
+        values = np.asarray(values, dtype=np.float32).copy()
+        if values.ndim == 1:
+            values = values[:, None]
+        for column in range(values.shape[1]):
+            current = values[:, column]
+            finite = np.isfinite(current)
+            center = float(np.median(current[finite])) if finite.any() else 0.0
+            current[~finite] = center
+            mad = float(np.median(np.abs(current - center)))
+            scale = max(1e-3, 1.4826 * mad)
+            values[:, column] = np.clip((current - center) / scale, -5.0, 5.0)
+        return values
+
+    @staticmethod
+    def _descriptor(rows: Sequence[dict[str, Any]]) -> np.ndarray:
+        phash = np.stack(
+            [CrossClassMatchingManager._phash_bits(row["perceptual_hash"]) for row in rows]
+        )
+        # {-1, +1}; distanța euclidiană păstrează informația Hamming.
+        phash = phash * 2.0 - 1.0
+        geometry = CrossClassMatchingManager._robust_standardize(
+            np.asarray(
+                [
+                    [
+                        _as_float(row.get("attention_area_ratio"), np.nan),
+                        _as_float(row.get("attention_centroid_x"), np.nan),
+                        _as_float(row.get("attention_centroid_y"), np.nan),
+                        _as_float(row.get("attention_boundary_touch_fraction"), np.nan),
+                    ]
+                    for row in rows
+                ],
+                dtype=np.float32,
+            )
+        )
+        sequence = CrossClassMatchingManager._robust_standardize(
+            np.asarray(
+                [[CrossClassMatchingManager._sequence_position(row)] for row in rows],
+                dtype=np.float32,
+            )
+        )
+        quality = CrossClassMatchingManager._robust_standardize(
+            np.asarray(
+                [
+                    [
+                        math.log1p(max(0.0, _as_float(row.get("sharpness"), 0.0))),
+                        _as_float(row.get("noise_ratio"), np.nan),
+                        _as_float(row.get("dynamic_range"), np.nan),
+                    ]
+                    for row in rows
+                ],
+                dtype=np.float32,
+            )
+        )
+
+        def block_scale(weight: float, dimensions: int) -> float:
+            return math.sqrt(max(float(weight), 0.0) / max(1, int(dimensions)))
+
+        descriptor = np.concatenate(
+            [
+                phash * block_scale(Settings.Matching.PHASH_BLOCK_WEIGHT, phash.shape[1]),
+                geometry
+                * block_scale(Settings.Matching.GEOMETRY_BLOCK_WEIGHT, geometry.shape[1]),
+                sequence
+                * block_scale(Settings.Matching.SEQUENCE_BLOCK_WEIGHT, sequence.shape[1]),
+                quality
+                * block_scale(Settings.Matching.QUALITY_BLOCK_WEIGHT, quality.shape[1]),
+            ],
+            axis=1,
+        )
+        return np.ascontiguousarray(descriptor, dtype=np.float32)
+
+    @staticmethod
+    def _merge_rows(
+        dataset_rows: Sequence[dict[str, Any]], workspace: Workspace
+    ) -> list[dict[str, Any]]:
+        quality = {
+            str(row.get("image_token", "")): row
+            for row in FileManager.read_csv(workspace.quality_audit)
+        }
+        predictions = {
+            str(row.get("image_token", "")): row
+            for row in FileManager.read_csv(workspace.prediction_audit)
+        }
+        merged: list[dict[str, Any]] = []
+        for original in dataset_rows:
+            row = dict(original)
+            token = str(row["image_token"])
+            row.update(predictions.get(token, {}))
+            row.update(quality.get(token, {}))
+
+            # Workspace-urile vechi pot să nu conțină centroidul. În acest caz
+            # geometria este calculată direct din masca OOF, fără clasificator CAD.
+            centroid_x = _as_float(row.get("attention_centroid_x"), np.nan)
+            centroid_y = _as_float(row.get("attention_centroid_y"), np.nan)
+            if not (np.isfinite(centroid_x) and np.isfinite(centroid_y)):
+                mask_path = Path(str(row.get("predicted_attention_mask_path", "")))
+                if mask_path.is_file():
+                    try:
+                        features = SegmentationManager._mask_features(
+                            MaskManager.read_binary(mask_path)
+                        )
+                        row["attention_area_ratio"] = features["area"]
+                        row["attention_boundary_touch_fraction"] = features["boundary"]
+                        row["attention_centroid_x"] = features["centroid_x"]
+                        row["attention_centroid_y"] = features["centroid_y"]
+                    except Exception:
+                        pass
+            merged.append(row)
+        return merged
+
+    @staticmethod
+    def _eligibility_reason(row: dict[str, Any]) -> str:
+        reasons: list[str] = []
+        if _as_int(row.get("quality_valid"), 0) != 1:
+            reasons.append("quality_invalid")
+        if _as_int(row.get("attention_valid_final"), 0) != 1:
+            reasons.append("attention_invalid")
+        if _as_int(row.get("attention_heart_present"), 1) != 1:
+            reasons.append("heart_not_visible")
+        if (
+            _as_float(row.get("attention_area_ratio"), 0.0)
+            < Settings.Segmentation.PREDICTION_MIN_AREA_RATIO
+        ):
+            reasons.append("attention_area_too_small")
+        if not str(row.get("perceptual_hash", "")).strip():
+            reasons.append("missing_phash")
+        if not Path(str(row.get("predicted_attention_mask_path", ""))).is_file():
+            reasons.append("missing_attention_mask")
+        return ";".join(reasons)
+
+    @staticmethod
+    def _family_count(number_of_images: int) -> int:
+        estimate = int(
+            math.ceil(
+                number_of_images
+                / max(1, Settings.Matching.TARGET_IMAGES_PER_FAMILY)
+            )
+        )
+        count = int(
+            np.clip(
+                estimate,
+                Settings.Matching.MIN_FAMILIES,
+                Settings.Matching.MAX_FAMILIES,
+            )
+        )
+        return max(2, min(count, number_of_images))
+
+    @staticmethod
+    def _family_is_shared(rows: Sequence[dict[str, Any]]) -> bool:
+        for label in (0, 1):
+            class_rows = [row for row in rows if _as_int(row.get("label"), -1) == label]
+            if len(class_rows) < Settings.Matching.MIN_IMAGES_PER_CLASS_PER_FAMILY:
+                return False
+            if (
+                len({str(row.get("patient_id", "")) for row in class_rows})
+                < Settings.Matching.MIN_PATIENTS_PER_CLASS_PER_FAMILY
+            ):
+                return False
+        return True
+
+    @staticmethod
+    def build(
+        dataset_rows: Sequence[dict[str, Any]],
+        workspace: Workspace,
+        force: bool = False,
+    ) -> list[dict[str, Any]]:
+        fingerprint = CrossClassMatchingManager._fingerprint(dataset_rows, workspace)
+        old_summary = FileManager.read_json(workspace.cross_class_matching_summary, {}) or {}
+        old_manifest = FileManager.read_csv(workspace.cross_class_matching_manifest)
+        if (
+            not force
+            and old_summary.get("fingerprint") == fingerprint
+            and len(old_manifest) == len(dataset_rows)
+            and any(
+                _as_int(row.get("selected_for_matched_cohort"), 0) == 1
+                for row in old_manifest
+            )
+        ):
+            print(
+                "[MATCHING] Manifest Sick↔Normal compatibil reutilizat: "
+                f"{old_summary.get('matched_pairs', '?')} perechi."
+            )
+            return old_manifest
+
+        if not Settings.Matching.ENABLED:
+            raise RuntimeError("Cross-class matching este dezactivat în Settings.Matching.")
+
+        merged = CrossClassMatchingManager._merge_rows(dataset_rows, workspace)
+        manifest_by_token: dict[str, dict[str, Any]] = {}
+        eligible_rows: list[dict[str, Any]] = []
+        for row in merged:
+            token = str(row["image_token"])
+            reason = CrossClassMatchingManager._eligibility_reason(row)
+            record = {
+                "image_token": token,
+                "image_path": str(row.get("image_path", "")),
+                "patient_id": str(row.get("patient_id", "")),
+                "series_id": str(row.get("series_id", "")),
+                "sequence_group_id": str(
+                    row.get("sequence_group_id") or row.get("series_id", "")
+                ),
+                "label": _as_int(row.get("label"), -1),
+                "class_name": "Sick" if _as_int(row.get("label"), -1) == 1 else "Normal",
+                "eligible_for_matching": int(not reason),
+                "acquisition_family": "",
+                "shared_family": 0,
+                "selected_for_matched_cohort": 0,
+                "pair_id": "",
+                "matched_partner_token": "",
+                "matched_partner_patient": "",
+                "matched_partner_series": "",
+                "match_distance": "",
+                "mutual_rank_from_sick": "",
+                "mutual_rank_from_normal": "",
+                "family_caliper": "",
+                "sequence_position": CrossClassMatchingManager._sequence_position(row),
+                "attention_area_ratio": _as_float(
+                    row.get("attention_area_ratio"), np.nan
+                ),
+                "exclusion_reason": reason,
+            }
+            manifest_by_token[token] = record
+            if not reason:
+                eligible_rows.append(row)
+
+        labels = np.asarray(
+            [_as_int(row.get("label"), -1) for row in eligible_rows], dtype=np.int64
+        )
+        if len(eligible_rows) < 4 or set(labels.tolist()) != {0, 1}:
+            raise RuntimeError(
+                "Matching-ul necesită imagini eligibile din ambele clase; "
+                f"au rămas Normal={int(np.sum(labels == 0))}, Sick={int(np.sum(labels == 1))}."
+            )
+
+        descriptor = CrossClassMatchingManager._descriptor(eligible_rows)
+        family_count = CrossClassMatchingManager._family_count(len(eligible_rows))
+        batch_size = min(4096, max(256, len(eligible_rows) // 10))
+        clusterer = MiniBatchKMeans(
+            n_clusters=family_count,
+            random_state=Settings.Runtime.RANDOM_SEED,
+            batch_size=batch_size,
+            n_init=5,
+            max_iter=200,
+            reassignment_ratio=0.01,
+        )
+        family_labels = clusterer.fit_predict(descriptor).astype(np.int64)
+
+        family_indices: dict[int, list[int]] = defaultdict(list)
+        for index, family in enumerate(family_labels.tolist()):
+            family_indices[int(family)].append(index)
+            token = str(eligible_rows[index]["image_token"])
+            manifest_by_token[token]["acquisition_family"] = int(family)
+
+        shared_families: set[int] = set()
+        for family, indices in family_indices.items():
+            family_rows = [eligible_rows[index] for index in indices]
+            if CrossClassMatchingManager._family_is_shared(family_rows):
+                shared_families.add(int(family))
+                for index in indices:
+                    manifest_by_token[str(eligible_rows[index]["image_token"])][
+                        "shared_family"
+                    ] = 1
+            else:
+                for index in indices:
+                    manifest_by_token[str(eligible_rows[index]["image_token"])][
+                        "exclusion_reason"
+                    ] = "family_not_shared_between_classes"
+
+        if not shared_families:
+            raise RuntimeError(
+                "Nicio familie de achiziție nu conține suficiente imagini și "
+                "pacienți din ambele clase. Redu pragurile din Settings.Matching "
+                "numai după auditarea cross_class_matching_summary.json."
+            )
+
+        used_tokens: set[str] = set()
+        patient_family_counts: dict[tuple[str, int], int] = defaultdict(int)
+        sequence_counts: dict[tuple[str, int], int] = defaultdict(int)
+        selected_pair_distances: list[float] = []
+        family_summaries: list[dict[str, Any]] = []
+        pair_number = 0
+
+        for family in sorted(shared_families):
+            indices = family_indices[family]
+            normal_positions = [
+                index for index in indices if _as_int(eligible_rows[index].get("label"), -1) == 0
+            ]
+            sick_positions = [
+                index for index in indices if _as_int(eligible_rows[index].get("label"), -1) == 1
+            ]
+            normal_descriptor = descriptor[normal_positions]
+            sick_descriptor = descriptor[sick_positions]
+            neighbors_sick_to_normal = min(
+                Settings.Matching.MUTUAL_NEIGHBORS, len(normal_positions)
+            )
+            neighbors_normal_to_sick = min(
+                Settings.Matching.MUTUAL_NEIGHBORS, len(sick_positions)
+            )
+
+            normal_model = NearestNeighbors(
+                n_neighbors=neighbors_sick_to_normal,
+                metric="euclidean",
+                algorithm="auto",
+                n_jobs=-1,
+            ).fit(normal_descriptor)
+            sick_to_normal_distance, sick_to_normal_index = normal_model.kneighbors(
+                sick_descriptor, return_distance=True
+            )
+            sick_model = NearestNeighbors(
+                n_neighbors=neighbors_normal_to_sick,
+                metric="euclidean",
+                algorithm="auto",
+                n_jobs=-1,
+            ).fit(sick_descriptor)
+            normal_to_sick_distance, normal_to_sick_index = sick_model.kneighbors(
+                normal_descriptor, return_distance=True
+            )
+
+            reverse_rank = [
+                {int(sick_local): int(rank) for rank, sick_local in enumerate(neighbors)}
+                for neighbors in normal_to_sick_index
+            ]
+            mutual_edges: list[dict[str, Any]] = []
+            mutual_tokens: set[str] = set()
+            for sick_local, normal_neighbors in enumerate(sick_to_normal_index):
+                sick_global = sick_positions[sick_local]
+                sick_row = eligible_rows[sick_global]
+                sick_sequence = CrossClassMatchingManager._sequence_position(sick_row)
+                sick_area = _as_float(sick_row.get("attention_area_ratio"), np.nan)
+                for rank_from_sick, normal_local_value in enumerate(normal_neighbors):
+                    normal_local = int(normal_local_value)
+                    rank_from_normal = reverse_rank[normal_local].get(sick_local)
+                    if rank_from_normal is None:
+                        continue
+                    normal_global = normal_positions[normal_local]
+                    normal_row = eligible_rows[normal_global]
+                    normal_sequence = CrossClassMatchingManager._sequence_position(normal_row)
+                    normal_area = _as_float(normal_row.get("attention_area_ratio"), np.nan)
+                    if (
+                        abs(sick_sequence - normal_sequence)
+                        > Settings.Matching.MAX_SEQUENCE_POSITION_DIFFERENCE
+                    ):
+                        continue
+                    if (
+                        np.isfinite(sick_area)
+                        and np.isfinite(normal_area)
+                        and abs(sick_area - normal_area)
+                        > Settings.Matching.MAX_AREA_RATIO_DIFFERENCE
+                    ):
+                        continue
+                    distance = 0.5 * (
+                        float(sick_to_normal_distance[sick_local, rank_from_sick])
+                        + float(normal_to_sick_distance[normal_local, rank_from_normal])
+                    )
+                    sick_token = str(sick_row["image_token"])
+                    normal_token = str(normal_row["image_token"])
+                    mutual_tokens.update((sick_token, normal_token))
+                    mutual_edges.append(
+                        {
+                            "distance": distance,
+                            "sick_global": sick_global,
+                            "normal_global": normal_global,
+                            "rank_from_sick": int(rank_from_sick + 1),
+                            "rank_from_normal": int(rank_from_normal + 1),
+                            "tie": hashlib.sha256(
+                                f"{family}|{sick_token}|{normal_token}".encode("utf-8")
+                            ).hexdigest(),
+                        }
+                    )
+
+            if mutual_edges:
+                edge_distances = np.asarray(
+                    [edge["distance"] for edge in mutual_edges], dtype=np.float64
+                )
+                median = float(np.median(edge_distances))
+                mad = float(np.median(np.abs(edge_distances - median)))
+                robust_scale = max(1e-9, 1.4826 * mad)
+                mad_caliper = median + Settings.Matching.CALIPER_MAD_MULTIPLIER * robust_scale
+                quantile_caliper = float(
+                    np.quantile(edge_distances, Settings.Matching.CALIPER_QUANTILE)
+                )
+                caliper = max(median, min(mad_caliper, quantile_caliper))
+            else:
+                caliper = np.nan
+
+            below_caliper_tokens: set[str] = set()
+            selected_in_family = 0
+            for edge in sorted(
+                mutual_edges, key=lambda item: (item["distance"], item["tie"])
+            ):
+                if edge["distance"] > caliper:
+                    continue
+                sick_row = eligible_rows[edge["sick_global"]]
+                normal_row = eligible_rows[edge["normal_global"]]
+                sick_token = str(sick_row["image_token"])
+                normal_token = str(normal_row["image_token"])
+                below_caliper_tokens.update((sick_token, normal_token))
+                if sick_token in used_tokens or normal_token in used_tokens:
+                    continue
+
+                sick_patient_key = (str(sick_row["patient_id"]), family)
+                normal_patient_key = (str(normal_row["patient_id"]), family)
+                sick_sequence_key = (
+                    str(sick_row.get("sequence_group_id") or sick_row["series_id"]),
+                    family,
+                )
+                normal_sequence_key = (
+                    str(normal_row.get("sequence_group_id") or normal_row["series_id"]),
+                    family,
+                )
+                if (
+                    patient_family_counts[sick_patient_key]
+                    >= Settings.Matching.MAX_MATCHES_PER_PATIENT_PER_FAMILY
+                    or patient_family_counts[normal_patient_key]
+                    >= Settings.Matching.MAX_MATCHES_PER_PATIENT_PER_FAMILY
+                    or sequence_counts[sick_sequence_key]
+                    >= Settings.Matching.MAX_MATCHES_PER_SEQUENCE_GROUP
+                    or sequence_counts[normal_sequence_key]
+                    >= Settings.Matching.MAX_MATCHES_PER_SEQUENCE_GROUP
+                ):
+                    continue
+
+                pair_number += 1
+                pair_id = f"CCM_F{family:02d}_P{pair_number:06d}"
+                for source_row, partner_row in (
+                    (sick_row, normal_row),
+                    (normal_row, sick_row),
+                ):
+                    source_token = str(source_row["image_token"])
+                    record = manifest_by_token[source_token]
+                    record.update(
+                        {
+                            "selected_for_matched_cohort": 1,
+                            "pair_id": pair_id,
+                            "matched_partner_token": str(partner_row["image_token"]),
+                            "matched_partner_patient": str(partner_row["patient_id"]),
+                            "matched_partner_series": str(partner_row["series_id"]),
+                            "match_distance": float(edge["distance"]),
+                            "mutual_rank_from_sick": int(edge["rank_from_sick"]),
+                            "mutual_rank_from_normal": int(edge["rank_from_normal"]),
+                            "family_caliper": float(caliper),
+                            "exclusion_reason": "",
+                        }
+                    )
+                used_tokens.update((sick_token, normal_token))
+                patient_family_counts[sick_patient_key] += 1
+                patient_family_counts[normal_patient_key] += 1
+                sequence_counts[sick_sequence_key] += 1
+                sequence_counts[normal_sequence_key] += 1
+                selected_pair_distances.append(float(edge["distance"]))
+                selected_in_family += 1
+
+            for index in indices:
+                token = str(eligible_rows[index]["image_token"])
+                record = manifest_by_token[token]
+                if _as_int(record.get("selected_for_matched_cohort"), 0) == 1:
+                    continue
+                if token not in mutual_tokens:
+                    record["exclusion_reason"] = "no_mutual_cross_class_neighbor"
+                elif token not in below_caliper_tokens:
+                    record["exclusion_reason"] = "above_family_caliper"
+                else:
+                    record["exclusion_reason"] = "one_to_one_or_capacity_limit"
+                if np.isfinite(caliper):
+                    record["family_caliper"] = float(caliper)
+
+            family_summaries.append(
+                {
+                    "family": family,
+                    "normal_images": len(normal_positions),
+                    "sick_images": len(sick_positions),
+                    "normal_patients": len(
+                        {str(eligible_rows[index]["patient_id"]) for index in normal_positions}
+                    ),
+                    "sick_patients": len(
+                        {str(eligible_rows[index]["patient_id"]) for index in sick_positions}
+                    ),
+                    "mutual_candidate_edges": len(mutual_edges),
+                    "caliper": float(caliper) if np.isfinite(caliper) else None,
+                    "selected_pairs": selected_in_family,
+                }
+            )
+
+        manifest = [
+            manifest_by_token[str(row["image_token"])] for row in dataset_rows
+        ]
+        selected = [
+            row
+            for row in manifest
+            if _as_int(row.get("selected_for_matched_cohort"), 0) == 1
+        ]
+        selected_normal = [row for row in selected if _as_int(row.get("label"), -1) == 0]
+        selected_sick = [row for row in selected if _as_int(row.get("label"), -1) == 1]
+        normal_patients = sorted({str(row["patient_id"]) for row in selected_normal})
+        sick_patients = sorted({str(row["patient_id"]) for row in selected_sick})
+        if len(selected_normal) != len(selected_sick):
+            raise RuntimeError("Matching-ul intern a produs clase cu dimensiuni diferite.")
+        if len(normal_patients) < 2 or len(sick_patients) < 2:
+            raise RuntimeError(
+                "Cohorta matched are prea puțini pacienți pentru evaluare: "
+                f"Normal={len(normal_patients)}, Sick={len(sick_patients)}."
+            )
+
+        per_patient: dict[str, int] = defaultdict(int)
+        for row in selected:
+            per_patient[str(row["patient_id"])] += 1
+        summary = {
+            "fingerprint": fingerprint,
+            **CrossClassMatchingManager._settings_payload(),
+            "dataset_images": len(dataset_rows),
+            "eligible_images": len(eligible_rows),
+            "acquisition_families": family_count,
+            "shared_families": len(shared_families),
+            "matched_pairs": len(selected_normal),
+            "selected_images": len(selected),
+            "selected_normal_images": len(selected_normal),
+            "selected_sick_images": len(selected_sick),
+            "selected_normal_patients": len(normal_patients),
+            "selected_sick_patients": len(sick_patients),
+            "normal_patients": normal_patients,
+            "sick_patients": sick_patients,
+            "selected_images_per_patient": dict(sorted(per_patient.items())),
+            "distance_median": (
+                float(np.median(selected_pair_distances))
+                if selected_pair_distances
+                else None
+            ),
+            "distance_p90": (
+                float(np.quantile(selected_pair_distances, 0.90))
+                if selected_pair_distances
+                else None
+            ),
+            "families": family_summaries,
+            "manifest": str(workspace.cross_class_matching_manifest),
+            "interpretation": (
+                "Matched-cohort sensitivity analysis; original all-image modes "
+                "remain the primary analysis."
+            ),
+        }
+        FileManager.write_csv(
+            workspace.cross_class_matching_manifest,
+            manifest,
+            CrossClassMatchingManager.MANIFEST_FIELDS,
+        )
+        FileManager.write_json(workspace.cross_class_matching_summary, summary)
+        print(
+            "[MATCHING] Sick↔Normal: "
+            f"eligible={len(eligible_rows)}, shared_families={len(shared_families)}, "
+            f"pairs={len(selected_normal)}, patients Normal={len(normal_patients)}, "
+            f"Sick={len(sick_patients)} | {workspace.cross_class_matching_manifest}"
+        )
+        return manifest
+
+    @staticmethod
+    def selected_tokens(manifest: Sequence[dict[str, Any]]) -> set[str]:
+        return {
+            str(row.get("image_token", ""))
+            for row in manifest
+            if _as_int(row.get("selected_for_matched_cohort"), 0) == 1
+        }
+
+
+# =============================================================================
+# DEFINIȚII 12 — CONSTRUIREA FEATURE BANK-ULUI
 # =============================================================================
 class FeatureManager:
-    """Extrage doar cele șapte reprezentări necesare și salvează vectori per pacient."""
+    """Extrage reprezentările complete, manuale și cross-class matched per pacient."""
 
     @staticmethod
     def _region_normalize(images: torch.Tensor, masks: torch.Tensor) -> torch.Tensor:
@@ -5243,7 +5950,7 @@ class FeatureManager:
         prediction_summary = FileManager.read_json(workspace.prediction_summary, {}) or {}
         digest = hashlib.sha256()
         payload = {
-            "schema": "simple-patient-feature-bank-v2",
+            "schema": "simple-patient-feature-bank-cross-class-v3",
             "modes": Settings.Classification.MODES,
             "prediction_fingerprint": prediction_summary.get("fingerprint", ""),
             "support_dilation": Settings.Segmentation.SUPPORT_DILATION_KERNEL,
@@ -5266,6 +5973,7 @@ class FeatureManager:
             workspace.manual_audit,
             workspace.manual_annotations,
             workspace.prediction_audit,
+            workspace.cross_class_matching_manifest,
         ):
             if audit_path.is_file():
                 digest.update(audit_path.name.encode("utf-8"))
@@ -5365,6 +6073,17 @@ class FeatureManager:
             if row.get("status") == "ACCEPTED"
             and row.get("target_type") == MaskManager.HEART_PRESENT
         }
+        matching_manifest = FileManager.read_csv(
+            workspace.cross_class_matching_manifest
+        )
+        matched_tokens = CrossClassMatchingManager.selected_tokens(
+            matching_manifest
+        )
+        if not matched_tokens:
+            raise RuntimeError(
+                "Manifestul cross-class matching lipsește sau nu conține perechi. "
+                "Rulează pipeline.build_cross_class_matching()."
+            )
         if len(predictions) != len(dataset_rows):
             raise RuntimeError("Prediction audit nu acoperă întregul dataset.")
 
@@ -5383,6 +6102,9 @@ class FeatureManager:
             row["keep_manual_matched"] = int(
                 row["image_token"] in accepted_manual
             )
+            row["keep_cross_class_matched"] = int(
+                row["image_token"] in matched_tokens and row["keep_attention"] == 1
+            )
             rows.append(row)
 
         extractor = RuntimeManager.prepare_model(FrozenEfficientNet(), device).eval()
@@ -5396,10 +6118,16 @@ class FeatureManager:
         pool = StreamingPatientPool(Settings.Classification.MODES)
         started = time.perf_counter()
 
+        matched_aliases = {
+            "FULL_IMAGE": "CROSS_CLASS_MATCHED_FULL_IMAGE",
+            "AU1_ATTENTION_ROI": "CROSS_CLASS_MATCHED_AU1_ATTENTION_ROI",
+            "AU5_ATTENTION_COMPLEMENT": "CROSS_CLASS_MATCHED_AU5_ATTENTION_COMPLEMENT",
+        }
+
         def encode_groups(
             groups: list[tuple[str, torch.Tensor, list[dict[str, Any]]]],
         ) -> None:
-            """Grupează modurile și trimite numai imaginile finale la extractor."""
+            """Rulează extractorul o singură dată și reutilizează embeddingurile matched."""
 
             valid_groups = [
                 (mode, images, selected_rows)
@@ -5427,11 +6155,22 @@ class FeatureManager:
             cursor = 0
             for mode, images, selected_rows in valid_groups:
                 count = int(images.shape[0])
-                pool.add(
-                    mode,
-                    embeddings[cursor : cursor + count],
-                    selected_rows,
-                )
+                current_embeddings = embeddings[cursor : cursor + count]
+                pool.add(mode, current_embeddings, selected_rows)
+
+                alias_mode = matched_aliases.get(mode)
+                if alias_mode is not None:
+                    alias_positions = [
+                        position
+                        for position, row in enumerate(selected_rows)
+                        if _as_int(row.get("keep_cross_class_matched"), 0) == 1
+                    ]
+                    if alias_positions:
+                        pool.add(
+                            alias_mode,
+                            current_embeddings[np.asarray(alias_positions, dtype=np.int64)],
+                            [selected_rows[position] for position in alias_positions],
+                        )
                 cursor += count
             del combined, embeddings, embedding_chunks
 
@@ -5582,6 +6321,12 @@ class FeatureManager:
                 time.perf_counter() - started
             ),
             "feature_bank": str(workspace.feature_bank),
+            "cross_class_matching_manifest": str(
+                workspace.cross_class_matching_manifest
+            ),
+            "cross_class_matching_summary": str(
+                workspace.cross_class_matching_summary
+            ),
         }
         FileManager.write_json(workspace.feature_metadata, metadata)
         print("[FEATURE BANK] Salvat:", workspace.feature_bank)
@@ -5713,6 +6458,13 @@ class EvaluationManager:
         labels = merged["true_label"].to_numpy(dtype=np.int64)
         first_scores = merged["score_first"].to_numpy(dtype=np.float64)
         second_scores = merged["score_second"].to_numpy(dtype=np.float64)
+        if len(merged) < 4 or len(np.unique(labels)) < 2:
+            return {
+                "n_patients": len(merged),
+                "auc_difference_first_minus_second": np.nan,
+                "ci_low": np.nan,
+                "ci_high": np.nan,
+            }
         observed = float(roc_auc_score(labels, first_scores) - roc_auc_score(labels, second_scores))
         rng = np.random.default_rng(seed)
         differences = []
@@ -5756,6 +6508,11 @@ class EvaluationManager:
             for fold in sorted(np.unique(patient_folds)):
                 train_index = np.flatnonzero(patient_folds != fold)
                 valid_index = np.flatnonzero(patient_folds == fold)
+                if len(np.unique(y[train_index])) < 2:
+                    raise RuntimeError(
+                        f"{mode}: foldul {fold} nu are ambele clase în train. "
+                        "Cohorta matched este prea rară; verifică matching summary."
+                    )
                 best_c, threshold = EvaluationManager._select_c_and_threshold(
                     X[train_index], y[train_index], Settings.Runtime.RANDOM_SEED + int(fold)
                 )
@@ -5786,6 +6543,11 @@ class EvaluationManager:
             summary_rows.append(
                 {
                     "mode": mode,
+                    "cohort": (
+                        "cross_class_matched"
+                        if mode.startswith("CROSS_CLASS_MATCHED_")
+                        else "all_or_manual_subset"
+                    ),
                     "patients": len(patients),
                     "source_slices": values["source_slices"],
                     "series_proxies": values["series_proxies"],
@@ -5803,6 +6565,26 @@ class EvaluationManager:
         comparisons = []
         for first_mode, second_mode, question in (
             ("AU1_ATTENTION_ROI", "AU5_ATTENTION_COMPLEMENT", "heart_roi_vs_outside"),
+            (
+                "CROSS_CLASS_MATCHED_AU1_ATTENTION_ROI",
+                "CROSS_CLASS_MATCHED_AU5_ATTENTION_COMPLEMENT",
+                "cross_class_matched_heart_roi_vs_outside",
+            ),
+            (
+                "FULL_IMAGE",
+                "CROSS_CLASS_MATCHED_FULL_IMAGE",
+                "all_images_vs_cross_class_matched_full",
+            ),
+            (
+                "AU1_ATTENTION_ROI",
+                "CROSS_CLASS_MATCHED_AU1_ATTENTION_ROI",
+                "all_images_vs_cross_class_matched_roi",
+            ),
+            (
+                "AU5_ATTENTION_COMPLEMENT",
+                "CROSS_CLASS_MATCHED_AU5_ATTENTION_COMPLEMENT",
+                "all_images_vs_cross_class_matched_complement",
+            ),
             ("AU6_MANUAL_ROI", "AU8_ATTENTION_MATCHED_MANUAL_ROI", "manual_vs_attention_same_images"),
             ("AU7_MANUAL_COMPLEMENT", "AU9_ATTENTION_MATCHED_MANUAL_COMPLEMENT", "manual_vs_attention_complement_same_images"),
         ):
@@ -6025,6 +6807,30 @@ class CADPipeline:
         )
         return editor.show()
 
+    # ----------------------------- ETAPĂ CPU -----------------------------
+    def build_cross_class_matching(
+        self,
+        force: bool = False,
+    ) -> list[dict[str, Any]]:
+        """CPU: selectează perechi comparabile Sick/Normal pentru analiza matched."""
+
+        rows = self._rows()
+        imported_quality = WorkspaceCompatibilityManager.ensure_quality_audit(
+            rows, self.workspace
+        )
+        if len(imported_quality) != len(rows):
+            self.audit_quality(refresh=False)
+        WorkspaceCompatibilityManager.ensure_prediction_audit(
+            rows,
+            self.workspace,
+            require_complete=True,
+        )
+        return CrossClassMatchingManager.build(
+            rows,
+            self.workspace,
+            force=force,
+        )
+
     # ------------------------- ETAPĂ CPU SAU GPU -------------------------
     def build_feature_bank(
         self,
@@ -6055,6 +6861,9 @@ class CADPipeline:
         )
         if not self.workspace.manual_audit.is_file() or annotations_newer:
             self.audit_manual_masks()
+        # Matching-ul rulează integral pe CPU înainte de verificarea cache-ului
+        # și înainte de inițializarea EfficientNet/GPU.
+        self.build_cross_class_matching(force=force)
         if not force:
             cached = FeatureManager.load_compatible_cache(rows, self.workspace)
             if cached is not None:
@@ -6112,6 +6921,8 @@ class CADPipeline:
             "manual_annotations": self.workspace.manual_annotations.is_file(),
             "prediction_audit": self.workspace.prediction_audit.is_file(),
             "segmentation_oof_metrics": self.workspace.segmentation_metrics.is_file(),
+            "cross_class_matching_manifest": self.workspace.cross_class_matching_manifest.is_file(),
+            "cross_class_matching_summary": self.workspace.cross_class_matching_summary.is_file(),
             "feature_bank": self.workspace.feature_bank.is_file(),
             "results": self.workspace.results_csv.is_file(),
             **WorkspaceCompatibilityManager.legacy_status(self.workspace),
@@ -6123,7 +6934,7 @@ class CADPipeline:
 RuntimeManager.seed_everything(include_cuda=False)
 print(f"[PIPELINE] Versiune: {PIPELINE_VERSION}")
 print("[PIPELINE] Clasele au fost încărcate fără inițializarea CUDA.")
-print("[PIPELINE] 2.5D + heart-present + negative explicite sunt active.")
+print("[PIPELINE] 2.5D + heart-present + negative explicite + Sick↔Normal matching sunt active.")
 print("[PIPELINE] CPU este implicit; device='cuda' se dă numai etapei dorite.")
 
 # =============================================================================
@@ -6227,6 +7038,9 @@ def run_complete_pipeline(
         "attention_checkpoints": attention_checkpoints,
         "attention_predictions": attention_predictions,
         "feature_bank": feature_bank,
+        "matching_summary": FileManager.read_json(
+            pipeline.workspace.cross_class_matching_summary, {}
+        ) or {},
         "results": results,
         "status": status,
         "backup_path": backup_path,
@@ -6339,6 +7153,9 @@ def run_after_review_pipeline(
         "attention_checkpoints": attention_checkpoints,
         "attention_predictions": attention_predictions,
         "feature_bank": feature_bank,
+        "matching_summary": FileManager.read_json(
+            pipeline.workspace.cross_class_matching_summary, {}
+        ) or {},
         "results": results,
         "status": status,
         "backup_path": backup_path,
@@ -6389,6 +7206,18 @@ def run_attention_prediction(
     predictions = pipeline.generate_attention_masks(force=force, device=device)
     print("Predicții Attention:", len(predictions))
     return predictions
+
+
+def run_cross_class_matching(
+    pipeline: CADPipeline,
+    force: bool = False,
+) -> list[dict[str, Any]]:
+    manifest = pipeline.build_cross_class_matching(force=force)
+    summary = FileManager.read_json(
+        pipeline.workspace.cross_class_matching_summary, {}
+    ) or {}
+    print(json.dumps(summary, indent=2, ensure_ascii=False, default=str))
+    return manifest
 
 
 def run_feature_bank(
@@ -6530,9 +7359,10 @@ def run_kaggle_cpu_final_stage(
     review_round: int = 1,
     review_seed: int = 42,
 ) -> dict[str, Any]:
-    """Blocul CPU final, cu trei acțiuni posibile.
+    """Blocul CPU final, cu patru acțiuni posibile.
 
-    action="evaluate": feature bank pe CPU + evaluare + backup opțional.
+    action="matching": construiește/auditează numai cohorta Sick↔Normal.
+    action="evaluate": matching + feature bank pe CPU + evaluare + backup opțional.
     action="review": deschide editorul manual pe CPU.
     action="status": afișează numai starea workspace-ului.
 
@@ -6542,8 +7372,10 @@ def run_kaggle_cpu_final_stage(
     """
 
     action = str(action).strip().lower()
-    if action not in {"evaluate", "review", "status"}:
-        raise ValueError("action trebuie să fie 'evaluate', 'review' sau 'status'.")
+    if action not in {"matching", "evaluate", "review", "status"}:
+        raise ValueError(
+            "action trebuie să fie 'matching', 'evaluate', 'review' sau 'status'."
+        )
 
     _execution_banner(f"KAGGLE CPU FINAL — {action.upper()}")
     pipeline = create_pipeline(
@@ -6556,6 +7388,19 @@ def run_kaggle_cpu_final_stage(
 
     if action == "status":
         return {"pipeline": pipeline, "status": pipeline.status()}
+
+    if action == "matching":
+        manifest = pipeline.build_cross_class_matching(
+            force=force_feature_bank
+        )
+        return {
+            "pipeline": pipeline,
+            "matching_manifest": manifest,
+            "matching_summary": FileManager.read_json(
+                pipeline.workspace.cross_class_matching_summary, {}
+            ) or {},
+            "status": pipeline.status(),
+        }
 
     if action == "review":
         editor = run_review_block(
@@ -6584,6 +7429,9 @@ def run_kaggle_cpu_final_stage(
     return {
         "pipeline": pipeline,
         "feature_bank": feature_bank,
+        "matching_summary": FileManager.read_json(
+            pipeline.workspace.cross_class_matching_summary, {}
+        ) or {},
         "results": results,
         "status": status,
         "backup_path": backup_path,
@@ -6616,6 +7464,7 @@ def main() -> None:
             "audit",
             "train",
             "predict",
+            "matching",
             "features",
             "evaluate",
             "status",
@@ -6651,7 +7500,7 @@ def main() -> None:
     parser.add_argument(
         "--final-action",
         default="evaluate",
-        choices=["evaluate", "review", "status"],
+        choices=["matching", "evaluate", "review", "status"],
     )
     args = parser.parse_args()
 
@@ -6691,6 +7540,8 @@ def main() -> None:
         )
         if args.final_action == "evaluate":
             print(output["results"].to_string(index=False))
+        elif args.final_action == "matching":
+            print(json.dumps(output["matching_summary"], indent=2, ensure_ascii=False))
         return
 
     if args.stage == "full":
@@ -6755,6 +7606,8 @@ def main() -> None:
         )
     elif args.stage == "predict":
         run_attention_prediction(pipeline, force=args.force, device=args.device)
+    elif args.stage == "matching":
+        run_cross_class_matching(pipeline, force=args.force)
     elif args.stage == "features":
         run_feature_bank(pipeline, force=args.force, device=args.device)
     elif args.stage == "evaluate":
