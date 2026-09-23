@@ -12,8 +12,8 @@ Ideea centrală:
 5. Sampling-ul este echilibrat pe pacient, serie, pHash și tip de țintă.
 6. CPU și GPU sunt alese separat pentru fiecare etapă costisitoare.
 7. Clasificarea și toate metricile sunt calculate la nivel de pacient.
-8. Review-ul afișează exclusiv imagini cu target=UNLABELED și le elimină
-   imediat din coadă după etichetare.
+8. Review-ul pornește exclusiv cu imagini target=UNLABELED; imaginile
+   etichetate rămân în coada sesiunii pentru navigare cu Prev/Next.
 9. Imaginile Sick și Normal pot fi potrivite într-o cohortă cross-class
    comparabilă, pe familii de achiziție și mutual nearest neighbours.
 10. Workspace-urile notebook-ului full sunt importate automat pentru review.
@@ -70,7 +70,7 @@ from tqdm.auto import tqdm
 
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
-PIPELINE_VERSION = "2026-09-23-attention-2p5d-presence-cross-class-matching-v8-review-unlabeled-only"
+PIPELINE_VERSION = "2026-09-23-attention-2p5d-presence-cross-class-matching-v9-review-prev-enabled"
 
 
 def _as_float(value: Any, default: float = 0.0) -> float:
@@ -4118,11 +4118,12 @@ class HammingBKTree:
 
 
 class ReviewManager:
-    """Construiește cozi echilibrate care conțin numai target=UNLABELED.
+    """Construiește cozi echilibrate care pornesc numai cu target=UNLABELED.
 
     Orice target explicit (HEART_PRESENT, NO_HEART_VISIBLE sau UNUSABLE) este
-    exclus înainte de aplicarea scope-ului. Astfel, imaginile deja decise nu
-    reapar la o rulare ulterioară a ``CPU_FINAL_ACTION = "review"``.
+    exclus înainte de aplicarea scope-ului. În editor, o imagine etichetată în
+    sesiunea curentă rămâne în coada din memorie pentru navigare cu Prev/Next,
+    dar nu reapare la o rulare ulterioară a ``CPU_FINAL_ACTION = "review"``.
     """
 
     HISTORY_FIELDS = (
@@ -4734,42 +4735,34 @@ class MaskEditor:
         ):
             control.disabled = bool(disabled)
 
-    def _complete_current_target(self, message: str) -> None:
-        """Elimină imediat din coadă imaginea care tocmai a primit un target."""
+    def _advance_after_target(self, message: str) -> None:
+        """Avansează fără a elimina imaginea etichetată din coada sesiunii.
+
+        Coada este filtrată la UNLABELED numai când editorul este deschis. După
+        etichetare, rândul rămâne în ``self.rows`` pentru ca utilizatorul să poată
+        reveni cu Previous și să corecteze targetul sau masca în aceeași sesiune.
+        La următoarea deschidere a review-ului, targetul salvat îl va exclude.
+        """
 
         if not self.rows:
             return
-        completed = self.rows.pop(self.index)
-        remaining = len(self.rows)
-        if remaining == 0:
-            self.image = None
-            self.auto_mask = None
-            self.base_mask = None
-            self.mask = None
-            self._set_controls_disabled(True)
-            with self.output:
-                clear_output(wait=True)
-                display(
-                    HTML(
-                        "<div style='padding:16px;border:1px solid #7aa;"
-                        "border-radius:6px;font-family:Arial,sans-serif'>"
-                        "<b>Review complet.</b><br>Nu mai există imagini "
-                        "cu target=UNLABELED în această coadă.</div>"
-                    )
-                )
-            self.status.value = (
-                "<span style='margin-left:12px'><b>"
-                f"{message}</b> {completed['image_token']} a fost eliminată din "
-                "coadă; rămase=0.</span>"
+        completed_index = int(self.index)
+        completed_token = str(self.rows[completed_index].get("image_token", ""))
+        if completed_index < len(self.rows) - 1:
+            self.index = completed_index + 1
+            self.load_current()
+            self.update_status(
+                f"{message} Imaginea {completed_token} rămâne în coada sesiunii; "
+                "folosește Prev [P] pentru a reveni."
             )
             return
 
-        if self.index >= remaining:
-            self.index = remaining - 1
-        self.load_current()
+        # La ultima imagine rămânem pe ea: astfel Previous continuă să permită
+        # revizuirea întregii cozi, iar targetul salvat este vizibil în antet.
+        self.render()
         self.update_status(
-            f"{message} Imaginea etichetată nu va mai fi afișată; "
-            f"rămase={remaining}."
+            f"{message} Sfârșitul cozii; imaginea rămâne accesibilă, iar "
+            "Prev [P] permite revenirea la imaginile anterioare."
         )
 
     def _brush_changed(self, change: dict[str, Any]) -> None:
@@ -4815,6 +4808,12 @@ class MaskEditor:
 
     def render(self) -> None:
         row = self.rows[self.index]
+        target_type = (
+            ReviewManager._normalize_target_type(
+                row.get("manual_annotation_type", row.get("target_type", ""))
+            )
+            or "UNLABELED"
+        )
         image_uri = self._image_uri(np.stack([self.image] * 3, axis=-1))
         base_uri = self._mask_uri(self.base_mask)
         mask_uri = self._mask_uri(self.mask)
@@ -4825,7 +4824,7 @@ class MaskEditor:
         <div style="font-family:Arial,sans-serif;max-width:900px">
           <div style="margin-bottom:6px;font-size:14px">
             <b>{self.index + 1}/{len(self.rows)}</b> | {row['patient_id']} | {row['series_id']} |
-            scope={self.review_scope} | target=UNLABELED
+            scope={self.review_scope} | target={target_type}
           </div>
           <canvas id="{canvas_id}" width="{size * 3}" height="{size * 3}"
                   oncontextmenu="return false;"
@@ -5333,7 +5332,7 @@ class MaskEditor:
 
     def save_next(self) -> None:
         self.save()
-        self._complete_current_target("Saved HEART_PRESENT.")
+        self._advance_after_target("Saved HEART_PRESENT.")
 
     def accept_auto(self) -> None:
         if float((self.auto_mask > 0).mean()) < Settings.Segmentation.MANUAL_MIN_AREA_RATIO:
@@ -5347,7 +5346,7 @@ class MaskEditor:
             action="accept_auto_and_save",
             sample_weight=Settings.Segmentation.AUTO_CONFIRMED_WEIGHT,
         )
-        self._complete_current_target(
+        self._advance_after_target(
             f"Auto saved HEART_PRESENT; weight={Settings.Segmentation.AUTO_CONFIRMED_WEIGHT:.2f}."
         )
 
@@ -5360,7 +5359,7 @@ class MaskEditor:
             action="mark_no_heart_visible",
             sample_weight=Settings.Segmentation.NO_HEART_WEIGHT,
         )
-        self._complete_current_target("Saved NO_HEART_VISIBLE negative target.")
+        self._advance_after_target("Saved NO_HEART_VISIBLE negative target.")
 
     def mark_unusable(self) -> None:
         row = self.rows[self.index]
@@ -5382,7 +5381,7 @@ class MaskEditor:
             self.index,
             len(self.rows),
         )
-        self._complete_current_target("Marked UNUSABLE; excluded from training.")
+        self._advance_after_target("Marked UNUSABLE; excluded from training.")
 
     def skip(self) -> None:
         ReviewManager.log(
@@ -7382,7 +7381,7 @@ print("[PIPELINE] 2.5D + heart-present + negative explicite + Sick↔Normal matc
 print("[PIPELINE] Migrarea automată a auditului manual vechi pentru AU6--AU9 este activă.")
 print("[PIPELINE] Editorul blochează local meniul contextual Kaggle la ștergerea cu click dreapta.")
 print("[PIPELINE] Review-ul etichetează automat măștile manuale non-goale ca HEART_PRESENT.")
-print("[PIPELINE] Editorul de review afișează exclusiv target=UNLABELED.")
+print("[PIPELINE] Coada inițială de review conține exclusiv target=UNLABELED; etichetările rămân navigabile în sesiune.")
 print("[PIPELINE] CPU este implicit; device='cuda' se dă numai etapei dorite.")
 
 # =============================================================================
@@ -7503,12 +7502,13 @@ def run_review_block(
     review_round: int = 1,
     seed: int = 42,
 ) -> MaskEditor | None:
-    """Deschide pe CPU o coadă formată exclusiv din target=UNLABELED.
+    """Deschide pe CPU o coadă inițială formată numai din target=UNLABELED.
 
     Scope-urile ``invalid``, ``uncertain``, ``empty``, ``novel``, ``manual`` și
     ``all`` sunt filtre suplimentare peste această regulă. O imagine care primește
-    HEART_PRESENT, NO_HEART_VISIBLE sau UNUSABLE este eliminată imediat din coada
-    activă și nu mai apare la rulările următoare.
+    HEART_PRESENT, NO_HEART_VISIBLE sau UNUSABLE rămâne în coada sesiunii curente,
+    astfel încât Previous poate reveni la ea. Targetul salvat o exclude însă la
+    următoarea rulare a review-ului.
 
     La pornire, toate PNG-urile manuale non-goale care nu au deja o etichetă
     explicită sunt înregistrate automat cu ``target=HEART_PRESENT`` și, prin
