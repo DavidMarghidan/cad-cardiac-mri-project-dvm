@@ -69,7 +69,7 @@ from tqdm.auto import tqdm
 
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
-PIPELINE_VERSION = "2026-09-23-attention-2p5d-presence-cross-class-matching-v6-editor-contextmenu-fix"
+PIPELINE_VERSION = "2026-09-23-attention-2p5d-presence-cross-class-matching-v7-review-auto-heart-present"
 
 
 def _as_float(value: Any, default: float = 0.0) -> float:
@@ -1833,6 +1833,105 @@ class MaskManager:
             [records[token] for token in sorted(records)],
             MaskManager.ANNOTATION_FIELDS,
         )
+
+    @staticmethod
+    def register_existing_manual_masks_as_heart_present(
+        rows: Sequence[dict[str, Any]],
+        workspace: Workspace,
+    ) -> dict[str, Any]:
+        """Înregistrează automat măștile manuale non-goale drept HEART_PRESENT.
+
+        Metoda este apelată înainte de deschiderea oricărui review. Astfel, un
+        PNG manual existent devine imediat o țintă explicită de antrenare, fără
+        ca utilizatorul să fie obligat să apese din nou ``Save`` în editor.
+
+        Etichetele explicite existente au prioritate: ``NO_HEART_VISIBLE``,
+        ``UNUSABLE`` și ``HEART_PRESENT`` nu sunt suprascrise. Măștile goale,
+        ilizibile sau aproape complet pline nu sunt promovate automat, pentru a
+        nu transforma o salvare greșită într-o țintă pozitivă.
+        """
+
+        by_token = {
+            str(row.get("image_token", "")).strip(): dict(row)
+            for row in rows
+            if str(row.get("image_token", "")).strip()
+        }
+        annotations = MaskManager.annotation_map(workspace)
+        manual_files = sorted(workspace.manual_masks.glob("*.png"))
+        timestamp = pd.Timestamp.utcnow().isoformat()
+
+        summary: dict[str, Any] = {
+            "timestamp_utc": timestamp,
+            "manual_png_files": len(manual_files),
+            "registered_heart_present": 0,
+            "already_explicitly_labeled": 0,
+            "skipped_empty_or_invalid": 0,
+            "skipped_token_absent_from_dataset": 0,
+            "reason_counts": {},
+            "annotations_path": str(workspace.manual_annotations),
+        }
+        reason_counts: dict[str, int] = defaultdict(int)
+
+        for mask_path in manual_files:
+            token = str(mask_path.stem)
+            row = by_token.get(token)
+            if row is None:
+                summary["skipped_token_absent_from_dataset"] += 1
+                reason_counts["token_absent_from_dataset"] += 1
+                continue
+
+            existing = annotations.get(token, {})
+            existing_target = str(existing.get("target_type", "")).strip().upper()
+            if existing_target in MaskManager.VALID_TARGET_TYPES:
+                summary["already_explicitly_labeled"] += 1
+                reason_counts[f"already_{existing_target.lower()}"] += 1
+                continue
+
+            mask_qc = MaskManager.manual_qc(mask_path)
+            if not bool(mask_qc.get("usable", 0)):
+                summary["skipped_empty_or_invalid"] += 1
+                reason = str(mask_qc.get("reason", "") or "invalid_manual_mask")
+                reason_counts[reason] += 1
+                continue
+
+            annotations[token] = {
+                "timestamp_utc": timestamp,
+                "image_token": token,
+                "patient_id": str(row.get("patient_id", "")),
+                "series_id": str(row.get("series_id", "")),
+                "target_type": MaskManager.HEART_PRESENT,
+                "source": "existing_manual_on_review",
+                "sample_weight": float(Settings.Segmentation.MANUAL_DRAWN_WEIGHT),
+                "note": (
+                    "Existing non-empty manual PNG registered automatically "
+                    "when review was opened; the mask file itself was not rewritten."
+                ),
+            }
+            summary["registered_heart_present"] += 1
+            reason_counts["registered_heart_present"] += 1
+
+        # O singură scriere atomică, indiferent de numărul măștilor. Aceasta este
+        # mult mai rapidă decât apelarea set_annotation pentru fiecare PNG.
+        if summary["registered_heart_present"] > 0 or not workspace.manual_annotations.is_file():
+            FileManager.write_csv(
+                workspace.manual_annotations,
+                [annotations[token] for token in sorted(annotations)],
+                MaskManager.ANNOTATION_FIELDS,
+            )
+
+        summary["reason_counts"] = dict(sorted(reason_counts.items()))
+        FileManager.write_json(
+            workspace.outputs / "review_manual_target_registration.json",
+            summary,
+        )
+        print(
+            "[REVIEW][MĂȘTI EXISTENTE] "
+            f"HEART_PRESENT înregistrate={summary['registered_heart_present']}, "
+            f"deja etichetate={summary['already_explicitly_labeled']}, "
+            f"goale/invalide={summary['skipped_empty_or_invalid']}, "
+            f"token absent={summary['skipped_token_absent_from_dataset']}"
+        )
+        return summary
 
     @staticmethod
     def audit_manual_masks(
@@ -7153,6 +7252,7 @@ print("[PIPELINE] Clasele au fost încărcate fără inițializarea CUDA.")
 print("[PIPELINE] 2.5D + heart-present + negative explicite + Sick↔Normal matching sunt active.")
 print("[PIPELINE] Migrarea automată a auditului manual vechi pentru AU6--AU9 este activă.")
 print("[PIPELINE] Editorul blochează local meniul contextual Kaggle la ștergerea cu click dreapta.")
+print("[PIPELINE] Review-ul etichetează automat măștile manuale non-goale ca HEART_PRESENT.")
 print("[PIPELINE] CPU este implicit; device='cuda' se dă numai etapei dorite.")
 
 # =============================================================================
@@ -7281,13 +7381,27 @@ def run_review_block(
     `scope="novel"` propune imagini clare și diferite de cele deja etichetate.
     `scope="manual"` redeschide imaginile deja etichetate.
     `scope="all"` permite verificarea tuturor măștilor Attention disponibile.
+
+    La pornire, toate PNG-urile manuale non-goale care nu au deja o etichetă
+    explicită sunt înregistrate automat cu ``target=HEART_PRESENT``. Fișierul
+    măștii nu este rescris, iar etichetele NO_HEART_VISIBLE/UNUSABLE sunt păstrate.
     """
 
     scope = str(scope).strip().lower()
     _execution_banner(f"REVIEW MANUAL PE CPU — scope={scope}")
+
+    # Orice mască manuală non-goală deja existentă primește targetul explicit
+    # HEART_PRESENT înainte de construirea cozii. Nu este necesară reapăsarea
+    # butonului Save doar pentru a confirma un PNG care se află deja pe disc.
+    dataset_rows = pipeline._rows()
+    MaskManager.register_existing_manual_masks_as_heart_present(
+        dataset_rows,
+        pipeline.workspace,
+    )
+
     if scope == "invalid":
         prediction_rows = WorkspaceCompatibilityManager.ensure_prediction_audit(
-            pipeline._rows(),
+            dataset_rows,
             pipeline.workspace,
             require_complete=False,
         )
