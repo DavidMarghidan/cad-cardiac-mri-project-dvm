@@ -12,7 +12,8 @@ Ideea centrală:
 5. Sampling-ul este echilibrat pe pacient, serie, pHash și tip de țintă.
 6. CPU și GPU sunt alese separat pentru fiecare etapă costisitoare.
 7. Clasificarea și toate metricile sunt calculate la nivel de pacient.
-8. Review-ul poate selecta predicții invalide, noi sau incerte.
+8. Review-ul afișează exclusiv imagini cu target=UNLABELED și le elimină
+   imediat din coadă după etichetare.
 9. Imaginile Sick și Normal pot fi potrivite într-o cohortă cross-class
    comparabilă, pe familii de achiziție și mutual nearest neighbours.
 10. Workspace-urile notebook-ului full sunt importate automat pentru review.
@@ -69,7 +70,7 @@ from tqdm.auto import tqdm
 
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
-PIPELINE_VERSION = "2026-09-23-attention-2p5d-presence-cross-class-matching-v7-review-auto-heart-present"
+PIPELINE_VERSION = "2026-09-23-attention-2p5d-presence-cross-class-matching-v8-review-unlabeled-only"
 
 
 def _as_float(value: Any, default: float = 0.0) -> float:
@@ -4117,7 +4118,12 @@ class HammingBKTree:
 
 
 class ReviewManager:
-    """Construiește cozi pe pacient/serie pentru invalid, uncertain și novel."""
+    """Construiește cozi echilibrate care conțin numai target=UNLABELED.
+
+    Orice target explicit (HEART_PRESENT, NO_HEART_VISIBLE sau UNUSABLE) este
+    exclus înainte de aplicarea scope-ului. Astfel, imaginile deja decise nu
+    reapar la o rulare ulterioară a ``CPU_FINAL_ACTION = "review"``.
+    """
 
     HISTORY_FIELDS = (
         "timestamp_utc",
@@ -4152,7 +4158,11 @@ class ReviewManager:
             row.update(quality.get(row["image_token"], {}))
             row.update(predictions.get(row["image_token"], {}))
             annotation = annotations.get(str(row["image_token"]), {})
-            row["manual_annotation_type"] = annotation.get("target_type", "")
+            annotation_type = ReviewManager._normalize_target_type(
+                annotation.get("target_type", "")
+            )
+            row["manual_annotation_type"] = annotation_type
+            row["review_target_type"] = annotation_type or "UNLABELED"
             row["manual_annotation_source"] = annotation.get("source", "")
             mask_qc = MaskManager.manual_qc(row["manual_mask_path"])
             row.update(
@@ -4165,6 +4175,25 @@ class ReviewManager:
             )
             merged.append(row)
         return merged
+
+    @staticmethod
+    def _normalize_target_type(value: Any) -> str:
+        """Normalizează targetul; valorile goale/legacy devin UNLABELED intern."""
+
+        target = str(value or "").strip().upper()
+        if target in {"", "UNLABELED", "NONE", "NAN"}:
+            return ""
+        return target
+
+    @staticmethod
+    def _row_target_type(row: dict[str, Any]) -> str:
+        return ReviewManager._normalize_target_type(
+            row.get("manual_annotation_type", row.get("target_type", ""))
+        )
+
+    @staticmethod
+    def _is_unlabeled(row: dict[str, Any]) -> bool:
+        return ReviewManager._row_target_type(row) == ""
 
     @staticmethod
     def _reviewed_tokens(workspace: Workspace, review_round: int) -> set[str]:
@@ -4251,15 +4280,15 @@ class ReviewManager:
         seed: int = 42,
         review_round: int = 1,
     ) -> list[dict[str, Any]]:
-        """Selectează imagini fără să supra-reprezinte un singur pacient.
+        """Selectează numai imagini UNLABELED, echilibrat pe pacient/serie.
 
-        - ``invalid``: măști care nu au putut fi reparate;
-        - ``uncertain``: măști formal valide, dar cu entropie/disagreement mare
-          sau presence score apropiat de prag;
-        - ``empty``: măști goale vechi încă neclasificate ca no-heart/unusable;
-        - ``novel``: imagini clare și diferite de orice imagine deja etichetată;
-        - ``manual``: toate imaginile deja etichetate explicit sau cu PNG manual;
-        - ``all``: toate imaginile cu predicție Attention.
+        Filtrul ``target=UNLABELED`` se aplică înaintea oricărui scope:
+        - ``invalid``: predicții nereparate care încă nu au target;
+        - ``uncertain``: predicții instabile care încă nu au target;
+        - ``empty``: măști goale vechi încă neclasificate;
+        - ``novel``: imagini clare și diferite de imaginile deja etichetate;
+        - ``manual``: PNG-uri manuale existente, dar încă fără target explicit;
+        - ``all``: toate imaginile UNLABELED cu predicție Attention.
         """
 
         scope = str(scope).lower()
@@ -4269,7 +4298,18 @@ class ReviewManager:
                 "scope trebuie să fie invalid/uncertain/empty/novel/manual/all."
             )
         limit = int(Settings.Review.DEFAULT_LIMIT if limit is None else limit)
-        rows = ReviewManager._merge_rows(dataset_rows, workspace)
+        all_rows = ReviewManager._merge_rows(dataset_rows, workspace)
+        target_counts: dict[str, int] = defaultdict(int)
+        for row in all_rows:
+            target = ReviewManager._row_target_type(row) or "UNLABELED"
+            target_counts[target] += 1
+        rows = [row for row in all_rows if ReviewManager._is_unlabeled(row)]
+        labeled_excluded = len(all_rows) - len(rows)
+        print(
+            "[REVIEW][TARGET FILTER] "
+            f"UNLABELED={len(rows)}, deja etichetate excluse={labeled_excluded}, "
+            f"distribuție={dict(sorted(target_counts.items()))}"
+        )
         reviewed = ReviewManager._reviewed_tokens(workspace, review_round)
 
         if scope == "invalid":
@@ -4366,14 +4406,14 @@ class ReviewManager:
                 seed=seed,
             )
         elif scope == "manual":
+            # Compatibilitate: arată doar PNG-uri manuale care au rămas UNLABELED
+            # (de regulă măști goale/legacy), niciodată targeturi deja decise.
             candidates = [
                 row
                 for row in rows
-                if (
-                    Path(row["manual_mask_path"]).is_file()
-                    or bool(row.get("manual_annotation_type"))
-                )
+                if Path(row["manual_mask_path"]).is_file()
                 and Path(row["predicted_attention_mask_path"]).is_file()
+                and row["image_token"] not in reviewed
             ]
             candidates.sort(
                 key=lambda row: (
@@ -4387,6 +4427,7 @@ class ReviewManager:
                 row
                 for row in rows
                 if Path(row["predicted_attention_mask_path"]).is_file()
+                and row["image_token"] not in reviewed
             ]
             candidates.sort(
                 key=lambda row: (
@@ -4399,7 +4440,7 @@ class ReviewManager:
             # Orice adnotare explicită, inclusiv UNUSABLE, devine referință de
             # noutate și blochează cadre aproape identice.
             manual_hashes = []
-            for row in rows:
+            for row in all_rows:
                 is_annotated = bool(row.get("manual_annotation_type")) or Path(
                     row["manual_mask_path"]
                 ).is_file()
@@ -4454,7 +4495,11 @@ class ReviewManager:
         if limit > 0 and scope in {"manual", "all"}:
             candidates = candidates[:limit]
         if not candidates:
-            raise RuntimeError(f"Nu există imagini eligibile pentru scope={scope!r}.")
+            raise RuntimeError(
+                "Nu există imagini cu target=UNLABELED eligibile pentru "
+                f"scope={scope!r}. Imaginile HEART_PRESENT, "
+                "NO_HEART_VISIBLE și UNUSABLE sunt excluse automat."
+            )
         queue_path = (
             workspace.outputs / f"review_queue_{scope}_round_{review_round}.csv"
         )
@@ -4517,11 +4562,28 @@ class MaskEditor:
         review_round: int = 1,
         review_scope: str = "invalid",
     ):
-        if not rows:
-            raise ValueError("Editorul necesită cel puțin un rând.")
         import ipywidgets as widgets
 
-        self.rows = list(rows)
+        annotations = MaskManager.annotation_map(workspace)
+        unlabeled_rows: list[dict[str, Any]] = []
+        for source_row in rows:
+            row = dict(source_row)
+            annotation = annotations.get(str(row.get("image_token", "")), {})
+            target = ReviewManager._normalize_target_type(
+                annotation.get("target_type", row.get("manual_annotation_type", ""))
+            )
+            if target:
+                continue
+            row["manual_annotation_type"] = ""
+            row["review_target_type"] = "UNLABELED"
+            unlabeled_rows.append(row)
+        if not unlabeled_rows:
+            raise ValueError(
+                "Editorul nu mai are imagini cu target=UNLABELED. "
+                "Targeturile deja decise nu sunt redeschise."
+            )
+
+        self.rows = unlabeled_rows
         self.workspace = workspace
         self.index = int(np.clip(start_index, 0, len(self.rows) - 1))
         self.brush_radius = max(1, int(brush_radius))
@@ -4655,6 +4717,61 @@ class MaskEditor:
             self.status.value = f"<span style='color:#b00020'><b>{message}</b></span>"
             print("[EDITOR ERROR]", message)
 
+    def _set_controls_disabled(self, disabled: bool) -> None:
+        for control in (
+            self.previous_button,
+            self.next_button,
+            self.save_next_button,
+            self.raw_button,
+            self.reset_button,
+            self.accept_button,
+            self.no_heart_button,
+            self.unusable_button,
+            self.skip_button,
+            self.clear_button,
+            self.delete_button,
+            self.brush_slider,
+        ):
+            control.disabled = bool(disabled)
+
+    def _complete_current_target(self, message: str) -> None:
+        """Elimină imediat din coadă imaginea care tocmai a primit un target."""
+
+        if not self.rows:
+            return
+        completed = self.rows.pop(self.index)
+        remaining = len(self.rows)
+        if remaining == 0:
+            self.image = None
+            self.auto_mask = None
+            self.base_mask = None
+            self.mask = None
+            self._set_controls_disabled(True)
+            with self.output:
+                clear_output(wait=True)
+                display(
+                    HTML(
+                        "<div style='padding:16px;border:1px solid #7aa;"
+                        "border-radius:6px;font-family:Arial,sans-serif'>"
+                        "<b>Review complet.</b><br>Nu mai există imagini "
+                        "cu target=UNLABELED în această coadă.</div>"
+                    )
+                )
+            self.status.value = (
+                "<span style='margin-left:12px'><b>"
+                f"{message}</b> {completed['image_token']} a fost eliminată din "
+                "coadă; rămase=0.</span>"
+            )
+            return
+
+        if self.index >= remaining:
+            self.index = remaining - 1
+        self.load_current()
+        self.update_status(
+            f"{message} Imaginea etichetată nu va mai fi afișată; "
+            f"rămase={remaining}."
+        )
+
     def _brush_changed(self, change: dict[str, Any]) -> None:
         self.brush_radius = int(change["new"])
         if self.image is not None:
@@ -4708,7 +4825,7 @@ class MaskEditor:
         <div style="font-family:Arial,sans-serif;max-width:900px">
           <div style="margin-bottom:6px;font-size:14px">
             <b>{self.index + 1}/{len(self.rows)}</b> | {row['patient_id']} | {row['series_id']} |
-            scope={self.review_scope}
+            scope={self.review_scope} | target=UNLABELED
           </div>
           <canvas id="{canvas_id}" width="{size * 3}" height="{size * 3}"
                   oncontextmenu="return false;"
@@ -5044,6 +5161,8 @@ class MaskEditor:
         """Execută cel mult o acțiune Python pentru fiecare comandă JS."""
 
         payload = str(change.get("new", "") or "").strip()
+        if not self.rows:
+            return
         if not payload or payload == self._last_shortcut_payload:
             return
         self._last_shortcut_payload = payload
@@ -5127,12 +5246,21 @@ class MaskEditor:
             self.mask_sync.value = value
 
     def update_status(self, prefix: str = "") -> None:
+        if not self.rows:
+            self.status.value = (
+                "<span style='margin-left:12px'><b>Review complet.</b> "
+                "Nu mai există imagini cu target=UNLABELED.</span>"
+            )
+            return
         row = self.rows[self.index]
         manual = MaskManager.manual_qc(row["manual_mask_path"])
         annotation = MaskManager.annotation_map(self.workspace).get(
             str(row["image_token"]), {}
         )
-        target_type = annotation.get("target_type", "unlabeled")
+        target_type = (
+            ReviewManager._normalize_target_type(annotation.get("target_type", ""))
+            or "UNLABELED"
+        )
         self.status.value = (
             "<span style='margin-left:12px'>"
             f"<b>{prefix}</b> index={self.index + 1}/{len(self.rows)}; "
@@ -5205,7 +5333,7 @@ class MaskEditor:
 
     def save_next(self) -> None:
         self.save()
-        self.next()
+        self._complete_current_target("Saved HEART_PRESENT.")
 
     def accept_auto(self) -> None:
         if float((self.auto_mask > 0).mean()) < Settings.Segmentation.MANUAL_MIN_AREA_RATIO:
@@ -5219,10 +5347,9 @@ class MaskEditor:
             action="accept_auto_and_save",
             sample_weight=Settings.Segmentation.AUTO_CONFIRMED_WEIGHT,
         )
-        self.update_status(
-            f"Auto saved for training; weight={Settings.Segmentation.AUTO_CONFIRMED_WEIGHT:.2f}."
+        self._complete_current_target(
+            f"Auto saved HEART_PRESENT; weight={Settings.Segmentation.AUTO_CONFIRMED_WEIGHT:.2f}."
         )
-        self.next()
 
     def mark_no_heart(self) -> None:
         empty = np.zeros_like(self.auto_mask, dtype=np.uint8)
@@ -5233,8 +5360,7 @@ class MaskEditor:
             action="mark_no_heart_visible",
             sample_weight=Settings.Segmentation.NO_HEART_WEIGHT,
         )
-        self.update_status("Saved NO_HEART_VISIBLE negative target.")
-        self.next()
+        self._complete_current_target("Saved NO_HEART_VISIBLE negative target.")
 
     def mark_unusable(self) -> None:
         row = self.rows[self.index]
@@ -5256,8 +5382,7 @@ class MaskEditor:
             self.index,
             len(self.rows),
         )
-        self.update_status("Marked UNUSABLE; excluded from training.")
-        self.next()
+        self._complete_current_target("Marked UNUSABLE; excluded from training.")
 
     def skip(self) -> None:
         ReviewManager.log(
@@ -5314,6 +5439,8 @@ class MaskEditor:
         self.update_status("Manual target and annotation deleted.")
 
     def next(self) -> None:
+        if not self.rows:
+            return
         if self.index < len(self.rows) - 1:
             self.index += 1
             self.load_current()
@@ -5321,6 +5448,8 @@ class MaskEditor:
             self.update_status("End of queue.")
 
     def previous(self) -> None:
+        if not self.rows:
+            return
         if self.index > 0:
             self.index -= 1
             self.load_current()
@@ -7089,7 +7218,7 @@ class CADPipeline:
         review_round: int = 1,
         seed: int = 42,
     ) -> MaskEditor:
-        """CPU: deschide editorul HTML; nu încarcă niciun model neural."""
+        """CPU: deschide editorul numai pentru target=UNLABELED, fără GPU."""
 
         rows = self._rows()
         # Într-un workspace creat de notebook-ul full, predicțiile există în
@@ -7253,6 +7382,7 @@ print("[PIPELINE] 2.5D + heart-present + negative explicite + Sick↔Normal matc
 print("[PIPELINE] Migrarea automată a auditului manual vechi pentru AU6--AU9 este activă.")
 print("[PIPELINE] Editorul blochează local meniul contextual Kaggle la ștergerea cu click dreapta.")
 print("[PIPELINE] Review-ul etichetează automat măștile manuale non-goale ca HEART_PRESENT.")
+print("[PIPELINE] Editorul de review afișează exclusiv target=UNLABELED.")
 print("[PIPELINE] CPU este implicit; device='cuda' se dă numai etapei dorite.")
 
 # =============================================================================
@@ -7373,18 +7503,16 @@ def run_review_block(
     review_round: int = 1,
     seed: int = 42,
 ) -> MaskEditor | None:
-    """Deschide pe CPU una dintre cozile editorului manual.
+    """Deschide pe CPU o coadă formată exclusiv din target=UNLABELED.
 
-    `scope="invalid"` corectează predicțiile Attention rămase invalide.
-    `scope="uncertain"` prioritizează predicțiile formal valide, dar instabile.
-    `scope="empty"` clasifică măștile goale vechi în no-heart sau unusable.
-    `scope="novel"` propune imagini clare și diferite de cele deja etichetate.
-    `scope="manual"` redeschide imaginile deja etichetate.
-    `scope="all"` permite verificarea tuturor măștilor Attention disponibile.
+    Scope-urile ``invalid``, ``uncertain``, ``empty``, ``novel``, ``manual`` și
+    ``all`` sunt filtre suplimentare peste această regulă. O imagine care primește
+    HEART_PRESENT, NO_HEART_VISIBLE sau UNUSABLE este eliminată imediat din coada
+    activă și nu mai apare la rulările următoare.
 
     La pornire, toate PNG-urile manuale non-goale care nu au deja o etichetă
-    explicită sunt înregistrate automat cu ``target=HEART_PRESENT``. Fișierul
-    măștii nu este rescris, iar etichetele NO_HEART_VISIBLE/UNUSABLE sunt păstrate.
+    explicită sunt înregistrate automat cu ``target=HEART_PRESENT`` și, prin
+    urmare, sunt excluse din review. Fișierul măștii nu este rescris.
     """
 
     scope = str(scope).strip().lower()
@@ -7405,24 +7533,42 @@ def run_review_block(
             pipeline.workspace,
             require_complete=False,
         )
+        annotations = MaskManager.annotation_map(pipeline.workspace)
+        labeled_tokens = {
+            str(token)
+            for token, annotation in annotations.items()
+            if ReviewManager._normalize_target_type(
+                annotation.get("target_type", "")
+            )
+        }
         invalid_rows = [
             row
             for row in prediction_rows
             if _as_int(row.get("attention_valid_final"), 1) == 0
             and Path(row.get("predicted_attention_mask_path", "")).is_file()
+            and str(row.get("image_token", "")) not in labeled_tokens
         ]
-        print("Predicții invalide:", len(invalid_rows))
+        print("Predicții invalide cu target=UNLABELED:", len(invalid_rows))
         if not invalid_rows:
-            print("Nu există predicții invalide de corectat.")
+            print(
+                "Nu există predicții invalide UNLABELED de corectat; "
+                "imaginile deja etichetate nu sunt redeschise."
+            )
             return None
 
-    return pipeline.open_editor(
-        scope=scope,
-        limit=limit,
-        start_index=start_index,
-        review_round=review_round,
-        seed=seed,
-    )
+    try:
+        return pipeline.open_editor(
+            scope=scope,
+            limit=limit,
+            start_index=start_index,
+            review_round=review_round,
+            seed=seed,
+        )
+    except (RuntimeError, ValueError) as error:
+        if "UNLABELED" in str(error):
+            print(str(error))
+            return None
+        raise
 
 
 def run_after_review_pipeline(
@@ -7695,7 +7841,7 @@ def run_kaggle_cpu_final_stage(
 
     action="matching": construiește/auditează numai cohorta Sick↔Normal.
     action="evaluate": matching + feature bank pe CPU + evaluare + backup opțional.
-    action="review": deschide editorul manual pe CPU.
+    action="review": deschide numai imaginile target=UNLABELED pe CPU.
     action="status": afișează numai starea workspace-ului.
 
     După `action="review"`, schimbă acceleratorul pe GPU și rulează din nou
