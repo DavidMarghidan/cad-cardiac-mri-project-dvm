@@ -69,7 +69,7 @@ from tqdm.auto import tqdm
 
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
-PIPELINE_VERSION = "2026-09-23-attention-2p5d-presence-cross-class-matching-v6-editor-contextmenu-fix"
+PIPELINE_VERSION = "2026-09-22-attention-2p5d-presence-cross-class-matching-v5-manual-audit-fix"
 
 
 def _as_float(value: Any, default: float = 0.0) -> float:
@@ -4612,12 +4612,10 @@ class MaskEditor:
             scope={self.review_scope}
           </div>
           <canvas id="{canvas_id}" width="{size * 3}" height="{size * 3}"
-                  oncontextmenu="return false;"
                   style="width:768px;height:768px;max-width:100%;border:1px solid #999;
-                         cursor:crosshair;touch-action:none;user-select:none;
-                         -webkit-user-select:none;-webkit-touch-callout:none"></canvas>
+                         cursor:crosshair;touch-action:none;user-select:none"></canvas>
           <div style="font-size:12px;margin-top:5px;line-height:1.4">
-            Left drag = draw | Right drag = erase (Kaggle menu disabled) | S = Save & Next | P/N = Prev/Next |
+            Left drag = draw | Right drag = erase | S = Save & Next | P/N = Prev/Next |
             I = image | R = auto reset | A = Auto OK | H = no heart | U = unusable |
             K = Skip | C = Clear | D = Delete | [ / ] = Brush −/+
           </div>
@@ -4635,46 +4633,7 @@ class MaskEditor:
           const maskCanvas = document.createElement('canvas');
           maskCanvas.width = W; maskCanvas.height = H;
           const maskCtx = maskCanvas.getContext('2d', {{willReadFrequently:true}});
-          const pointerControllerKey = '__cadMaskEditorPointerController';
-          const oldPointerController = window[pointerControllerKey];
-          if (oldPointerController && typeof oldPointerController.dispose === 'function') {{
-            try {{ oldPointerController.dispose(); }} catch (_) {{}}
-          }}
-
-          let drawing = false, erase = false, last = null, rightDragActive = false;
-
-          function eventTargetsCanvas(event) {{
-            if (event.target === canvas) return true;
-            try {{
-              const path = typeof event.composedPath === 'function'
-                ? event.composedPath()
-                : [];
-              return path.includes(canvas);
-            }} catch (_) {{
-              return false;
-            }}
-          }}
-          function blockEvent(event) {{
-            if (!event) return false;
-            if (typeof event.preventDefault === 'function') event.preventDefault();
-            if (typeof event.stopPropagation === 'function') event.stopPropagation();
-            if (typeof event.stopImmediatePropagation === 'function') {{
-              event.stopImmediatePropagation();
-            }}
-            return false;
-          }}
-          function suppressContextMenu(event) {{
-            // Listener-ul de pe window/capture rulează înaintea meniului Kaggle.
-            // În afara canvasului nu este modificat comportamentul paginii.
-            if (!rightDragActive && !eventTargetsCanvas(event)) return;
-            return blockEvent(event);
-          }}
-          function releasePointerState() {{
-            drawing = false;
-            erase = false;
-            rightDragActive = false;
-            last = null;
-          }}
+          let drawing = false, erase = false, last = null;
 
           function hidden() {{
             return Array.from(document.querySelectorAll('textarea'))
@@ -4725,79 +4684,27 @@ class MaskEditor:
           }}
           function begin(e) {{
             if (![0,2].includes(e.button)) return;
-            const startsErase = e.button === 2;
-            if (startsErase) blockEvent(e);
-            else e.preventDefault();
-            drawing = true;
-            erase = startsErase;
-            rightDragActive = startsErase;
-            last = null;
+            e.preventDefault(); drawing = true; erase = e.button === 2; last = null;
             try {{ canvas.setPointerCapture?.(e.pointerId); }} catch (_) {{}}
             paint(point(e));
           }}
           function move(e) {{
             if (!drawing) return;
-            const requiredButton = erase ? 2 : 1;
-            if ((Number(e.buttons || 0) & requiredButton) === 0) return finish(e);
-            if (erase) blockEvent(e);
-            else e.preventDefault();
-            paint(point(e));
+            if (e.buttons === 0) return finish(e);
+            e.preventDefault(); paint(point(e));
           }}
           function finish(e) {{
-            if (!drawing) {{
-              if (e && e.button === 2) rightDragActive = false;
-              return;
-            }}
-            const wasErase = erase;
-            if (wasErase || (e && e.button === 2)) blockEvent(e);
-            else e?.preventDefault?.();
-            try {{ canvas.releasePointerCapture?.(e.pointerId); }} catch (_) {{}}
-            drawing = false;
-            erase = false;
-            rightDragActive = false;
-            last = null;
-            sync();
+            if (!drawing) return;
+            e.preventDefault?.(); drawing = false; last = null; sync();
           }}
-
-          const activeOptions = {{capture: true, passive: false}};
-          // Protecție locală + protecție timpurie pe window. Aceasta blochează
-          // atât meniul nativ, cât și meniul contextual adăugat de Kaggle/Jupyter.
-          canvas.oncontextmenu = suppressContextMenu;
-          canvas.addEventListener('contextmenu', suppressContextMenu, activeOptions);
-          window.addEventListener('contextmenu', suppressContextMenu, activeOptions);
-          canvas.addEventListener('auxclick', event => {{
-            if (event.button === 2) blockEvent(event);
-          }}, activeOptions);
-          canvas.addEventListener('dragstart', blockEvent, activeOptions);
-          canvas.addEventListener('selectstart', blockEvent, activeOptions);
-
-          // Pointer Events și Mouse Events nu sunt instalate simultan, evitând
-          // executarea dublă a aceleiași apăsări în Chrome/Kaggle.
-          if (window.PointerEvent) {{
-            canvas.addEventListener('pointerdown', begin, activeOptions);
-            canvas.addEventListener('pointermove', move, activeOptions);
-            canvas.addEventListener('pointerup', finish, activeOptions);
-            canvas.addEventListener('pointercancel', finish, activeOptions);
-          }} else {{
-            canvas.addEventListener('mousedown', begin, activeOptions);
-            canvas.addEventListener('mousemove', move, activeOptions);
-            canvas.addEventListener('mouseup', finish, activeOptions);
-            canvas.addEventListener('mouseleave', event => {{
-              if (drawing && Number(event.buttons || 0) === 0) finish(event);
-            }}, activeOptions);
-          }}
-
-          window.addEventListener('blur', releasePointerState, true);
-          document.addEventListener('visibilitychange', releasePointerState, true);
-          window[pointerControllerKey] = {{
-            editorId: {json.dumps(self.widget_id)},
-            dispose: () => {{
-              window.removeEventListener('contextmenu', suppressContextMenu, true);
-              window.removeEventListener('blur', releasePointerState, true);
-              document.removeEventListener('visibilitychange', releasePointerState, true);
-              releasePointerState();
-            }}
-          }};
+          canvas.addEventListener('contextmenu', e => e.preventDefault(), true);
+          canvas.addEventListener('pointerdown', begin, true);
+          canvas.addEventListener('pointermove', move, true);
+          canvas.addEventListener('pointerup', finish, true);
+          canvas.addEventListener('pointercancel', finish, true);
+          canvas.addEventListener('mousedown', begin, true);
+          canvas.addEventListener('mousemove', move, true);
+          canvas.addEventListener('mouseup', finish, true);
           function load(target, source) {{
             return new Promise((resolve, reject) => {{ target.onload = resolve; target.onerror = reject; target.src = source; }});
           }}
@@ -7152,7 +7059,6 @@ print(f"[PIPELINE] Versiune: {PIPELINE_VERSION}")
 print("[PIPELINE] Clasele au fost încărcate fără inițializarea CUDA.")
 print("[PIPELINE] 2.5D + heart-present + negative explicite + Sick↔Normal matching sunt active.")
 print("[PIPELINE] Migrarea automată a auditului manual vechi pentru AU6--AU9 este activă.")
-print("[PIPELINE] Editorul blochează local meniul contextual Kaggle la ștergerea cu click dreapta.")
 print("[PIPELINE] CPU este implicit; device='cuda' se dă numai etapei dorite.")
 
 # =============================================================================
