@@ -70,7 +70,7 @@ from tqdm.auto import tqdm
 
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
-PIPELINE_VERSION = "2026-09-23-attention-2p5d-presence-cross-class-matching-v9-review-prev-enabled"
+PIPELINE_VERSION = "2026-09-24-attention-2p5d-presence-cross-class-matching-v10-reset-o-keyboard-isolation"
 
 
 def _as_float(value: Any, default: float = 0.0) -> float:
@@ -4637,7 +4637,7 @@ class MaskEditor:
             "Image [I]", "74px", "Hide overlays and start from the image — I"
         )
         self.reset_button = compact_button(
-            "Auto reset [R]", "94px", "Restore the automatic mask — R"
+            "Auto reset [O]", "94px", "Restore the automatic mask — O"
         )
         self.accept_button = compact_button(
             "Auto OK [A]", "84px", "Save confirmed auto mask for training — A", "info"
@@ -4818,6 +4818,7 @@ class MaskEditor:
         base_uri = self._mask_uri(self.base_mask)
         mask_uri = self._mask_uri(self.mask)
         canvas_id = f"cad_canvas_{self.widget_id}"
+        keyboard_sink_id = f"cad_keyboard_sink_{self.widget_id}"
         placeholder = f"CAD_MASK_SYNC_{self.widget_id}"
         size = Settings.Image.SEGMENTATION_SIZE
         html = f"""
@@ -4826,6 +4827,11 @@ class MaskEditor:
             <b>{self.index + 1}/{len(self.rows)}</b> | {row['patient_id']} | {row['series_id']} |
             scope={self.review_scope} | target={target_type}
           </div>
+          <input id="{keyboard_sink_id}" type="text" value="" tabindex="-1"
+                 autocomplete="off" autocapitalize="off" spellcheck="false"
+                 aria-label="CAD mask editor keyboard focus"
+                 style="position:fixed;left:-10000px;top:0;width:1px;height:1px;
+                        opacity:0;pointer-events:none;border:0;padding:0;margin:0" />
           <canvas id="{canvas_id}" width="{size * 3}" height="{size * 3}"
                   oncontextmenu="return false;"
                   style="width:768px;height:768px;max-width:100%;border:1px solid #999;
@@ -4833,7 +4839,7 @@ class MaskEditor:
                          -webkit-user-select:none;-webkit-touch-callout:none"></canvas>
           <div style="font-size:12px;margin-top:5px;line-height:1.4">
             Left drag = draw | Right drag = erase (Kaggle menu disabled) | S = Save & Next | P/N = Prev/Next |
-            I = image | R = auto reset | A = Auto OK | H = no heart | U = unusable |
+            I = image | O = auto reset | A = Auto OK | H = no heart | U = unusable |
             K = Skip | C = Clear | D = Delete | [ / ] = Brush −/+
           </div>
         </div>
@@ -4841,6 +4847,7 @@ class MaskEditor:
         js = f"""
         (() => {{
           const canvas = document.getElementById({json.dumps(canvas_id)});
+          const keyboardSink = document.getElementById({json.dumps(keyboard_sink_id)});
           if (!canvas) return;
           const ctx = canvas.getContext('2d');
           const W = {size}, H = {size};
@@ -4857,6 +4864,16 @@ class MaskEditor:
           }}
 
           let drawing = false, erase = false, last = null, rightDragActive = false;
+
+          function focusKeyboardSink() {{
+            if (!keyboardSink) return;
+            try {{
+              keyboardSink.focus({{preventScroll: true}});
+            }} catch (_) {{
+              try {{ keyboardSink.focus(); }} catch (_) {{}}
+            }}
+            keyboardSink.value = '';
+          }}
 
           function eventTargetsCanvas(event) {{
             if (event.target === canvas) return true;
@@ -4940,6 +4957,7 @@ class MaskEditor:
           }}
           function begin(e) {{
             if (![0,2].includes(e.button)) return;
+            focusKeyboardSink();
             const startsErase = e.button === 2;
             if (startsErase) blockEvent(e);
             else e.preventDefault();
@@ -4972,6 +4990,7 @@ class MaskEditor:
             rightDragActive = false;
             last = null;
             sync();
+            focusKeyboardSink();
           }}
 
           const activeOptions = {{capture: true, passive: false}};
@@ -5016,11 +5035,22 @@ class MaskEditor:
           function load(target, source) {{
             return new Promise((resolve, reject) => {{ target.onload = resolve; target.onerror = reject; target.src = source; }});
           }}
+          // Focalizarea unui input invizibil pune notebook-ul în context de
+          // tastare înainte de prima scurtătură și împiedică modul command Kaggle
+          // să interpreteze O/P/N/etc. ca operații asupra celulelor.
+          focusKeyboardSink();
+          requestAnimationFrame(focusKeyboardSink);
           Promise.all([
             load(image, {json.dumps(image_uri)}),
             load(base, {json.dumps(base_uri)}),
             load(initialMask, {json.dumps(mask_uri)})
-          ]).then(() => {{ maskCtx.clearRect(0,0,W,H); maskCtx.drawImage(initialMask,0,0,W,H); draw(); }});
+          ]).then(() => {{
+            maskCtx.clearRect(0,0,W,H);
+            maskCtx.drawImage(initialMask,0,0,W,H);
+            draw();
+            focusKeyboardSink();
+            requestAnimationFrame(focusKeyboardSink);
+          }});
         }})();
         """
         with self.output:
@@ -5029,22 +5059,24 @@ class MaskEditor:
             display(Javascript(js))
 
     def _shortcut_script(self) -> str:
-        """Instalează un singur handler global pentru editorul activ.
+        """Instalează un singur handler de tastatură pentru editorul activ.
 
         Handlerul este separat de ``render()``. Navigarea poate reda canvasul de
-        sute de ori fără să mai adauge listeners. Evenimentele sunt trimise
-        Python-ului printr-un textarea ascuns, nu prin căutarea butoanelor după
-        text. Capture + stopImmediatePropagation neutralizează și listeners
-        anonimi rămași din versiuni vechi în aceeași sesiune Kaggle.
+        sute de ori fără să adauge listeners noi. Un input invizibil este ținut
+        focalizat, astfel încât Kaggle/Jupyter nu mai tratează tastele editorului
+        ca shortcut-uri de notebook. Evenimentele sunt interceptate pe ``window``
+        în faza capture și sunt oprite înainte să ajungă la managerul de celule.
         """
 
         placeholder = f"CAD_SHORTCUT_SYNC_{self.widget_id}"
+        keyboard_sink_id = f"cad_keyboard_sink_{self.widget_id}"
         controller_key = "__cadMaskEditorKeyboardController"
         return f"""
         (() => {{
           const controllerKey = {json.dumps(controller_key)};
           const editorId = {json.dumps(self.widget_id)};
           const placeholder = {json.dumps(placeholder)};
+          const keyboardSinkId = {json.dumps(keyboard_sink_id)};
 
           const oldController = window[controllerKey];
           if (oldController && typeof oldController.dispose === 'function') {{
@@ -5055,14 +5087,34 @@ class MaskEditor:
           const lastFire = new Map();
           let serial = 0;
           const minimumGapMs = 220;
+          const keyOptions = {{capture: true, passive: false}};
 
           function commandTarget() {{
             return Array.from(document.querySelectorAll('textarea'))
               .find(node => node.placeholder === placeholder) || null;
           }}
 
+          function keyboardSink() {{
+            return document.getElementById(keyboardSinkId) || null;
+          }}
+
+          function focusKeyboardSink() {{
+            const sink = keyboardSink();
+            if (!sink) return;
+            try {{
+              sink.focus({{preventScroll: true}});
+            }} catch (_) {{
+              try {{ sink.focus(); }} catch (_) {{}}
+            }}
+            sink.value = '';
+          }}
+
+          function isEditorSink(target) {{
+            return Boolean(target && String(target.id || '') === keyboardSinkId);
+          }}
+
           function isTypingTarget(target) {{
-            if (!target) return false;
+            if (!target || isEditorSink(target)) return false;
             const tag = String(target.tagName || '').toLowerCase();
             return tag === 'input' || tag === 'textarea' || tag === 'select' ||
                    target.isContentEditable === true;
@@ -5073,7 +5125,10 @@ class MaskEditor:
             if (code) return code;
             const key = String(event.key || '').toLowerCase();
             const fallback = {{
-              p: 'KeyP', n: 'KeyN', s: 'KeyS', i: 'KeyI', r: 'KeyR',
+              p: 'KeyP', n: 'KeyN', s: 'KeyS', i: 'KeyI', o: 'KeyO',
+              // R nu mai execută resetarea; este reținut numai pentru a bloca
+              // vechiul shortcut Kaggle dacă este apăsat din obișnuință.
+              r: 'KeyR',
               a: 'KeyA', h: 'KeyH', u: 'KeyU', k: 'KeyK', c: 'KeyC', d: 'KeyD',
               '[': 'BracketLeft', ']': 'BracketRight'
             }};
@@ -5085,7 +5140,7 @@ class MaskEditor:
             KeyN: 'next',
             KeyS: 'save_next',
             KeyI: 'reset_image',
-            KeyR: 'reset_auto',
+            KeyO: 'reset_auto',
             KeyA: 'accept_auto',
             KeyH: 'no_heart',
             KeyU: 'unusable',
@@ -5095,64 +5150,98 @@ class MaskEditor:
             BracketLeft: 'brush_down',
             BracketRight: 'brush_up',
           }};
+          const legacyBlockedCodes = new Set(['KeyR']);
 
           function blockEvent(event) {{
-            event.preventDefault();
-            event.stopPropagation();
+            if (!event) return;
+            if (typeof event.preventDefault === 'function') event.preventDefault();
+            if (typeof event.stopPropagation === 'function') event.stopPropagation();
             if (typeof event.stopImmediatePropagation === 'function') {{
               event.stopImmediatePropagation();
             }}
           }}
 
-          function onKeyDown(event) {{
+          function shortcutInfo(event) {{
             const code = normalizeCode(event);
-            const action = actions[code];
-            if (!action || event.ctrlKey || event.metaKey || event.altKey ||
-                isTypingTarget(event.target)) return;
+            const action = actions[code] || '';
+            const legacyBlocked = legacyBlockedCodes.has(code);
+            if ((!action && !legacyBlocked) || event.ctrlKey || event.metaKey ||
+                event.altKey || isTypingTarget(event.target)) return null;
+            return {{code, action, legacyBlocked}};
+          }}
 
-            // Blochează listeners vechi chiar și atunci când browserul trimite
-            // auto-repeat. O apăsare fizică poate produce cel mult o comandă.
+          function onKeyDown(event) {{
+            const info = shortcutInfo(event);
+            if (!info) return;
+
+            // Oprirea are loc înainte de orice mesaj trimis către Python. Astfel,
+            // inclusiv tasta O (shortcut Kaggle pentru output) rămâne exclusiv a
+            // editorului, iar vechiul R nu mai poate modifica sau crea celule.
             blockEvent(event);
-            if (event.repeat || held.has(code)) return;
+            focusKeyboardSink();
+            if (info.legacyBlocked) {{
+              held.delete(info.code);
+              return;
+            }}
+            if (event.repeat || held.has(info.code)) return;
 
             const now = performance.now();
-            const previous = lastFire.get(code) || -Infinity;
+            const previous = lastFire.get(info.code) || -Infinity;
             if (now - previous < minimumGapMs) return;
 
             const target = commandTarget();
             if (!target) return;
-            held.add(code);
-            lastFire.set(code, now);
+            held.add(info.code);
+            lastFire.set(info.code, now);
             serial += 1;
-            target.value = `${{action}}|${{Date.now()}}|${{serial}}`;
+            target.value = `${{info.action}}|${{Date.now()}}|${{serial}}`;
             target.dispatchEvent(new Event('input', {{bubbles: true}}));
             target.dispatchEvent(new Event('change', {{bubbles: true}}));
           }}
 
+          function onKeyPress(event) {{
+            const info = shortcutInfo(event);
+            if (info) blockEvent(event);
+          }}
+
           function onKeyUp(event) {{
-            const code = normalizeCode(event);
-            if (code in actions) held.delete(code);
+            const info = shortcutInfo(event);
+            if (!info) return;
+            blockEvent(event);
+            held.delete(info.code);
+            focusKeyboardSink();
           }}
 
           function releaseAll() {{ held.clear(); }}
 
-          // Capture pe document rulează înaintea vechilor listeners de tip
-          // window/bubble și le împiedică să apese Next/Previous de mai multe ori.
-          document.addEventListener('keydown', onKeyDown, true);
-          document.addEventListener('keyup', onKeyUp, true);
+          // Window/capture este mai timpuriu decât document/capture. Împreună cu
+          // focusul pe input, acesta izolează shortcut-urile de modul command al
+          // notebook-ului și evită apariția/modificarea accidentală a celulelor.
+          window.addEventListener('keydown', onKeyDown, keyOptions);
+          window.addEventListener('keypress', onKeyPress, keyOptions);
+          window.addEventListener('keyup', onKeyUp, keyOptions);
           window.addEventListener('blur', releaseAll, true);
           document.addEventListener('visibilitychange', releaseAll, true);
 
           window[controllerKey] = {{
             editorId,
             dispose: () => {{
-              document.removeEventListener('keydown', onKeyDown, true);
-              document.removeEventListener('keyup', onKeyUp, true);
+              window.removeEventListener('keydown', onKeyDown, true);
+              window.removeEventListener('keypress', onKeyPress, true);
+              window.removeEventListener('keyup', onKeyUp, true);
               window.removeEventListener('blur', releaseAll, true);
               document.removeEventListener('visibilitychange', releaseAll, true);
+              const sink = keyboardSink();
+              if (sink && document.activeElement === sink) {{
+                try {{ sink.blur(); }} catch (_) {{}}
+              }}
               held.clear();
             }}
           }};
+
+          focusKeyboardSink();
+          requestAnimationFrame(focusKeyboardSink);
+          setTimeout(focusKeyboardSink, 0);
         }})();
         """
 
