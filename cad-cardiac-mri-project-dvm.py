@@ -14,6 +14,8 @@ a smaller, ready experiment set. The non-negotiable guarantees are:
 6. The existing ``/kaggle/working/cad_attention_unet_workspace`` is reused.
    Checkpoints, masks, audits, review labels, matching files, and legacy feature
    bank keys remain compatible; cached neural stages are not rerun needlessly.
+7. Cross-class matching preserves a strict mutual-neighbour core and expands it
+   with unique, capacity-controlled Sick/Normal pairs from the same acquisition families.
 
 The three Kaggle entry points at the bottom separate CPU audit, GPU segmentation,
 and final CPU evaluation so that expensive accelerators are used only where they
@@ -67,7 +69,7 @@ from tqdm.auto import tqdm
 
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
-PIPELINE_VERSION = "2026-09-24-clean-v1-workspace-compatible"
+PIPELINE_VERSION = "2026-09-24-clean-v2-expanded-cross-class-matching"
 
 
 def _as_float(value: Any, default: float = 0.0) -> float:
@@ -378,9 +380,9 @@ class ClassificationSettings:
         "B0_FULL_IMAGE": "Full-image baseline on all eligible slices",
         "AU1_ATTENTION_ROI": "Automatic Attention U-Net heart ROI",
         "C1_ATTENTION_COMPLEMENT": "Pixels outside the automatic heart ROI",
-        "B1_MATCHED_FULL_IMAGE": "Full-image baseline on matched Sick/Normal slices",
-        "AU2_MATCHED_ATTENTION_ROI": "Automatic heart ROI on matched slices",
-        "C2_MATCHED_ATTENTION_COMPLEMENT": "Automatic-ROI complement on matched slices",
+        "B1_MATCHED_FULL_IMAGE": "Full-image baseline on the expanded balanced Sick/Normal cohort",
+        "AU2_MATCHED_ATTENTION_ROI": "Automatic heart ROI on the expanded balanced matched cohort",
+        "C2_MATCHED_ATTENTION_COMPLEMENT": "Automatic-ROI complement on the expanded balanced matched cohort",
         "M1_MANUAL_ROI": "Manual heart ROI on the annotated subset",
         "C3_MANUAL_COMPLEMENT": "Complement of the manual ROI",
         "AU3_ATTENTION_ROI_MANUAL_SUBSET": "Automatic ROI on the same manually annotated images",
@@ -389,7 +391,13 @@ class ClassificationSettings:
 
 
 class MatchingSettings:
+    """Settings for strict-core plus expanded Sick/Normal matching.
 
+    The old mutual-top-5 cohort is retained as an auditable core. The cohort used
+    by B1/AU2/C2 then adds unique one-to-one pairs that are close in the same
+    acquisition family. Expansion is driven mainly by more candidate neighbours
+    and larger diversity caps, rather than by removing anatomical constraints.
+    """
 
     ENABLED = True
     MIN_FAMILIES = 8
@@ -398,7 +406,7 @@ class MatchingSettings:
     MIN_IMAGES_PER_CLASS_PER_FAMILY = 12
     MIN_PATIENTS_PER_CLASS_PER_FAMILY = 2
 
-
+    # Strict core: reproduces the previous mutual-neighbour logic.
     MUTUAL_NEIGHBORS = 5
     CALIPER_MAD_MULTIPLIER = 2.5
     CALIPER_QUANTILE = 0.90
@@ -407,6 +415,23 @@ class MatchingSettings:
     MAX_MATCHES_PER_PATIENT_PER_FAMILY = 20
     MAX_MATCHES_PER_SEQUENCE_GROUP = 5
 
+    # Expanded cohort. Every image is still used at most once and both classes
+    # remain exactly balanced. With the current dataset the default target is
+    # about 30% of eligible slices, instead of the previous ~13%.
+    TARGET_MATCHED_IMAGE_FRACTION = 0.30
+    EXTENDED_NEIGHBORS = 12
+    EXTENDED_CALIPER_MAD_MULTIPLIER = 3.5
+    EXTENDED_CALIPER_QUANTILE = 0.97
+    EXTENDED_MAX_CALIPER_MULTIPLIER = 1.18
+    EXTENDED_MAX_SEQUENCE_POSITION_DIFFERENCE = 0.25
+    EXTENDED_MAX_AREA_RATIO_DIFFERENCE = 0.20
+    EXTENDED_MAX_MATCHES_PER_PATIENT_PER_FAMILY = 60
+    EXTENDED_MAX_MATCHES_PER_SEQUENCE_GROUP = 15
+    EXTENDED_MAX_MATCHES_PER_SEQUENCE_PAIR = 12
+    EXTENDED_MAX_MATCHES_PER_PATIENT_PAIR = 60
+    PATIENT_TOTAL_CAP_MULTIPLIER = 1.70
+    EXTENDED_BALANCE_QUOTA_STEPS = 12
+    PRIORITIZE_CORE_SEQUENCE_PAIRS = True
 
     PHASH_BLOCK_WEIGHT = 0.45
     GEOMETRY_BLOCK_WEIGHT = 0.25
@@ -5700,13 +5725,13 @@ class StreamingPatientPool:
 
 
 class CrossClassMatchingManager:
-    """Construct a Sick/Normal sensitivity cohort without using CAD predictions.
+    """Construct a balanced Sick/Normal sensitivity cohort in two stages.
 
-    Matching relies on unsupervised acquisition families, pHash, mask geometry,
-    sequence position, and quality. It tests whether performance survives after
-    reducing acquisition differences between classes.
+    Stage 1 is the previous strict mutual-neighbour cohort. Stage 2 keeps every
+    strict pair and adds unique one-to-one pairs from the same acquisition family.
+    Extended candidates must still satisfy sequence-position and mask-area gates,
+    a family-specific distance caliper, per-patient caps, and per-sequence caps.
     """
-
 
     MANIFEST_FIELDS = (
         "image_token",
@@ -5719,7 +5744,9 @@ class CrossClassMatchingManager:
         "eligible_for_matching",
         "acquisition_family",
         "shared_family",
+        "selected_for_core_matched_cohort",
         "selected_for_matched_cohort",
+        "match_stage",
         "pair_id",
         "matched_partner_token",
         "matched_partner_patient",
@@ -5727,6 +5754,10 @@ class CrossClassMatchingManager:
         "match_distance",
         "mutual_rank_from_sick",
         "mutual_rank_from_normal",
+        "reciprocal_extended_neighbor",
+        "sequence_pair_seeded_by_core",
+        "family_core_caliper",
+        "family_extended_caliper",
         "family_caliper",
         "sequence_position",
         "attention_area_ratio",
@@ -5736,19 +5767,32 @@ class CrossClassMatchingManager:
     @staticmethod
     def _settings_payload() -> dict[str, Any]:
         return {
-            "schema": "cross-class-matching-v1",
+            "schema": "cross-class-matching-v2-core-plus-extended",
             "min_families": Settings.Matching.MIN_FAMILIES,
             "max_families": Settings.Matching.MAX_FAMILIES,
             "target_images_per_family": Settings.Matching.TARGET_IMAGES_PER_FAMILY,
             "minimum_images_per_class_per_family": Settings.Matching.MIN_IMAGES_PER_CLASS_PER_FAMILY,
             "minimum_patients_per_class_per_family": Settings.Matching.MIN_PATIENTS_PER_CLASS_PER_FAMILY,
-            "mutual_neighbors": Settings.Matching.MUTUAL_NEIGHBORS,
-            "caliper_mad_multiplier": Settings.Matching.CALIPER_MAD_MULTIPLIER,
-            "caliper_quantile": Settings.Matching.CALIPER_QUANTILE,
+            "core_mutual_neighbors": Settings.Matching.MUTUAL_NEIGHBORS,
+            "core_caliper_mad_multiplier": Settings.Matching.CALIPER_MAD_MULTIPLIER,
+            "core_caliper_quantile": Settings.Matching.CALIPER_QUANTILE,
             "maximum_sequence_position_difference": Settings.Matching.MAX_SEQUENCE_POSITION_DIFFERENCE,
             "maximum_area_ratio_difference": Settings.Matching.MAX_AREA_RATIO_DIFFERENCE,
-            "maximum_matches_per_patient_per_family": Settings.Matching.MAX_MATCHES_PER_PATIENT_PER_FAMILY,
-            "maximum_matches_per_sequence_group": Settings.Matching.MAX_MATCHES_PER_SEQUENCE_GROUP,
+            "core_maximum_matches_per_patient_per_family": Settings.Matching.MAX_MATCHES_PER_PATIENT_PER_FAMILY,
+            "core_maximum_matches_per_sequence_group": Settings.Matching.MAX_MATCHES_PER_SEQUENCE_GROUP,
+            "target_matched_image_fraction": Settings.Matching.TARGET_MATCHED_IMAGE_FRACTION,
+            "extended_neighbors": Settings.Matching.EXTENDED_NEIGHBORS,
+            "extended_caliper_mad_multiplier": Settings.Matching.EXTENDED_CALIPER_MAD_MULTIPLIER,
+            "extended_caliper_quantile": Settings.Matching.EXTENDED_CALIPER_QUANTILE,
+            "extended_max_caliper_multiplier": Settings.Matching.EXTENDED_MAX_CALIPER_MULTIPLIER,
+            "extended_maximum_sequence_position_difference": Settings.Matching.EXTENDED_MAX_SEQUENCE_POSITION_DIFFERENCE,
+            "extended_maximum_area_ratio_difference": Settings.Matching.EXTENDED_MAX_AREA_RATIO_DIFFERENCE,
+            "extended_maximum_matches_per_patient_per_family": Settings.Matching.EXTENDED_MAX_MATCHES_PER_PATIENT_PER_FAMILY,
+            "extended_maximum_matches_per_sequence_group": Settings.Matching.EXTENDED_MAX_MATCHES_PER_SEQUENCE_GROUP,
+            "extended_maximum_matches_per_sequence_pair": Settings.Matching.EXTENDED_MAX_MATCHES_PER_SEQUENCE_PAIR,
+            "extended_maximum_matches_per_patient_pair": Settings.Matching.EXTENDED_MAX_MATCHES_PER_PATIENT_PAIR,
+            "patient_total_cap_multiplier": Settings.Matching.PATIENT_TOTAL_CAP_MULTIPLIER,
+            "prioritize_core_sequence_pairs": Settings.Matching.PRIORITIZE_CORE_SEQUENCE_PAIRS,
             "block_weights": {
                 "phash": Settings.Matching.PHASH_BLOCK_WEIGHT,
                 "geometry": Settings.Matching.GEOMETRY_BLOCK_WEIGHT,
@@ -5816,7 +5860,6 @@ class CrossClassMatchingManager:
         phash = np.stack(
             [CrossClassMatchingManager._phash_bits(row["perceptual_hash"]) for row in rows]
         )
-
         phash = phash * 2.0 - 1.0
         geometry = CrossClassMatchingManager._robust_standardize(
             np.asarray(
@@ -5887,8 +5930,6 @@ class CrossClassMatchingManager:
             token = str(row["image_token"])
             row.update(predictions.get(token, {}))
             row.update(quality.get(token, {}))
-
-
             centroid_x = _as_float(row.get("attention_centroid_x"), np.nan)
             centroid_y = _as_float(row.get("attention_centroid_y"), np.nan)
             if not (np.isfinite(centroid_x) and np.isfinite(centroid_y)):
@@ -5958,6 +5999,85 @@ class CrossClassMatchingManager:
         return True
 
     @staticmethod
+    def _robust_caliper(
+        distances: Sequence[float],
+        mad_multiplier: float,
+        quantile: float,
+    ) -> float:
+        values = np.asarray(list(distances), dtype=np.float64)
+        values = values[np.isfinite(values)]
+        if not len(values):
+            return np.nan
+        median = float(np.median(values))
+        mad = float(np.median(np.abs(values - median)))
+        robust_scale = max(1e-9, 1.4826 * mad)
+        mad_caliper = median + float(mad_multiplier) * robust_scale
+        quantile_caliper = float(np.quantile(values, float(quantile)))
+        return float(max(median, min(mad_caliper, quantile_caliper)))
+
+    @staticmethod
+    def _edge_passes_anatomical_gates(
+        sick_row: dict[str, Any],
+        normal_row: dict[str, Any],
+        extended: bool,
+    ) -> bool:
+        sequence_limit = (
+            Settings.Matching.EXTENDED_MAX_SEQUENCE_POSITION_DIFFERENCE
+            if extended
+            else Settings.Matching.MAX_SEQUENCE_POSITION_DIFFERENCE
+        )
+        area_limit = (
+            Settings.Matching.EXTENDED_MAX_AREA_RATIO_DIFFERENCE
+            if extended
+            else Settings.Matching.MAX_AREA_RATIO_DIFFERENCE
+        )
+        if (
+            abs(
+                CrossClassMatchingManager._sequence_position(sick_row)
+                - CrossClassMatchingManager._sequence_position(normal_row)
+            )
+            > sequence_limit
+        ):
+            return False
+        sick_area = _as_float(sick_row.get("attention_area_ratio"), np.nan)
+        normal_area = _as_float(normal_row.get("attention_area_ratio"), np.nan)
+        if (
+            np.isfinite(sick_area)
+            and np.isfinite(normal_area)
+            and abs(sick_area - normal_area) > area_limit
+        ):
+            return False
+        return True
+
+    @staticmethod
+    def _pair_keys(
+        sick_row: dict[str, Any], normal_row: dict[str, Any], family: int
+    ) -> tuple[
+        tuple[str, int],
+        tuple[str, int],
+        tuple[str, int],
+        tuple[str, int],
+        tuple[str, str],
+        tuple[str, str],
+    ]:
+        sick_patient = str(sick_row["patient_id"])
+        normal_patient = str(normal_row["patient_id"])
+        sick_sequence = str(
+            sick_row.get("sequence_group_id") or sick_row.get("series_id", "")
+        )
+        normal_sequence = str(
+            normal_row.get("sequence_group_id") or normal_row.get("series_id", "")
+        )
+        return (
+            (sick_patient, family),
+            (normal_patient, family),
+            (sick_sequence, family),
+            (normal_sequence, family),
+            (sick_patient, normal_patient),
+            (sick_sequence, normal_sequence),
+        )
+
+    @staticmethod
     def build(
         dataset_rows: Sequence[dict[str, Any]],
         workspace: Workspace,
@@ -5976,8 +6096,9 @@ class CrossClassMatchingManager:
             )
         ):
             print(
-                "[MATCHING] Compatible Sick↔Normal manifest reused: "
-                f"{old_summary.get('matched_pairs', '?')} pairs."
+                "[MATCHING] Compatible expanded Sick↔Normal manifest reused: "
+                f"{old_summary.get('matched_pairs', '?')} total pairs "
+                f"({old_summary.get('core_matched_pairs', '?')} strict core)."
             )
             return old_manifest
 
@@ -6003,7 +6124,9 @@ class CrossClassMatchingManager:
                 "eligible_for_matching": int(not reason),
                 "acquisition_family": "",
                 "shared_family": 0,
+                "selected_for_core_matched_cohort": 0,
                 "selected_for_matched_cohort": 0,
+                "match_stage": "",
                 "pair_id": "",
                 "matched_partner_token": "",
                 "matched_partner_patient": "",
@@ -6011,6 +6134,10 @@ class CrossClassMatchingManager:
                 "match_distance": "",
                 "mutual_rank_from_sick": "",
                 "mutual_rank_from_normal": "",
+                "reciprocal_extended_neighbor": "",
+                "sequence_pair_seeded_by_core": "",
+                "family_core_caliper": "",
+                "family_extended_caliper": "",
                 "family_caliper": "",
                 "sequence_position": CrossClassMatchingManager._sequence_position(row),
                 "attention_area_ratio": _as_float(
@@ -6067,18 +6194,66 @@ class CrossClassMatchingManager:
 
         if not shared_families:
             raise RuntimeError(
-                "No acquisition family contains enough images and "
-                "patients from both classes. Relax Settings.Matching thresholds "
-                "only after auditing cross_class_matching_summary.json."
+                "No acquisition family contains enough images and patients from both classes."
             )
+
+        normal_count = int(np.sum(labels == 0))
+        sick_count = int(np.sum(labels == 1))
+        maximum_possible_pairs = min(normal_count, sick_count)
+        requested_target_pairs = int(
+            round(
+                len(eligible_rows)
+                * float(Settings.Matching.TARGET_MATCHED_IMAGE_FRACTION)
+                / 2.0
+            )
+        )
+        requested_target_pairs = max(1, min(requested_target_pairs, maximum_possible_pairs))
+
+        patients_by_label = {
+            label: sorted(
+                {
+                    str(row["patient_id"])
+                    for row in eligible_rows
+                    if _as_int(row.get("label"), -1) == label
+                }
+            )
+            for label in (0, 1)
+        }
+        patient_total_caps = {
+            label: max(
+                Settings.Matching.EXTENDED_MAX_MATCHES_PER_PATIENT_PER_FAMILY,
+                int(
+                    math.ceil(
+                        requested_target_pairs
+                        / max(1, len(patients_by_label[label]))
+                        * Settings.Matching.PATIENT_TOTAL_CAP_MULTIPLIER
+                    )
+                ),
+            )
+            for label in (0, 1)
+        }
 
         used_tokens: set[str] = set()
         patient_family_counts: dict[tuple[str, int], int] = defaultdict(int)
         sequence_counts: dict[tuple[str, int], int] = defaultdict(int)
+        patient_total_counts: dict[str, int] = defaultdict(int)
+        patient_pair_counts: dict[tuple[str, str], int] = defaultdict(int)
+        sequence_pair_counts: dict[tuple[str, str], int] = defaultdict(int)
+        core_sequence_pairs: set[tuple[str, str]] = set()
         selected_pair_distances: list[float] = []
+        core_pair_distances: list[float] = []
+        extended_pair_distances: list[float] = []
         family_summaries: list[dict[str, Any]] = []
         pair_number = 0
+        core_pair_count = 0
+        extended_pair_count = 0
 
+        family_data: dict[int, dict[str, Any]] = {}
+        token_candidate_stage: dict[str, str] = {}
+
+        # Build candidate graphs first. The extended graph is the union of the
+        # top-K neighbours from both directions; the strict graph is its mutual
+        # top-5 subset.
         for family in sorted(shared_families):
             indices = family_indices[family]
             normal_positions = [
@@ -6089,15 +6264,15 @@ class CrossClassMatchingManager:
             ]
             normal_descriptor = descriptor[normal_positions]
             sick_descriptor = descriptor[sick_positions]
-            neighbors_sick_to_normal = min(
-                Settings.Matching.MUTUAL_NEIGHBORS, len(normal_positions)
+            extended_sick_to_normal = min(
+                int(Settings.Matching.EXTENDED_NEIGHBORS), len(normal_positions)
             )
-            neighbors_normal_to_sick = min(
-                Settings.Matching.MUTUAL_NEIGHBORS, len(sick_positions)
+            extended_normal_to_sick = min(
+                int(Settings.Matching.EXTENDED_NEIGHBORS), len(sick_positions)
             )
 
             normal_model = NearestNeighbors(
-                n_neighbors=neighbors_sick_to_normal,
+                n_neighbors=extended_sick_to_normal,
                 metric="euclidean",
                 algorithm="auto",
                 n_jobs=-1,
@@ -6106,7 +6281,7 @@ class CrossClassMatchingManager:
                 sick_descriptor, return_distance=True
             )
             sick_model = NearestNeighbors(
-                n_neighbors=neighbors_normal_to_sick,
+                n_neighbors=extended_normal_to_sick,
                 metric="euclidean",
                 algorithm="auto",
                 n_jobs=-1,
@@ -6115,168 +6290,495 @@ class CrossClassMatchingManager:
                 normal_descriptor, return_distance=True
             )
 
-            reverse_rank = [
-                {int(sick_local): int(rank) for rank, sick_local in enumerate(neighbors)}
-                for neighbors in normal_to_sick_index
+            sick_rank_maps = [
+                {int(normal_local): int(rank + 1) for rank, normal_local in enumerate(neighbours)}
+                for neighbours in sick_to_normal_index
             ]
-            mutual_edges: list[dict[str, Any]] = []
-            mutual_tokens: set[str] = set()
-            for sick_local, normal_neighbors in enumerate(sick_to_normal_index):
+            normal_rank_maps = [
+                {int(sick_local): int(rank + 1) for rank, sick_local in enumerate(neighbours)}
+                for neighbours in normal_to_sick_index
+            ]
+            edge_keys: set[tuple[int, int]] = set()
+            for sick_local, neighbours in enumerate(sick_to_normal_index):
+                edge_keys.update((int(sick_local), int(value)) for value in neighbours)
+            for normal_local, neighbours in enumerate(normal_to_sick_index):
+                edge_keys.update((int(value), int(normal_local)) for value in neighbours)
+
+            all_edges: list[dict[str, Any]] = []
+            core_edges: list[dict[str, Any]] = []
+            for sick_local, normal_local in edge_keys:
                 sick_global = sick_positions[sick_local]
+                normal_global = normal_positions[normal_local]
                 sick_row = eligible_rows[sick_global]
-                sick_sequence = CrossClassMatchingManager._sequence_position(sick_row)
-                sick_area = _as_float(sick_row.get("attention_area_ratio"), np.nan)
-                for rank_from_sick, normal_local_value in enumerate(normal_neighbors):
-                    normal_local = int(normal_local_value)
-                    rank_from_normal = reverse_rank[normal_local].get(sick_local)
-                    if rank_from_normal is None:
-                        continue
-                    normal_global = normal_positions[normal_local]
-                    normal_row = eligible_rows[normal_global]
-                    normal_sequence = CrossClassMatchingManager._sequence_position(normal_row)
-                    normal_area = _as_float(normal_row.get("attention_area_ratio"), np.nan)
-                    if (
-                        abs(sick_sequence - normal_sequence)
-                        > Settings.Matching.MAX_SEQUENCE_POSITION_DIFFERENCE
-                    ):
-                        continue
-                    if (
-                        np.isfinite(sick_area)
-                        and np.isfinite(normal_area)
-                        and abs(sick_area - normal_area)
-                        > Settings.Matching.MAX_AREA_RATIO_DIFFERENCE
-                    ):
-                        continue
-                    distance = 0.5 * (
-                        float(sick_to_normal_distance[sick_local, rank_from_sick])
-                        + float(normal_to_sick_distance[normal_local, rank_from_normal])
-                    )
-                    sick_token = str(sick_row["image_token"])
-                    normal_token = str(normal_row["image_token"])
-                    mutual_tokens.update((sick_token, normal_token))
-                    mutual_edges.append(
-                        {
-                            "distance": distance,
-                            "sick_global": sick_global,
-                            "normal_global": normal_global,
-                            "rank_from_sick": int(rank_from_sick + 1),
-                            "rank_from_normal": int(rank_from_normal + 1),
-                            "tie": hashlib.sha256(
-                                f"{family}|{sick_token}|{normal_token}".encode("utf-8")
-                            ).hexdigest(),
-                        }
-                    )
-
-            if mutual_edges:
-                edge_distances = np.asarray(
-                    [edge["distance"] for edge in mutual_edges], dtype=np.float64
-                )
-                median = float(np.median(edge_distances))
-                mad = float(np.median(np.abs(edge_distances - median)))
-                robust_scale = max(1e-9, 1.4826 * mad)
-                mad_caliper = median + Settings.Matching.CALIPER_MAD_MULTIPLIER * robust_scale
-                quantile_caliper = float(
-                    np.quantile(edge_distances, Settings.Matching.CALIPER_QUANTILE)
-                )
-                caliper = max(median, min(mad_caliper, quantile_caliper))
-            else:
-                caliper = np.nan
-
-            below_caliper_tokens: set[str] = set()
-            selected_in_family = 0
-            for edge in sorted(
-                mutual_edges, key=lambda item: (item["distance"], item["tie"])
-            ):
-                if edge["distance"] > caliper:
+                normal_row = eligible_rows[normal_global]
+                if not CrossClassMatchingManager._edge_passes_anatomical_gates(
+                    sick_row, normal_row, extended=True
+                ):
                     continue
-                sick_row = eligible_rows[edge["sick_global"]]
-                normal_row = eligible_rows[edge["normal_global"]]
+                rank_from_sick = sick_rank_maps[sick_local].get(normal_local)
+                rank_from_normal = normal_rank_maps[normal_local].get(sick_local)
+                distance = float(
+                    np.linalg.norm(
+                        descriptor[sick_global] - descriptor[normal_global]
+                    )
+                )
+                reciprocal = rank_from_sick is not None and rank_from_normal is not None
+                is_core = bool(
+                    reciprocal
+                    and rank_from_sick <= Settings.Matching.MUTUAL_NEIGHBORS
+                    and rank_from_normal <= Settings.Matching.MUTUAL_NEIGHBORS
+                    and CrossClassMatchingManager._edge_passes_anatomical_gates(
+                        sick_row, normal_row, extended=False
+                    )
+                )
                 sick_token = str(sick_row["image_token"])
                 normal_token = str(normal_row["image_token"])
-                below_caliper_tokens.update((sick_token, normal_token))
-                if sick_token in used_tokens or normal_token in used_tokens:
-                    continue
+                token_candidate_stage.setdefault(sick_token, "extended_candidate")
+                token_candidate_stage.setdefault(normal_token, "extended_candidate")
+                if is_core:
+                    token_candidate_stage[sick_token] = "core_candidate"
+                    token_candidate_stage[normal_token] = "core_candidate"
+                edge = {
+                    "family": int(family),
+                    "distance": distance,
+                    "sick_global": int(sick_global),
+                    "normal_global": int(normal_global),
+                    "rank_from_sick": rank_from_sick,
+                    "rank_from_normal": rank_from_normal,
+                    "reciprocal": int(reciprocal),
+                    "is_core": int(is_core),
+                    "tie": hashlib.sha256(
+                        f"{family}|{sick_token}|{normal_token}".encode("utf-8")
+                    ).hexdigest(),
+                }
+                all_edges.append(edge)
+                if is_core:
+                    core_edges.append(edge)
 
-                sick_patient_key = (str(sick_row["patient_id"]), family)
-                normal_patient_key = (str(normal_row["patient_id"]), family)
-                sick_sequence_key = (
-                    str(sick_row.get("sequence_group_id") or sick_row["series_id"]),
-                    family,
+            core_caliper = CrossClassMatchingManager._robust_caliper(
+                [edge["distance"] for edge in core_edges],
+                Settings.Matching.CALIPER_MAD_MULTIPLIER,
+                Settings.Matching.CALIPER_QUANTILE,
+            )
+            extended_caliper = CrossClassMatchingManager._robust_caliper(
+                [edge["distance"] for edge in all_edges],
+                Settings.Matching.EXTENDED_CALIPER_MAD_MULTIPLIER,
+                Settings.Matching.EXTENDED_CALIPER_QUANTILE,
+            )
+            if np.isfinite(core_caliper):
+                maximum_extended = (
+                    float(core_caliper)
+                    * float(Settings.Matching.EXTENDED_MAX_CALIPER_MULTIPLIER)
                 )
-                normal_sequence_key = (
-                    str(normal_row.get("sequence_group_id") or normal_row["series_id"]),
-                    family,
-                )
+                if np.isfinite(extended_caliper):
+                    extended_caliper = max(
+                        float(core_caliper),
+                        min(float(extended_caliper), maximum_extended),
+                    )
+                else:
+                    extended_caliper = maximum_extended
+
+            family_data[family] = {
+                "normal_positions": normal_positions,
+                "sick_positions": sick_positions,
+                "core_edges": core_edges,
+                "all_edges": all_edges,
+                "core_caliper": core_caliper,
+                "extended_caliper": extended_caliper,
+                "core_selected": 0,
+                "extended_selected": 0,
+            }
+            for index in indices:
+                record = manifest_by_token[str(eligible_rows[index]["image_token"])]
+                if np.isfinite(core_caliper):
+                    record["family_core_caliper"] = float(core_caliper)
+                if np.isfinite(extended_caliper):
+                    record["family_extended_caliper"] = float(extended_caliper)
+
+        def can_select(
+            edge: dict[str, Any],
+            stage: str,
+            patient_quota: dict[int, int] | None = None,
+        ) -> bool:
+            family = int(edge["family"])
+            sick_row = eligible_rows[int(edge["sick_global"])]
+            normal_row = eligible_rows[int(edge["normal_global"])]
+            sick_token = str(sick_row["image_token"])
+            normal_token = str(normal_row["image_token"])
+            if sick_token in used_tokens or normal_token in used_tokens:
+                return False
+            (
+                sick_patient_key,
+                normal_patient_key,
+                sick_sequence_key,
+                normal_sequence_key,
+                patient_pair_key,
+                sequence_pair_key,
+            ) = CrossClassMatchingManager._pair_keys(sick_row, normal_row, family)
+            if stage == "core_mutual":
+                patient_family_limit = Settings.Matching.MAX_MATCHES_PER_PATIENT_PER_FAMILY
+                sequence_limit = Settings.Matching.MAX_MATCHES_PER_SEQUENCE_GROUP
+            else:
+                patient_family_limit = Settings.Matching.EXTENDED_MAX_MATCHES_PER_PATIENT_PER_FAMILY
+                sequence_limit = Settings.Matching.EXTENDED_MAX_MATCHES_PER_SEQUENCE_GROUP
+            if (
+                patient_family_counts[sick_patient_key] >= patient_family_limit
+                or patient_family_counts[normal_patient_key] >= patient_family_limit
+                or sequence_counts[sick_sequence_key] >= sequence_limit
+                or sequence_counts[normal_sequence_key] >= sequence_limit
+            ):
+                return False
+            if stage != "core_mutual":
                 if (
-                    patient_family_counts[sick_patient_key]
-                    >= Settings.Matching.MAX_MATCHES_PER_PATIENT_PER_FAMILY
-                    or patient_family_counts[normal_patient_key]
-                    >= Settings.Matching.MAX_MATCHES_PER_PATIENT_PER_FAMILY
-                    or sequence_counts[sick_sequence_key]
-                    >= Settings.Matching.MAX_MATCHES_PER_SEQUENCE_GROUP
-                    or sequence_counts[normal_sequence_key]
-                    >= Settings.Matching.MAX_MATCHES_PER_SEQUENCE_GROUP
+                    patient_pair_counts[patient_pair_key]
+                    >= Settings.Matching.EXTENDED_MAX_MATCHES_PER_PATIENT_PAIR
+                    or sequence_pair_counts[sequence_pair_key]
+                    >= Settings.Matching.EXTENDED_MAX_MATCHES_PER_SEQUENCE_PAIR
                 ):
-                    continue
+                    return False
+                for row in (sick_row, normal_row):
+                    label = _as_int(row.get("label"), -1)
+                    patient = str(row["patient_id"])
+                    cap = int(patient_total_caps[label])
+                    if patient_total_counts[patient] >= cap:
+                        return False
+                    if patient_quota is not None and patient_total_counts[patient] >= int(
+                        patient_quota[label]
+                    ):
+                        return False
+            return True
 
-                pair_number += 1
-                pair_id = f"CCM_F{family:02d}_P{pair_number:06d}"
-                for source_row, partner_row in (
-                    (sick_row, normal_row),
-                    (normal_row, sick_row),
-                ):
-                    source_token = str(source_row["image_token"])
-                    record = manifest_by_token[source_token]
-                    record.update(
+        def select_edge(edge: dict[str, Any], stage: str) -> None:
+            nonlocal pair_number, core_pair_count, extended_pair_count
+            family = int(edge["family"])
+            sick_row = eligible_rows[int(edge["sick_global"])]
+            normal_row = eligible_rows[int(edge["normal_global"])]
+            sick_token = str(sick_row["image_token"])
+            normal_token = str(normal_row["image_token"])
+            (
+                sick_patient_key,
+                normal_patient_key,
+                sick_sequence_key,
+                normal_sequence_key,
+                patient_pair_key,
+                sequence_pair_key,
+            ) = CrossClassMatchingManager._pair_keys(sick_row, normal_row, family)
+            seeded = int(sequence_pair_key in core_sequence_pairs)
+            pair_number += 1
+            prefix = "CORE" if stage == "core_mutual" else "EXT"
+            pair_id = f"CCM_{prefix}_F{family:02d}_P{pair_number:06d}"
+            applied_caliper = (
+                family_data[family]["core_caliper"]
+                if stage == "core_mutual"
+                else family_data[family]["extended_caliper"]
+            )
+            for source_row, partner_row in (
+                (sick_row, normal_row),
+                (normal_row, sick_row),
+            ):
+                source_token = str(source_row["image_token"])
+                record = manifest_by_token[source_token]
+                record.update(
+                    {
+                        "selected_for_core_matched_cohort": int(stage == "core_mutual"),
+                        "selected_for_matched_cohort": 1,
+                        "match_stage": stage,
+                        "pair_id": pair_id,
+                        "matched_partner_token": str(partner_row["image_token"]),
+                        "matched_partner_patient": str(partner_row["patient_id"]),
+                        "matched_partner_series": str(partner_row["series_id"]),
+                        "match_distance": float(edge["distance"]),
+                        "mutual_rank_from_sick": (
+                            "" if edge.get("rank_from_sick") is None else int(edge["rank_from_sick"])
+                        ),
+                        "mutual_rank_from_normal": (
+                            "" if edge.get("rank_from_normal") is None else int(edge["rank_from_normal"])
+                        ),
+                        "reciprocal_extended_neighbor": int(edge.get("reciprocal", 0)),
+                        "sequence_pair_seeded_by_core": seeded,
+                        "family_caliper": float(applied_caliper),
+                        "exclusion_reason": "",
+                    }
+                )
+            used_tokens.update((sick_token, normal_token))
+            patient_family_counts[sick_patient_key] += 1
+            patient_family_counts[normal_patient_key] += 1
+            sequence_counts[sick_sequence_key] += 1
+            sequence_counts[normal_sequence_key] += 1
+            patient_total_counts[str(sick_row["patient_id"])] += 1
+            patient_total_counts[str(normal_row["patient_id"])] += 1
+            patient_pair_counts[patient_pair_key] += 1
+            sequence_pair_counts[sequence_pair_key] += 1
+            selected_pair_distances.append(float(edge["distance"]))
+            if stage == "core_mutual":
+                core_sequence_pairs.add(sequence_pair_key)
+                core_pair_distances.append(float(edge["distance"]))
+                core_pair_count += 1
+                family_data[family]["core_selected"] += 1
+            else:
+                extended_pair_distances.append(float(edge["distance"]))
+                extended_pair_count += 1
+                family_data[family]["extended_selected"] += 1
+
+        # Stage 1: preserve the previous strict cohort.
+        for family in sorted(shared_families):
+            caliper = family_data[family]["core_caliper"]
+            if not np.isfinite(caliper):
+                continue
+            for edge in sorted(
+                family_data[family]["core_edges"],
+                key=lambda item: (item["distance"], item["tie"]),
+            ):
+                if float(edge["distance"]) > float(caliper):
+                    continue
+                if can_select(edge, "core_mutual"):
+                    select_edge(edge, "core_mutual")
+
+        # Allocate the remaining target proportionally to the unused common
+        # support of each family. This prevents a few large families from taking
+        # the whole extension.
+        remaining_target = max(0, requested_target_pairs - core_pair_count)
+        remaining_capacity = {
+            family: max(
+                0,
+                min(
+                    len(family_data[family]["normal_positions"]),
+                    len(family_data[family]["sick_positions"]),
+                )
+                - int(family_data[family]["core_selected"]),
+            )
+            for family in sorted(shared_families)
+        }
+        total_remaining_capacity = sum(remaining_capacity.values())
+        extension_targets = {family: 0 for family in shared_families}
+        if remaining_target > 0 and total_remaining_capacity > 0:
+            raw_targets = {
+                family: remaining_target
+                * remaining_capacity[family]
+                / total_remaining_capacity
+                for family in shared_families
+            }
+            extension_targets = {
+                family: min(
+                    remaining_capacity[family], int(math.floor(raw_targets[family]))
+                )
+                for family in shared_families
+            }
+            unassigned = remaining_target - sum(extension_targets.values())
+            for family in sorted(
+                shared_families,
+                key=lambda value: (
+                    raw_targets[value] - math.floor(raw_targets[value]),
+                    remaining_capacity[value],
+                ),
+                reverse=True,
+            ):
+                if unassigned <= 0:
+                    break
+                if extension_targets[family] < remaining_capacity[family]:
+                    extension_targets[family] += 1
+                    unassigned -= 1
+
+        # Stage 2: add close one-sided or reciprocal top-K neighbours. Core-seeded
+        # sequence pairs are considered first, then reciprocal candidates, then
+        # distance/rank. Quota passes stop a single patient from monopolising a family.
+        for family in sorted(shared_families):
+            family_target = int(extension_targets.get(family, 0))
+            if family_target <= 0:
+                continue
+            extended_caliper = family_data[family]["extended_caliper"]
+            if not np.isfinite(extended_caliper):
+                continue
+            candidates = []
+            for edge in family_data[family]["all_edges"]:
+                if float(edge["distance"]) > float(extended_caliper):
+                    continue
+                sick_row = eligible_rows[int(edge["sick_global"])]
+                normal_row = eligible_rows[int(edge["normal_global"])]
+                sequence_pair = CrossClassMatchingManager._pair_keys(
+                    sick_row, normal_row, family
+                )[-1]
+                seeded = int(sequence_pair in core_sequence_pairs)
+                rank_sick = edge.get("rank_from_sick")
+                rank_normal = edge.get("rank_from_normal")
+                rank_sum = int(rank_sick or Settings.Matching.EXTENDED_NEIGHBORS + 1) + int(
+                    rank_normal or Settings.Matching.EXTENDED_NEIGHBORS + 1
+                )
+                candidates.append(
+                    {
+                        **edge,
+                        "seeded": seeded,
+                        "rank_sum": rank_sum,
+                        "normalized_distance": float(edge["distance"])
+                        / max(float(extended_caliper), 1e-9),
+                    }
+                )
+            candidates.sort(
+                key=lambda item: (
+                    0
+                    if (
+                        Settings.Matching.PRIORITIZE_CORE_SEQUENCE_PAIRS
+                        and item["seeded"]
+                    )
+                    else 1,
+                    0 if item.get("reciprocal", 0) else 1,
+                    item["normalized_distance"],
+                    item["rank_sum"],
+                    item["tie"],
+                )
+            )
+
+            selected_here = 0
+            max_cap = max(patient_total_caps.values())
+            starting_quota = max(
+                1,
+                min(
+                    [patient_total_counts.get(patient, 0) for patient in patient_total_counts]
+                    or [1]
+                ),
+            )
+            quota_values = np.unique(
+                np.ceil(
+                    np.linspace(
+                        starting_quota,
+                        max_cap,
+                        max(2, int(Settings.Matching.EXTENDED_BALANCE_QUOTA_STEPS)),
+                    )
+                ).astype(int)
+            )
+            for quota in quota_values:
+                if selected_here >= family_target or pair_number >= requested_target_pairs:
+                    break
+                patient_quota = {0: int(quota), 1: int(quota)}
+                for edge in candidates:
+                    if selected_here >= family_target or pair_number >= requested_target_pairs:
+                        break
+                    if can_select(edge, "extended_neighbor", patient_quota=patient_quota):
+                        select_edge(edge, "extended_neighbor")
+                        selected_here += 1
+
+        # Spillover pass: if a family could not fill its proportional allocation,
+        # other families with unused high-quality edges may contribute the remainder.
+        # All one-to-one and capacity constraints remain active.
+        if pair_number < requested_target_pairs:
+            spillover_added = 0
+            for family in sorted(shared_families):
+                if pair_number >= requested_target_pairs:
+                    break
+                extended_caliper = family_data[family]["extended_caliper"]
+                if not np.isfinite(extended_caliper):
+                    continue
+                spillover_candidates = []
+                for edge in family_data[family]["all_edges"]:
+                    if float(edge["distance"]) > float(extended_caliper):
+                        continue
+                    sick_row = eligible_rows[int(edge["sick_global"])]
+                    normal_row = eligible_rows[int(edge["normal_global"])]
+                    sequence_pair = CrossClassMatchingManager._pair_keys(
+                        sick_row, normal_row, family
+                    )[-1]
+                    rank_sick = edge.get("rank_from_sick")
+                    rank_normal = edge.get("rank_from_normal")
+                    spillover_candidates.append(
                         {
-                            "selected_for_matched_cohort": 1,
-                            "pair_id": pair_id,
-                            "matched_partner_token": str(partner_row["image_token"]),
-                            "matched_partner_patient": str(partner_row["patient_id"]),
-                            "matched_partner_series": str(partner_row["series_id"]),
-                            "match_distance": float(edge["distance"]),
-                            "mutual_rank_from_sick": int(edge["rank_from_sick"]),
-                            "mutual_rank_from_normal": int(edge["rank_from_normal"]),
-                            "family_caliper": float(caliper),
-                            "exclusion_reason": "",
+                            **edge,
+                            "seeded": int(sequence_pair in core_sequence_pairs),
+                            "rank_sum": int(
+                                rank_sick or Settings.Matching.EXTENDED_NEIGHBORS + 1
+                            )
+                            + int(
+                                rank_normal or Settings.Matching.EXTENDED_NEIGHBORS + 1
+                            ),
+                            "normalized_distance": float(edge["distance"])
+                            / max(float(extended_caliper), 1e-9),
                         }
                     )
-                used_tokens.update((sick_token, normal_token))
-                patient_family_counts[sick_patient_key] += 1
-                patient_family_counts[normal_patient_key] += 1
-                sequence_counts[sick_sequence_key] += 1
-                sequence_counts[normal_sequence_key] += 1
-                selected_pair_distances.append(float(edge["distance"]))
-                selected_in_family += 1
+                spillover_candidates.sort(
+                    key=lambda item: (
+                        0
+                        if (
+                            Settings.Matching.PRIORITIZE_CORE_SEQUENCE_PAIRS
+                            and item["seeded"]
+                        )
+                        else 1,
+                        0 if item.get("reciprocal", 0) else 1,
+                        item["normalized_distance"],
+                        item["rank_sum"],
+                        item["tie"],
+                    )
+                )
+                for edge in spillover_candidates:
+                    if pair_number >= requested_target_pairs:
+                        break
+                    if can_select(edge, "extended_neighbor", patient_quota=None):
+                        select_edge(edge, "extended_neighbor")
+                        spillover_added += 1
+            if spillover_added:
+                print(
+                    "[MATCHING] Spillover redistributed "
+                    f"{spillover_added} extended pairs across families."
+                )
 
-            for index in indices:
+        # Explain every non-selected image in the manifest.
+        for family in sorted(shared_families):
+            data = family_data[family]
+            candidate_tokens = set()
+            below_extended_tokens = set()
+            for edge in data["all_edges"]:
+                sick_token = str(eligible_rows[int(edge["sick_global"])]["image_token"])
+                normal_token = str(eligible_rows[int(edge["normal_global"])]["image_token"])
+                candidate_tokens.update((sick_token, normal_token))
+                if np.isfinite(data["extended_caliper"]) and float(edge["distance"]) <= float(
+                    data["extended_caliper"]
+                ):
+                    below_extended_tokens.update((sick_token, normal_token))
+            for index in family_indices[family]:
                 token = str(eligible_rows[index]["image_token"])
                 record = manifest_by_token[token]
                 if _as_int(record.get("selected_for_matched_cohort"), 0) == 1:
                     continue
-                if token not in mutual_tokens:
-                    record["exclusion_reason"] = "no_mutual_cross_class_neighbor"
-                elif token not in below_caliper_tokens:
-                    record["exclusion_reason"] = "above_family_caliper"
+                if token not in candidate_tokens:
+                    record["exclusion_reason"] = "no_cross_class_neighbor_in_extended_top_k"
+                elif token not in below_extended_tokens:
+                    record["exclusion_reason"] = "above_extended_family_caliper"
+                elif pair_number >= requested_target_pairs:
+                    record["exclusion_reason"] = "expanded_target_reached"
                 else:
                     record["exclusion_reason"] = "one_to_one_or_capacity_limit"
-                if np.isfinite(caliper):
-                    record["family_caliper"] = float(caliper)
 
             family_summaries.append(
                 {
                     "family": family,
-                    "normal_images": len(normal_positions),
-                    "sick_images": len(sick_positions),
+                    "normal_images": len(data["normal_positions"]),
+                    "sick_images": len(data["sick_positions"]),
                     "normal_patients": len(
-                        {str(eligible_rows[index]["patient_id"]) for index in normal_positions}
+                        {
+                            str(eligible_rows[index]["patient_id"])
+                            for index in data["normal_positions"]
+                        }
                     ),
                     "sick_patients": len(
-                        {str(eligible_rows[index]["patient_id"]) for index in sick_positions}
+                        {
+                            str(eligible_rows[index]["patient_id"])
+                            for index in data["sick_positions"]
+                        }
                     ),
-                    "mutual_candidate_edges": len(mutual_edges),
-                    "caliper": float(caliper) if np.isfinite(caliper) else None,
-                    "selected_pairs": selected_in_family,
+                    "core_candidate_edges": len(data["core_edges"]),
+                    "extended_candidate_edges": len(data["all_edges"]),
+                    "core_caliper": (
+                        float(data["core_caliper"])
+                        if np.isfinite(data["core_caliper"])
+                        else None
+                    ),
+                    "extended_caliper": (
+                        float(data["extended_caliper"])
+                        if np.isfinite(data["extended_caliper"])
+                        else None
+                    ),
+                    "core_selected_pairs": int(data["core_selected"]),
+                    "extended_added_pairs": int(data["extended_selected"]),
+                    "selected_pairs": int(data["core_selected"] + data["extended_selected"]),
+                    "extended_target_pairs": int(extension_targets.get(family, 0)),
                 }
             )
 
@@ -6287,6 +6789,11 @@ class CrossClassMatchingManager:
             row
             for row in manifest
             if _as_int(row.get("selected_for_matched_cohort"), 0) == 1
+        ]
+        core_selected = [
+            row
+            for row in manifest
+            if _as_int(row.get("selected_for_core_matched_cohort"), 0) == 1
         ]
         selected_normal = [row for row in selected if _as_int(row.get("label"), -1) == 0]
         selected_sick = [row for row in selected if _as_int(row.get("label"), -1) == 1]
@@ -6303,6 +6810,8 @@ class CrossClassMatchingManager:
         per_patient: dict[str, int] = defaultdict(int)
         for row in selected:
             per_patient[str(row["patient_id"])] += 1
+        selected_fraction_eligible = len(selected) / max(1, len(eligible_rows))
+        selected_fraction_dataset = len(selected) / max(1, len(dataset_rows))
         summary = {
             "fingerprint": fingerprint,
             **CrossClassMatchingManager._settings_payload(),
@@ -6310,14 +6819,27 @@ class CrossClassMatchingManager:
             "eligible_images": len(eligible_rows),
             "acquisition_families": family_count,
             "shared_families": len(shared_families),
+            "requested_target_pairs": requested_target_pairs,
+            "requested_target_images": requested_target_pairs * 2,
+            "core_matched_pairs": len(core_selected) // 2,
+            "core_selected_images": len(core_selected),
+            "extended_added_pairs": extended_pair_count,
+            "extended_added_images": extended_pair_count * 2,
             "matched_pairs": len(selected_normal),
             "selected_images": len(selected),
+            "selected_fraction_of_eligible": float(selected_fraction_eligible),
+            "selected_fraction_of_dataset": float(selected_fraction_dataset),
+            "target_achieved": bool(len(selected_normal) >= requested_target_pairs),
             "selected_normal_images": len(selected_normal),
             "selected_sick_images": len(selected_sick),
             "selected_normal_patients": len(normal_patients),
             "selected_sick_patients": len(sick_patients),
             "normal_patients": normal_patients,
             "sick_patients": sick_patients,
+            "patient_total_caps_by_class": {
+                "Normal": int(patient_total_caps[0]),
+                "Sick": int(patient_total_caps[1]),
+            },
             "selected_images_per_patient": dict(sorted(per_patient.items())),
             "distance_median": (
                 float(np.median(selected_pair_distances))
@@ -6329,11 +6851,30 @@ class CrossClassMatchingManager:
                 if selected_pair_distances
                 else None
             ),
+            "core_distance_median": (
+                float(np.median(core_pair_distances)) if core_pair_distances else None
+            ),
+            "core_distance_p90": (
+                float(np.quantile(core_pair_distances, 0.90))
+                if core_pair_distances
+                else None
+            ),
+            "extended_distance_median": (
+                float(np.median(extended_pair_distances))
+                if extended_pair_distances
+                else None
+            ),
+            "extended_distance_p90": (
+                float(np.quantile(extended_pair_distances, 0.90))
+                if extended_pair_distances
+                else None
+            ),
             "families": family_summaries,
             "manifest": str(workspace.cross_class_matching_manifest),
             "interpretation": (
-                "Matched-cohort sensitivity analysis; original all-image modes "
-                "remain the primary analysis."
+                "B1/AU2/C2 use the expanded balanced cohort. The previous strict "
+                "mutual-neighbour cohort is retained in selected_for_core_matched_cohort "
+                "for audit and sensitivity checks."
             ),
         }
         FileManager.write_csv(
@@ -6342,20 +6883,35 @@ class CrossClassMatchingManager:
             CrossClassMatchingManager.MANIFEST_FIELDS,
         )
         FileManager.write_json(workspace.cross_class_matching_summary, summary)
+        if not summary["target_achieved"]:
+            print(
+                "[MATCHING][WARNING] The requested expanded target could not be fully "
+                "reached without violating one-to-one, anatomical, patient, or sequence caps."
+            )
         print(
-            "[MATCHING] Sick↔Normal: "
-            f"eligible={len(eligible_rows)}, shared_families={len(shared_families)}, "
-            f"pairs={len(selected_normal)}, patients Normal={len(normal_patients)}, "
-            f"Sick={len(sick_patients)} | {workspace.cross_class_matching_manifest}"
+            "[MATCHING] Sick↔Normal core+extended: "
+            f"eligible={len(eligible_rows)}, core_pairs={len(core_selected) // 2}, "
+            f"total_pairs={len(selected_normal)}, images={len(selected)} "
+            f"({100.0 * selected_fraction_dataset:.1f}% dataset), "
+            f"patients Normal={len(normal_patients)}, Sick={len(sick_patients)} | "
+            f"{workspace.cross_class_matching_manifest}"
         )
         return manifest
 
     @staticmethod
-    def selected_tokens(manifest: Sequence[dict[str, Any]]) -> set[str]:
+    def selected_tokens(
+        manifest: Sequence[dict[str, Any]],
+        core_only: bool = False,
+    ) -> set[str]:
+        field = (
+            "selected_for_core_matched_cohort"
+            if core_only
+            else "selected_for_matched_cohort"
+        )
         return {
             str(row.get("image_token", ""))
             for row in manifest
-            if _as_int(row.get("selected_for_matched_cohort"), 0) == 1
+            if _as_int(row.get(field), 0) == 1
         }
 
 
@@ -6488,7 +7044,7 @@ class FeatureManager:
         prediction_summary = FileManager.read_json(workspace.prediction_summary, {}) or {}
         digest = hashlib.sha256()
         payload = {
-            "schema": "simple-patient-feature-bank-cross-class-v4-manual-audit-compatible",
+            "schema": "simple-patient-feature-bank-cross-class-v5-expanded-matching",
             "modes": Settings.Classification.LEGACY_STORAGE_MODES,
             "prediction_fingerprint": prediction_summary.get("fingerprint", ""),
             "support_dilation": Settings.Segmentation.SUPPORT_DILATION_KERNEL,
@@ -6560,6 +7116,64 @@ class FeatureManager:
         return bank
 
     @staticmethod
+    def _static_modes() -> tuple[str, ...]:
+        return tuple(
+            mode
+            for mode in Settings.Classification.MODES
+            if mode not in Settings.Classification.MATCHED_MODES
+        )
+
+    @staticmethod
+    def _reusable_static_bank(
+        workspace: Workspace,
+    ) -> dict[str, dict[str, Any]] | None:
+        """Reuse modes unaffected by a matching-only change.
+
+        The old feature bank is safe only when it is newer than every static input:
+        quality/prediction/manual audits, explicit annotations, and all manual masks.
+        The matching manifest is intentionally excluded because it affects only
+        B1/AU2/C2. This lets a new, larger matched cohort avoid a full two-hour CPU
+        extraction while preserving strict cache invalidation for changed masks.
+        """
+
+        if not workspace.feature_bank.is_file() or not workspace.feature_metadata.is_file():
+            return None
+        try:
+            bank_mtime = workspace.feature_bank.stat().st_mtime_ns
+        except OSError:
+            return None
+        static_inputs = (
+            workspace.quality_audit,
+            workspace.manual_audit,
+            workspace.manual_annotations,
+            workspace.prediction_audit,
+        )
+        for path in static_inputs:
+            if path.is_file() and path.stat().st_mtime_ns > bank_mtime:
+                return None
+        try:
+            newest_manual = max(
+                (path.stat().st_mtime_ns for path in workspace.manual_masks.glob("*.png")),
+                default=0,
+            )
+        except OSError:
+            return None
+        if newest_manual > bank_mtime:
+            return None
+        try:
+            previous = FeatureManager.load(workspace)
+        except Exception:
+            return None
+        static_modes = FeatureManager._static_modes()
+        if any(mode not in previous for mode in static_modes):
+            return None
+        print(
+            "[FEATURE BANK] Matching changed, but static inputs did not. "
+            "Reusing B0/AU1/C1 and manual-control modes; recomputing only B1/AU2/C2."
+        )
+        return {mode: previous[mode] for mode in static_modes}
+
+    @staticmethod
     def load_compatible_cache(
         dataset_rows: Sequence[dict[str, Any]],
         workspace: Workspace,
@@ -6598,6 +7212,7 @@ class FeatureManager:
 
 
         fingerprint = FeatureManager._feature_fingerprint(dataset_rows, workspace)
+        reusable_static_bank: dict[str, dict[str, Any]] | None = None
         if not force:
             bank = FeatureManager.load_compatible_cache(
                 dataset_rows, workspace, fingerprint=fingerprint
@@ -6608,6 +7223,7 @@ class FeatureManager:
                     "the extractor is not loaded on the GPU."
                 )
                 return bank
+            reusable_static_bank = FeatureManager._reusable_static_bank(workspace)
 
         quality = {
             row["image_token"]: row
@@ -6661,6 +7277,19 @@ class FeatureManager:
             )
             rows.append(row)
 
+        matched_only_rebuild = reusable_static_bank is not None
+        if matched_only_rebuild:
+            rows = [row for row in rows if row["keep_cross_class_matched"] == 1]
+            if not rows:
+                raise RuntimeError("The expanded matching manifest contains no usable Attention rows.")
+            modes_to_compute = tuple(Settings.Classification.MATCHED_MODES)
+            print(
+                "[FEATURE BANK] Matched-only rebuild: "
+                f"{len(rows)} images, modes={list(modes_to_compute)}"
+            )
+        else:
+            modes_to_compute = tuple(Settings.Classification.MODES)
+
         extractor = RuntimeManager.prepare_model(FrozenEfficientNet(), device).eval()
         loader = DataLoader(
             FeatureDataset(rows),
@@ -6669,14 +7298,18 @@ class FeatureManager:
             num_workers=Settings.Runtime.NUM_WORKERS,
             pin_memory=device.type == "cuda",
         )
-        pool = StreamingPatientPool(Settings.Classification.MODES)
+        pool = StreamingPatientPool(modes_to_compute)
         started = time.perf_counter()
 
-        matched_aliases = {
-            "B0_FULL_IMAGE": "B1_MATCHED_FULL_IMAGE",
-            "AU1_ATTENTION_ROI": "AU2_MATCHED_ATTENTION_ROI",
-            "C1_ATTENTION_COMPLEMENT": "C2_MATCHED_ATTENTION_COMPLEMENT",
-        }
+        matched_aliases = (
+            {}
+            if matched_only_rebuild
+            else {
+                "B0_FULL_IMAGE": "B1_MATCHED_FULL_IMAGE",
+                "AU1_ATTENTION_ROI": "AU2_MATCHED_ATTENTION_ROI",
+                "C1_ATTENTION_COMPLEMENT": "C2_MATCHED_ATTENTION_COMPLEMENT",
+            }
+        )
 
         def encode_groups(
             groups: list[tuple[str, torch.Tensor, list[dict[str, Any]]]],
@@ -6737,7 +7370,15 @@ class FeatureManager:
                 batch_rows = [rows[int(index)] for index in indices]
                 groups: list[
                     tuple[str, torch.Tensor, list[dict[str, Any]]]
-                ] = [("B0_FULL_IMAGE", robust, batch_rows)]
+                ] = [
+                    (
+                        "B1_MATCHED_FULL_IMAGE"
+                        if matched_only_rebuild
+                        else "B0_FULL_IMAGE",
+                        robust,
+                        batch_rows,
+                    )
+                ]
 
                 attention_positions = [
                     position
@@ -6760,14 +7401,22 @@ class FeatureManager:
                     groups.extend(
                         [
                             (
-                                "AU1_ATTENTION_ROI",
+                                (
+                                    "AU2_MATCHED_ATTENTION_ROI"
+                                    if matched_only_rebuild
+                                    else "AU1_ATTENTION_ROI"
+                                ),
                                 FeatureManager._region_normalize(
                                     selected_raw, support
                                 ),
                                 selected_rows,
                             ),
                             (
-                                "C1_ATTENTION_COMPLEMENT",
+                                (
+                                    "C2_MATCHED_ATTENTION_COMPLEMENT"
+                                    if matched_only_rebuild
+                                    else "C1_ATTENTION_COMPLEMENT"
+                                ),
                                 FeatureManager._region_normalize(
                                     selected_raw,
                                     (selected_content > 0.5).float()
@@ -6778,11 +7427,15 @@ class FeatureManager:
                         ]
                     )
 
-                manual_positions = [
-                    position
-                    for position, row in enumerate(batch_rows)
-                    if row["keep_manual_matched"]
-                ]
+                manual_positions = (
+                    []
+                    if matched_only_rebuild
+                    else [
+                        position
+                        for position, row in enumerate(batch_rows)
+                        if row["keep_manual_matched"]
+                    ]
+                )
                 if manual_positions:
                     positions = torch.as_tensor(
                         manual_positions, dtype=torch.long
@@ -6839,10 +7492,19 @@ class FeatureManager:
                 encode_groups(groups)
                 del groups
 
-        bank = {
+        computed_bank = {
             mode: pool.finalize(mode)
-            for mode in Settings.Classification.MODES
+            for mode in modes_to_compute
         }
+        bank = dict(reusable_static_bank or {})
+        bank.update(computed_bank)
+        missing_modes = [
+            mode for mode in Settings.Classification.MODES if mode not in bank
+        ]
+        if missing_modes:
+            raise RuntimeError(
+                f"Feature-bank rebuild is missing modes: {missing_modes}"
+            )
         arrays: dict[str, np.ndarray] = {}
         metadata_modes: dict[str, dict[str, Any]] = {}
         for mode, values in bank.items():
@@ -6874,6 +7536,11 @@ class FeatureManager:
             "preprocessing_device": "cpu",
             "extractor_device": device.type,
             "modes": metadata_modes,
+            "reused_static_modes": (
+                sorted(reusable_static_bank) if reusable_static_bank else []
+            ),
+            "recomputed_modes": sorted(computed_bank),
+            "matched_only_rebuild": bool(matched_only_rebuild),
             "elapsed": RuntimeManager.format_seconds(
                 time.perf_counter() - started
             ),
@@ -7462,6 +8129,9 @@ class CADPipeline:
     def status(self) -> dict[str, Any]:
 
 
+        matching_summary = FileManager.read_json(
+            self.workspace.cross_class_matching_summary, {}
+        ) or {}
         status = {
             "pipeline_version": PIPELINE_VERSION,
             "controller_device": "cpu",
@@ -7486,6 +8156,18 @@ class CADPipeline:
             "segmentation_oof_metrics": self.workspace.segmentation_metrics.is_file(),
             "cross_class_matching_manifest": self.workspace.cross_class_matching_manifest.is_file(),
             "cross_class_matching_summary": self.workspace.cross_class_matching_summary.is_file(),
+            "cross_class_core_pairs": _as_int(
+                matching_summary.get("core_matched_pairs"), 0
+            ),
+            "cross_class_total_pairs": _as_int(
+                matching_summary.get("matched_pairs"), 0
+            ),
+            "cross_class_selected_images": _as_int(
+                matching_summary.get("selected_images"), 0
+            ),
+            "cross_class_selected_fraction_dataset": _as_float(
+                matching_summary.get("selected_fraction_of_dataset"), 0.0
+            ),
             "feature_bank": self.workspace.feature_bank.is_file(),
             "results": self.workspace.results_csv.is_file(),
             **WorkspaceCompatibilityManager.legacy_status(self.workspace),
@@ -7497,7 +8179,7 @@ class CADPipeline:
 RuntimeManager.seed_everything(include_cuda=False)
 print(f"[PIPELINE] Version: {PIPELINE_VERSION}")
 print("[PIPELINE] Classes loaded without initializing CUDA.")
-print("[PIPELINE] 2.5D context, heart-presence targets, explicit negatives, and Sick↔Normal matching are active.")
+print("[PIPELINE] 2.5D context, explicit negatives, and core+extended Sick↔Normal matching are active.")
 print("[PIPELINE] Legacy manual-audit migration for M1/C3/AU3/C4 is active.")
 print("[PIPELINE] The editor locally blocks Kaggle's context menu during right-click erasing.")
 print("[PIPELINE] Review automatically registers existing non-empty manual masks as HEART_PRESENT.")
