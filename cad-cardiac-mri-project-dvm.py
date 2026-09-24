@@ -1,26 +1,23 @@
-# =============================================================================
-# DEFINIȚII 1 — IMPORTURI ȘI SETĂRI
-# =============================================================================
-"""Pipeline simplificat pentru clasificarea CAD din imagini cardiac MRI.
+"""Patient-level cardiac MRI CAD research pipeline.
 
-Ideea centrală:
-1. Directory_* este pacientul și nu traversează niciodată foldurile.
-2. Attention U-Net folosește ținte HEART_PRESENT și NO_HEART_VISIBLE explicite.
-3. Intrarea este 2.5D (cadrul anterior, curent și următor), cu un cap separat
-   care estimează dacă inima este vizibilă.
-4. Fiecare pacient este prezis de un model care nu a văzut acel pacient.
-5. Sampling-ul este echilibrat pe pacient, serie, pHash și tip de țintă.
-6. CPU și GPU sunt alese separat pentru fiecare etapă costisitoare.
-7. Clasificarea și toate metricile sunt calculate la nivel de pacient.
-8. Review-ul pornește exclusiv cu imagini target=UNLABELED; imaginile
-   etichetate rămân în coada sesiunii pentru navigare cu Prev/Next.
-9. Imaginile Sick și Normal pot fi potrivite într-o cohortă cross-class
-   comparabilă, pe familii de achiziție și mutual nearest neighbours.
-10. Workspace-urile notebook-ului full sunt importate automat pentru review.
+This version keeps the complete scientific workflow while presenting it through
+a smaller, ready experiment set. The non-negotiable guarantees are:
 
-Pipeline-ul nu selectează GPU la inițializare. Auditul, editorul, agregarea și
-evaluarea rămân pe CPU. Antrenarea/predicția Attention U-Net pot folosi GPU,
-iar feature bank-ul rulează implicit pe CPU, cu o opțiune GPU separată.
+1. ``Directory_*`` is the patient identifier and never crosses validation folds.
+2. Attention U-Net is trained by patient-level cross-fitting with explicit
+   ``HEART_PRESENT``, ``NO_HEART_VISIBLE``, and ``UNUSABLE`` targets.
+3. Every segmentation mask used downstream is out-of-fold for its patient.
+4. CAD classification and all reported metrics are computed at patient level.
+5. ``AU*`` names always denote an automatic Attention ROI, while ``C*`` names
+   always denote its complement/control region. ``B*`` denotes a full-image
+   baseline and ``M*`` a manual ROI reference.
+6. The existing ``/kaggle/working/cad_attention_unet_workspace`` is reused.
+   Checkpoints, masks, audits, review labels, matching files, and legacy feature
+   bank keys remain compatible; cached neural stages are not rerun needlessly.
+
+The three Kaggle entry points at the bottom separate CPU audit, GPU segmentation,
+and final CPU evaluation so that expensive accelerators are used only where they
+provide a real benefit.
 """
 
 from __future__ import annotations
@@ -70,11 +67,11 @@ from tqdm.auto import tqdm
 
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
-PIPELINE_VERSION = "2026-09-24-attention-2p5d-presence-cross-class-matching-v10-reset-o-keyboard-isolation"
+PIPELINE_VERSION = "2026-09-24-clean-v1-workspace-compatible"
 
 
 def _as_float(value: Any, default: float = 0.0) -> float:
-    """Convertește sigur valori citite din CSV, inclusiv șiruri goale."""
+
 
     try:
         result = float(value)
@@ -88,11 +85,7 @@ def _as_int(value: Any, default: int = 0) -> int:
 
 
 def _default_dataset_path() -> Path:
-    """Găsește automat rădăcina datasetului în Kaggle sau local.
 
-    Este acceptat primul director care conține simultan folderele `Normal` și
-    `Sick`. Variabila de mediu CAD_DATASET_PATH are prioritate.
-    """
 
     env_value = os.environ.get("CAD_DATASET_PATH", "").strip()
     candidates: list[Path] = []
@@ -135,8 +128,16 @@ def _default_workspace_path() -> Path:
     return Path.cwd() / "cad_attention_unet_workspace"
 
 
+# -----------------------------------------------------------------------------
+# Configuration and persistent workspace contract
+# -----------------------------------------------------------------------------
 class PathSettings:
-    """Toate locațiile importante. În mod normal se modifică doar DATASET_PATH."""
+    """Centralize dataset and workspace locations.
+
+    By default Kaggle artifacts stay in
+    ``/kaggle/working/cad_attention_unet_workspace`` so every stage can reuse
+    files created by previous CPU or GPU sessions.
+    """
 
     DATASET_PATH = _default_dataset_path()
     WORKSPACE_ROOT = Path(
@@ -145,15 +146,13 @@ class PathSettings:
 
 
 class RuntimeSettings:
-    """Dispozitive separate pentru a evita folosirea accidentală a GPU-ului."""
 
-    # Pipeline-ul pornește întotdeauna pe CPU. Aceste valori sunt citite numai
-    # când se apelează explicit o etapă de deep learning.
+
     ATTENTION_DEVICE = os.environ.get("CAD_ATTENTION_DEVICE", "cuda").strip().lower()
     FEATURE_DEVICE = os.environ.get("CAD_FEATURE_DEVICE", "cpu").strip().lower()
 
     RANDOM_SEED = 42
-    NUM_WORKERS = 0  # 0 este cel mai robust în notebook/Kaggle
+    NUM_WORKERS = 0  
     USE_AMP_ON_CUDA = True
     USE_CHANNELS_LAST_ON_CUDA = True
     CUDNN_BENCHMARK_ON_CUDA = True
@@ -164,13 +163,13 @@ class RuntimeSettings:
 
 
 class ImageSettings:
-    """Geometria comună pentru segmentare și clasificare."""
+
 
     SEGMENTATION_SIZE = 256
     CLASSIFICATION_SIZE = 224
     STANDARDIZED_CONTENT_LONG_SIDE = 240
 
-    # Detectarea conservatoare a benzilor negre de la marginea exportului JPEG.
+
     DARK_LINE_MAX_MEAN = 12.0
     DARK_LINE_MAX_STD = 4.0
     DARK_PIXEL_MAX_VALUE = 20
@@ -182,7 +181,7 @@ class ImageSettings:
     ROBUST_LOWER_PERCENTILE = 1.0
     ROBUST_UPPER_PERCENTILE = 99.0
 
-    # Normalizarea este calculată numai în regiunea care rămâne vizibilă.
+
     REGION_LOWER_PERCENTILE = 1.0
     REGION_UPPER_PERCENTILE = 99.0
     REGION_MIN_PIXELS = 64
@@ -198,11 +197,11 @@ class ImageSettings:
 
 
 class SegmentationSettings:
-    """Setările Attention U-Net, țintele explicite și validarea măștilor."""
+
 
     FOLDS = 5
     BASE_CHANNELS = 24
-    INPUT_CHANNELS = 3  # 2.5D: cadrul anterior, curent și următor
+    INPUT_CHANNELS = 3  
     USE_2_5D = True
 
     EPOCHS = 36
@@ -213,7 +212,7 @@ class SegmentationSettings:
     LR_REDUCE_FACTOR = 0.5
     MIN_LEARNING_RATE = 1e-6
 
-    # Loss: focal BCE + Tversky pentru segmentare, plus capul heart-present.
+
     FOCAL_WEIGHT = 0.40
     TVERSKY_WEIGHT = 0.60
     FOCAL_GAMMA = 2.0
@@ -221,7 +220,7 @@ class SegmentationSettings:
     TVERSKY_BETA_FN = 0.35
     PRESENCE_LOSS_WEIGHT = 0.30
 
-    # Greutăți diferite pentru proveniența țintelor.
+
     MANUAL_DRAWN_WEIGHT = 1.00
     AUTO_CONFIRMED_WEIGHT = 0.72
     NO_HEART_WEIGHT = 0.90
@@ -232,13 +231,13 @@ class SegmentationSettings:
     INFERENCE_BATCH_SIZE_CUDA = 10
     INFERENCE_BATCH_SIZE_CPU = 3
 
-    # Minimul se aplică țintelor HEART_PRESENT, nu exemplelor negative suplimentare.
+
     MIN_MANUAL_MASKS = 800
     MANUAL_MIN_AREA_RATIO = 0.0005
     MANUAL_MAX_AREA_RATIO = 0.98
     VALIDATION_PATIENT_FRACTION = 0.20
 
-    # Augmentări realiste; flip-ul stânga-dreapta este dezactivat implicit.
+
     AUGMENT_HORIZONTAL_FLIP = False
     AUGMENT_ROTATION_DEGREES = 7.0
     AUGMENT_TRANSLATION_FRACTION = 0.06
@@ -289,7 +288,7 @@ class SegmentationSettings:
     REPAIR_MORPHOLOGY_KERNEL = 5
     PRIOR_MAX_ROBUST_Z = 5.5
 
-    # TTA fotometric pentru toate imaginile; nu schimbă orientarea anatomică.
+
     TTA_CONTRAST_FACTOR = 1.10
     UNCERTAINTY_DISAGREEMENT_SCALE = 0.08
 
@@ -298,14 +297,17 @@ class SegmentationSettings:
 
 
 class ClassificationSettings:
-    """Setările extractorului frozen și ale clasificării la nivel de pacient."""
+    """Frozen feature extraction and patient-level classification settings.
 
-    # Numărul de imagini pregătite de CPU într-un batch.
+    The registry below is deliberately small: six primary experiments plus four
+    mask-validation controls. It is sufficient to present a coherent research
+    narrative without hiding the principal confounder checks.
+    """
+
     FEATURE_BATCH_SIZE_CUDA = 12
     FEATURE_BATCH_SIZE_CPU = 4
 
-    # Numărul maxim de imagini trimise simultan prin EfficientNet. Pe GPU,
-    # imaginile din mai multe moduri sunt grupate pentru a reduce overhead-ul.
+
     FEATURE_FORWARD_BATCH_SIZE_CUDA = 32
     FEATURE_FORWARD_BATCH_SIZE_CPU = 4
 
@@ -316,9 +318,44 @@ class ClassificationSettings:
     C_GRID = (0.01, 0.1, 1.0, 10.0)
     BOOTSTRAP_REPEATS = 2000
 
-    # Modurile CROSS_CLASS_MATCHED folosesc exact aceleași perechi Sick/Normal
-    # pentru full image, ROI și complement; modurile complete rămân neschimbate.
-    MODES = (
+
+    # The six primary experiments answer the central scientific question:
+    # does CAD signal come from the segmented heart or from acquisition/background
+    # confounders? The four validation experiments test mask quality on the exact
+    # manually annotated subset. Prefixes are semantic and never overloaded.
+    PRIMARY_MODES = (
+        "B0_FULL_IMAGE",
+        "AU1_ATTENTION_ROI",
+        "C1_ATTENTION_COMPLEMENT",
+        "B1_MATCHED_FULL_IMAGE",
+        "AU2_MATCHED_ATTENTION_ROI",
+        "C2_MATCHED_ATTENTION_COMPLEMENT",
+    )
+    VALIDATION_MODES = (
+        "M1_MANUAL_ROI",
+        "C3_MANUAL_COMPLEMENT",
+        "AU3_ATTENTION_ROI_MANUAL_SUBSET",
+        "C4_ATTENTION_COMPLEMENT_MANUAL_SUBSET",
+    )
+    MODES = PRIMARY_MODES + VALIDATION_MODES
+
+    # Existing .npz files in /kaggle/working use these historical keys. Keeping
+    # this mapping allows the renamed experiments to load the old feature bank
+    # without running EfficientNet again. New feature banks are also written with
+    # the legacy storage keys so older notebooks remain able to read them.
+    LEGACY_MODE_ALIASES = {
+        "B0_FULL_IMAGE": "FULL_IMAGE",
+        "AU1_ATTENTION_ROI": "AU1_ATTENTION_ROI",
+        "C1_ATTENTION_COMPLEMENT": "AU5_ATTENTION_COMPLEMENT",
+        "B1_MATCHED_FULL_IMAGE": "CROSS_CLASS_MATCHED_FULL_IMAGE",
+        "AU2_MATCHED_ATTENTION_ROI": "CROSS_CLASS_MATCHED_AU1_ATTENTION_ROI",
+        "C2_MATCHED_ATTENTION_COMPLEMENT": "CROSS_CLASS_MATCHED_AU5_ATTENTION_COMPLEMENT",
+        "M1_MANUAL_ROI": "AU6_MANUAL_ROI",
+        "C3_MANUAL_COMPLEMENT": "AU7_MANUAL_COMPLEMENT",
+        "AU3_ATTENTION_ROI_MANUAL_SUBSET": "AU8_ATTENTION_MATCHED_MANUAL_ROI",
+        "C4_ATTENTION_COMPLEMENT_MANUAL_SUBSET": "AU9_ATTENTION_MATCHED_MANUAL_COMPLEMENT",
+    }
+    LEGACY_STORAGE_MODES = (
         "FULL_IMAGE",
         "AU1_ATTENTION_ROI",
         "AU5_ATTENTION_COMPLEMENT",
@@ -330,10 +367,29 @@ class ClassificationSettings:
         "AU8_ATTENTION_MATCHED_MANUAL_ROI",
         "AU9_ATTENTION_MATCHED_MANUAL_COMPLEMENT",
     )
+    MATCHED_MODES = frozenset(
+        {
+            "B1_MATCHED_FULL_IMAGE",
+            "AU2_MATCHED_ATTENTION_ROI",
+            "C2_MATCHED_ATTENTION_COMPLEMENT",
+        }
+    )
+    MODE_DESCRIPTIONS = {
+        "B0_FULL_IMAGE": "Full-image baseline on all eligible slices",
+        "AU1_ATTENTION_ROI": "Automatic Attention U-Net heart ROI",
+        "C1_ATTENTION_COMPLEMENT": "Pixels outside the automatic heart ROI",
+        "B1_MATCHED_FULL_IMAGE": "Full-image baseline on matched Sick/Normal slices",
+        "AU2_MATCHED_ATTENTION_ROI": "Automatic heart ROI on matched slices",
+        "C2_MATCHED_ATTENTION_COMPLEMENT": "Automatic-ROI complement on matched slices",
+        "M1_MANUAL_ROI": "Manual heart ROI on the annotated subset",
+        "C3_MANUAL_COMPLEMENT": "Complement of the manual ROI",
+        "AU3_ATTENTION_ROI_MANUAL_SUBSET": "Automatic ROI on the same manually annotated images",
+        "C4_ATTENTION_COMPLEMENT_MANUAL_SUBSET": "Automatic complement on the same manually annotated images",
+    }
 
 
 class MatchingSettings:
-    """Matching Sick ↔ Normal după achiziție/anatomie, nu după scorul CAD."""
+
 
     ENABLED = True
     MIN_FAMILIES = 8
@@ -342,8 +398,7 @@ class MatchingSettings:
     MIN_IMAGES_PER_CLASS_PER_FAMILY = 12
     MIN_PATIENTS_PER_CLASS_PER_FAMILY = 2
 
-    # Mutual kNN reduce relațiile unilaterale; fiecare imagine intră în cel mult
-    # o pereche, iar limitele de mai jos împiedică dominarea unui pacient/serii.
+
     MUTUAL_NEIGHBORS = 5
     CALIPER_MAD_MULTIPLIER = 2.5
     CALIPER_QUANTILE = 0.90
@@ -352,8 +407,7 @@ class MatchingSettings:
     MAX_MATCHES_PER_PATIENT_PER_FAMILY = 20
     MAX_MATCHES_PER_SEQUENCE_GROUP = 5
 
-    # Distanța este calculată din pHash low-frequency + geometria măștii +
-    # poziția în secvență + indicatorii de calitate. Ponderile însumează 1.
+
     PHASH_BLOCK_WEIGHT = 0.45
     GEOMETRY_BLOCK_WEIGHT = 0.25
     SEQUENCE_BLOCK_WEIGHT = 0.15
@@ -361,7 +415,7 @@ class MatchingSettings:
 
 
 class ReviewSettings:
-    """Selectarea imaginilor pentru corectare manuală."""
+
 
     NEW_IMAGES_PER_PATIENT = 10
     PHASH_MAX_DISTANCE = 6
@@ -372,7 +426,7 @@ class ReviewSettings:
 
 
 class Settings:
-    """Un singur punct de acces pentru toate clasele de setări."""
+
 
     Paths = PathSettings
     Runtime = RuntimeSettings
@@ -383,28 +437,30 @@ class Settings:
     Review = ReviewSettings
 
 
-# =============================================================================
-# DEFINIȚII 2 — RUNTIME, TIPURI DE DATE ȘI FIȘIERE
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Runtime, data records, and atomic persistence
+# -----------------------------------------------------------------------------
 class RuntimeManager:
-    """Pornește un dispozitiv numai pentru etapa care îl solicită explicit.
+    """Own device initialization at stage boundaries, never at import time.
 
-    Inițializarea pipeline-ului nu apelează CUDA. Astfel, auditul și editorul
-    pot rula într-o sesiune CPU fără să rezerve memorie sau timp GPU.
+    This is what permits a single persisted workspace to move safely between
+    Kaggle CPU and GPU sessions without reserving CUDA memory during audits,
+    manual review, matching, or evaluation.
     """
+
 
     @staticmethod
     def resolve_device(requested: str | None = None) -> torch.device:
         requested = (requested or "cpu").strip().lower()
         if requested not in {"auto", "cpu", "cuda"}:
-            raise ValueError("device trebuie să fie 'auto', 'cpu' sau 'cuda'.")
+            raise ValueError("device must be 'auto', 'cpu', or 'cuda'.")
         if requested == "cpu":
             return torch.device("cpu")
         if requested == "cuda":
             if not torch.cuda.is_available():
                 raise RuntimeError(
-                    "CUDA a fost cerut pentru această etapă, dar nu este disponibil. "
-                    "Folosește device='cpu' sau activează acceleratorul GPU."
+                    "CUDA was requested for this stage but is unavailable. "
+                    "Use device='cpu' or enable a GPU accelerator."
                 )
             return torch.device("cuda")
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -414,7 +470,7 @@ class RuntimeManager:
         seed: int | None = None,
         include_cuda: bool = False,
     ) -> None:
-        """Fixează seed-urile CPU; seed-urile CUDA sunt atinse doar în etapa GPU."""
+
 
         seed = int(Settings.Runtime.RANDOM_SEED if seed is None else seed)
         random.seed(seed)
@@ -443,7 +499,7 @@ class RuntimeManager:
     @staticmethod
     @contextlib.contextmanager
     def device_scope(requested: str | None, stage_name: str):
-        """Context scurt: pregătește dispozitivul și îl eliberează la final."""
+
 
         device = RuntimeManager.resolve_device(requested)
         RuntimeManager.seed_everything(include_cuda=device.type == "cuda")
@@ -464,7 +520,7 @@ class RuntimeManager:
                 except Exception:
                     pass
             RuntimeManager.release(device)
-            print(f"[DEVICE] {stage_name}: resurse eliberate")
+            print(f"[DEVICE] {stage_name}: resources released")
 
     @staticmethod
     def prepare_model(model: nn.Module, device: torch.device) -> nn.Module:
@@ -518,7 +574,7 @@ class RuntimeManager:
 
     @staticmethod
     def autocast(device: torch.device):
-        """Folosește mixed precision numai pe GPU; pe CPU nu schimbă nimic."""
+
 
         enabled = bool(Settings.Runtime.USE_AMP_ON_CUDA and device.type == "cuda")
         if not enabled:
@@ -538,7 +594,7 @@ class RuntimeManager:
 
     @staticmethod
     def release(device: torch.device) -> None:
-        """Eliberează obiectele Python și cache-ul CUDA după fiecare etapă/fold."""
+
 
         gc.collect()
         if device.type == "cuda" and torch.cuda.is_available():
@@ -562,7 +618,7 @@ class RuntimeManager:
 
 @dataclass(frozen=True)
 class Sample:
-    """O imagine și identitatea pacientului/seriei din care provine."""
+
 
     image_path: str
     label: int
@@ -574,7 +630,7 @@ class Sample:
 
 @dataclass(frozen=True)
 class Workspace:
-    """Fișiere persistente produse de etapele pipeline-ului."""
+
 
     root: Path
     manual_masks: Path
@@ -603,7 +659,7 @@ class Workspace:
 
 
 class FileManager:
-    """Scrieri atomice: un fișier incomplet nu înlocuiește rezultatul bun anterior."""
+
 
     @staticmethod
     def create_workspace(root: Path | str | None = None) -> Workspace:
@@ -686,7 +742,7 @@ class FileManager:
 
     @staticmethod
     def write_png(path: Path, image: np.ndarray) -> None:
-        """Evită fișiere PNG parțiale și eroarea repetată `libpng Write Error`."""
+
 
         path.parent.mkdir(parents=True, exist_ok=True)
         array = np.asarray(image)
@@ -696,7 +752,7 @@ class FileManager:
             [cv2.IMWRITE_PNG_COMPRESSION, int(Settings.Runtime.PNG_COMPRESSION)],
         )
         if not ok:
-            raise RuntimeError(f"OpenCV nu a putut encoda PNG-ul: {path}")
+            raise RuntimeError(f"OpenCV could not encode PNG: {path}")
         temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
         try:
             temporary.write_bytes(encoded.tobytes())
@@ -714,20 +770,16 @@ class FileManager:
         return digest.hexdigest()
 
 
-# =============================================================================
-# DEFINIȚII 3 — DESCOPERIREA DATASETULUI
-# =============================================================================
-
-
+# -----------------------------------------------------------------------------
+# Dataset discovery and backward-compatible workspace import
+# -----------------------------------------------------------------------------
 class WorkspaceCompatibilityManager:
-    """Importă sigur rezultatele notebook-ului full în schema simplificată.
+    """Reuse artifacts produced by earlier full or simplified notebooks.
 
-    Notebook-ul full salvează metadatele predicțiilor în
-    ``attention_unet_full_review_manifest.csv``. Notebook-ul simplificat citește
-    ``simple_attention_prediction_audit.csv``. Măștile PNG și token-urile sunt
-    compatibile, deci această clasă convertește doar metadatele CSV; nu rulează
-    modelul, nu modifică măștile și nu pornește GPU-ul.
+    Conversion is metadata-only: existing PNG masks and image tokens are not
+    rewritten, and no model is executed merely to import an older workspace.
     """
+
 
     LEGACY_FULL_REVIEW_MANIFEST = "attention_unet_full_review_manifest.csv"
     LEGACY_QUALITY_AUDIT = "attention_image_quality_audit.csv"
@@ -748,7 +800,7 @@ class WorkspaceCompatibilityManager:
         source_row: dict[str, Any],
         workspace: Workspace,
     ) -> Path:
-        """Preferă masca din workspace-ul curent, apoi calea din CSV-ul vechi."""
+
 
         token = str(base_row["image_token"])
         expected = workspace.predicted_masks / f"{token}.png"
@@ -767,7 +819,7 @@ class WorkspaceCompatibilityManager:
         dataset_rows: Sequence[dict[str, Any]],
         workspace: Workspace,
     ) -> list[dict[str, Any]]:
-        """Convertește un audit simplu sau manifestul full în aceeași schemă."""
+
 
         source_by_token = {
             str(row.get("image_token", "")).strip(): dict(row)
@@ -799,9 +851,8 @@ class WorkspaceCompatibilityManager:
                     "image_path": str(base["image_path"]),
                     "patient_id": str(base["patient_id"]),
                     "series_id": str(base["series_id"]),
-                    # Foldul notebook-ului simplificat rămâne autoritar. Acest
-                    # import este pentru review/feature extraction, nu pentru a
-                    # pretinde compatibilitatea checkpointurilor full.
+
+
                     "segmentation_fold": int(base["segmentation_fold"]),
                     "predicted_attention_mask_path": str(mask_path),
                     "attention_valid_initial": initial_valid,
@@ -873,7 +924,7 @@ class WorkspaceCompatibilityManager:
         dataset_rows: Sequence[dict[str, Any]],
         workspace: Workspace,
     ) -> list[dict[str, Any]]:
-        """Fallback: construiește un audit minim din PNG-urile deja existente."""
+
 
         invalid_tokens = {
             str(row.get("image_token", "")).strip()
@@ -934,11 +985,7 @@ class WorkspaceCompatibilityManager:
         workspace: Workspace,
         require_complete: bool = False,
     ) -> list[dict[str, Any]]:
-        """Găsește cea mai completă sursă de predicții și creează auditul simplu.
 
-        Ordinea practică este: audit simplu existent, manifest full, apoi PNG-uri.
-        Este aleasă sursa care acoperă cele mai multe imagini cu mască lizibilă.
-        """
 
         current_raw = FileManager.read_csv(workspace.prediction_audit)
         current = cls._normalize_prediction_rows(current_raw, dataset_rows, workspace)
@@ -948,7 +995,7 @@ class WorkspaceCompatibilityManager:
         legacy = cls._normalize_prediction_rows(legacy_raw, dataset_rows, workspace)
 
         derived = cls._derive_prediction_rows_from_masks(dataset_rows, workspace)
-        # La egalitate se păstrează auditul simplu, apoi manifestul full.
+
         candidates = [
             (len(current), 3, "simple", current),
             (len(legacy), 2, "full_manifest", legacy),
@@ -958,19 +1005,19 @@ class WorkspaceCompatibilityManager:
 
         if not selected:
             raise FileNotFoundError(
-                "Nu există metadate sau măști Attention reutilizabile. Au fost "
-                f"căutate {workspace.prediction_audit}, {legacy_path} și "
-                f"{workspace.predicted_masks}. Rulează blocul GPU de antrenare/"
-                "predicție numai dacă aceste rezultate nu au fost generate deja."
+                "No reusable Attention metadata or masks were found. The pipeline searched "
+                f"{workspace.prediction_audit}, {legacy_path}, and "
+                f"{workspace.predicted_masks}. Run the GPU training/"
+                "prediction stage only if these artifacts have not already been generated."
             )
 
         total = len(dataset_rows)
         if require_complete and len(selected) != total:
             raise RuntimeError(
-                "Feature bank-ul necesită câte o mască Attention pentru fiecare "
-                f"imagine, dar au fost găsite {len(selected)}/{total}. Sursa aleasă: "
-                f"{source}. Pentru review poți continua cu subsetul existent; pentru "
-                "evaluare trebuie completată inferența Attention."
+                "The feature bank requires one Attention mask for every "
+                f"image, but only {len(selected)}/{total} were found. Selected source: "
+                f"{source}. Review may continue on the available subset; "
+                "evaluation requires complete Attention inference."
             )
 
         should_write = (
@@ -995,21 +1042,21 @@ class WorkspaceCompatibilityManager:
                     "legacy_full_review_manifest": str(legacy_path),
                     "prediction_masks_directory": str(workspace.predicted_masks),
                     "note": (
-                        "Metadatele au fost convertite pentru review/feature extraction; "
-                        "simple_prediction_summary.json nu a fost falsificat, deci cache-ul "
-                        "de inferență al modelului simplificat rămâne separat."
+                        "Metadata were converted for review and feature extraction; "
+                        "simple_prediction_summary.json was intentionally left unchanged, "
+                        "so the simplified model inference cache remains independent."
                     ),
                 },
             )
             print(
-                "[COMPATIBILITATE] Auditul de predicții a fost construit din "
-                f"{source}: {len(selected)}/{total} imagini -> "
+                "[COMPATIBILITY] Prediction audit built from "
+                f"{source}: {len(selected)}/{total} images -> "
                 f"{workspace.prediction_audit}"
             )
         else:
             print(
-                "[COMPATIBILITATE] Audit simplu existent reutilizat: "
-                f"{len(selected)}/{total} imagini."
+                "[COMPATIBILITY] Existing simplified audit reused: "
+                f"{len(selected)}/{total} images."
             )
         return selected
 
@@ -1019,7 +1066,7 @@ class WorkspaceCompatibilityManager:
         dataset_rows: Sequence[dict[str, Any]],
         workspace: Workspace,
     ) -> list[dict[str, Any]]:
-        """Importă auditul de calitate full când auditul simplu lipsește."""
+
 
         current = FileManager.read_csv(workspace.quality_audit)
         current_tokens = {
@@ -1090,8 +1137,8 @@ class WorkspaceCompatibilityManager:
                 QualityManager.FIELDS,
             )
             print(
-                "[COMPATIBILITATE] Auditul de calitate full a fost importat: "
-                f"{len(normalized)}/{len(dataset_rows)} imagini -> "
+                "[COMPATIBILITY] Full-workspace quality audit imported: "
+                f"{len(normalized)}/{len(dataset_rows)} images -> "
                 f"{workspace.quality_audit}"
             )
             return normalized
@@ -1113,7 +1160,12 @@ class WorkspaceCompatibilityManager:
 
 
 class DatasetManager:
-    """Descoperă imaginile și păstrează pacientul ca unitate statistică."""
+    """Discover images while treating the patient as the statistical unit.
+
+    Immediate child directories are only series proxies. Fold assignment is
+    deterministic and patient-level, preventing slice leakage across folds.
+    """
+
 
     IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
 
@@ -1123,22 +1175,25 @@ class DatasetManager:
         for index, part in enumerate(parts):
             if str(part).startswith("Directory_"):
                 return "/".join(map(str, parts[index:]))
-        raise ValueError(f"Calea nu conține Directory_*: {image_path}")
+        raise ValueError(f"Path does not contain Directory_*: {image_path}")
 
     @staticmethod
     def image_token(image_path: Path, patient_id: str, series_id: str) -> str:
-        """Păstrează exact schema veche, astfel încât măștile manuale existente rămân valide."""
+
 
         relative = DatasetManager._relative_token_path(image_path)
         digest = hashlib.sha256(relative.encode("utf-8")).hexdigest()[:20]
         safe_series = str(series_id).replace("/", "__").replace("\\", "__").replace(" ", "_")
         return f"{patient_id}__{safe_series}__{digest}"
 
+    # Fold assignment is derived only from patient identity and class label.
+    # No image-level random split is permitted because thousands of correlated
+    # slices from one patient would otherwise leak into both train and validation.
     @staticmethod
     def patient_folds(
         patients: dict[str, int] | Iterable[str],
     ) -> dict[str, int]:
-        """Împarte pacienții determinist; când există etichete, păstrează echilibrul claselor."""
+
 
         if isinstance(patients, dict):
             groups: dict[int, list[str]] = defaultdict(list)
@@ -1161,11 +1216,7 @@ class DatasetManager:
 
     @staticmethod
     def discover(dataset_path: Path | str, workspace: Workspace | None = None) -> list[Sample]:
-        """Scanează folderul fără să decodeze imaginile.
 
-        `Directory_*` este pacientul. Primul subfolder din pacient este doar un
-        proxy de serie; foldurile sunt create după pacient, nu după imagine.
-        """
 
         dataset_path = Path(dataset_path)
         started = time.perf_counter()
@@ -1175,7 +1226,7 @@ class DatasetManager:
         for class_name, label in (("Normal", 0), ("Sick", 1)):
             class_path = dataset_path / class_name
             if not class_path.is_dir():
-                raise FileNotFoundError(f"Lipsește folderul: {class_path}")
+                raise FileNotFoundError(f"Missing directory: {class_path}")
 
             for patient_path in sorted(class_path.iterdir()):
                 if not patient_path.is_dir() or not patient_path.name.lower().startswith("directory_"):
@@ -1183,15 +1234,15 @@ class DatasetManager:
                 patient_id = patient_path.name
                 old_label = patient_to_label.get(patient_id)
                 if old_label is not None and old_label != label:
-                    raise RuntimeError(f"{patient_id} apare în ambele clase.")
+                    raise RuntimeError(f"{patient_id} appears in both classes.")
                 patient_to_label[patient_id] = label
 
-                # Imagini direct în Directory_*.
+
                 for image_path in sorted(patient_path.iterdir()):
                     if image_path.is_file() and image_path.suffix.lower() in DatasetManager.IMAGE_EXTENSIONS:
                         raw_rows.append((image_path, label, patient_id, f"{patient_id}/__ROOT__"))
 
-                # Fiecare copil imediat este un proxy de serie; subfolderele lui nu îl despart.
+
                 for series_path in sorted(path for path in patient_path.iterdir() if path.is_dir()):
                     series_id = f"{patient_id}/{series_path.name}"
                     for image_path in sorted(series_path.rglob("*")):
@@ -1199,7 +1250,7 @@ class DatasetManager:
                             raw_rows.append((image_path, label, patient_id, series_id))
 
         if not raw_rows:
-            raise RuntimeError(f"Nu au fost găsite imagini în {dataset_path}")
+            raise RuntimeError(f"No images were found in {dataset_path}")
 
         folds = DatasetManager.patient_folds(patient_to_label)
         samples = [
@@ -1215,7 +1266,7 @@ class DatasetManager:
         ]
 
         if len({sample.image_token for sample in samples}) != len(samples):
-            raise RuntimeError("Au fost generate token-uri duplicate pentru imagini.")
+            raise RuntimeError("Duplicate image tokens were generated.")
 
         rows = [
             {
@@ -1234,17 +1285,17 @@ class DatasetManager:
         if workspace is not None:
             FileManager.write_csv(workspace.dataset_manifest, rows, rows[0].keys())
 
-        print("[DATE] Pacienți:", len(patient_to_label))
-        print("[DATE] Normal:", sum(label == 0 for label in patient_to_label.values()))
-        print("[DATE] Sick:", sum(label == 1 for label in patient_to_label.values()))
-        print("[DATE] Imagini:", len(samples))
-        print("[DATE] Proxy-uri de serie:", len({sample.series_id for sample in samples}))
-        print("[DATE] Scanare:", RuntimeManager.format_seconds(time.perf_counter() - started))
+        print("[DATA] Patients:", len(patient_to_label))
+        print("[DATA] Normal:", sum(label == 0 for label in patient_to_label.values()))
+        print("[DATA] Sick:", sum(label == 1 for label in patient_to_label.values()))
+        print("[DATA] Images:", len(samples))
+        print("[DATA] Series proxies:", len({sample.series_id for sample in samples}))
+        print("[DATA] Scan time:", RuntimeManager.format_seconds(time.perf_counter() - started))
         return samples
 
     @staticmethod
     def _natural_path_key(path: str) -> tuple[Any, ...]:
-        """Sortează img2 înainte de img10, păstrând ordinea secvenței."""
+
 
         return tuple(
             int(part) if part.isdigit() else part.lower()
@@ -1268,12 +1319,11 @@ class DatasetManager:
             for index, sample in enumerate(samples)
         ]
 
-        # Context 2.5D fără a traversa seria sau pacientul. La capete se repetă
-        # cadrul curent, deci geometria rămâne definită pentru fiecare imagine.
+
         by_sequence_group: dict[str, list[int]] = defaultdict(list)
         for index, row in enumerate(rows):
-            # Nu traversăm între două subfoldere-leaf diferite din același proxy
-            # de serie (important pentru structura Sick/SR_*/...).
+
+
             parent = str(Path(row["image_path"]).parent)
             sequence_group = f"{row['series_id']}::{parent}"
             row["sequence_group_id"] = sequence_group
@@ -1296,21 +1346,22 @@ class DatasetManager:
         return rows
 
 
-# =============================================================================
-# DEFINIȚII 4 — PREPROCESAREA IMAGINILOR
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Label-independent preprocessing, image quality, and manual targets
+# -----------------------------------------------------------------------------
 class ImageProcessor:
-    """Transformări fără etichetă, identice pentru train, validare și test.
+    """Apply label-independent preprocessing consistently to every split.
 
-    Geometria de 256x256 este păstrată compatibilă cu măștile manuale create în
-    versiunile anterioare ale notebook-ului.
+    The 256×256 geometry is intentionally unchanged so historical manual masks
+    remain aligned and reusable in the current Kaggle workspace.
     """
+
 
     @staticmethod
     def read_gray(path: Path | str) -> np.ndarray:
         image = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
         if image is None:
-            raise FileNotFoundError(f"OpenCV nu poate citi imaginea: {path}")
+            raise FileNotFoundError(f"OpenCV cannot read image: {path}")
         return image
 
     @staticmethod
@@ -1336,7 +1387,7 @@ class ImageProcessor:
     @staticmethod
     def detect_padding_bounds(image: np.ndarray) -> tuple[int, int, int, int]:
         if image.ndim != 2:
-            raise ValueError("Imaginea trebuie să fie grayscale 2D.")
+            raise ValueError("The image must be a 2D grayscale array.")
         height, width = image.shape
         min_height = max(8, int(np.ceil(height * Settings.Image.MIN_RETAINED_FRACTION)))
         min_width = max(8, int(np.ceil(width * Settings.Image.MIN_RETAINED_FRACTION)))
@@ -1432,12 +1483,12 @@ class ImageProcessor:
 
     @staticmethod
     def standardize(image: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Returnează patru imagini aliniate: robustă, min-max, raw și content mask."""
+
 
         top, bottom, left, right = ImageProcessor.detect_padding_bounds(image)
         cropped = image[top:bottom, left:right]
         if cropped.size == 0:
-            raise RuntimeError("Crop-ul automat a produs o imagine goală.")
+            raise RuntimeError("Automatic cropping produced an empty image.")
         robust, _, _ = ImageProcessor.robust_scale(cropped)
         minmax = ImageProcessor.scale_0_1(cropped)
         raw = cropped.astype(np.float32) / 255.0
@@ -1450,7 +1501,7 @@ class ImageProcessor:
 
     @staticmethod
     def standardized_uint8(path: Path | str) -> np.ndarray:
-        """Imagine robust-normalizată pentru segmentare și editor."""
+
 
         image = ImageProcessor.read_gray(path)
         robust, _, _, _ = ImageProcessor.standardize(image)
@@ -1483,7 +1534,7 @@ class ImageProcessor:
 
 
 class ImageCache:
-    """Cache RAM mic pentru imaginile 256x256 folosite repetat în antrenare."""
+
 
     _cache: OrderedDict[str, np.ndarray] = OrderedDict()
 
@@ -1504,11 +1555,8 @@ class ImageCache:
         cls._cache.clear()
 
 
-# =============================================================================
-# DEFINIȚII 5 — AUDITUL CALITĂȚII ȘI AL MĂȘTILOR MANUALE
-# =============================================================================
 class QualityManager:
-    """Calculează blur, zgomot și pHash fără a folosi eticheta CAD."""
+
 
     FIELDS = (
         "image_token",
@@ -1601,7 +1649,7 @@ class QualityManager:
             records.append(record)
             if index == 1 or index % 5000 == 0 or index == len(rows):
                 print(
-                    f"[CALITATE] {index}/{len(rows)} | "
+                    f"[QUALITY] {index}/{len(rows)} | "
                     f"{RuntimeManager.format_seconds(time.perf_counter() - started)}"
                 )
 
@@ -1644,19 +1692,17 @@ class QualityManager:
 
         FileManager.write_csv(workspace.quality_audit, records, QualityManager.FIELDS)
         valid = sum(int(row["quality_valid"]) for row in records)
-        print(f"[CALITATE] valide={valid}/{len(records)} | {workspace.quality_audit}")
+        print(f"[QUALITY] valid={valid}/{len(records)} | {workspace.quality_audit}")
         return {str(row["image_token"]): row for row in records}
 
 
 class MaskManager:
-    """Gestionează trei tipuri explicite de adnotări pentru segmentare.
+    """Maintain explicit, auditable segmentation targets.
 
-    ``HEART_PRESENT`` este o țintă non-goală. ``NO_HEART_VISIBLE`` este o
-    imagine validă cu țintă goală și este folosită ca exemplu negativ.
-    ``UNUSABLE`` marchează blur/zgomot/localizer neinterpretabil și este exclusă.
-    Măștile goale vechi, fără etichetă explicită, rămân excluse pentru a nu
-    transforma accidental o salvare greșită într-un exemplu negativ.
+    A non-empty heart mask, a valid no-heart frame, and an unusable frame have
+    different meanings. They are never inferred from an accidentally empty PNG.
     """
+
 
     HEART_PRESENT = "HEART_PRESENT"
     NO_HEART_VISIBLE = "NO_HEART_VISIBLE"
@@ -1694,7 +1740,7 @@ class MaskManager:
     def read_binary(path: Path | str, size: int | None = None) -> np.ndarray:
         mask = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
         if mask is None:
-            raise FileNotFoundError(f"Masca nu poate fi citită: {path}")
+            raise FileNotFoundError(f"Mask cannot be read: {path}")
         size = int(size or Settings.Image.SEGMENTATION_SIZE)
         if mask.shape != (size, size):
             mask = cv2.resize(mask, (size, size), interpolation=cv2.INTER_NEAREST)
@@ -1720,14 +1766,7 @@ class MaskManager:
 
     @staticmethod
     def manual_audit_refresh_reason(workspace: Workspace) -> str:
-        """Spune de ce auditul manual trebuie reconstruit înainte de feature bank.
 
-        Versiunile vechi ale pipeline-ului scriau un CSV fără ``target_type``,
-        ``heart_present`` și ``sample_weight``. Un asemenea fișier nu este
-        compatibil cu modurile AU6--AU9: toate măștile manuale ar fi interpretate
-        accidental ca absente. Sunt detectate și măștile/adnotările modificate
-        după ultima generare a auditului.
-        """
 
         path = workspace.manual_audit
         if not path.is_file():
@@ -1772,7 +1811,7 @@ class MaskManager:
 
     @staticmethod
     def annotation_map(workspace: Workspace) -> dict[str, dict[str, Any]]:
-        """Returnează ultima etichetă explicită pentru fiecare imagine."""
+
 
         result: dict[str, dict[str, Any]] = {}
         for row in FileManager.read_csv(workspace.manual_annotations):
@@ -1802,7 +1841,7 @@ class MaskManager:
     ) -> None:
         target_type = str(target_type).strip().upper()
         if target_type not in MaskManager.VALID_TARGET_TYPES:
-            raise ValueError(f"Tip de adnotare necunoscut: {target_type}")
+            raise ValueError(f"Unknown annotation type: {target_type}")
         records = MaskManager.annotation_map(workspace)
         weight = (
             MaskManager._default_weight(target_type, source)
@@ -1840,17 +1879,7 @@ class MaskManager:
         rows: Sequence[dict[str, Any]],
         workspace: Workspace,
     ) -> dict[str, Any]:
-        """Înregistrează automat măștile manuale non-goale drept HEART_PRESENT.
 
-        Metoda este apelată înainte de deschiderea oricărui review. Astfel, un
-        PNG manual existent devine imediat o țintă explicită de antrenare, fără
-        ca utilizatorul să fie obligat să apese din nou ``Save`` în editor.
-
-        Etichetele explicite existente au prioritate: ``NO_HEART_VISIBLE``,
-        ``UNUSABLE`` și ``HEART_PRESENT`` nu sunt suprascrise. Măștile goale,
-        ilizibile sau aproape complet pline nu sunt promovate automat, pentru a
-        nu transforma o salvare greșită într-o țintă pozitivă.
-        """
 
         by_token = {
             str(row.get("image_token", "")).strip(): dict(row)
@@ -1911,8 +1940,7 @@ class MaskManager:
             summary["registered_heart_present"] += 1
             reason_counts["registered_heart_present"] += 1
 
-        # O singură scriere atomică, indiferent de numărul măștilor. Aceasta este
-        # mult mai rapidă decât apelarea set_annotation pentru fiecare PNG.
+
         if summary["registered_heart_present"] > 0 or not workspace.manual_annotations.is_file():
             FileManager.write_csv(
                 workspace.manual_annotations,
@@ -1926,11 +1954,11 @@ class MaskManager:
             summary,
         )
         print(
-            "[REVIEW][MĂȘTI EXISTENTE] "
-            f"HEART_PRESENT înregistrate={summary['registered_heart_present']}, "
-            f"deja etichetate={summary['already_explicitly_labeled']}, "
-            f"goale/invalide={summary['skipped_empty_or_invalid']}, "
-            f"token absent={summary['skipped_token_absent_from_dataset']}"
+            "[REVIEW][EXISTING MASKS] "
+            f"registered HEART_PRESENT={summary['registered_heart_present']}, "
+            f"already labeled={summary['already_explicitly_labeled']}, "
+            f"empty/invalid={summary['skipped_empty_or_invalid']}, "
+            f"token missing={summary['skipped_token_absent_from_dataset']}"
         )
         return summary
 
@@ -1941,7 +1969,7 @@ class MaskManager:
         workspace: Workspace,
         minimum_masks: int | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        """Construiește cohorta cu ținte pozitive și negative explicite."""
+
 
         minimum_masks = int(minimum_masks or Settings.Segmentation.MIN_MANUAL_MASKS)
         by_token = {str(row["image_token"]): dict(row) for row in rows}
@@ -2107,7 +2135,7 @@ class MaskManager:
             "annotations": str(workspace.manual_annotations),
         }
         print(
-            "[MĂȘTI MANUALE] "
+            "[MANUAL MASKS] "
             f"heart_present={positive_count}, no_heart={negative_count}, "
             f"rejected={rejected}, unusable={unusable_count}, "
             f"patients={len(patient_counts)}"
@@ -2115,7 +2143,7 @@ class MaskManager:
 
         if positive_count < minimum_masks:
             raise RuntimeError(
-                f"Au rămas {positive_count} măști HEART_PRESENT valide, sub minimul "
+                f"Only {positive_count} valid HEART_PRESENT masks remain, below the minimum of "
                 f"{minimum_masks}. Vezi {workspace.manual_audit}"
             )
         missing_folds = [
@@ -2125,18 +2153,18 @@ class MaskManager:
         ]
         if missing_folds:
             raise RuntimeError(
-                f"Nu există măști HEART_PRESENT valide în foldurile {missing_folds}."
+                f"No valid HEART_PRESENT masks exist in folds {missing_folds}."
             )
         if len(positive_patient_counts) < Settings.Segmentation.FOLDS + 1:
-            raise RuntimeError("Prea puțini pacienți au măști pozitive pentru cross-fitting.")
+            raise RuntimeError("Too few patients have positive masks for cross-fitting.")
         return accepted, summary
 
 
-# =============================================================================
-# DEFINIȚII 6 — ARHITECTURA ATTENTION U-NET
-# =============================================================================
+# -----------------------------------------------------------------------------
+# 2.5D Attention U-Net and leakage-safe out-of-fold inference
+# -----------------------------------------------------------------------------
 class AttentionConvBlock(nn.Module):
-    """Două convoluții. GroupNorm funcționează stabil și la batch-uri mici pe CPU."""
+
 
     def __init__(self, in_channels: int, out_channels: int):
         super().__init__()
@@ -2155,7 +2183,7 @@ class AttentionConvBlock(nn.Module):
 
 
 class AttentionGate(nn.Module):
-    """Învață cât din conexiunea U-Net de tip skip trebuie păstrat."""
+
 
     def __init__(self, gating_channels: int, skip_channels: int, inter_channels: int):
         super().__init__()
@@ -2193,7 +2221,12 @@ class AttentionUpBlock(nn.Module):
 
 
 class AttentionUNet(nn.Module):
-    """Attention U-Net 2.5D cu segmentare și clasificare ``heart_present``."""
+    """2.5D Attention U-Net with segmentation and heart-presence heads.
+
+    Neighboring frames provide local sequence context, while the auxiliary head
+    suppresses false positive masks on localizers or frames without visible heart.
+    """
+
 
     def __init__(
         self,
@@ -2239,7 +2272,7 @@ class AttentionUNet(nn.Module):
 
 
 class SegmentationDataset(Dataset):
-    """Ținte pozitive/negative și context 2.5D cu augmentări aliniate."""
+
 
     def __init__(self, rows: Sequence[dict[str, Any]], augment: bool, seed: int):
         self.rows = list(rows)
@@ -2366,11 +2399,13 @@ class SegmentationInferenceDataset(Dataset):
         return torch.from_numpy(np.ascontiguousarray(image)).float(), int(index)
 
 
-# =============================================================================
-# DEFINIȚII 7 — ANTRENAREA ȘI PREDICȚIA ATTENTION
-# =============================================================================
 class SegmentationManager:
-    """Antrenează cross-fitted Attention U-Net și auditează incertitudinea OOF."""
+    """Train, calibrate, and run patient-level out-of-fold segmentation.
+
+    Each patient's predicted mask comes from a model that excluded that patient
+    from training and threshold calibration. This is the central leakage barrier.
+    """
+
 
     PREDICTION_FIELDS = (
         "image_token",
@@ -2427,7 +2462,7 @@ class SegmentationManager:
         presence_targets: torch.Tensor,
         sample_weights: torch.Tensor,
     ) -> torch.Tensor:
-        """Focal + Tversky, cu penalizare explicită pentru false-positive-uri."""
+
 
         probability = torch.sigmoid(logits)
         bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
@@ -2523,7 +2558,7 @@ class SegmentationManager:
         validation_patients: set[str],
         target_fold: int,
     ) -> set[str]:
-        """Păstrează pozitive/negative în train și validation când este posibil."""
+
 
         patients = sorted({str(row["patient_id"]) for row in rows})
         has_label: dict[int, set[str]] = {0: set(), 1: set()}
@@ -2564,7 +2599,7 @@ class SegmentationManager:
                     validation.remove(ordered(set(removable), f"remove-{label}")[0])
                 validation.add(incoming)
             if not (labelled - validation):
-                # Toți pacienții cu acest label au ajuns în validation; mută unul în train.
+
                 outgoing = ordered(validation & labelled, f"outgoing-{label}")[-1]
                 validation.remove(outgoing)
                 replacement_candidates = set(patients) - validation - {outgoing}
@@ -2581,7 +2616,7 @@ class SegmentationManager:
         rows: Sequence[dict[str, Any]],
         seed: int,
     ) -> WeightedRandomSampler:
-        """Uniformizează pacientul, seria, clusterul pHash și tipul de țintă."""
+
 
         rows = list(rows)
         series_by_patient: dict[str, set[str]] = defaultdict(set)
@@ -2786,7 +2821,7 @@ class SegmentationManager:
                     )
                     invalid += int(not valid)
                 else:
-                    # Pentru un negativ corect, masca trebuie să rămână goală.
+
                     quality = 1.0 - min(1.0, float(prediction.mean()) / 0.10)
                 by_patient[patient_id].append(float(quality))
             patient_scores = [
@@ -2818,6 +2853,9 @@ class SegmentationManager:
         )
         return result
 
+    # For target fold k, every patient assigned to k is excluded from both model
+    # fitting and threshold calibration. The saved checkpoint therefore produces
+    # genuinely out-of-fold masks for those patients.
     @staticmethod
     def train_crossfit(
         accepted_rows: Sequence[dict[str, Any]],
@@ -2825,7 +2863,7 @@ class SegmentationManager:
         device: torch.device,
         force: bool = False,
     ) -> dict[int, Path]:
-        """Pentru foldul k, pacienții din foldul k nu apar în train sau calibrare."""
+
 
         RuntimeManager.seed_everything(include_cuda=device.type == "cuda")
         checkpoint_map: dict[int, Path] = {}
@@ -2864,7 +2902,7 @@ class SegmentationManager:
                 checkpoint = SegmentationManager._torch_load(checkpoint_path)
                 if checkpoint.get("fingerprint") == fingerprint:
                     print(
-                        f"[ATTENTION] Fold {fold}: checkpoint 2.5D compatibil reutilizat."
+                        f"[ATTENTION] Fold {fold}: checkpoint 2.5D compatibil reused."
                     )
                     checkpoint_map[fold] = checkpoint_path
                     fold_summaries.append(
@@ -2879,7 +2917,7 @@ class SegmentationManager:
                     continue
 
             if not train_rows or not validation_rows:
-                raise RuntimeError(f"Fold {fold}: train/validation este gol.")
+                raise RuntimeError(f"Fold {fold}: train or validation split is empty.")
 
             train_positive = sum(
                 _as_int(row.get("heart_present"), 1) == 1 for row in train_rows
@@ -3076,11 +3114,11 @@ class SegmentationManager:
                 else:
                     patience += 1
                     if patience >= Settings.Segmentation.EARLY_STOPPING_PATIENCE:
-                        print(f"  early stopping după epoch {epoch}.")
+                        print(f"  early stopping after epoch {epoch}.")
                         break
 
             if best_state is None:
-                raise RuntimeError(f"Fold {fold}: nu s-a salvat niciun model.")
+                raise RuntimeError(f"Fold {fold}: no model checkpoint was selected.")
             model.load_state_dict(best_state)
             geometry_prior = SegmentationManager._geometry_prior(train_rows)
             calibration = SegmentationManager._calibrate_threshold(
@@ -3166,7 +3204,7 @@ class SegmentationManager:
             path = SegmentationManager._checkpoint_path(workspace, fold)
             if not path.is_file():
                 raise FileNotFoundError(
-                    f"Lipsește checkpointul foldului {fold}: {path}. Rulează train_attention()."
+                    f"Missing checkpoint for fold {fold}: {path}. Run train_attention()."
                 )
             result[fold] = path
         return result
@@ -3264,7 +3302,7 @@ class SegmentationManager:
         threshold: float,
         geometry_prior: dict[str, Any] | None = None,
     ) -> tuple[np.ndarray, bool, str, float, str, float]:
-        """Alege pragul după probabilitate, margine și prior OOF, fără arie fixă 0.15."""
+
 
         candidates = []
         thresholds = [threshold] + [
@@ -3480,7 +3518,7 @@ class SegmentationManager:
         prediction_rows: Sequence[dict[str, Any]],
         dataset_rows: Sequence[dict[str, Any]],
     ) -> None:
-        """Adaugă inconsistența față de cadrele vecine din aceeași secvență-leaf."""
+
 
         base_by_token = {
             str(row["image_token"]): row for row in dataset_rows
@@ -3553,7 +3591,7 @@ class SegmentationManager:
         workspace: Workspace,
         prediction_rows: Sequence[dict[str, Any]],
     ) -> dict[str, Any]:
-        """Compară predicțiile OOF cu toate țintele manuale acceptate."""
+
 
         predictions = {
             str(row.get("image_token", "")): row for row in prediction_rows
@@ -3709,6 +3747,9 @@ class SegmentationManager:
             )
         return summary
 
+    # Inference is resumable per fold. A fold result is reused only when its
+    # checkpoint and all image/context fingerprints match; otherwise that fold alone
+    # is recomputed. This makes post-review retraining incremental rather than global.
     @staticmethod
     def predict_all(
         rows: Sequence[dict[str, Any]],
@@ -3717,7 +3758,7 @@ class SegmentationManager:
         checkpoint_map: dict[int, Path] | None = None,
         force: bool = False,
     ) -> list[dict[str, Any]]:
-        """Generează măști OOF, presence score și incertitudine pentru fiecare imagine."""
+
 
         checkpoint_map = checkpoint_map or SegmentationManager.load_checkpoint_map(
             workspace
@@ -3731,8 +3772,8 @@ class SegmentationManager:
             )
             if cached is not None:
                 print(
-                    "[ATTENTION] Predicțiile 2.5D compatibile sunt deja în cache; "
-                    "GPU-ul nu este folosit."
+                    "[ATTENTION] Compatible 2.5D predictions are already cached; "
+                    "the GPU is not used."
                 )
                 SegmentationManager.evaluate_oof_segmentation(workspace, cached)
                 return cached
@@ -3798,7 +3839,7 @@ class SegmentationManager:
                     ]
                 reused_folds.append(fold)
                 print(
-                    f"[ATTENTION] Fold {fold}: rezultat per-fold 2.5D reutilizat."
+                    f"[ATTENTION] Fold {fold}: rezultat per-fold 2.5D reused."
                 )
                 continue
 
@@ -3839,8 +3880,8 @@ class SegmentationManager:
                 pin_memory=device.type == "cuda",
             )
             print(
-                f"[ATTENTION] Predicție 2.5D fold {fold}: {len(fold_rows)} "
-                f"imagini, device={device.type}"
+                f"[ATTENTION] 2.5D prediction for fold {fold}: {len(fold_rows)} "
+                f"images, device={device.type}"
             )
             fold_results: list[dict[str, Any]] = []
 
@@ -4008,7 +4049,7 @@ class SegmentationManager:
         final_results = [result for result in results if result is not None]
         if len(final_results) != len(rows):
             raise RuntimeError(
-                "Predicția nu a produs câte un rând pentru fiecare imagine."
+                "Prediction did not produce exactly one row per image."
             )
         SegmentationManager._apply_sequence_consistency(final_results, rows)
         FileManager.write_csv(
@@ -4075,11 +4116,12 @@ class SegmentationManager:
         ImageCache.clear()
         return final_results
 
-# =============================================================================
-# DEFINIȚII 8 — ALEGEREA IMAGINILOR PENTRU REVIEW
-# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Manual review and annotation editor
+# -----------------------------------------------------------------------------
 class HammingBKTree:
-    """Structură mică pentru a găsi rapid imagini cu pHash foarte apropiat."""
+
 
     def __init__(self):
         self.root: tuple[int, dict[int, Any]] | None = None
@@ -4118,13 +4160,12 @@ class HammingBKTree:
 
 
 class ReviewManager:
-    """Construiește cozi echilibrate care pornesc numai cu target=UNLABELED.
+    """Build balanced review queues containing only unresolved labels.
 
-    Orice target explicit (HEART_PRESENT, NO_HEART_VISIBLE sau UNUSABLE) este
-    exclus înainte de aplicarea scope-ului. În editor, o imagine etichetată în
-    sesiunea curentă rămâne în coada din memorie pentru navigare cu Prev/Next,
-    dar nu reapare la o rulare ulterioară a ``CPU_FINAL_ACTION = "review"``.
+    Selection is distributed across patients and series and can prioritize invalid,
+    uncertain, empty, novel, manual, or all currently UNLABELED images.
     """
+
 
     HISTORY_FIELDS = (
         "timestamp_utc",
@@ -4179,7 +4220,7 @@ class ReviewManager:
 
     @staticmethod
     def _normalize_target_type(value: Any) -> str:
-        """Normalizează targetul; valorile goale/legacy devin UNLABELED intern."""
+
 
         target = str(value or "").strip().upper()
         if target in {"", "UNLABELED", "NONE", "NAN"}:
@@ -4272,6 +4313,9 @@ class ReviewManager:
             position += 1
         return selected
 
+    # The UNLABELED filter is always applied before the review scope. This prevents
+    # a prior HEART_PRESENT, NO_HEART_VISIBLE, or UNUSABLE decision from silently
+    # reappearing in a later annotation round.
     @staticmethod
     def select(
         dataset_rows: Sequence[dict[str, Any]],
@@ -4281,22 +4325,13 @@ class ReviewManager:
         seed: int = 42,
         review_round: int = 1,
     ) -> list[dict[str, Any]]:
-        """Selectează numai imagini UNLABELED, echilibrat pe pacient/serie.
 
-        Filtrul ``target=UNLABELED`` se aplică înaintea oricărui scope:
-        - ``invalid``: predicții nereparate care încă nu au target;
-        - ``uncertain``: predicții instabile care încă nu au target;
-        - ``empty``: măști goale vechi încă neclasificate;
-        - ``novel``: imagini clare și diferite de imaginile deja etichetate;
-        - ``manual``: PNG-uri manuale existente, dar încă fără target explicit;
-        - ``all``: toate imaginile UNLABELED cu predicție Attention.
-        """
 
         scope = str(scope).lower()
         allowed = {"invalid", "uncertain", "empty", "novel", "manual", "all"}
         if scope not in allowed:
             raise ValueError(
-                "scope trebuie să fie invalid/uncertain/empty/novel/manual/all."
+                "scope must be invalid/uncertain/empty/novel/manual/all."
             )
         limit = int(Settings.Review.DEFAULT_LIMIT if limit is None else limit)
         all_rows = ReviewManager._merge_rows(dataset_rows, workspace)
@@ -4308,8 +4343,8 @@ class ReviewManager:
         labeled_excluded = len(all_rows) - len(rows)
         print(
             "[REVIEW][TARGET FILTER] "
-            f"UNLABELED={len(rows)}, deja etichetate excluse={labeled_excluded}, "
-            f"distribuție={dict(sorted(target_counts.items()))}"
+            f"UNLABELED={len(rows)}, already-labeled excluded={labeled_excluded}, "
+            f"distribution={dict(sorted(target_counts.items()))}"
         )
         reviewed = ReviewManager._reviewed_tokens(workspace, review_round)
 
@@ -4366,7 +4401,7 @@ class ReviewManager:
                     and _as_int(row.get("attention_valid_final"), 1) == 1
                 ):
                     continue
-                # Valoare negativă: sortarea crescătoare pune incertitudinea mare prima.
+
                 row["review_priority"] = -uncertainty
                 candidates.append(row)
             candidates = ReviewManager._round_robin(
@@ -4407,8 +4442,8 @@ class ReviewManager:
                 seed=seed,
             )
         elif scope == "manual":
-            # Compatibilitate: arată doar PNG-uri manuale care au rămas UNLABELED
-            # (de regulă măști goale/legacy), niciodată targeturi deja decise.
+
+
             candidates = [
                 row
                 for row in rows
@@ -4438,8 +4473,8 @@ class ReviewManager:
                 )
             )
         else:
-            # Orice adnotare explicită, inclusiv UNUSABLE, devine referință de
-            # noutate și blochează cadre aproape identice.
+
+
             manual_hashes = []
             for row in all_rows:
                 is_annotated = bool(row.get("manual_annotation_type")) or Path(
@@ -4449,7 +4484,7 @@ class ReviewManager:
                     manual_hashes.append(int(str(row["perceptual_hash"]), 16))
             if not manual_hashes:
                 raise RuntimeError(
-                    "Scope-ul novel necesită cel puțin o imagine etichetată."
+                    "The novel scope requires at least one labeled image."
                 )
             tree = HammingBKTree()
             for value in sorted(set(manual_hashes)):
@@ -4491,15 +4526,15 @@ class ReviewManager:
                 per_patient=Settings.Review.NEW_IMAGES_PER_PATIENT,
                 seed=seed,
             )
-            print(f"[REVIEW novel] excluse={dict(excluded)}")
+            print(f"[REVIEW novel] excluded={dict(excluded)}")
 
         if limit > 0 and scope in {"manual", "all"}:
             candidates = candidates[:limit]
         if not candidates:
             raise RuntimeError(
-                "Nu există imagini cu target=UNLABELED eligibile pentru "
-                f"scope={scope!r}. Imaginile HEART_PRESENT, "
-                "NO_HEART_VISIBLE și UNUSABLE sunt excluse automat."
+                "No target=UNLABELED images are eligible for "
+                f"scope={scope!r}. HEART_PRESENT, "
+                "NO_HEART_VISIBLE, and UNUSABLE images are excluded automatically."
             )
         queue_path = (
             workspace.outputs / f"review_queue_{scope}_round_{review_round}.csv"
@@ -4507,7 +4542,7 @@ class ReviewManager:
         fields = sorted({key for row in candidates for key in row.keys()})
         FileManager.write_csv(queue_path, candidates, fields)
         print(
-            f"[REVIEW] scope={scope}, imagini={len(candidates)}, coadă={queue_path}"
+            f"[REVIEW] scope={scope}, images={len(candidates)}, queue={queue_path}"
         )
         return candidates
 
@@ -4543,16 +4578,14 @@ class ReviewManager:
         )
 
 
-# =============================================================================
-# DEFINIȚII 9 — EDITORUL MANUAL
-# =============================================================================
 class MaskEditor:
-    """Editor HTML5 compatibil Kaggle/JupyterLab, fără jupyter-matplotlib.
+    """Kaggle-safe HTML5 editor for correcting segmentation targets.
 
-    Portocaliu = predicția automată. Magenta = masca editabilă. Click stânga
-    desenează, click dreapta șterge. `Save & Next` scrie masca manuală atomic.
-    Shortcut-urile sunt instalate o singură dată, nu la fiecare imagine.
+    Keyboard listeners are installed once and isolated from notebook command mode.
+    Labeled images remain navigable during the current session but are excluded
+    when a later review queue is constructed.
     """
+
 
     def __init__(
         self,
@@ -4580,8 +4613,8 @@ class MaskEditor:
             unlabeled_rows.append(row)
         if not unlabeled_rows:
             raise ValueError(
-                "Editorul nu mai are imagini cu target=UNLABELED. "
-                "Targeturile deja decise nu sunt redeschise."
+                "The editor has no remaining target=UNLABELED images. "
+                "Previously decided targets are not reopened."
             )
 
         self.rows = unlabeled_rows
@@ -4625,9 +4658,7 @@ class MaskEditor:
                 style={"font_weight": "500"},
             )
 
-        # Etichetele includ shortcut-ul. În plus, ele sunt intenționat diferite
-        # de vechile "Next"/"Previous", astfel încât listener-ele anonime rămase
-        # dintr-o versiune veche a notebook-ului nu mai pot apăsa aceste butoane.
+
         self.previous_button = compact_button("← Prev [P]", "68px", "Previous — P")
         self.next_button = compact_button("Next [N] →", "72px", "Next — N")
         self.save_next_button = compact_button(
@@ -4736,13 +4767,7 @@ class MaskEditor:
             control.disabled = bool(disabled)
 
     def _advance_after_target(self, message: str) -> None:
-        """Avansează fără a elimina imaginea etichetată din coada sesiunii.
 
-        Coada este filtrată la UNLABELED numai când editorul este deschis. După
-        etichetare, rândul rămâne în ``self.rows`` pentru ca utilizatorul să poată
-        reveni cu Previous și să corecteze targetul sau masca în aceeași sesiune.
-        La următoarea deschidere a review-ului, targetul salvat îl va exclude.
-        """
 
         if not self.rows:
             return
@@ -4752,17 +4777,16 @@ class MaskEditor:
             self.index = completed_index + 1
             self.load_current()
             self.update_status(
-                f"{message} Imaginea {completed_token} rămâne în coada sesiunii; "
-                "folosește Prev [P] pentru a reveni."
+                f"{message} Image {completed_token} remains in the session queue; "
+                "use Prev [P] to return to it."
             )
             return
 
-        # La ultima imagine rămânem pe ea: astfel Previous continuă să permită
-        # revizuirea întregii cozi, iar targetul salvat este vizibil în antet.
+
         self.render()
         self.update_status(
-            f"{message} Sfârșitul cozii; imaginea rămâne accesibilă, iar "
-            "Prev [P] permite revenirea la imaginile anterioare."
+            f"{message} End of queue; the image remains accessible, and "
+            "Prev [P] returns to earlier images."
         )
 
     def _brush_changed(self, change: dict[str, Any]) -> None:
@@ -4775,7 +4799,7 @@ class MaskEditor:
         array = np.clip(np.round(rgb * 255.0), 0, 255).astype(np.uint8)
         ok, encoded = cv2.imencode(".png", cv2.cvtColor(array, cv2.COLOR_RGB2BGR))
         if not ok:
-            raise RuntimeError("Imaginea editorului nu poate fi encodată.")
+            raise RuntimeError("The editor image could not be encoded.")
         return "data:image/png;base64," + base64.b64encode(encoded.tobytes()).decode("ascii")
 
     @staticmethod
@@ -4787,14 +4811,14 @@ class MaskEditor:
         bgra[..., 3] = foreground
         ok, encoded = cv2.imencode(".png", bgra)
         if not ok:
-            raise RuntimeError("Masca editorului nu poate fi encodată.")
+            raise RuntimeError("The editor mask could not be encoded.")
         return "data:image/png;base64," + base64.b64encode(encoded.tobytes()).decode("ascii")
 
     def load_current(self) -> None:
         row = self.rows[self.index]
         auto_path = Path(row["predicted_attention_mask_path"])
         if not auto_path.is_file():
-            raise FileNotFoundError(f"Lipsește masca Attention: {auto_path}")
+            raise FileNotFoundError(f"Missing Attention mask: {auto_path}")
         image = ImageProcessor.standardized_uint8(row["image_path"])
         auto_mask = MaskManager.read_binary(auto_path)
         manual_path = Path(row["manual_mask_path"])
@@ -4896,8 +4920,8 @@ class MaskEditor:
             return false;
           }}
           function suppressContextMenu(event) {{
-            // Listener-ul de pe window/capture rulează înaintea meniului Kaggle.
-            // În afara canvasului nu este modificat comportamentul paginii.
+            // The window/capture listener runs before Kaggle's context menu.
+            // Page behavior outside the canvas is unchanged.
             if (!rightDragActive && !eventTargetsCanvas(event)) return;
             return blockEvent(event);
           }}
@@ -4994,8 +5018,8 @@ class MaskEditor:
           }}
 
           const activeOptions = {{capture: true, passive: false}};
-          // Protecție locală + protecție timpurie pe window. Aceasta blochează
-          // atât meniul nativ, cât și meniul contextual adăugat de Kaggle/Jupyter.
+          // Local protection plus an early window listener blocks both the native
+          // context menu and the menu installed by Kaggle/Jupyter.
           canvas.oncontextmenu = suppressContextMenu;
           canvas.addEventListener('contextmenu', suppressContextMenu, activeOptions);
           window.addEventListener('contextmenu', suppressContextMenu, activeOptions);
@@ -5005,8 +5029,8 @@ class MaskEditor:
           canvas.addEventListener('dragstart', blockEvent, activeOptions);
           canvas.addEventListener('selectstart', blockEvent, activeOptions);
 
-          // Pointer Events și Mouse Events nu sunt instalate simultan, evitând
-          // executarea dublă a aceleiași apăsări în Chrome/Kaggle.
+          // Pointer Events and Mouse Events are never installed together, avoiding
+          // duplicate handling of a single press in Chrome/Kaggle.
           if (window.PointerEvent) {{
             canvas.addEventListener('pointerdown', begin, activeOptions);
             canvas.addEventListener('pointermove', move, activeOptions);
@@ -5035,9 +5059,9 @@ class MaskEditor:
           function load(target, source) {{
             return new Promise((resolve, reject) => {{ target.onload = resolve; target.onerror = reject; target.src = source; }});
           }}
-          // Focalizarea unui input invizibil pune notebook-ul în context de
-          // tastare înainte de prima scurtătură și împiedică modul command Kaggle
-          // să interpreteze O/P/N/etc. ca operații asupra celulelor.
+          // Focusing an invisible input places the notebook in typing mode before the
+          // first shortcut and prevents Kaggle command mode from interpreting
+          // O/P/N/etc. as notebook-cell operations.
           focusKeyboardSink();
           requestAnimationFrame(focusKeyboardSink);
           Promise.all([
@@ -5059,14 +5083,7 @@ class MaskEditor:
             display(Javascript(js))
 
     def _shortcut_script(self) -> str:
-        """Instalează un singur handler de tastatură pentru editorul activ.
 
-        Handlerul este separat de ``render()``. Navigarea poate reda canvasul de
-        sute de ori fără să adauge listeners noi. Un input invizibil este ținut
-        focalizat, astfel încât Kaggle/Jupyter nu mai tratează tastele editorului
-        ca shortcut-uri de notebook. Evenimentele sunt interceptate pe ``window``
-        în faza capture și sunt oprite înainte să ajungă la managerul de celule.
-        """
 
         placeholder = f"CAD_SHORTCUT_SYNC_{self.widget_id}"
         keyboard_sink_id = f"cad_keyboard_sink_{self.widget_id}"
@@ -5126,8 +5143,8 @@ class MaskEditor:
             const key = String(event.key || '').toLowerCase();
             const fallback = {{
               p: 'KeyP', n: 'KeyN', s: 'KeyS', i: 'KeyI', o: 'KeyO',
-              // R nu mai execută resetarea; este reținut numai pentru a bloca
-              // vechiul shortcut Kaggle dacă este apăsat din obișnuință.
+              // R no longer resets the mask; it is retained only to block the legacy
+              // Kaggle shortcut when pressed out of habit.
               r: 'KeyR',
               a: 'KeyA', h: 'KeyH', u: 'KeyU', k: 'KeyK', c: 'KeyC', d: 'KeyD',
               '[': 'BracketLeft', ']': 'BracketRight'
@@ -5174,9 +5191,9 @@ class MaskEditor:
             const info = shortcutInfo(event);
             if (!info) return;
 
-            // Oprirea are loc înainte de orice mesaj trimis către Python. Astfel,
-            // inclusiv tasta O (shortcut Kaggle pentru output) rămâne exclusiv a
-            // editorului, iar vechiul R nu mai poate modifica sau crea celule.
+            // The event is stopped before any message reaches Python. Therefore O
+            // (Kaggle's output shortcut) remains exclusive to the editor, and
+            // legacy R cannot modify or create notebook cells.
             blockEvent(event);
             focusKeyboardSink();
             if (info.legacyBlocked) {{
@@ -5214,9 +5231,9 @@ class MaskEditor:
 
           function releaseAll() {{ held.clear(); }}
 
-          // Window/capture este mai timpuriu decât document/capture. Împreună cu
-          // focusul pe input, acesta izolează shortcut-urile de modul command al
-          // notebook-ului și evită apariția/modificarea accidentală a celulelor.
+          // Window/capture fires before document/capture. Together with the focused
+          // input, it isolates editor shortcuts from notebook command mode and
+          // prevents accidental cell creation or modification.
           window.addEventListener('keydown', onKeyDown, keyOptions);
           window.addEventListener('keypress', onKeyPress, keyOptions);
           window.addEventListener('keyup', onKeyUp, keyOptions);
@@ -5246,7 +5263,7 @@ class MaskEditor:
         """
 
     def _shortcut_sync_changed(self, change: dict[str, Any]) -> None:
-        """Execută cel mult o acțiune Python pentru fiecare comandă JS."""
+
 
         payload = str(change.get("new", "") or "").strip()
         if not self.rows:
@@ -5256,7 +5273,7 @@ class MaskEditor:
         self._last_shortcut_payload = payload
         action = payload.split("|", 1)[0].strip().lower()
 
-        # A doua protecție, în Python, pentru mesaje duplicate livrate de frontend.
+
         now = time.monotonic()
         if self._shortcut_busy or now - self._last_shortcut_at < 0.12:
             return
@@ -5326,7 +5343,7 @@ class MaskEditor:
                 interpolation=cv2.INTER_NEAREST,
             ).astype(np.uint8)
         except Exception as error:
-            print("[EDITOR WARNING] Sincronizarea măștii a eșuat:", error)
+            print("[EDITOR WARNING] Mask synchronization failed:", error)
 
     def _sync_python_mask(self) -> None:
         value = self._mask_uri(self.mask).split(",", 1)[1]
@@ -5336,8 +5353,8 @@ class MaskEditor:
     def update_status(self, prefix: str = "") -> None:
         if not self.rows:
             self.status.value = (
-                "<span style='margin-left:12px'><b>Review complet.</b> "
-                "Nu mai există imagini cu target=UNLABELED.</span>"
+                "<span style='margin-left:12px'><b>Review complete.</b> "
+                "No target=UNLABELED images remain.</span>"
             )
             return
         row = self.rows[self.index]
@@ -5406,8 +5423,8 @@ class MaskEditor:
     def save(self) -> None:
         if float((self.mask > 0).mean()) < Settings.Segmentation.MANUAL_MIN_AREA_RATIO:
             raise ValueError(
-                "Masca este goală. Folosește No heart [H] pentru o imagine validă "
-                "fără inimă sau Unusable [U] pentru blur/zgomot."
+                "The mask is empty. Use No heart [H] for a valid image "
+                "without a visible heart, or Unusable [U] for blur/noise/localizer frames."
             )
         self._write_target(
             self.mask,
@@ -5426,7 +5443,7 @@ class MaskEditor:
     def accept_auto(self) -> None:
         if float((self.auto_mask > 0).mean()) < Settings.Segmentation.MANUAL_MIN_AREA_RATIO:
             raise ValueError(
-                "Masca automată este goală; folosește No heart [H], nu Auto OK."
+                "The automatic mask is empty; use No heart [H], not Auto OK."
             )
         self._write_target(
             self.auto_mask,
@@ -5548,11 +5565,11 @@ class MaskEditor:
         return self
 
 
-# =============================================================================
-# DEFINIȚII 10 — EXTRACTORUL FROZEN ȘI AGREGAREA PER PACIENT
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Frozen feature extraction, confounder matching, and patient aggregation
+# -----------------------------------------------------------------------------
 class FeatureDataset(Dataset):
-    """Pregătește o singură dată imaginile și măștile necesare tuturor modurilor."""
+
 
     def __init__(self, rows: Sequence[dict[str, Any]]):
         self.rows = list(rows)
@@ -5594,7 +5611,7 @@ class FeatureDataset(Dataset):
 
 
 class FrozenEfficientNet(nn.Module):
-    """EfficientNet-B0 fără capul de clasificare; greutățile rămân înghețate."""
+
 
     def __init__(self):
         super().__init__()
@@ -5607,9 +5624,9 @@ class FrozenEfficientNet(nn.Module):
             model = efficientnet_b0(weights=weights)
         except Exception as error:
             raise RuntimeError(
-                "Greutățile EfficientNet-B0 nu au putut fi încărcate. "
-                "Activează Internet în Kaggle sau pune greutățile în cache-ul Torch. "
-                f"Eroare originală: {type(error).__name__}: {error}"
+                "EfficientNet-B0 weights could not be loaded. "
+                "Enable Internet in Kaggle or place the weights in the Torch cache. "
+                f"Original error: {type(error).__name__}: {error}"
             ) from error
         model.classifier = nn.Identity()
         for parameter in model.parameters():
@@ -5628,7 +5645,7 @@ class FrozenEfficientNet(nn.Module):
 
 
 class StreamingPatientPool:
-    """Media pe imagini în fiecare serie, apoi media seriilor în fiecare pacient."""
+
 
     def __init__(self, modes: Sequence[str]):
         self.modes = tuple(modes)
@@ -5651,7 +5668,7 @@ class StreamingPatientPool:
                 entry = [np.zeros_like(embedding, dtype=np.float32), 0, int(row["label"])]
                 self.series_data[mode][key] = entry
             if int(entry[2]) != int(row["label"]):
-                raise RuntimeError(f"Etichete inconsistente pentru pacientul {row['patient_id']}.")
+                raise RuntimeError(f"Inconsistent labels for patient {row['patient_id']}.")
             entry[0] += embedding
             entry[1] += 1
             self.source_slices[mode] += 1
@@ -5665,9 +5682,9 @@ class StreamingPatientPool:
         patients = sorted(patient_series)
         if not patients:
             raise RuntimeError(
-                f"Modul {mode} nu conține niciun pacient. Pentru AU6--AU9, "
-                "verifică mesajul [FEATURE BANK][MANUAL] și schema auditului "
-                "manual; pipeline-ul v5 reconstruiește automat auditurile vechi."
+                f"Mode {mode} contains no patients. For M1/C3/AU3/C4, "
+                "inspect [FEATURE BANK][MANUAL] and the manual-audit schema; "
+                "legacy audits are rebuilt automatically."
             )
         X = np.stack(
             [np.mean(np.stack(patient_series[patient]), axis=0) for patient in patients]
@@ -5682,19 +5699,14 @@ class StreamingPatientPool:
         }
 
 
-# =============================================================================
-# DEFINIȚII 11 — MATCHING CROSS-CLASS SICK ↔ NORMAL
-# =============================================================================
 class CrossClassMatchingManager:
-    """Construiește o cohortă comparabilă Sick/Normal înainte de clasificare.
+    """Construct a Sick/Normal sensitivity cohort without using CAD predictions.
 
-    Matching-ul este o analiză de sensibilitate separată. Nu modifică setul de
-    antrenare Attention U-Net și nu înlocuiește experimentele pe toate imaginile.
-    Sunt eligibile numai imagini clare, cu mască Attention validă și inimă
-    prezisă ca vizibilă. Familiile de achiziție sunt învățate nesupravegheat,
-    apoi se păstrează perechi mutual-kNN între clase, cu caliper și limite per
-    pacient/serie. Clasificatorul CAD nu este folosit la selecție.
+    Matching relies on unsupervised acquisition families, pHash, mask geometry,
+    sequence position, and quality. It tests whether performance survives after
+    reducing acquisition differences between classes.
     """
+
 
     MANIFEST_FIELDS = (
         "image_token",
@@ -5804,7 +5816,7 @@ class CrossClassMatchingManager:
         phash = np.stack(
             [CrossClassMatchingManager._phash_bits(row["perceptual_hash"]) for row in rows]
         )
-        # {-1, +1}; distanța euclidiană păstrează informația Hamming.
+
         phash = phash * 2.0 - 1.0
         geometry = CrossClassMatchingManager._robust_standardize(
             np.asarray(
@@ -5876,8 +5888,7 @@ class CrossClassMatchingManager:
             row.update(predictions.get(token, {}))
             row.update(quality.get(token, {}))
 
-            # Workspace-urile vechi pot să nu conțină centroidul. În acest caz
-            # geometria este calculată direct din masca OOF, fără clasificator CAD.
+
             centroid_x = _as_float(row.get("attention_centroid_x"), np.nan)
             centroid_y = _as_float(row.get("attention_centroid_y"), np.nan)
             if not (np.isfinite(centroid_x) and np.isfinite(centroid_y)):
@@ -5965,13 +5976,13 @@ class CrossClassMatchingManager:
             )
         ):
             print(
-                "[MATCHING] Manifest Sick↔Normal compatibil reutilizat: "
-                f"{old_summary.get('matched_pairs', '?')} perechi."
+                "[MATCHING] Compatible Sick↔Normal manifest reused: "
+                f"{old_summary.get('matched_pairs', '?')} pairs."
             )
             return old_manifest
 
         if not Settings.Matching.ENABLED:
-            raise RuntimeError("Cross-class matching este dezactivat în Settings.Matching.")
+            raise RuntimeError("Cross-class matching is disabled in Settings.Matching.")
 
         merged = CrossClassMatchingManager._merge_rows(dataset_rows, workspace)
         manifest_by_token: dict[str, dict[str, Any]] = {}
@@ -6016,8 +6027,8 @@ class CrossClassMatchingManager:
         )
         if len(eligible_rows) < 4 or set(labels.tolist()) != {0, 1}:
             raise RuntimeError(
-                "Matching-ul necesită imagini eligibile din ambele clase; "
-                f"au rămas Normal={int(np.sum(labels == 0))}, Sick={int(np.sum(labels == 1))}."
+                "Matching requires eligible images from both classes; "
+                f"remaining Normal={int(np.sum(labels == 0))}, Sick={int(np.sum(labels == 1))}."
             )
 
         descriptor = CrossClassMatchingManager._descriptor(eligible_rows)
@@ -6056,9 +6067,9 @@ class CrossClassMatchingManager:
 
         if not shared_families:
             raise RuntimeError(
-                "Nicio familie de achiziție nu conține suficiente imagini și "
-                "pacienți din ambele clase. Redu pragurile din Settings.Matching "
-                "numai după auditarea cross_class_matching_summary.json."
+                "No acquisition family contains enough images and "
+                "patients from both classes. Relax Settings.Matching thresholds "
+                "only after auditing cross_class_matching_summary.json."
             )
 
         used_tokens: set[str] = set()
@@ -6282,10 +6293,10 @@ class CrossClassMatchingManager:
         normal_patients = sorted({str(row["patient_id"]) for row in selected_normal})
         sick_patients = sorted({str(row["patient_id"]) for row in selected_sick})
         if len(selected_normal) != len(selected_sick):
-            raise RuntimeError("Matching-ul intern a produs clase cu dimensiuni diferite.")
+            raise RuntimeError("Internal matching produced unequal class sizes.")
         if len(normal_patients) < 2 or len(sick_patients) < 2:
             raise RuntimeError(
-                "Cohorta matched are prea puțini pacienți pentru evaluare: "
+                "The matched cohort has too few patients for evaluation: "
                 f"Normal={len(normal_patients)}, Sick={len(sick_patients)}."
             )
 
@@ -6348,15 +6359,17 @@ class CrossClassMatchingManager:
         }
 
 
-# =============================================================================
-# DEFINIȚII 12 — CONSTRUIREA FEATURE BANK-ULUI
-# =============================================================================
 class FeatureManager:
-    """Extrage reprezentările complete, manuale și cross-class matched per pacient."""
+    """Create patient-level EfficientNet feature banks for all registered modes.
+
+    ROI and complement construction stays on CPU. Only final three-channel images
+    enter the frozen network, and historical .npz keys are retained for reuse.
+    """
+
 
     @staticmethod
     def _region_normalize(images: torch.Tensor, masks: torch.Tensor) -> torch.Tensor:
-        """Scalează percentil doar în interiorul măștii, apoi face zero în exterior."""
+
 
         if masks.ndim == 3:
             masks = masks.unsqueeze(1)
@@ -6413,13 +6426,7 @@ class FeatureManager:
         workspace: Workspace,
         verbose: bool = False,
     ) -> set[str]:
-        """Returnează numai țintele manuale pozitive utilizabile.
 
-        Compatibilitatea cu auditul vechi este intenționată: un rând
-        ``ACCEPTED`` fără ``target_type`` este considerat HEART_PRESENT numai
-        dacă PNG-ul lui este efectiv non-gol și trece ``manual_qc``. Astfel nu
-        confundăm măștile goale/NO_HEART_VISIBLE cu ROI-uri manuale.
-        """
 
         audit_rows = FileManager.read_csv(workspace.manual_audit)
         accepted: set[str] = set()
@@ -6453,7 +6460,7 @@ class FeatureManager:
                     skipped_unusable += 1
                 continue
 
-            # Schema veche: status=ACCEPTED, dar fără target_type/heart_present.
+
             if not target_type and not heart_present_raw:
                 qc = MaskManager.manual_qc(path)
                 if qc.get("usable"):
@@ -6482,7 +6489,7 @@ class FeatureManager:
         digest = hashlib.sha256()
         payload = {
             "schema": "simple-patient-feature-bank-cross-class-v4-manual-audit-compatible",
-            "modes": Settings.Classification.MODES,
+            "modes": Settings.Classification.LEGACY_STORAGE_MODES,
             "prediction_fingerprint": prediction_summary.get("fingerprint", ""),
             "support_dilation": Settings.Segmentation.SUPPORT_DILATION_KERNEL,
             "imagenet_weights": Settings.Classification.USE_IMAGENET_WEIGHTS,
@@ -6522,16 +6529,33 @@ class FeatureManager:
     @staticmethod
     def load(workspace: Workspace) -> dict[str, dict[str, Any]]:
         if not workspace.feature_bank.is_file():
-            raise FileNotFoundError(f"Lipsește feature bank-ul: {workspace.feature_bank}")
+            raise FileNotFoundError(f"Missing feature bank: {workspace.feature_bank}")
         archive = np.load(workspace.feature_bank, allow_pickle=False)
-        bank = {}
+        available = set(archive.files)
+        bank: dict[str, dict[str, Any]] = {}
         for mode in Settings.Classification.MODES:
+            legacy_mode = Settings.Classification.LEGACY_MODE_ALIASES[mode]
+            storage_mode = (
+                mode if f"{mode}__X" in available else legacy_mode
+            )
+            required = {
+                f"{storage_mode}__X",
+                f"{storage_mode}__y",
+                f"{storage_mode}__patient_ids",
+                f"{storage_mode}__source_slices",
+                f"{storage_mode}__series_proxies",
+            }
+            missing = sorted(required - available)
+            if missing:
+                raise KeyError(
+                    f"Feature bank is missing keys for {mode}: {missing}"
+                )
             bank[mode] = {
-                "X": archive[f"{mode}__X"],
-                "y": archive[f"{mode}__y"],
-                "patient_ids": archive[f"{mode}__patient_ids"].astype(str),
-                "source_slices": int(archive[f"{mode}__source_slices"][0]),
-                "series_proxies": int(archive[f"{mode}__series_proxies"][0]),
+                "X": archive[f"{storage_mode}__X"],
+                "y": archive[f"{storage_mode}__y"],
+                "patient_ids": archive[f"{storage_mode}__patient_ids"].astype(str),
+                "source_slices": int(archive[f"{storage_mode}__source_slices"][0]),
+                "series_proxies": int(archive[f"{storage_mode}__series_proxies"][0]),
             }
         return bank
 
@@ -6541,7 +6565,7 @@ class FeatureManager:
         workspace: Workspace,
         fingerprint: str | None = None,
     ) -> dict[str, dict[str, Any]] | None:
-        """Verifică feature bank-ul pe CPU, înainte de încărcarea EfficientNet."""
+
 
         fingerprint = fingerprint or FeatureManager._feature_fingerprint(
             dataset_rows, workspace
@@ -6556,11 +6580,14 @@ class FeatureManager:
             return FeatureManager.load(workspace)
         except Exception as error:
             print(
-                "[FEATURE BANK] Cache-ul nu poate fi citit și va fi refăcut:",
+                "[FEATURE BANK] Cache cannot be read and will be rebuilt:",
                 f"{type(error).__name__}: {error}",
             )
             return None
 
+    # Build every experiment from one frozen embedding pass. The automatic ROI and
+    # its complement share exactly the same eligible slices, while matched aliases
+    # reuse embeddings from the same Sick/Normal pairs. This makes comparisons fair.
     @staticmethod
     def build(
         dataset_rows: Sequence[dict[str, Any]],
@@ -6568,13 +6595,7 @@ class FeatureManager:
         device: torch.device,
         force: bool = False,
     ) -> dict[str, dict[str, Any]]:
-        """Construiește feature bank-ul fără a ține măștile pe GPU.
 
-        Toată pregătirea ROI/complement rămâne pe CPU. Numai imaginile finale
-        de 3 canale intră în EfficientNet, în micro-batch-uri scurte. Astfel,
-        GPU-ul este folosit doar pentru forward-ul rețelei și poate fi eliberat
-        imediat după această etapă.
-        """
 
         fingerprint = FeatureManager._feature_fingerprint(dataset_rows, workspace)
         if not force:
@@ -6583,8 +6604,8 @@ class FeatureManager:
             )
             if bank is not None:
                 print(
-                    "[FEATURE BANK] Cache compatibil reutilizat; "
-                    "extractorul nu este încărcat pe GPU."
+                    "[FEATURE BANK] Compatible cache reused; "
+                    "the extractor is not loaded on the GPU."
                 )
                 return bank
 
@@ -6601,10 +6622,10 @@ class FeatureManager:
         )
         if not accepted_manual:
             raise RuntimeError(
-                "Nu există nicio mască manuală HEART_PRESENT utilizabilă pentru "
-                "AU6--AU9. Auditul a fost verificat/migrat, dar nu a rezultat "
-                "niciun PNG non-gol acceptat. Verifică simple_manual_mask_audit.csv "
-                "și manual_masks/. Modurile FULL/Attention nu sunt cauza acestei erori."
+                "No usable manual HEART_PRESENT mask is available for "
+                "M1/C3/AU3/C4. The audit was checked or migrated, but no "
+                "accepted non-empty PNG remained. Inspect simple_manual_mask_audit.csv "
+                "and manual_masks/. Baseline and automatic-Attention modes are not the cause of this error."
             )
         matching_manifest = FileManager.read_csv(
             workspace.cross_class_matching_manifest
@@ -6614,11 +6635,11 @@ class FeatureManager:
         )
         if not matched_tokens:
             raise RuntimeError(
-                "Manifestul cross-class matching lipsește sau nu conține perechi. "
-                "Rulează pipeline.build_cross_class_matching()."
+                "The cross-class matching manifest is missing or contains no pairs. "
+                "Run pipeline.build_cross_class_matching()."
             )
         if len(predictions) != len(dataset_rows):
-            raise RuntimeError("Prediction audit nu acoperă întregul dataset.")
+            raise RuntimeError("The prediction audit does not cover the full dataset.")
 
         rows = []
         for original in dataset_rows:
@@ -6652,15 +6673,15 @@ class FeatureManager:
         started = time.perf_counter()
 
         matched_aliases = {
-            "FULL_IMAGE": "CROSS_CLASS_MATCHED_FULL_IMAGE",
-            "AU1_ATTENTION_ROI": "CROSS_CLASS_MATCHED_AU1_ATTENTION_ROI",
-            "AU5_ATTENTION_COMPLEMENT": "CROSS_CLASS_MATCHED_AU5_ATTENTION_COMPLEMENT",
+            "B0_FULL_IMAGE": "B1_MATCHED_FULL_IMAGE",
+            "AU1_ATTENTION_ROI": "AU2_MATCHED_ATTENTION_ROI",
+            "C1_ATTENTION_COMPLEMENT": "C2_MATCHED_ATTENTION_COMPLEMENT",
         }
 
         def encode_groups(
             groups: list[tuple[str, torch.Tensor, list[dict[str, Any]]]],
         ) -> None:
-            """Rulează extractorul o singură dată și reutilizează embeddingurile matched."""
+
 
             valid_groups = [
                 (mode, images, selected_rows)
@@ -6711,12 +6732,12 @@ class FeatureManager:
             for robust, raw, content, attention, manual, indices in tqdm(
                 loader, desc=f"EfficientNet feature bank ({device.type})"
             ):
-                # Aceste tensori rămân pe CPU. GPU-ul nu primește măștile și nu
-                # execută normalizarea percentilelor sau operațiile morfologice.
+
+
                 batch_rows = [rows[int(index)] for index in indices]
                 groups: list[
                     tuple[str, torch.Tensor, list[dict[str, Any]]]
-                ] = [("FULL_IMAGE", robust, batch_rows)]
+                ] = [("B0_FULL_IMAGE", robust, batch_rows)]
 
                 attention_positions = [
                     position
@@ -6746,7 +6767,7 @@ class FeatureManager:
                                 selected_rows,
                             ),
                             (
-                                "AU5_ATTENTION_COMPLEMENT",
+                                "C1_ATTENTION_COMPLEMENT",
                                 FeatureManager._region_normalize(
                                     selected_raw,
                                     (selected_content > 0.5).float()
@@ -6783,14 +6804,14 @@ class FeatureManager:
                     groups.extend(
                         [
                             (
-                                "AU6_MANUAL_ROI",
+                                "M1_MANUAL_ROI",
                                 FeatureManager._region_normalize(
                                     selected_raw, manual_support
                                 ),
                                 selected_rows,
                             ),
                             (
-                                "AU7_MANUAL_COMPLEMENT",
+                                "C3_MANUAL_COMPLEMENT",
                                 FeatureManager._region_normalize(
                                     selected_raw,
                                     visible_content * (1.0 - manual_support),
@@ -6798,14 +6819,14 @@ class FeatureManager:
                                 selected_rows,
                             ),
                             (
-                                "AU8_ATTENTION_MATCHED_MANUAL_ROI",
+                                "AU3_ATTENTION_ROI_MANUAL_SUBSET",
                                 FeatureManager._region_normalize(
                                     selected_raw, attention_support
                                 ),
                                 selected_rows,
                             ),
                             (
-                                "AU9_ATTENTION_MATCHED_MANUAL_COMPLEMENT",
+                                "C4_ATTENTION_COMPLEMENT_MANUAL_SUBSET",
                                 FeatureManager._region_normalize(
                                     selected_raw,
                                     visible_content * (1.0 - attention_support),
@@ -6822,19 +6843,22 @@ class FeatureManager:
             mode: pool.finalize(mode)
             for mode in Settings.Classification.MODES
         }
-        arrays = {}
-        metadata_modes = {}
+        arrays: dict[str, np.ndarray] = {}
+        metadata_modes: dict[str, dict[str, Any]] = {}
         for mode, values in bank.items():
-            arrays[f"{mode}__X"] = values["X"]
-            arrays[f"{mode}__y"] = values["y"]
-            arrays[f"{mode}__patient_ids"] = values["patient_ids"].astype("U")
-            arrays[f"{mode}__source_slices"] = np.asarray(
+            storage_mode = Settings.Classification.LEGACY_MODE_ALIASES[mode]
+            arrays[f"{storage_mode}__X"] = values["X"]
+            arrays[f"{storage_mode}__y"] = values["y"]
+            arrays[f"{storage_mode}__patient_ids"] = values["patient_ids"].astype("U")
+            arrays[f"{storage_mode}__source_slices"] = np.asarray(
                 [values["source_slices"]], dtype=np.int64
             )
-            arrays[f"{mode}__series_proxies"] = np.asarray(
+            arrays[f"{storage_mode}__series_proxies"] = np.asarray(
                 [values["series_proxies"]], dtype=np.int64
             )
             metadata_modes[mode] = {
+                "description": Settings.Classification.MODE_DESCRIPTIONS[mode],
+                "storage_key": storage_mode,
                 "patients": int(len(values["patient_ids"])),
                 "source_slices": int(values["source_slices"]),
                 "series_proxies": int(values["series_proxies"]),
@@ -6862,17 +6886,22 @@ class FeatureManager:
             ),
         }
         FileManager.write_json(workspace.feature_metadata, metadata)
-        print("[FEATURE BANK] Salvat:", workspace.feature_bank)
+        print("[FEATURE BANK] Saved:", workspace.feature_bank)
         del extractor, loader
         RuntimeManager.release(device)
         return bank
 
 
-# =============================================================================
-# DEFINIȚII 12 — EVALUAREA LA NIVEL DE PACIENT
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Nested patient-level evaluation and paired sensitivity comparisons
+# -----------------------------------------------------------------------------
 class EvaluationManager:
-    """Nested CV simplificat: toate transformările sunt învățate numai pe train."""
+    """Run nested patient-level cross-validation with train-only transforms.
+
+    Scaling, PCA, regularization selection, and decision-threshold selection are
+    fitted inside training data. Final scores are strictly out of fold.
+    """
+
 
     @staticmethod
     def _pipeline(c_value: float) -> SklearnPipeline:
@@ -6935,7 +6964,7 @@ class EvaluationManager:
         class_counts = np.bincount(labels, minlength=2)
         n_splits = min(Settings.Classification.OUTER_FOLDS, int(class_counts.min()))
         if n_splits < 2:
-            raise RuntimeError("Sunt necesari cel puțin doi pacienți în fiecare clasă.")
+            raise RuntimeError("At least two patients are required in each class.")
         splitter = StratifiedKFold(
             n_splits=n_splits,
             shuffle=True,
@@ -7016,9 +7045,11 @@ class EvaluationManager:
             "ci_high": float(np.quantile(differences, 0.975)) if differences else np.nan,
         }
 
+    # All hyperparameters and probability thresholds are selected inside the outer
+    # training fold. The held-out patients are used once, only for OOF scoring.
     @staticmethod
     def evaluate(bank: dict[str, dict[str, Any]], workspace: Workspace) -> pd.DataFrame:
-        fold_map = EvaluationManager._fold_map(bank["FULL_IMAGE"])
+        fold_map = EvaluationManager._fold_map(bank["B0_FULL_IMAGE"])
         summary_rows = []
         prediction_tables: dict[str, pd.DataFrame] = {}
 
@@ -7028,10 +7059,10 @@ class EvaluationManager:
             y = np.asarray(values["y"], dtype=np.int64)
             patients = np.asarray(values["patient_ids"]).astype(str)
             if len(np.unique(y)) < 2:
-                raise RuntimeError(f"{mode}: lipsește una dintre clase.")
+                raise RuntimeError(f"{mode}: one class is missing.")
             unknown = sorted(set(patients) - set(fold_map))
             if unknown:
-                raise RuntimeError(f"{mode}: pacienți necunoscuți în fold map: {unknown}")
+                raise RuntimeError(f"{mode}: patients missing from the fold map: {unknown}")
             patient_folds = np.asarray([fold_map[patient] for patient in patients], dtype=np.int64)
             scores = np.full(len(y), np.nan, dtype=np.float64)
             predictions = np.full(len(y), -1, dtype=np.int64)
@@ -7043,8 +7074,8 @@ class EvaluationManager:
                 valid_index = np.flatnonzero(patient_folds == fold)
                 if len(np.unique(y[train_index])) < 2:
                     raise RuntimeError(
-                        f"{mode}: foldul {fold} nu are ambele clase în train. "
-                        "Cohorta matched este prea rară; verifică matching summary."
+                        f"{mode}: fold {fold} does not contain both classes in training. "
+                        "The matched cohort is too sparse; inspect the matching summary."
                     )
                 best_c, threshold = EvaluationManager._select_c_and_threshold(
                     X[train_index], y[train_index], Settings.Runtime.RANDOM_SEED + int(fold)
@@ -7058,7 +7089,7 @@ class EvaluationManager:
                 thresholds[valid_index] = threshold
 
             if not np.all(np.isfinite(scores)) or np.any(predictions < 0):
-                raise RuntimeError(f"{mode}: predicții OOF incomplete.")
+                raise RuntimeError(f"{mode}: incomplete OOF predictions.")
             metrics = EvaluationManager._metrics(y, scores, predictions)
             table = pd.DataFrame(
                 {
@@ -7076,9 +7107,15 @@ class EvaluationManager:
             summary_rows.append(
                 {
                     "mode": mode,
+                    "experiment_group": (
+                        "primary"
+                        if mode in Settings.Classification.PRIMARY_MODES
+                        else "mask_validation"
+                    ),
+                    "description": Settings.Classification.MODE_DESCRIPTIONS[mode],
                     "cohort": (
                         "cross_class_matched"
-                        if mode.startswith("CROSS_CLASS_MATCHED_")
+                        if mode in Settings.Classification.MATCHED_MODES
                         else "all_or_manual_subset"
                     ),
                     "patients": len(patients),
@@ -7088,7 +7125,7 @@ class EvaluationManager:
                 }
             )
             print(
-                f"[EVALUARE] {mode}: AUC={metrics['auc']:.3f} "
+                f"[EVALUATION] {mode}: AUC={metrics['auc']:.3f} "
                 f"AP={metrics['average_precision']:.3f} Brier={metrics['brier']:.3f}"
             )
 
@@ -7097,29 +7134,29 @@ class EvaluationManager:
 
         comparisons = []
         for first_mode, second_mode, question in (
-            ("AU1_ATTENTION_ROI", "AU5_ATTENTION_COMPLEMENT", "heart_roi_vs_outside"),
+            ("AU1_ATTENTION_ROI", "C1_ATTENTION_COMPLEMENT", "heart_roi_vs_outside"),
             (
-                "CROSS_CLASS_MATCHED_AU1_ATTENTION_ROI",
-                "CROSS_CLASS_MATCHED_AU5_ATTENTION_COMPLEMENT",
+                "AU2_MATCHED_ATTENTION_ROI",
+                "C2_MATCHED_ATTENTION_COMPLEMENT",
                 "cross_class_matched_heart_roi_vs_outside",
             ),
             (
-                "FULL_IMAGE",
-                "CROSS_CLASS_MATCHED_FULL_IMAGE",
+                "B0_FULL_IMAGE",
+                "B1_MATCHED_FULL_IMAGE",
                 "all_images_vs_cross_class_matched_full",
             ),
             (
                 "AU1_ATTENTION_ROI",
-                "CROSS_CLASS_MATCHED_AU1_ATTENTION_ROI",
+                "AU2_MATCHED_ATTENTION_ROI",
                 "all_images_vs_cross_class_matched_roi",
             ),
             (
-                "AU5_ATTENTION_COMPLEMENT",
-                "CROSS_CLASS_MATCHED_AU5_ATTENTION_COMPLEMENT",
+                "C1_ATTENTION_COMPLEMENT",
+                "C2_MATCHED_ATTENTION_COMPLEMENT",
                 "all_images_vs_cross_class_matched_complement",
             ),
-            ("AU6_MANUAL_ROI", "AU8_ATTENTION_MATCHED_MANUAL_ROI", "manual_vs_attention_same_images"),
-            ("AU7_MANUAL_COMPLEMENT", "AU9_ATTENTION_MATCHED_MANUAL_COMPLEMENT", "manual_vs_attention_complement_same_images"),
+            ("M1_MANUAL_ROI", "AU3_ATTENTION_ROI_MANUAL_SUBSET", "manual_vs_attention_same_images"),
+            ("C3_MANUAL_COMPLEMENT", "C4_ATTENTION_COMPLEMENT_MANUAL_SUBSET", "manual_vs_attention_complement_same_images"),
         ):
             comparison = EvaluationManager._paired_auc_difference(
                 prediction_tables[first_mode],
@@ -7138,20 +7175,20 @@ class EvaluationManager:
         pd.DataFrame(comparisons).to_csv(
             workspace.outputs / "paired_auc_comparisons.csv", index=False
         )
-        print("[EVALUARE] Rezultate:", workspace.results_csv)
+        print("[EVALUATION] Results:", workspace.results_csv)
         return summary
 
 
-# =============================================================================
-# DEFINIȚII 13 — INTERFAȚA PIPELINE-ULUI
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Public pipeline interface and Kaggle execution stages
+# -----------------------------------------------------------------------------
 class CADPipeline:
-    """Interfață simplă: CPU implicit, dispozitiv explicit pentru deep learning.
+    """Small public interface over the persisted CPU/GPU research stages.
 
-    Obiectul nu conține un `torch.device` și nu inițializează CUDA. Același
-    workspace poate fi deschis într-o sesiune CPU, apoi într-o sesiune GPU.
-    Rezultatele intermediare sunt citite de pe disc, nu din memoria GPU.
+    The object stores paths and configuration, not a live device. Every expensive
+    stage checks its fingerprinted cache before CUDA or EfficientNet is initialized.
     """
+
 
     def __init__(
         self,
@@ -7175,20 +7212,20 @@ class CADPipeline:
         ):
             if value not in {"auto", "cpu", "cuda"}:
                 raise ValueError(
-                    f"{name} trebuie să fie 'auto', 'cpu' sau 'cuda'."
+                    f"{name} must be 'auto', 'cpu', or 'cuda'."
                 )
 
         self.samples: list[Sample] | None = None
         self.dataset_rows: list[dict[str, Any]] | None = None
-        print("[PIPELINE] control și etape generale: cpu")
-        print(f"[PIPELINE] Attention U-Net configurat: {self.attention_device}")
-        print(f"[PIPELINE] EfficientNet configurat: {self.feature_device}")
+        print("[PIPELINE] orchestration and non-neural stages: cpu")
+        print(f"[PIPELINE] Attention U-Net configured for: {self.attention_device}")
+        print(f"[PIPELINE] EfficientNet configured for: {self.feature_device}")
         print(f"[PIPELINE] dataset={self.dataset_path}")
         print(f"[PIPELINE] workspace={self.workspace.root}")
 
-    # ----------------------------- ETAPE CPU -----------------------------
+
     def prepare(self) -> list[dict[str, Any]]:
-        """CPU: scanează căile și construiește manifestul."""
+
 
         self.samples = DatasetManager.discover(self.dataset_path, self.workspace)
         self.dataset_rows = DatasetManager.rows(self.samples, self.workspace)
@@ -7200,7 +7237,7 @@ class CADPipeline:
         return self.dataset_rows
 
     def audit_quality(self, refresh: bool = False) -> dict[str, dict[str, Any]]:
-        """CPU: blur, zgomot, contrast și pHash."""
+
 
         return QualityManager.build(self._rows(), self.workspace, refresh=refresh)
 
@@ -7209,14 +7246,14 @@ class CADPipeline:
         refresh_quality: bool = False,
         minimum_masks: int | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        """CPU: verifică măștile manuale și exclude țintele nevalide."""
+
 
         quality = self.audit_quality(refresh=refresh_quality)
         return MaskManager.audit_manual_masks(
             self._rows(), quality, self.workspace, minimum_masks=minimum_masks
         )
 
-    # ------------------------- ETAPE CPU SAU GPU -------------------------
+
     def train_attention(
         self,
         force: bool = False,
@@ -7224,9 +7261,8 @@ class CADPipeline:
         refresh_quality: bool = False,
         device: str | None = None,
     ) -> dict[int, Path]:
-        """Antrenează Attention U-Net pe dispozitivul ales doar pentru această etapă."""
 
-        # Auditul se termină pe CPU înainte ca modelul să fie încărcat pe GPU.
+
         accepted, manual_summary = self.audit_manual_masks(
             refresh_quality=refresh_quality,
             minimum_masks=minimum_masks,
@@ -7237,8 +7273,8 @@ class CADPipeline:
             )
             if cached_checkpoints is not None:
                 print(
-                    "[ATTENTION] Toate checkpointurile sunt compatibile; "
-                    "CUDA nu este inițializat."
+                    "[ATTENTION] All checkpoints are compatible; "
+                    "CUDA is not initialized."
                 )
                 summary = FileManager.read_json(
                     self.workspace.training_summary, {}
@@ -7250,7 +7286,7 @@ class CADPipeline:
 
         requested = device or self.attention_device
         with RuntimeManager.device_scope(
-            requested, "antrenare Attention U-Net"
+            requested, "Attention U-Net training"
         ) as compute_device:
             checkpoints = SegmentationManager.train_crossfit(
                 accepted, self.workspace, compute_device, force=force
@@ -7266,7 +7302,7 @@ class CADPipeline:
         force: bool = False,
         device: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Rulează inferența Attention U-Net și eliberează dispozitivul la final."""
+
 
         rows = self._rows()
         checkpoints = SegmentationManager.load_checkpoint_map(self.workspace)
@@ -7276,8 +7312,8 @@ class CADPipeline:
             )
             if cached is not None:
                 print(
-                    "[ATTENTION] Predicțiile finale sunt compatibile; "
-                    "CUDA nu este inițializat."
+                    "[ATTENTION] Final predictions are compatible; "
+                    "CUDA is not initialized."
                 )
                 SegmentationManager.evaluate_oof_segmentation(
                     self.workspace, cached
@@ -7286,7 +7322,7 @@ class CADPipeline:
 
         requested = device or self.attention_device
         with RuntimeManager.device_scope(
-            requested, "predicție Attention U-Net"
+            requested, "Attention U-Net prediction"
         ) as compute_device:
             return SegmentationManager.predict_all(
                 rows,
@@ -7296,7 +7332,7 @@ class CADPipeline:
                 force=force,
             )
 
-    # ----------------------------- ETAPE CPU -----------------------------
+
     def open_editor(
         self,
         scope: str = "invalid",
@@ -7306,12 +7342,11 @@ class CADPipeline:
         review_round: int = 1,
         seed: int = 42,
     ) -> MaskEditor:
-        """CPU: deschide editorul numai pentru target=UNLABELED, fără GPU."""
+
 
         rows = self._rows()
-        # Într-un workspace creat de notebook-ul full, predicțiile există în
-        # attention_unet_full_review_manifest.csv, nu în fișierul simplificat.
-        # Conversia de mai jos este doar CSV -> CSV și nu folosește GPU-ul.
+
+
         imported_quality = WorkspaceCompatibilityManager.ensure_quality_audit(
             rows, self.workspace
         )
@@ -7340,12 +7375,12 @@ class CADPipeline:
         )
         return editor.show()
 
-    # ----------------------------- ETAPĂ CPU -----------------------------
+
     def build_cross_class_matching(
         self,
         force: bool = False,
     ) -> list[dict[str, Any]]:
-        """CPU: selectează perechi comparabile Sick/Normal pentru analiza matched."""
+
 
         rows = self._rows()
         imported_quality = WorkspaceCompatibilityManager.ensure_quality_audit(
@@ -7364,21 +7399,17 @@ class CADPipeline:
             force=force,
         )
 
-    # ------------------------- ETAPĂ CPU SAU GPU -------------------------
+
     def build_feature_bank(
         self,
         force: bool = False,
         device: str | None = None,
     ) -> dict[str, dict[str, Any]]:
-        """Pregătește ROI-urile pe CPU; EfficientNet folosește dispozitivul ales.
 
-        `device="cpu"` economisește complet GPU-ul. `device="cuda"` este mai
-        rapid, dar GPU-ul este folosit numai pentru forward-urile EfficientNet.
-        """
 
         rows = self._rows()
-        # Acceptă atât auditul simplificat, cât și manifestul complet produs de
-        # notebook-ul full. Pentru feature bank este obligatorie acoperirea 100%.
+
+
         WorkspaceCompatibilityManager.ensure_prediction_audit(
             rows,
             self.workspace,
@@ -7389,39 +7420,39 @@ class CADPipeline:
         )
         if manual_audit_refresh_reason:
             print(
-                "[MĂȘTI MANUALE] Audit incompatibil sau vechi; se reconstruiește "
-                f"automat ({manual_audit_refresh_reason})."
+                "[MANUAL MASKS] Incompatible or stale audit; rebuilding "
+                f"automatically ({manual_audit_refresh_reason})."
             )
             self.audit_manual_masks(refresh_quality=False)
-        # Matching-ul rulează integral pe CPU înainte de verificarea cache-ului
-        # și înainte de inițializarea EfficientNet/GPU.
+
+
         self.build_cross_class_matching(force=force)
         if not force:
             cached = FeatureManager.load_compatible_cache(rows, self.workspace)
             if cached is not None:
                 print(
-                    "[FEATURE BANK] Cache compatibil; "
-                    "CUDA nu este inițializat."
+                    "[FEATURE BANK] Compatible cache found; "
+                    "CUDA is not initialized."
                 )
                 return cached
 
         requested = device or self.feature_device
         with RuntimeManager.device_scope(
-            requested, "extragere EfficientNet"
+            requested, "EfficientNet feature extraction"
         ) as compute_device:
             return FeatureManager.build(
                 rows, self.workspace, compute_device, force=force
             )
 
-    # ----------------------------- ETAPE CPU -----------------------------
+
     def evaluate(self) -> pd.DataFrame:
-        """CPU: PCA, regresie logistică, metrici și bootstrap."""
+
 
         bank = FeatureManager.load(self.workspace)
         return EvaluationManager.evaluate(bank, self.workspace)
 
     def backup(self, name: str = "cad_attention_workspace_backup") -> Path:
-        """CPU: arhivează rezultatele persistente, fără datasetul original."""
+
 
         destination = self.workspace.root.parent / name
         archive = Path(shutil.make_archive(str(destination), "zip", self.workspace.root))
@@ -7429,7 +7460,7 @@ class CADPipeline:
         return archive
 
     def status(self) -> dict[str, Any]:
-        """CPU: arată ce etape sunt deja salvate și pot fi reutilizate."""
+
 
         status = {
             "pipeline_version": PIPELINE_VERSION,
@@ -7464,20 +7495,18 @@ class CADPipeline:
 
 
 RuntimeManager.seed_everything(include_cuda=False)
-print(f"[PIPELINE] Versiune: {PIPELINE_VERSION}")
-print("[PIPELINE] Clasele au fost încărcate fără inițializarea CUDA.")
-print("[PIPELINE] 2.5D + heart-present + negative explicite + Sick↔Normal matching sunt active.")
-print("[PIPELINE] Migrarea automată a auditului manual vechi pentru AU6--AU9 este activă.")
-print("[PIPELINE] Editorul blochează local meniul contextual Kaggle la ștergerea cu click dreapta.")
-print("[PIPELINE] Review-ul etichetează automat măștile manuale non-goale ca HEART_PRESENT.")
-print("[PIPELINE] Coada inițială de review conține exclusiv target=UNLABELED; etichetările rămân navigabile în sesiune.")
-print("[PIPELINE] CPU este implicit; device='cuda' se dă numai etapei dorite.")
+print(f"[PIPELINE] Version: {PIPELINE_VERSION}")
+print("[PIPELINE] Classes loaded without initializing CUDA.")
+print("[PIPELINE] 2.5D context, heart-presence targets, explicit negatives, and Sick↔Normal matching are active.")
+print("[PIPELINE] Legacy manual-audit migration for M1/C3/AU3/C4 is active.")
+print("[PIPELINE] The editor locally blocks Kaggle's context menu during right-click erasing.")
+print("[PIPELINE] Review automatically registers existing non-empty manual masks as HEART_PRESENT.")
+print("[PIPELINE] The initial review queue contains only target=UNLABELED; labeled images remain navigable during the session.")
+print("[PIPELINE] CPU is the default; device='cuda' is passed only to the requested stage.")
 
-# =============================================================================
-# FUNCȚII DE RULARE GRUPATĂ
-# =============================================================================
+
 def _execution_banner(title: str) -> None:
-    """Afișează clar trecerea dintre partea CPU și partea GPU."""
+
 
     line = "=" * 88
     print(f"\n{line}\n{title}\n{line}")
@@ -7489,7 +7518,7 @@ def create_pipeline(
     attention_device: str = "cuda",
     feature_device: str = "cpu",
 ) -> CADPipeline:
-    """Creează pipeline-ul fără să inițializeze CUDA."""
+
 
     return CADPipeline(
         dataset_path=dataset_path,
@@ -7512,19 +7541,9 @@ def run_complete_pipeline(
     create_backup: bool = False,
     backup_name: str = "cad_attention_workspace_backup",
 ) -> dict[str, Any]:
-    """Rulează într-un singur apel toate etapele automate.
 
-    Ordinea dispozitivelor este intenționată:
-    1. CPU: manifestul și auditul calității/măștilor;
-    2. GPU sau CPU: antrenarea și inferența Attention U-Net;
-    3. CPU implicit sau GPU opțional: EfficientNet;
-    4. CPU: agregarea, clasificarea, metricile și backup-ul.
 
-    Cache-urile sunt verificate înainte de inițializarea CUDA. Dacă un rezultat
-    compatibil există deja, etapa respectivă este reutilizată fără GPU.
-    """
-
-    _execution_banner("BLOC PRINCIPAL — inițializare și manifest pe CPU")
+    _execution_banner("COMPLETE RUN — CPU initialization and manifest")
     pipeline = create_pipeline(
         dataset_path=dataset_path,
         workspace_root=workspace_root,
@@ -7534,8 +7553,8 @@ def run_complete_pipeline(
     dataset_rows = pipeline.prepare()
 
     _execution_banner(
-        f"BLOC PRINCIPAL — Attention U-Net pe {str(attention_device).upper()} "
-        "(auditul se execută întâi pe CPU)"
+        f"COMPLETE RUN — Attention U-Net on {str(attention_device).upper()} "
+        "(the audit runs on CPU first)"
     )
     attention_checkpoints = pipeline.train_attention(
         force=force_attention_training,
@@ -7549,7 +7568,7 @@ def run_complete_pipeline(
     )
 
     _execution_banner(
-        f"BLOC PRINCIPAL — feature bank pe {str(feature_device).upper()} și evaluare pe CPU"
+        f"COMPLETE RUN — feature bank on {str(feature_device).upper()} and CPU evaluation"
     )
     feature_bank = pipeline.build_feature_bank(
         force=force_feature_bank,
@@ -7591,25 +7610,12 @@ def run_review_block(
     review_round: int = 1,
     seed: int = 42,
 ) -> MaskEditor | None:
-    """Deschide pe CPU o coadă inițială formată numai din target=UNLABELED.
 
-    Scope-urile ``invalid``, ``uncertain``, ``empty``, ``novel``, ``manual`` și
-    ``all`` sunt filtre suplimentare peste această regulă. O imagine care primește
-    HEART_PRESENT, NO_HEART_VISIBLE sau UNUSABLE rămâne în coada sesiunii curente,
-    astfel încât Previous poate reveni la ea. Targetul salvat o exclude însă la
-    următoarea rulare a review-ului.
-
-    La pornire, toate PNG-urile manuale non-goale care nu au deja o etichetă
-    explicită sunt înregistrate automat cu ``target=HEART_PRESENT`` și, prin
-    urmare, sunt excluse din review. Fișierul măștii nu este rescris.
-    """
 
     scope = str(scope).strip().lower()
-    _execution_banner(f"REVIEW MANUAL PE CPU — scope={scope}")
+    _execution_banner(f"MANUAL REVIEW ON CPU — scope={scope}")
 
-    # Orice mască manuală non-goală deja existentă primește targetul explicit
-    # HEART_PRESENT înainte de construirea cozii. Nu este necesară reapăsarea
-    # butonului Save doar pentru a confirma un PNG care se află deja pe disc.
+
     dataset_rows = pipeline._rows()
     MaskManager.register_existing_manual_masks_as_heart_present(
         dataset_rows,
@@ -7637,11 +7643,11 @@ def run_review_block(
             and Path(row.get("predicted_attention_mask_path", "")).is_file()
             and str(row.get("image_token", "")) not in labeled_tokens
         ]
-        print("Predicții invalide cu target=UNLABELED:", len(invalid_rows))
+        print("Invalid predictions with target=UNLABELED:", len(invalid_rows))
         if not invalid_rows:
             print(
-                "Nu există predicții invalide UNLABELED de corectat; "
-                "imaginile deja etichetate nu sunt redeschise."
+                "There are no invalid UNLABELED predictions to correct; "
+                "already labeled images are not reopened."
             )
             return None
 
@@ -7670,19 +7676,13 @@ def run_after_review_pipeline(
     create_backup: bool = False,
     backup_name: str = "cad_attention_workspace_after_review",
 ) -> dict[str, Any]:
-    """Actualizează întregul rezultat după editarea măștilor manuale.
 
-    Cu `force_all=False`, comportamentul recomandat, fingerprinturile refac numai
-    foldurile Attention afectate de măștile noi. Inferența per fold și feature
-    bank-ul sunt invalidate automat doar când intrările lor s-au schimbat.
-    `force_all=True` recalculează tot și consumă mai mult GPU.
-    """
 
     attention_device = attention_device or pipeline.attention_device
     feature_device = feature_device or pipeline.feature_device
 
     _execution_banner(
-        f"DUPĂ REVIEW — reantrenare incrementală Attention pe {str(attention_device).upper()}"
+        f"AFTER REVIEW — incremental Attention retraining on {str(attention_device).upper()}"
     )
     attention_checkpoints = pipeline.train_attention(
         force=force_all,
@@ -7696,7 +7696,7 @@ def run_after_review_pipeline(
     )
 
     _execution_banner(
-        f"DUPĂ REVIEW — feature bank pe {str(feature_device).upper()} și evaluare pe CPU"
+        f"AFTER REVIEW — feature bank on {str(feature_device).upper()} and CPU evaluation"
     )
     feature_bank = pipeline.build_feature_bank(
         force=force_all,
@@ -7729,7 +7729,6 @@ def run_after_review_pipeline(
     }
 
 
-# Funcții fine-grained păstrate pentru folosire din alte notebook-uri sau CLI.
 def run_prepare(pipeline: CADPipeline) -> list[dict[str, Any]]:
     dataset_rows = pipeline.prepare()
     pipeline.status()
@@ -7771,7 +7770,7 @@ def run_attention_prediction(
     device: str | None = None,
 ) -> list[dict[str, Any]]:
     predictions = pipeline.generate_attention_masks(force=force, device=device)
-    print("Predicții Attention:", len(predictions))
+    print("Attention predictions:", len(predictions))
     return predictions
 
 
@@ -7811,20 +7810,13 @@ def run_evaluation(pipeline: CADPipeline) -> pd.DataFrame:
     return results
 
 
-# =============================================================================
-# TREI BLOCURI KAGGLE: CPU INIȚIAL -> GPU -> CPU FINAL
-# =============================================================================
 def run_kaggle_cpu_stage(
     dataset_path: Path | str | None = None,
     workspace_root: Path | str | None = None,
     refresh_quality: bool = False,
     minimum_masks: int | None = None,
 ) -> dict[str, Any]:
-    """Blocul CPU inițial: manifest, auditul imaginilor și auditul măștilor.
 
-    În Kaggle, rulează această funcție într-o sesiune cu
-    `Settings -> Accelerator -> None`.
-    """
 
     _execution_banner("KAGGLE CPU — MANIFEST + AUDIT")
     pipeline = create_pipeline(
@@ -7863,21 +7855,16 @@ def run_kaggle_gpu_stage(
     refresh_quality: bool = False,
     minimum_masks: int | None = None,
 ) -> dict[str, Any]:
-    """Blocul GPU: antrenarea și inferența Attention U-Net.
 
-    `after_review=True` este doar o etichetă clară pentru rerularea de după
-    corectarea măștilor. Cu force=False, fingerprinturile refac numai foldurile
-    afectate. În Kaggle, rulează într-o sesiune cu Accelerator=GPU.
-    """
 
     if not torch.cuda.is_available():
         raise RuntimeError(
-            "GPU-ul nu este disponibil. În Kaggle selectează "
-            "Settings -> Accelerator -> GPU, apoi repornește și rulează din nou "
-            "celula de definiții înaintea blocului GPU."
+            "A GPU is unavailable. In Kaggle choose "
+            "Settings -> Accelerator -> GPU, restart the session, and rerun "
+            "the definitions cell before the GPU stage."
         )
 
-    phase = "DUPĂ REVIEW" if after_review else "INIȚIAL"
+    phase = "AFTER REVIEW" if after_review else "INITIAL"
     _execution_banner(f"KAGGLE GPU — ATTENTION U-NET ({phase})")
     print("[GPU]", torch.cuda.get_device_name(0))
     pipeline = create_pipeline(
@@ -7886,7 +7873,7 @@ def run_kaggle_gpu_stage(
         attention_device="cuda",
         feature_device="cpu",
     )
-    # O sesiune nouă trebuie să reconstruiască rândurile datasetului în RAM.
+
     pipeline.prepare()
     checkpoints = pipeline.train_attention(
         force=force_training,
@@ -7901,8 +7888,8 @@ def run_kaggle_gpu_stage(
     status = pipeline.status()
     RuntimeManager.release(torch.device("cuda"))
     print(
-        "[GPU] Bloc terminat. Pentru oprirea acceleratorului, schimbă în Kaggle "
-        "Settings -> Accelerator -> None; sesiunea va reporni."
+        "[GPU] Stage complete. To stop the accelerator, choose Kaggle "
+        "Settings -> Accelerator -> None; the session will restart."
     )
     return {
         "pipeline": pipeline,
@@ -7926,22 +7913,12 @@ def run_kaggle_cpu_final_stage(
     review_round: int = 1,
     review_seed: int = 42,
 ) -> dict[str, Any]:
-    """Blocul CPU final, cu patru acțiuni posibile.
 
-    action="matching": construiește/auditează numai cohorta Sick↔Normal.
-    action="evaluate": matching + feature bank pe CPU + evaluare + backup opțional.
-    action="review": deschide numai imaginile target=UNLABELED pe CPU.
-    action="status": afișează numai starea workspace-ului.
-
-    După `action="review"`, schimbă acceleratorul pe GPU și rulează din nou
-    blocul GPU cu `after_review=True`; apoi revino la CPU și folosește
-    `action="evaluate"`.
-    """
 
     action = str(action).strip().lower()
     if action not in {"matching", "evaluate", "review", "status"}:
         raise ValueError(
-            "action trebuie să fie 'matching', 'evaluate', 'review' sau 'status'."
+            "action must be 'matching', 'evaluate', 'review', or 'status'."
         )
 
     _execution_banner(f"KAGGLE CPU FINAL — {action.upper()}")
@@ -8005,18 +7982,15 @@ def run_kaggle_cpu_final_stage(
     }
 
 
-# =============================================================================
-# INTERFAȚĂ CLI
-# =============================================================================
 def main() -> None:
-    """Rulează blocurile grupate sau o etapă individuală din terminal."""
+
 
     import argparse
 
     parser = argparse.ArgumentParser(
         description=(
-            "Pipeline CAD cardiac MRI cu rulare grupată CPU/GPU. "
-            "Etapa review trebuie deschisă într-un frontend Jupyter/Kaggle."
+            "Cardiac MRI CAD pipeline with grouped CPU/GPU stages. "
+            "Review must be opened in a Jupyter or Kaggle frontend."
         )
     )
     parser.add_argument(
@@ -8188,7 +8162,7 @@ def main() -> None:
 
 def _running_in_notebook() -> bool:
     try:
-        shell = get_ipython()  # type: ignore[name-defined]
+        shell = get_ipython()  
     except Exception:
         return False
     return shell is not None and shell.__class__.__name__ != "TerminalInteractiveShell"
