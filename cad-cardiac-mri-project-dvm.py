@@ -446,8 +446,8 @@ class MatchingSettings:
 
     # Expanded cohort. Every image is still used at most once and both classes
     # remain exactly balanced. With the current dataset the default target is
-    # about 30% of eligible slices, instead of the previous ~13%.
-    TARGET_MATCHED_IMAGE_FRACTION = 0.30
+    # about 50% of eligible slices, instead of the previous ~13%.
+    TARGET_MATCHED_IMAGE_FRACTION = 0.50
     EXTENDED_NEIGHBORS = 12
     EXTENDED_CALIPER_MAD_MULTIPLIER = 3.5
     EXTENDED_CALIPER_QUANTILE = 0.97
