@@ -16,6 +16,9 @@ a smaller, ready experiment set. The non-negotiable guarantees are:
    bank keys remain compatible; cached neural stages are not rerun needlessly.
 7. Cross-class matching preserves a strict mutual-neighbour core and expands it
    with unique, capacity-controlled Sick/Normal pairs from the same acquisition families.
+8. ``B2_ATTENTION_ELIGIBLE_FULL_IMAGE``, ``AU1_ATTENTION_ROI``, and
+   ``C1_ATTENTION_COMPLEMENT`` are built from exactly the same source slices.
+   ``B0_FULL_IMAGE`` is retained only as the broader all-slice reference.
 
 The three Kaggle entry points at the bottom separate CPU audit, GPU segmentation,
 and final CPU evaluation so that expensive accelerators are used only where they
@@ -69,7 +72,7 @@ from tqdm.auto import tqdm
 
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
-PIPELINE_VERSION = "2026-09-24-clean-v2-expanded-cross-class-matching"
+PIPELINE_VERSION = "2026-09-25-clean-v3-same-slice-full-image-control"
 
 
 def _as_float(value: Any, default: float = 0.0) -> float:
@@ -301,14 +304,14 @@ class SegmentationSettings:
 class ClassificationSettings:
     """Frozen feature extraction and patient-level classification settings.
 
-    The registry below is deliberately small: six primary experiments plus four
-    mask-validation controls. It is sufficient to present a coherent research
-    narrative without hiding the principal confounder checks.
+    The registry contains seven primary experiments plus four mask-validation
+    controls. ``B0`` remains the broad all-slice reference, while ``B2``, ``AU1``,
+    and ``C1`` form the direct same-slice comparison required to isolate the
+    effect of the automatic cardiac ROI from image-selection effects.
     """
 
     FEATURE_BATCH_SIZE_CUDA = 12
     FEATURE_BATCH_SIZE_CPU = 4
-
 
     FEATURE_FORWARD_BATCH_SIZE_CUDA = 32
     FEATURE_FORWARD_BATCH_SIZE_CPU = 4
@@ -320,13 +323,14 @@ class ClassificationSettings:
     C_GRID = (0.01, 0.1, 1.0, 10.0)
     BOOTSTRAP_REPEATS = 2000
 
-
-    # The six primary experiments answer the central scientific question:
-    # does CAD signal come from the segmented heart or from acquisition/background
-    # confounders? The four validation experiments test mask quality on the exact
-    # manually annotated subset. Prefixes are semantic and never overloaded.
+    # B0 answers the broad contextual question on every dataset slice. The direct
+    # automatic-mask experiment is the B2/AU1/C1 triad: all three modes use the
+    # exact same images, removing source-image selection as a confounder while
+    # retaining each mode's intended full/ROI/complement preprocessing.
+    # B1/AU2/C2 repeat that logic on the Sick/Normal matched cohort.
     PRIMARY_MODES = (
         "B0_FULL_IMAGE",
+        "B2_ATTENTION_ELIGIBLE_FULL_IMAGE",
         "AU1_ATTENTION_ROI",
         "C1_ATTENTION_COMPLEMENT",
         "B1_MATCHED_FULL_IMAGE",
@@ -341,12 +345,12 @@ class ClassificationSettings:
     )
     MODES = PRIMARY_MODES + VALIDATION_MODES
 
-    # Existing .npz files in /kaggle/working use these historical keys. Keeping
-    # this mapping allows the renamed experiments to load the old feature bank
-    # without running EfficientNet again. New feature banks are also written with
-    # the legacy storage keys so older notebooks remain able to read them.
+    # Existing .npz files in /kaggle/working use the historical keys below. The
+    # new B2 control has no historical equivalent, so it receives a new key while
+    # every pre-existing mode remains readable without recomputation.
     LEGACY_MODE_ALIASES = {
         "B0_FULL_IMAGE": "FULL_IMAGE",
+        "B2_ATTENTION_ELIGIBLE_FULL_IMAGE": "B2_ATTENTION_ELIGIBLE_FULL_IMAGE",
         "AU1_ATTENTION_ROI": "AU1_ATTENTION_ROI",
         "C1_ATTENTION_COMPLEMENT": "AU5_ATTENTION_COMPLEMENT",
         "B1_MATCHED_FULL_IMAGE": "CROSS_CLASS_MATCHED_FULL_IMAGE",
@@ -359,6 +363,7 @@ class ClassificationSettings:
     }
     LEGACY_STORAGE_MODES = (
         "FULL_IMAGE",
+        "B2_ATTENTION_ELIGIBLE_FULL_IMAGE",
         "AU1_ATTENTION_ROI",
         "AU5_ATTENTION_COMPLEMENT",
         "CROSS_CLASS_MATCHED_FULL_IMAGE",
@@ -369,6 +374,14 @@ class ClassificationSettings:
         "AU8_ATTENTION_MATCHED_MANUAL_ROI",
         "AU9_ATTENTION_MATCHED_MANUAL_COMPLEMENT",
     )
+
+    ATTENTION_ELIGIBLE_MODES = frozenset(
+        {
+            "B2_ATTENTION_ELIGIBLE_FULL_IMAGE",
+            "AU1_ATTENTION_ROI",
+            "C1_ATTENTION_COMPLEMENT",
+        }
+    )
     MATCHED_MODES = frozenset(
         {
             "B1_MATCHED_FULL_IMAGE",
@@ -376,10 +389,13 @@ class ClassificationSettings:
             "C2_MATCHED_ATTENTION_COMPLEMENT",
         }
     )
+    MANUAL_SUBSET_MODES = frozenset(VALIDATION_MODES)
+
     MODE_DESCRIPTIONS = {
-        "B0_FULL_IMAGE": "Full-image baseline on all eligible slices",
-        "AU1_ATTENTION_ROI": "Automatic Attention U-Net heart ROI",
-        "C1_ATTENTION_COMPLEMENT": "Pixels outside the automatic heart ROI",
+        "B0_FULL_IMAGE": "Full-image contextual baseline on every dataset slice",
+        "B2_ATTENTION_ELIGIBLE_FULL_IMAGE": "Full image on exactly the AU1/C1 attention-eligible slices",
+        "AU1_ATTENTION_ROI": "Automatic Attention U-Net heart ROI on the same attention-eligible slices",
+        "C1_ATTENTION_COMPLEMENT": "Pixels outside the automatic heart ROI on the same attention-eligible slices",
         "B1_MATCHED_FULL_IMAGE": "Full-image baseline on the expanded balanced Sick/Normal cohort",
         "AU2_MATCHED_ATTENTION_ROI": "Automatic heart ROI on the expanded balanced matched cohort",
         "C2_MATCHED_ATTENTION_COMPLEMENT": "Automatic-ROI complement on the expanded balanced matched cohort",
@@ -387,6 +403,19 @@ class ClassificationSettings:
         "C3_MANUAL_COMPLEMENT": "Complement of the manual ROI",
         "AU3_ATTENTION_ROI_MANUAL_SUBSET": "Automatic ROI on the same manually annotated images",
         "C4_ATTENTION_COMPLEMENT_MANUAL_SUBSET": "Automatic complement on the same manually annotated images",
+    }
+    MODE_COHORTS = {
+        "B0_FULL_IMAGE": "all_dataset_slices",
+        "B2_ATTENTION_ELIGIBLE_FULL_IMAGE": "attention_eligible_same_slices",
+        "AU1_ATTENTION_ROI": "attention_eligible_same_slices",
+        "C1_ATTENTION_COMPLEMENT": "attention_eligible_same_slices",
+        "B1_MATCHED_FULL_IMAGE": "cross_class_matched_same_slices",
+        "AU2_MATCHED_ATTENTION_ROI": "cross_class_matched_same_slices",
+        "C2_MATCHED_ATTENTION_COMPLEMENT": "cross_class_matched_same_slices",
+        "M1_MANUAL_ROI": "manual_positive_same_slices",
+        "C3_MANUAL_COMPLEMENT": "manual_positive_same_slices",
+        "AU3_ATTENTION_ROI_MANUAL_SUBSET": "manual_positive_same_slices",
+        "C4_ATTENTION_COMPLEMENT_MANUAL_SUBSET": "manual_positive_same_slices",
     }
 
 
@@ -2169,7 +2198,7 @@ class MaskManager:
         if positive_count < minimum_masks:
             raise RuntimeError(
                 f"Only {positive_count} valid HEART_PRESENT masks remain, below the minimum of "
-                f"{minimum_masks}. Vezi {workspace.manual_audit}"
+                f"{minimum_masks}. See {workspace.manual_audit}"
             )
         missing_folds = [
             fold
@@ -2927,7 +2956,7 @@ class SegmentationManager:
                 checkpoint = SegmentationManager._torch_load(checkpoint_path)
                 if checkpoint.get("fingerprint") == fingerprint:
                     print(
-                        f"[ATTENTION] Fold {fold}: checkpoint 2.5D compatibil reused."
+                        f"[ATTENTION] Fold {fold}: compatible 2.5D checkpoint reused."
                     )
                     checkpoint_map[fold] = checkpoint_path
                     fold_summaries.append(
@@ -7038,13 +7067,93 @@ class FeatureManager:
         return accepted
 
     @staticmethod
+    def _assert_same_cohort(
+        bank: dict[str, dict[str, Any]],
+        modes: Sequence[str],
+        cohort_name: str,
+    ) -> None:
+        """Fail loudly if modes advertised as same-slice controls diverge.
+
+        A shared patient list alone is not enough. The source-slice count and the
+        number of contributing series proxies must also match, otherwise an AUC
+        difference could partly reflect image selection rather than spatial masking.
+        """
+
+        modes = tuple(modes)
+        reference_mode = modes[0]
+        reference = bank[reference_mode]
+        reference_patients = np.asarray(reference["patient_ids"]).astype(str)
+        reference_labels = np.asarray(reference["y"], dtype=np.int64)
+        reference_slices = int(reference["source_slices"])
+        reference_series = int(reference["series_proxies"])
+
+        for mode in modes[1:]:
+            current = bank[mode]
+            checks = {
+                "patient_ids": np.array_equal(
+                    reference_patients,
+                    np.asarray(current["patient_ids"]).astype(str),
+                ),
+                "labels": np.array_equal(
+                    reference_labels,
+                    np.asarray(current["y"], dtype=np.int64),
+                ),
+                "source_slices": reference_slices == int(current["source_slices"]),
+                "series_proxies": reference_series == int(current["series_proxies"]),
+            }
+            failed = [name for name, passed in checks.items() if not passed]
+            if failed:
+                raise RuntimeError(
+                    f"Same-slice cohort {cohort_name!r} is inconsistent between "
+                    f"{reference_mode} and {mode}: {failed}. Rebuild the affected "
+                    "feature-bank modes before interpreting their AUC difference."
+                )
+
+        print(
+            f"[FEATURE BANK][COHORT] {cohort_name}: modes={list(modes)}, "
+            f"patients={len(reference_patients)}, slices={reference_slices}, "
+            f"series={reference_series}"
+        )
+
+    @staticmethod
+    def _validate_cohort_alignment(bank: dict[str, dict[str, Any]]) -> None:
+        FeatureManager._assert_same_cohort(
+            bank,
+            (
+                "B2_ATTENTION_ELIGIBLE_FULL_IMAGE",
+                "AU1_ATTENTION_ROI",
+                "C1_ATTENTION_COMPLEMENT",
+            ),
+            "attention_eligible_same_slices",
+        )
+        FeatureManager._assert_same_cohort(
+            bank,
+            (
+                "B1_MATCHED_FULL_IMAGE",
+                "AU2_MATCHED_ATTENTION_ROI",
+                "C2_MATCHED_ATTENTION_COMPLEMENT",
+            ),
+            "cross_class_matched_same_slices",
+        )
+        FeatureManager._assert_same_cohort(
+            bank,
+            (
+                "M1_MANUAL_ROI",
+                "C3_MANUAL_COMPLEMENT",
+                "AU3_ATTENTION_ROI_MANUAL_SUBSET",
+                "C4_ATTENTION_COMPLEMENT_MANUAL_SUBSET",
+            ),
+            "manual_positive_same_slices",
+        )
+
+    @staticmethod
     def _feature_fingerprint(
         rows: Sequence[dict[str, Any]], workspace: Workspace
     ) -> str:
         prediction_summary = FileManager.read_json(workspace.prediction_summary, {}) or {}
         digest = hashlib.sha256()
         payload = {
-            "schema": "simple-patient-feature-bank-cross-class-v5-expanded-matching",
+            "schema": "simple-patient-feature-bank-cross-class-v6-same-slice-baseline",
             "modes": Settings.Classification.LEGACY_STORAGE_MODES,
             "prediction_fingerprint": prediction_summary.get("fingerprint", ""),
             "support_dilation": Settings.Segmentation.SUPPORT_DILATION_KERNEL,
@@ -7083,57 +7192,90 @@ class FeatureManager:
         return digest.hexdigest()
 
     @staticmethod
-    def load(workspace: Workspace) -> dict[str, dict[str, Any]]:
+    def _load_modes(
+        workspace: Workspace,
+        modes: Sequence[str],
+        allow_missing: bool = False,
+    ) -> dict[str, dict[str, Any]]:
+        """Load selected modes while accepting the pre-B2 storage schema.
+
+        ``allow_missing=True`` is used only for the controlled cache migration that
+        adds B2. A partially written mode still raises an error; only a completely
+        absent mode may be skipped.
+        """
+
         if not workspace.feature_bank.is_file():
             raise FileNotFoundError(f"Missing feature bank: {workspace.feature_bank}")
-        archive = np.load(workspace.feature_bank, allow_pickle=False)
-        available = set(archive.files)
+
         bank: dict[str, dict[str, Any]] = {}
-        for mode in Settings.Classification.MODES:
-            legacy_mode = Settings.Classification.LEGACY_MODE_ALIASES[mode]
-            storage_mode = (
-                mode if f"{mode}__X" in available else legacy_mode
-            )
-            required = {
-                f"{storage_mode}__X",
-                f"{storage_mode}__y",
-                f"{storage_mode}__patient_ids",
-                f"{storage_mode}__source_slices",
-                f"{storage_mode}__series_proxies",
-            }
-            missing = sorted(required - available)
-            if missing:
-                raise KeyError(
-                    f"Feature bank is missing keys for {mode}: {missing}"
-                )
-            bank[mode] = {
-                "X": archive[f"{storage_mode}__X"],
-                "y": archive[f"{storage_mode}__y"],
-                "patient_ids": archive[f"{storage_mode}__patient_ids"].astype(str),
-                "source_slices": int(archive[f"{storage_mode}__source_slices"][0]),
-                "series_proxies": int(archive[f"{storage_mode}__series_proxies"][0]),
-            }
+        with np.load(workspace.feature_bank, allow_pickle=False) as archive:
+            available = set(archive.files)
+            for mode in modes:
+                legacy_mode = Settings.Classification.LEGACY_MODE_ALIASES[mode]
+                candidates = tuple(dict.fromkeys((mode, legacy_mode)))
+                storage_mode = None
+                partial_candidates: list[str] = []
+                for candidate in candidates:
+                    required = {
+                        f"{candidate}__X",
+                        f"{candidate}__y",
+                        f"{candidate}__patient_ids",
+                        f"{candidate}__source_slices",
+                        f"{candidate}__series_proxies",
+                    }
+                    present = required & available
+                    if required.issubset(available):
+                        storage_mode = candidate
+                        break
+                    if present:
+                        partial_candidates.append(
+                            f"{candidate}: missing={sorted(required - available)}"
+                        )
+
+                if storage_mode is None:
+                    if partial_candidates:
+                        raise KeyError(
+                            f"Feature bank contains an incomplete entry for {mode}: "
+                            + "; ".join(partial_candidates)
+                        )
+                    if allow_missing:
+                        continue
+                    raise KeyError(
+                        f"Feature bank is missing all storage keys for {mode}. "
+                        f"Tried {list(candidates)}."
+                    )
+
+                bank[mode] = {
+                    "X": archive[f"{storage_mode}__X"],
+                    "y": archive[f"{storage_mode}__y"],
+                    "patient_ids": archive[f"{storage_mode}__patient_ids"].astype(str),
+                    "source_slices": int(
+                        archive[f"{storage_mode}__source_slices"][0]
+                    ),
+                    "series_proxies": int(
+                        archive[f"{storage_mode}__series_proxies"][0]
+                    ),
+                }
         return bank
 
     @staticmethod
-    def _static_modes() -> tuple[str, ...]:
-        return tuple(
-            mode
-            for mode in Settings.Classification.MODES
-            if mode not in Settings.Classification.MATCHED_MODES
+    def load(workspace: Workspace) -> dict[str, dict[str, Any]]:
+        return FeatureManager._load_modes(
+            workspace,
+            Settings.Classification.MODES,
+            allow_missing=False,
         )
 
     @staticmethod
-    def _reusable_static_bank(
+    def _reusable_bank_for_incremental_rebuild(
         workspace: Workspace,
     ) -> dict[str, dict[str, Any]] | None:
-        """Reuse modes unaffected by a matching-only change.
+        """Reuse old modes for two explicitly safe incremental updates.
 
-        The old feature bank is safe only when it is newer than every static input:
-        quality/prediction/manual audits, explicit annotations, and all manual masks.
-        The matching manifest is intentionally excluded because it affects only
-        B1/AU2/C2. This lets a new, larger matched cohort avoid a full two-hour CPU
-        extraction while preserving strict cache invalidation for changed masks.
+        Safe update 1 adds the new B2 same-slice full-image control while leaving
+        every existing representation unchanged. Safe update 2 rebuilds only the
+        three matched modes after the matching manifest changes. Any newer quality,
+        prediction, manual-audit, annotation, or manual-mask input disables reuse.
         """
 
         if not workspace.feature_bank.is_file() or not workspace.feature_metadata.is_file():
@@ -7142,6 +7284,7 @@ class FeatureManager:
             bank_mtime = workspace.feature_bank.stat().st_mtime_ns
         except OSError:
             return None
+
         static_inputs = (
             workspace.quality_audit,
             workspace.manual_audit,
@@ -7160,18 +7303,50 @@ class FeatureManager:
             return None
         if newest_manual > bank_mtime:
             return None
+
         try:
-            previous = FeatureManager.load(workspace)
+            previous = FeatureManager._load_modes(
+                workspace,
+                Settings.Classification.MODES,
+                allow_missing=True,
+            )
         except Exception:
             return None
-        static_modes = FeatureManager._static_modes()
-        if any(mode not in previous for mode in static_modes):
+
+        b2_mode = "B2_ATTENTION_ELIGIBLE_FULL_IMAGE"
+        required_pre_b2_modes = set(Settings.Classification.MODES) - {b2_mode}
+        if not required_pre_b2_modes.issubset(previous):
             return None
-        print(
-            "[FEATURE BANK] Matching changed, but static inputs did not. "
-            "Reusing B0/AU1/C1 and manual-control modes; recomputing only B1/AU2/C2."
+
+        missing_b2 = b2_mode not in previous
+        matching_changed = bool(
+            workspace.cross_class_matching_manifest.is_file()
+            and workspace.cross_class_matching_manifest.stat().st_mtime_ns > bank_mtime
         )
-        return {mode: previous[mode] for mode in static_modes}
+        if not missing_b2 and not matching_changed:
+            # A different fingerprint cause may represent changed preprocessing or
+            # settings; do not silently reuse in that case.
+            return None
+
+        reusable = dict(previous)
+        if matching_changed:
+            for mode in Settings.Classification.MATCHED_MODES:
+                reusable.pop(mode, None)
+
+        missing_modes = [
+            mode for mode in Settings.Classification.MODES if mode not in reusable
+        ]
+        allowed_missing = {b2_mode}
+        if matching_changed:
+            allowed_missing.update(Settings.Classification.MATCHED_MODES)
+        if not set(missing_modes).issubset(allowed_missing):
+            return None
+
+        print(
+            "[FEATURE BANK] Safe incremental reuse: "
+            f"reused={sorted(reusable)}, recomputing={missing_modes}."
+        )
+        return reusable
 
     @staticmethod
     def load_compatible_cache(
@@ -7199,9 +7374,10 @@ class FeatureManager:
             )
             return None
 
-    # Build every experiment from one frozen embedding pass. The automatic ROI and
-    # its complement share exactly the same eligible slices, while matched aliases
-    # reuse embeddings from the same Sick/Normal pairs. This makes comparisons fair.
+    # Build every experiment from a frozen EfficientNet pass. B2, AU1, and C1
+    # are forced to share the exact same Attention-eligible rows. During a full
+    # rebuild, B0 embeddings are reused for the B2 and B1 subsets, so the added
+    # methodological control does not create duplicate full-image forward passes.
     @staticmethod
     def build(
         dataset_rows: Sequence[dict[str, Any]],
@@ -7210,20 +7386,22 @@ class FeatureManager:
         force: bool = False,
     ) -> dict[str, dict[str, Any]]:
 
-
         fingerprint = FeatureManager._feature_fingerprint(dataset_rows, workspace)
-        reusable_static_bank: dict[str, dict[str, Any]] | None = None
+        reusable_bank: dict[str, dict[str, Any]] | None = None
         if not force:
             bank = FeatureManager.load_compatible_cache(
                 dataset_rows, workspace, fingerprint=fingerprint
             )
             if bank is not None:
+                FeatureManager._validate_cohort_alignment(bank)
                 print(
                     "[FEATURE BANK] Compatible cache reused; "
                     "the extractor is not loaded on the GPU."
                 )
                 return bank
-            reusable_static_bank = FeatureManager._reusable_static_bank(workspace)
+            reusable_bank = FeatureManager._reusable_bank_for_incremental_rebuild(
+                workspace
+            )
 
         quality = {
             row["image_token"]: row
@@ -7257,7 +7435,7 @@ class FeatureManager:
         if len(predictions) != len(dataset_rows):
             raise RuntimeError("The prediction audit does not cover the full dataset.")
 
-        rows = []
+        rows: list[dict[str, Any]] = []
         for original in dataset_rows:
             row = dict(original)
             row.update(predictions.get(row["image_token"], {}))
@@ -7277,18 +7455,51 @@ class FeatureManager:
             )
             rows.append(row)
 
-        matched_only_rebuild = reusable_static_bank is not None
-        if matched_only_rebuild:
-            rows = [row for row in rows if row["keep_cross_class_matched"] == 1]
-            if not rows:
-                raise RuntimeError("The expanded matching manifest contains no usable Attention rows.")
-            modes_to_compute = tuple(Settings.Classification.MATCHED_MODES)
-            print(
-                "[FEATURE BANK] Matched-only rebuild: "
-                f"{len(rows)} images, modes={list(modes_to_compute)}"
+        reusable_bank = dict(reusable_bank or {})
+        modes_to_compute = tuple(
+            mode
+            for mode in Settings.Classification.MODES
+            if mode not in reusable_bank
+        )
+        if not modes_to_compute:
+            raise RuntimeError(
+                "The feature-bank fingerprint changed, but no safe mode was selected "
+                "for recomputation. Use force=True for a full rebuild."
             )
-        else:
-            modes_to_compute = tuple(Settings.Classification.MODES)
+        compute_set = set(modes_to_compute)
+
+        requires_all_rows = "B0_FULL_IMAGE" in compute_set
+        requires_attention_rows = bool(
+            compute_set & Settings.Classification.ATTENTION_ELIGIBLE_MODES
+        )
+        requires_matched_rows = bool(
+            compute_set & Settings.Classification.MATCHED_MODES
+        )
+        requires_manual_rows = bool(
+            compute_set & Settings.Classification.MANUAL_SUBSET_MODES
+        )
+
+        if not requires_all_rows:
+            rows = [
+                row
+                for row in rows
+                if (
+                    (requires_attention_rows and row["keep_attention"] == 1)
+                    or (requires_matched_rows and row["keep_cross_class_matched"] == 1)
+                    or (requires_manual_rows and row["keep_manual_matched"] == 1)
+                )
+            ]
+        if not rows:
+            raise RuntimeError(
+                f"No images are eligible for feature-bank modes {list(modes_to_compute)}."
+            )
+
+        rebuild_kind = "incremental" if reusable_bank else "full"
+        print(
+            f"[FEATURE BANK] {rebuild_kind.capitalize()} rebuild: "
+            f"input_images={len(rows)}, recomputing={list(modes_to_compute)}, "
+            f"reused={sorted(reusable_bank)}"
+        )
 
         extractor = RuntimeManager.prepare_model(FrozenEfficientNet(), device).eval()
         loader = DataLoader(
@@ -7301,25 +7512,34 @@ class FeatureManager:
         pool = StreamingPatientPool(modes_to_compute)
         started = time.perf_counter()
 
-        matched_aliases = (
-            {}
-            if matched_only_rebuild
-            else {
-                "B0_FULL_IMAGE": "B1_MATCHED_FULL_IMAGE",
-                "AU1_ATTENTION_ROI": "AU2_MATCHED_ATTENTION_ROI",
-                "C1_ATTENTION_COMPLEMENT": "C2_MATCHED_ATTENTION_COMPLEMENT",
-            }
-        )
+        # Aliases receive the very same embeddings from a strict subset of the
+        # source rows. This avoids duplicate forward passes and guarantees that the
+        # same-slice controls differ only by their image representation.
+        alias_rules: dict[str, tuple[tuple[str, str], ...]] = {
+            "B0_FULL_IMAGE": (
+                ("B2_ATTENTION_ELIGIBLE_FULL_IMAGE", "keep_attention"),
+                ("B1_MATCHED_FULL_IMAGE", "keep_cross_class_matched"),
+            ),
+            "B2_ATTENTION_ELIGIBLE_FULL_IMAGE": (
+                ("B1_MATCHED_FULL_IMAGE", "keep_cross_class_matched"),
+            ),
+            "AU1_ATTENTION_ROI": (
+                ("AU2_MATCHED_ATTENTION_ROI", "keep_cross_class_matched"),
+            ),
+            "C1_ATTENTION_COMPLEMENT": (
+                ("C2_MATCHED_ATTENTION_COMPLEMENT", "keep_cross_class_matched"),
+            ),
+        }
 
         def encode_groups(
             groups: list[tuple[str, torch.Tensor, list[dict[str, Any]]]],
         ) -> None:
-
-
             valid_groups = [
                 (mode, images, selected_rows)
                 for mode, images, selected_rows in groups
-                if len(selected_rows) > 0 and images.shape[0] > 0
+                if mode in compute_set
+                and len(selected_rows) > 0
+                and images.shape[0] > 0
             ]
             if not valid_groups:
                 return
@@ -7345,17 +7565,19 @@ class FeatureManager:
                 current_embeddings = embeddings[cursor : cursor + count]
                 pool.add(mode, current_embeddings, selected_rows)
 
-                alias_mode = matched_aliases.get(mode)
-                if alias_mode is not None:
+                for alias_mode, selector_field in alias_rules.get(mode, ()):
+                    if alias_mode not in compute_set:
+                        continue
                     alias_positions = [
                         position
                         for position, row in enumerate(selected_rows)
-                        if _as_int(row.get("keep_cross_class_matched"), 0) == 1
+                        if _as_int(row.get(selector_field), 0) == 1
                     ]
                     if alias_positions:
+                        index_array = np.asarray(alias_positions, dtype=np.int64)
                         pool.add(
                             alias_mode,
-                            current_embeddings[np.asarray(alias_positions, dtype=np.int64)],
+                            current_embeddings[index_array],
                             [selected_rows[position] for position in alias_positions],
                         )
                 cursor += count
@@ -7365,81 +7587,126 @@ class FeatureManager:
             for robust, raw, content, attention, manual, indices in tqdm(
                 loader, desc=f"EfficientNet feature bank ({device.type})"
             ):
-
-
                 batch_rows = [rows[int(index)] for index in indices]
-                groups: list[
-                    tuple[str, torch.Tensor, list[dict[str, Any]]]
-                ] = [
-                    (
-                        "B1_MATCHED_FULL_IMAGE"
-                        if matched_only_rebuild
-                        else "B0_FULL_IMAGE",
-                        robust,
-                        batch_rows,
-                    )
-                ]
-
                 attention_positions = [
                     position
                     for position, row in enumerate(batch_rows)
-                    if row["keep_attention"]
+                    if row["keep_attention"] == 1
                 ]
-                if attention_positions:
-                    positions = torch.as_tensor(
-                        attention_positions, dtype=torch.long
+                matched_positions = [
+                    position
+                    for position, row in enumerate(batch_rows)
+                    if row["keep_cross_class_matched"] == 1
+                ]
+                manual_positions = [
+                    position
+                    for position, row in enumerate(batch_rows)
+                    if row["keep_manual_matched"] == 1
+                ]
+
+                groups: list[
+                    tuple[str, torch.Tensor, list[dict[str, Any]]]
+                ] = []
+
+                # One full-image pass supplies B0 and, through exact row subsets,
+                # B2 and B1. During an incremental migration, B2 alone is computed
+                # on the Attention-eligible rows while all previous modes are reused.
+                if "B0_FULL_IMAGE" in compute_set:
+                    groups.append(("B0_FULL_IMAGE", robust, batch_rows))
+                elif (
+                    "B2_ATTENTION_ELIGIBLE_FULL_IMAGE" in compute_set
+                    and attention_positions
+                ):
+                    positions = torch.as_tensor(attention_positions, dtype=torch.long)
+                    groups.append(
+                        (
+                            "B2_ATTENTION_ELIGIBLE_FULL_IMAGE",
+                            robust.index_select(0, positions),
+                            [batch_rows[position] for position in attention_positions],
+                        )
                     )
-                    selected_raw = raw.index_select(0, positions)
-                    selected_content = content.index_select(0, positions)
-                    selected_mask = attention.index_select(0, positions)
-                    support = FeatureManager._support(
-                        selected_mask, selected_content
-                    )
-                    selected_rows = [
-                        batch_rows[position] for position in attention_positions
-                    ]
-                    groups.extend(
-                        [
-                            (
-                                (
-                                    "AU2_MATCHED_ATTENTION_ROI"
-                                    if matched_only_rebuild
-                                    else "AU1_ATTENTION_ROI"
-                                ),
-                                FeatureManager._region_normalize(
-                                    selected_raw, support
-                                ),
-                                selected_rows,
-                            ),
-                            (
-                                (
-                                    "C2_MATCHED_ATTENTION_COMPLEMENT"
-                                    if matched_only_rebuild
-                                    else "C1_ATTENTION_COMPLEMENT"
-                                ),
-                                FeatureManager._region_normalize(
-                                    selected_raw,
-                                    (selected_content > 0.5).float()
-                                    * (1.0 - support),
-                                ),
-                                selected_rows,
-                            ),
-                        ]
+                elif "B1_MATCHED_FULL_IMAGE" in compute_set and matched_positions:
+                    positions = torch.as_tensor(matched_positions, dtype=torch.long)
+                    groups.append(
+                        (
+                            "B1_MATCHED_FULL_IMAGE",
+                            robust.index_select(0, positions),
+                            [batch_rows[position] for position in matched_positions],
+                        )
                     )
 
-                manual_positions = (
-                    []
-                    if matched_only_rebuild
-                    else [
-                        position
-                        for position, row in enumerate(batch_rows)
-                        if row["keep_manual_matched"]
-                    ]
+                needs_automatic_regions = bool(
+                    compute_set
+                    & {
+                        "AU1_ATTENTION_ROI",
+                        "C1_ATTENTION_COMPLEMENT",
+                        "AU2_MATCHED_ATTENTION_ROI",
+                        "C2_MATCHED_ATTENTION_COMPLEMENT",
+                    }
                 )
-                if manual_positions:
-                    positions = torch.as_tensor(
-                        manual_positions, dtype=torch.long
+                if needs_automatic_regions:
+                    use_attention_superset = bool(
+                        compute_set
+                        & {"AU1_ATTENTION_ROI", "C1_ATTENTION_COMPLEMENT"}
                     )
+                    automatic_positions = (
+                        attention_positions if use_attention_superset else matched_positions
+                    )
+                    if automatic_positions:
+                        positions = torch.as_tensor(
+                            automatic_positions, dtype=torch.long
+                        )
+                        selected_raw = raw.index_select(0, positions)
+                        selected_content = content.index_select(0, positions)
+                        selected_mask = attention.index_select(0, positions)
+                        support = FeatureManager._support(
+                            selected_mask, selected_content
+                        )
+                        selected_rows = [
+                            batch_rows[position] for position in automatic_positions
+                        ]
+
+                        if "AU1_ATTENTION_ROI" in compute_set:
+                            roi_mode = "AU1_ATTENTION_ROI"
+                        elif "AU2_MATCHED_ATTENTION_ROI" in compute_set:
+                            roi_mode = "AU2_MATCHED_ATTENTION_ROI"
+                        else:
+                            roi_mode = ""
+                        if roi_mode:
+                            groups.append(
+                                (
+                                    roi_mode,
+                                    FeatureManager._region_normalize(
+                                        selected_raw, support
+                                    ),
+                                    selected_rows,
+                                )
+                            )
+
+                        if "C1_ATTENTION_COMPLEMENT" in compute_set:
+                            complement_mode = "C1_ATTENTION_COMPLEMENT"
+                        elif "C2_MATCHED_ATTENTION_COMPLEMENT" in compute_set:
+                            complement_mode = "C2_MATCHED_ATTENTION_COMPLEMENT"
+                        else:
+                            complement_mode = ""
+                        if complement_mode:
+                            groups.append(
+                                (
+                                    complement_mode,
+                                    FeatureManager._region_normalize(
+                                        selected_raw,
+                                        (selected_content > 0.5).float()
+                                        * (1.0 - support),
+                                    ),
+                                    selected_rows,
+                                )
+                            )
+
+                if (
+                    compute_set & Settings.Classification.MANUAL_SUBSET_MODES
+                    and manual_positions
+                ):
+                    positions = torch.as_tensor(manual_positions, dtype=torch.long)
                     selected_raw = raw.index_select(0, positions)
                     selected_content = content.index_select(0, positions)
                     manual_mask = manual.index_select(0, positions)
@@ -7454,39 +7721,38 @@ class FeatureManager:
                         batch_rows[position] for position in manual_positions
                     ]
                     visible_content = (selected_content > 0.5).float()
+                    manual_groups = (
+                        (
+                            "M1_MANUAL_ROI",
+                            FeatureManager._region_normalize(
+                                selected_raw, manual_support
+                            ),
+                        ),
+                        (
+                            "C3_MANUAL_COMPLEMENT",
+                            FeatureManager._region_normalize(
+                                selected_raw,
+                                visible_content * (1.0 - manual_support),
+                            ),
+                        ),
+                        (
+                            "AU3_ATTENTION_ROI_MANUAL_SUBSET",
+                            FeatureManager._region_normalize(
+                                selected_raw, attention_support
+                            ),
+                        ),
+                        (
+                            "C4_ATTENTION_COMPLEMENT_MANUAL_SUBSET",
+                            FeatureManager._region_normalize(
+                                selected_raw,
+                                visible_content * (1.0 - attention_support),
+                            ),
+                        ),
+                    )
                     groups.extend(
-                        [
-                            (
-                                "M1_MANUAL_ROI",
-                                FeatureManager._region_normalize(
-                                    selected_raw, manual_support
-                                ),
-                                selected_rows,
-                            ),
-                            (
-                                "C3_MANUAL_COMPLEMENT",
-                                FeatureManager._region_normalize(
-                                    selected_raw,
-                                    visible_content * (1.0 - manual_support),
-                                ),
-                                selected_rows,
-                            ),
-                            (
-                                "AU3_ATTENTION_ROI_MANUAL_SUBSET",
-                                FeatureManager._region_normalize(
-                                    selected_raw, attention_support
-                                ),
-                                selected_rows,
-                            ),
-                            (
-                                "C4_ATTENTION_COMPLEMENT_MANUAL_SUBSET",
-                                FeatureManager._region_normalize(
-                                    selected_raw,
-                                    visible_content * (1.0 - attention_support),
-                                ),
-                                selected_rows,
-                            ),
-                        ]
+                        (mode, images, selected_rows)
+                        for mode, images in manual_groups
+                        if mode in compute_set
                     )
 
                 encode_groups(groups)
@@ -7496,7 +7762,7 @@ class FeatureManager:
             mode: pool.finalize(mode)
             for mode in modes_to_compute
         }
-        bank = dict(reusable_static_bank or {})
+        bank = dict(reusable_bank)
         bank.update(computed_bank)
         missing_modes = [
             mode for mode in Settings.Classification.MODES if mode not in bank
@@ -7505,9 +7771,13 @@ class FeatureManager:
             raise RuntimeError(
                 f"Feature-bank rebuild is missing modes: {missing_modes}"
             )
+
+        FeatureManager._validate_cohort_alignment(bank)
+
         arrays: dict[str, np.ndarray] = {}
         metadata_modes: dict[str, dict[str, Any]] = {}
-        for mode, values in bank.items():
+        for mode in Settings.Classification.MODES:
+            values = bank[mode]
             storage_mode = Settings.Classification.LEGACY_MODE_ALIASES[mode]
             arrays[f"{storage_mode}__X"] = values["X"]
             arrays[f"{storage_mode}__y"] = values["y"]
@@ -7520,6 +7790,7 @@ class FeatureManager:
             )
             metadata_modes[mode] = {
                 "description": Settings.Classification.MODE_DESCRIPTIONS[mode],
+                "cohort": Settings.Classification.MODE_COHORTS[mode],
                 "storage_key": storage_mode,
                 "patients": int(len(values["patient_ids"])),
                 "source_slices": int(values["source_slices"]),
@@ -7533,14 +7804,34 @@ class FeatureManager:
         os.replace(temporary, workspace.feature_bank)
         metadata = {
             "fingerprint": fingerprint,
+            "schema": "simple-patient-feature-bank-cross-class-v6-same-slice-baseline",
             "preprocessing_device": "cpu",
             "extractor_device": device.type,
             "modes": metadata_modes,
-            "reused_static_modes": (
-                sorted(reusable_static_bank) if reusable_static_bank else []
+            "reused_modes": sorted(reusable_bank),
+            # Retained for readers expecting the previous metadata field.
+            "reused_static_modes": sorted(
+                mode
+                for mode in reusable_bank
+                if mode not in Settings.Classification.MATCHED_MODES
             ),
             "recomputed_modes": sorted(computed_bank),
-            "matched_only_rebuild": bool(matched_only_rebuild),
+            "incremental_rebuild": bool(reusable_bank),
+            "matched_only_rebuild": (
+                set(computed_bank) == set(Settings.Classification.MATCHED_MODES)
+            ),
+            "same_slice_controls": {
+                "attention_eligible": [
+                    "B2_ATTENTION_ELIGIBLE_FULL_IMAGE",
+                    "AU1_ATTENTION_ROI",
+                    "C1_ATTENTION_COMPLEMENT",
+                ],
+                "cross_class_matched": [
+                    "B1_MATCHED_FULL_IMAGE",
+                    "AU2_MATCHED_ATTENTION_ROI",
+                    "C2_MATCHED_ATTENTION_COMPLEMENT",
+                ],
+            },
             "elapsed": RuntimeManager.format_seconds(
                 time.perf_counter() - started
             ),
@@ -7780,11 +8071,7 @@ class EvaluationManager:
                         else "mask_validation"
                     ),
                     "description": Settings.Classification.MODE_DESCRIPTIONS[mode],
-                    "cohort": (
-                        "cross_class_matched"
-                        if mode in Settings.Classification.MATCHED_MODES
-                        else "all_or_manual_subset"
-                    ),
+                    "cohort": Settings.Classification.MODE_COHORTS[mode],
                     "patients": len(patients),
                     "source_slices": values["source_slices"],
                     "series_proxies": values["series_proxies"],
@@ -7801,29 +8088,66 @@ class EvaluationManager:
 
         comparisons = []
         for first_mode, second_mode, question in (
-            ("AU1_ATTENTION_ROI", "C1_ATTENTION_COMPLEMENT", "heart_roi_vs_outside"),
+            (
+                "AU1_ATTENTION_ROI",
+                "B2_ATTENTION_ELIGIBLE_FULL_IMAGE",
+                "same_attention_eligible_slices_roi_vs_full_image",
+            ),
+            (
+                "B2_ATTENTION_ELIGIBLE_FULL_IMAGE",
+                "C1_ATTENTION_COMPLEMENT",
+                "same_attention_eligible_slices_full_image_vs_complement",
+            ),
+            (
+                "AU1_ATTENTION_ROI",
+                "C1_ATTENTION_COMPLEMENT",
+                "same_attention_eligible_slices_roi_vs_complement",
+            ),
+            (
+                "B2_ATTENTION_ELIGIBLE_FULL_IMAGE",
+                "B0_FULL_IMAGE",
+                "attention_eligible_selection_effect_on_full_image",
+            ),
+            (
+                "AU2_MATCHED_ATTENTION_ROI",
+                "B1_MATCHED_FULL_IMAGE",
+                "cross_class_matched_roi_vs_full_image",
+            ),
             (
                 "AU2_MATCHED_ATTENTION_ROI",
                 "C2_MATCHED_ATTENTION_COMPLEMENT",
-                "cross_class_matched_heart_roi_vs_outside",
+                "cross_class_matched_roi_vs_complement",
+            ),
+            (
+                "B1_MATCHED_FULL_IMAGE",
+                "C2_MATCHED_ATTENTION_COMPLEMENT",
+                "cross_class_matched_full_image_vs_complement",
             ),
             (
                 "B0_FULL_IMAGE",
                 "B1_MATCHED_FULL_IMAGE",
-                "all_images_vs_cross_class_matched_full",
+                "all_slices_vs_cross_class_matched_full_image",
             ),
             (
                 "AU1_ATTENTION_ROI",
                 "AU2_MATCHED_ATTENTION_ROI",
-                "all_images_vs_cross_class_matched_roi",
+                "attention_eligible_vs_cross_class_matched_roi",
             ),
             (
                 "C1_ATTENTION_COMPLEMENT",
                 "C2_MATCHED_ATTENTION_COMPLEMENT",
-                "all_images_vs_cross_class_matched_complement",
+                "attention_eligible_vs_cross_class_matched_complement",
             ),
-            ("M1_MANUAL_ROI", "AU3_ATTENTION_ROI_MANUAL_SUBSET", "manual_vs_attention_same_images"),
-            ("C3_MANUAL_COMPLEMENT", "C4_ATTENTION_COMPLEMENT_MANUAL_SUBSET", "manual_vs_attention_complement_same_images"),
+            (
+                "M1_MANUAL_ROI",
+                "AU3_ATTENTION_ROI_MANUAL_SUBSET",
+                "manual_vs_attention_roi_same_images",
+            ),
+            (
+                "C3_MANUAL_COMPLEMENT",
+                "C4_ATTENTION_COMPLEMENT_MANUAL_SUBSET",
+                "manual_vs_attention_complement_same_images",
+            ),
         ):
             comparison = EvaluationManager._paired_auc_difference(
                 prediction_tables[first_mode],
