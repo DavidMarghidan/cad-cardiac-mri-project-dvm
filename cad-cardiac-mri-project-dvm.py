@@ -19,6 +19,8 @@ a smaller, ready experiment set. The non-negotiable guarantees are:
 8. ``B2_ATTENTION_ELIGIBLE_FULL_IMAGE``, ``AU1_ATTENTION_ROI``, and
    ``C1_ATTENTION_COMPLEMENT`` are built from exactly the same source slices.
    ``B0_FULL_IMAGE`` is retained only as the broader all-slice reference.
+9. Dilated-25 experiments expand the existing AU support by 25% in linear
+   scale around its centroid, without rewriting the persisted mask PNG files.
 
 The three Kaggle entry points at the bottom separate CPU audit, GPU segmentation,
 and final CPU evaluation so that expensive accelerators are used only where they
@@ -72,7 +74,7 @@ from tqdm.auto import tqdm
 
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
-PIPELINE_VERSION = "2026-09-25-clean-v3-same-slice-full-image-control"
+PIPELINE_VERSION = "2026-09-26-clean-v4-dilated25-attention-control"
 
 
 def _as_float(value: Any, default: float = 0.0) -> float:
@@ -304,10 +306,12 @@ class SegmentationSettings:
 class ClassificationSettings:
     """Frozen feature extraction and patient-level classification settings.
 
-    The registry contains seven primary experiments plus four mask-validation
+    The registry contains eleven primary experiments plus four mask-validation
     controls. ``B0`` remains the broad all-slice reference, while ``B2``, ``AU1``,
     and ``C1`` form the direct same-slice comparison required to isolate the
-    effect of the automatic cardiac ROI from image-selection effects.
+    effect of the automatic cardiac ROI from image-selection effects. The four
+    Dilated-25 modes test whether a wider peri-cardiac support improves the ROI
+    and removes predictive signal from its complement.
     """
 
     FEATURE_BATCH_SIZE_CUDA = 12
@@ -323,19 +327,29 @@ class ClassificationSettings:
     C_GRID = (0.01, 0.1, 1.0, 10.0)
     BOOTSTRAP_REPEATS = 2000
 
+    # The Dilated-25 experiment scales the already constructed AU support
+    # (including the baseline fixed support dilation) by 1.25 around its own
+    # centroid. The original masks on disk are never modified.
+    ATTENTION_SUPPORT_EXPANSION_PERCENT = 25.0
+
     # B0 answers the broad contextual question on every dataset slice. The direct
     # automatic-mask experiment is the B2/AU1/C1 triad: all three modes use the
     # exact same images, removing source-image selection as a confounder while
-    # retaining each mode's intended full/ROI/complement preprocessing.
-    # B1/AU2/C2 repeat that logic on the Sick/Normal matched cohort.
+    # retaining each mode's intended full/ROI/complement preprocessing. AU4/C5
+    # repeat the ROI/complement calculation after 25% support expansion.
+    # B1/AU2/C2 and AU5/C6 repeat both logics on the matched cohort.
     PRIMARY_MODES = (
         "B0_FULL_IMAGE",
         "B2_ATTENTION_ELIGIBLE_FULL_IMAGE",
         "AU1_ATTENTION_ROI",
         "C1_ATTENTION_COMPLEMENT",
+        "AU4_DILATED25_ATTENTION_ROI",
+        "C5_DILATED25_ATTENTION_COMPLEMENT",
         "B1_MATCHED_FULL_IMAGE",
         "AU2_MATCHED_ATTENTION_ROI",
         "C2_MATCHED_ATTENTION_COMPLEMENT",
+        "AU5_MATCHED_DILATED25_ATTENTION_ROI",
+        "C6_MATCHED_DILATED25_ATTENTION_COMPLEMENT",
     )
     VALIDATION_MODES = (
         "M1_MANUAL_ROI",
@@ -353,9 +367,13 @@ class ClassificationSettings:
         "B2_ATTENTION_ELIGIBLE_FULL_IMAGE": "B2_ATTENTION_ELIGIBLE_FULL_IMAGE",
         "AU1_ATTENTION_ROI": "AU1_ATTENTION_ROI",
         "C1_ATTENTION_COMPLEMENT": "AU5_ATTENTION_COMPLEMENT",
+        "AU4_DILATED25_ATTENTION_ROI": "AU4_DILATED25_ATTENTION_ROI",
+        "C5_DILATED25_ATTENTION_COMPLEMENT": "C5_DILATED25_ATTENTION_COMPLEMENT",
         "B1_MATCHED_FULL_IMAGE": "CROSS_CLASS_MATCHED_FULL_IMAGE",
         "AU2_MATCHED_ATTENTION_ROI": "CROSS_CLASS_MATCHED_AU1_ATTENTION_ROI",
         "C2_MATCHED_ATTENTION_COMPLEMENT": "CROSS_CLASS_MATCHED_AU5_ATTENTION_COMPLEMENT",
+        "AU5_MATCHED_DILATED25_ATTENTION_ROI": "AU5_MATCHED_DILATED25_ATTENTION_ROI",
+        "C6_MATCHED_DILATED25_ATTENTION_COMPLEMENT": "C6_MATCHED_DILATED25_ATTENTION_COMPLEMENT",
         "M1_MANUAL_ROI": "AU6_MANUAL_ROI",
         "C3_MANUAL_COMPLEMENT": "AU7_MANUAL_COMPLEMENT",
         "AU3_ATTENTION_ROI_MANUAL_SUBSET": "AU8_ATTENTION_MATCHED_MANUAL_ROI",
@@ -366,9 +384,13 @@ class ClassificationSettings:
         "B2_ATTENTION_ELIGIBLE_FULL_IMAGE",
         "AU1_ATTENTION_ROI",
         "AU5_ATTENTION_COMPLEMENT",
+        "AU4_DILATED25_ATTENTION_ROI",
+        "C5_DILATED25_ATTENTION_COMPLEMENT",
         "CROSS_CLASS_MATCHED_FULL_IMAGE",
         "CROSS_CLASS_MATCHED_AU1_ATTENTION_ROI",
         "CROSS_CLASS_MATCHED_AU5_ATTENTION_COMPLEMENT",
+        "AU5_MATCHED_DILATED25_ATTENTION_ROI",
+        "C6_MATCHED_DILATED25_ATTENTION_COMPLEMENT",
         "AU6_MANUAL_ROI",
         "AU7_MANUAL_COMPLEMENT",
         "AU8_ATTENTION_MATCHED_MANUAL_ROI",
@@ -380,6 +402,8 @@ class ClassificationSettings:
             "B2_ATTENTION_ELIGIBLE_FULL_IMAGE",
             "AU1_ATTENTION_ROI",
             "C1_ATTENTION_COMPLEMENT",
+            "AU4_DILATED25_ATTENTION_ROI",
+            "C5_DILATED25_ATTENTION_COMPLEMENT",
         }
     )
     MATCHED_MODES = frozenset(
@@ -387,6 +411,16 @@ class ClassificationSettings:
             "B1_MATCHED_FULL_IMAGE",
             "AU2_MATCHED_ATTENTION_ROI",
             "C2_MATCHED_ATTENTION_COMPLEMENT",
+            "AU5_MATCHED_DILATED25_ATTENTION_ROI",
+            "C6_MATCHED_DILATED25_ATTENTION_COMPLEMENT",
+        }
+    )
+    DILATED25_MODES = frozenset(
+        {
+            "AU4_DILATED25_ATTENTION_ROI",
+            "C5_DILATED25_ATTENTION_COMPLEMENT",
+            "AU5_MATCHED_DILATED25_ATTENTION_ROI",
+            "C6_MATCHED_DILATED25_ATTENTION_COMPLEMENT",
         }
     )
     MANUAL_SUBSET_MODES = frozenset(VALIDATION_MODES)
@@ -396,9 +430,13 @@ class ClassificationSettings:
         "B2_ATTENTION_ELIGIBLE_FULL_IMAGE": "Full image on exactly the AU1/C1 attention-eligible slices",
         "AU1_ATTENTION_ROI": "Automatic Attention U-Net heart ROI on the same attention-eligible slices",
         "C1_ATTENTION_COMPLEMENT": "Pixels outside the automatic heart ROI on the same attention-eligible slices",
+        "AU4_DILATED25_ATTENTION_ROI": "Attention ROI after 25% linear expansion of the AU1 support",
+        "C5_DILATED25_ATTENTION_COMPLEMENT": "Pixels outside the 25%-expanded AU1 support",
         "B1_MATCHED_FULL_IMAGE": "Full-image baseline on the expanded balanced Sick/Normal cohort",
         "AU2_MATCHED_ATTENTION_ROI": "Automatic heart ROI on the expanded balanced matched cohort",
         "C2_MATCHED_ATTENTION_COMPLEMENT": "Automatic-ROI complement on the expanded balanced matched cohort",
+        "AU5_MATCHED_DILATED25_ATTENTION_ROI": "25%-expanded Attention ROI on the matched cohort",
+        "C6_MATCHED_DILATED25_ATTENTION_COMPLEMENT": "Complement outside the 25%-expanded Attention ROI on the matched cohort",
         "M1_MANUAL_ROI": "Manual heart ROI on the annotated subset",
         "C3_MANUAL_COMPLEMENT": "Complement of the manual ROI",
         "AU3_ATTENTION_ROI_MANUAL_SUBSET": "Automatic ROI on the same manually annotated images",
@@ -409,9 +447,13 @@ class ClassificationSettings:
         "B2_ATTENTION_ELIGIBLE_FULL_IMAGE": "attention_eligible_same_slices",
         "AU1_ATTENTION_ROI": "attention_eligible_same_slices",
         "C1_ATTENTION_COMPLEMENT": "attention_eligible_same_slices",
+        "AU4_DILATED25_ATTENTION_ROI": "attention_eligible_same_slices",
+        "C5_DILATED25_ATTENTION_COMPLEMENT": "attention_eligible_same_slices",
         "B1_MATCHED_FULL_IMAGE": "cross_class_matched_same_slices",
         "AU2_MATCHED_ATTENTION_ROI": "cross_class_matched_same_slices",
         "C2_MATCHED_ATTENTION_COMPLEMENT": "cross_class_matched_same_slices",
+        "AU5_MATCHED_DILATED25_ATTENTION_ROI": "cross_class_matched_same_slices",
+        "C6_MATCHED_DILATED25_ATTENTION_COMPLEMENT": "cross_class_matched_same_slices",
         "M1_MANUAL_ROI": "manual_positive_same_slices",
         "C3_MANUAL_COMPLEMENT": "manual_positive_same_slices",
         "AU3_ATTENTION_ROI_MANUAL_SUBSET": "manual_positive_same_slices",
@@ -7007,6 +7049,68 @@ class FeatureManager:
         return (support > 0.5).float() * (content > 0.5).float()
 
     @staticmethod
+    def _expand_support_linear(
+        support: torch.Tensor,
+        content: torch.Tensor,
+        percent: float,
+    ) -> torch.Tensor:
+        """Expand each binary support around its own centroid by a linear factor.
+
+        A value of 25 means that horizontal and vertical distances from the mask
+        centroid are multiplied by 1.25. The transformation is performed only in
+        memory for feature extraction: predicted/manual PNG masks are not edited.
+        The original support is unioned back after resampling, guaranteeing that
+        the expanded region is never smaller because of nearest-neighbour rounding.
+        """
+
+        if support.ndim == 3:
+            support = support.unsqueeze(1)
+        if content.ndim == 3:
+            content = content.unsqueeze(1)
+        binary = (support > 0.5).float()
+        visible_content = (content > 0.5).float()
+        percent = float(percent)
+        if percent <= 0.0:
+            return binary * visible_content
+
+        scale = 1.0 + percent / 100.0
+        if not np.isfinite(scale) or scale <= 1.0:
+            raise ValueError(f"Invalid support expansion percent: {percent}")
+
+        batch_size, _channels, height, width = binary.shape
+        weights = binary[:, 0]
+        counts = weights.sum(dim=(1, 2))
+        safe_counts = counts.clamp_min(1.0)
+        x_coordinates = torch.linspace(
+            -1.0, 1.0, width, device=binary.device, dtype=binary.dtype
+        ).view(1, 1, width)
+        y_coordinates = torch.linspace(
+            -1.0, 1.0, height, device=binary.device, dtype=binary.dtype
+        ).view(1, height, 1)
+        centroid_x = (weights * x_coordinates).sum(dim=(1, 2)) / safe_counts
+        centroid_y = (weights * y_coordinates).sum(dim=(1, 2)) / safe_counts
+
+        inverse_scale = 1.0 / scale
+        theta = torch.zeros(
+            (batch_size, 2, 3), device=binary.device, dtype=binary.dtype
+        )
+        theta[:, 0, 0] = inverse_scale
+        theta[:, 1, 1] = inverse_scale
+        theta[:, 0, 2] = centroid_x * (1.0 - inverse_scale)
+        theta[:, 1, 2] = centroid_y * (1.0 - inverse_scale)
+        grid = F.affine_grid(theta, binary.shape, align_corners=True)
+        expanded = F.grid_sample(
+            binary,
+            grid,
+            mode="nearest",
+            padding_mode="zeros",
+            align_corners=True,
+        )
+        expanded = torch.maximum(expanded, binary)
+        nonempty = (counts > 0).view(-1, 1, 1, 1).float()
+        return (expanded > 0.5).float() * visible_content * nonempty
+
+    @staticmethod
     def _accepted_manual_tokens(
         workspace: Workspace,
         verbose: bool = False,
@@ -7123,6 +7227,8 @@ class FeatureManager:
                 "B2_ATTENTION_ELIGIBLE_FULL_IMAGE",
                 "AU1_ATTENTION_ROI",
                 "C1_ATTENTION_COMPLEMENT",
+                "AU4_DILATED25_ATTENTION_ROI",
+                "C5_DILATED25_ATTENTION_COMPLEMENT",
             ),
             "attention_eligible_same_slices",
         )
@@ -7132,6 +7238,8 @@ class FeatureManager:
                 "B1_MATCHED_FULL_IMAGE",
                 "AU2_MATCHED_ATTENTION_ROI",
                 "C2_MATCHED_ATTENTION_COMPLEMENT",
+                "AU5_MATCHED_DILATED25_ATTENTION_ROI",
+                "C6_MATCHED_DILATED25_ATTENTION_COMPLEMENT",
             ),
             "cross_class_matched_same_slices",
         )
@@ -7153,10 +7261,16 @@ class FeatureManager:
         prediction_summary = FileManager.read_json(workspace.prediction_summary, {}) or {}
         digest = hashlib.sha256()
         payload = {
-            "schema": "simple-patient-feature-bank-cross-class-v6-same-slice-baseline",
+            "schema": "simple-patient-feature-bank-cross-class-v7-dilated25",
             "modes": Settings.Classification.LEGACY_STORAGE_MODES,
             "prediction_fingerprint": prediction_summary.get("fingerprint", ""),
             "support_dilation": Settings.Segmentation.SUPPORT_DILATION_KERNEL,
+            "attention_support_expansion_percent": (
+                Settings.Classification.ATTENTION_SUPPORT_EXPANSION_PERCENT
+            ),
+            "attention_support_expansion_definition": (
+                "linear_scale_about_support_centroid_after_baseline_support_dilation"
+            ),
             "imagenet_weights": Settings.Classification.USE_IMAGENET_WEIGHTS,
             "classification_size": Settings.Image.CLASSIFICATION_SIZE,
             "quality_thresholds": {
@@ -7197,11 +7311,11 @@ class FeatureManager:
         modes: Sequence[str],
         allow_missing: bool = False,
     ) -> dict[str, dict[str, Any]]:
-        """Load selected modes while accepting the pre-B2 storage schema.
+        """Load selected modes while accepting older additive schemas.
 
-        ``allow_missing=True`` is used only for the controlled cache migration that
-        adds B2. A partially written mode still raises an error; only a completely
-        absent mode may be skipped.
+        ``allow_missing=True`` is used only for controlled cache migration when B2
+        or the Dilated-25 experiments are absent. A partially written mode still
+        raises an error; only a completely absent mode may be skipped.
         """
 
         if not workspace.feature_bank.is_file():
@@ -7270,12 +7384,13 @@ class FeatureManager:
     def _reusable_bank_for_incremental_rebuild(
         workspace: Workspace,
     ) -> dict[str, dict[str, Any]] | None:
-        """Reuse old modes for two explicitly safe incremental updates.
+        """Reuse all unaffected arrays when additive experiments are introduced.
 
-        Safe update 1 adds the new B2 same-slice full-image control while leaving
-        every existing representation unchanged. Safe update 2 rebuilds only the
-        three matched modes after the matching manifest changes. Any newer quality,
-        prediction, manual-audit, annotation, or manual-mask input disables reuse.
+        B2 and the four Dilated-25 modes are pure feature-bank additions: they do
+        not change checkpoints, prediction masks, audits, or any historical input
+        representation. They may therefore be computed without rebuilding older
+        modes. A newer matching manifest still invalidates every matched mode.
+        Any newer quality/prediction/manual input disables this migration entirely.
         """
 
         if not workspace.feature_bank.is_file() or not workspace.feature_metadata.is_file():
@@ -7291,12 +7406,15 @@ class FeatureManager:
             workspace.manual_annotations,
             workspace.prediction_audit,
         )
-        for path in static_inputs:
-            if path.is_file() and path.stat().st_mtime_ns > bank_mtime:
+        for input_path in static_inputs:
+            if input_path.is_file() and input_path.stat().st_mtime_ns > bank_mtime:
                 return None
         try:
             newest_manual = max(
-                (path.stat().st_mtime_ns for path in workspace.manual_masks.glob("*.png")),
+                (
+                    mask_path.stat().st_mtime_ns
+                    for mask_path in workspace.manual_masks.glob("*.png")
+                ),
                 default=0,
             )
         except OSError:
@@ -7313,21 +7431,20 @@ class FeatureManager:
         except Exception:
             return None
 
-        b2_mode = "B2_ATTENTION_ELIGIBLE_FULL_IMAGE"
-        required_pre_b2_modes = set(Settings.Classification.MODES) - {b2_mode}
-        if not required_pre_b2_modes.issubset(previous):
+        safely_additive_modes = {
+            "B2_ATTENTION_ELIGIBLE_FULL_IMAGE",
+            *Settings.Classification.DILATED25_MODES,
+        }
+        required_historical_modes = (
+            set(Settings.Classification.MODES) - safely_additive_modes
+        )
+        if not required_historical_modes.issubset(previous):
             return None
 
-        missing_b2 = b2_mode not in previous
         matching_changed = bool(
             workspace.cross_class_matching_manifest.is_file()
             and workspace.cross_class_matching_manifest.stat().st_mtime_ns > bank_mtime
         )
-        if not missing_b2 and not matching_changed:
-            # A different fingerprint cause may represent changed preprocessing or
-            # settings; do not silently reuse in that case.
-            return None
-
         reusable = dict(previous)
         if matching_changed:
             for mode in Settings.Classification.MATCHED_MODES:
@@ -7336,7 +7453,12 @@ class FeatureManager:
         missing_modes = [
             mode for mode in Settings.Classification.MODES if mode not in reusable
         ]
-        allowed_missing = {b2_mode}
+        if not missing_modes and not matching_changed:
+            # A different fingerprint cause may represent changed preprocessing or
+            # settings; do not silently reuse in that case.
+            return None
+
+        allowed_missing = set(safely_additive_modes)
         if matching_changed:
             allowed_missing.update(Settings.Classification.MATCHED_MODES)
         if not set(missing_modes).issubset(allowed_missing):
@@ -7529,6 +7651,12 @@ class FeatureManager:
             "C1_ATTENTION_COMPLEMENT": (
                 ("C2_MATCHED_ATTENTION_COMPLEMENT", "keep_cross_class_matched"),
             ),
+            "AU4_DILATED25_ATTENTION_ROI": (
+                ("AU5_MATCHED_DILATED25_ATTENTION_ROI", "keep_cross_class_matched"),
+            ),
+            "C5_DILATED25_ATTENTION_COMPLEMENT": (
+                ("C6_MATCHED_DILATED25_ATTENTION_COMPLEMENT", "keep_cross_class_matched"),
+            ),
         }
 
         def encode_groups(
@@ -7635,72 +7763,165 @@ class FeatureManager:
                         )
                     )
 
-                needs_automatic_regions = bool(
-                    compute_set
-                    & {
-                        "AU1_ATTENTION_ROI",
-                        "C1_ATTENTION_COMPLEMENT",
-                        "AU2_MATCHED_ATTENTION_ROI",
-                        "C2_MATCHED_ATTENTION_COMPLEMENT",
-                    }
-                )
-                if needs_automatic_regions:
-                    use_attention_superset = bool(
-                        compute_set
-                        & {"AU1_ATTENTION_ROI", "C1_ATTENTION_COMPLEMENT"}
+                unmatched_original_modes = {
+                    "AU1_ATTENTION_ROI",
+                    "C1_ATTENTION_COMPLEMENT",
+                }
+                unmatched_dilated25_modes = {
+                    "AU4_DILATED25_ATTENTION_ROI",
+                    "C5_DILATED25_ATTENTION_COMPLEMENT",
+                }
+                direct_matched_original_modes = {
+                    mode
+                    for mode, source_mode in (
+                        ("AU2_MATCHED_ATTENTION_ROI", "AU1_ATTENTION_ROI"),
+                        ("C2_MATCHED_ATTENTION_COMPLEMENT", "C1_ATTENTION_COMPLEMENT"),
                     )
-                    automatic_positions = (
-                        attention_positions if use_attention_superset else matched_positions
+                    if mode in compute_set and source_mode not in compute_set
+                }
+                direct_matched_dilated25_modes = {
+                    mode
+                    for mode, source_mode in (
+                        (
+                            "AU5_MATCHED_DILATED25_ATTENTION_ROI",
+                            "AU4_DILATED25_ATTENTION_ROI",
+                        ),
+                        (
+                            "C6_MATCHED_DILATED25_ATTENTION_COMPLEMENT",
+                            "C5_DILATED25_ATTENTION_COMPLEMENT",
+                        ),
                     )
-                    if automatic_positions:
-                        positions = torch.as_tensor(
-                            automatic_positions, dtype=torch.long
-                        )
-                        selected_raw = raw.index_select(0, positions)
-                        selected_content = content.index_select(0, positions)
-                        selected_mask = attention.index_select(0, positions)
-                        support = FeatureManager._support(
-                            selected_mask, selected_content
-                        )
-                        selected_rows = [
-                            batch_rows[position] for position in automatic_positions
-                        ]
+                    if mode in compute_set and source_mode not in compute_set
+                }
 
-                        if "AU1_ATTENTION_ROI" in compute_set:
-                            roi_mode = "AU1_ATTENTION_ROI"
-                        elif "AU2_MATCHED_ATTENTION_ROI" in compute_set:
-                            roi_mode = "AU2_MATCHED_ATTENTION_ROI"
-                        else:
-                            roi_mode = ""
-                        if roi_mode:
+                def append_automatic_region_groups(
+                    selected_positions: list[int],
+                    original_roi_mode: str,
+                    original_complement_mode: str,
+                    expanded_roi_mode: str,
+                    expanded_complement_mode: str,
+                ) -> None:
+                    if not selected_positions:
+                        return
+                    positions = torch.as_tensor(
+                        selected_positions, dtype=torch.long
+                    )
+                    selected_raw = raw.index_select(0, positions)
+                    selected_content = content.index_select(0, positions)
+                    selected_mask = attention.index_select(0, positions)
+                    support = FeatureManager._support(
+                        selected_mask, selected_content
+                    )
+                    selected_rows = [
+                        batch_rows[position] for position in selected_positions
+                    ]
+                    visible_content = (selected_content > 0.5).float()
+
+                    if original_roi_mode:
+                        groups.append(
+                            (
+                                original_roi_mode,
+                                FeatureManager._region_normalize(
+                                    selected_raw, support
+                                ),
+                                selected_rows,
+                            )
+                        )
+                    if original_complement_mode:
+                        groups.append(
+                            (
+                                original_complement_mode,
+                                FeatureManager._region_normalize(
+                                    selected_raw,
+                                    visible_content * (1.0 - support),
+                                ),
+                                selected_rows,
+                            )
+                        )
+
+                    if expanded_roi_mode or expanded_complement_mode:
+                        expanded_support = FeatureManager._expand_support_linear(
+                            support,
+                            selected_content,
+                            Settings.Classification.ATTENTION_SUPPORT_EXPANSION_PERCENT,
+                        )
+                        if expanded_roi_mode:
                             groups.append(
                                 (
-                                    roi_mode,
+                                    expanded_roi_mode,
                                     FeatureManager._region_normalize(
-                                        selected_raw, support
+                                        selected_raw, expanded_support
                                     ),
                                     selected_rows,
                                 )
                             )
-
-                        if "C1_ATTENTION_COMPLEMENT" in compute_set:
-                            complement_mode = "C1_ATTENTION_COMPLEMENT"
-                        elif "C2_MATCHED_ATTENTION_COMPLEMENT" in compute_set:
-                            complement_mode = "C2_MATCHED_ATTENTION_COMPLEMENT"
-                        else:
-                            complement_mode = ""
-                        if complement_mode:
+                        if expanded_complement_mode:
                             groups.append(
                                 (
-                                    complement_mode,
+                                    expanded_complement_mode,
                                     FeatureManager._region_normalize(
                                         selected_raw,
-                                        (selected_content > 0.5).float()
-                                        * (1.0 - support),
+                                        visible_content * (1.0 - expanded_support),
                                     ),
                                     selected_rows,
                                 )
                             )
+
+                if compute_set & (
+                    unmatched_original_modes | unmatched_dilated25_modes
+                ):
+                    append_automatic_region_groups(
+                        attention_positions,
+                        (
+                            "AU1_ATTENTION_ROI"
+                            if "AU1_ATTENTION_ROI" in compute_set
+                            else ""
+                        ),
+                        (
+                            "C1_ATTENTION_COMPLEMENT"
+                            if "C1_ATTENTION_COMPLEMENT" in compute_set
+                            else ""
+                        ),
+                        (
+                            "AU4_DILATED25_ATTENTION_ROI"
+                            if "AU4_DILATED25_ATTENTION_ROI" in compute_set
+                            else ""
+                        ),
+                        (
+                            "C5_DILATED25_ATTENTION_COMPLEMENT"
+                            if "C5_DILATED25_ATTENTION_COMPLEMENT" in compute_set
+                            else ""
+                        ),
+                    )
+
+                if direct_matched_original_modes or direct_matched_dilated25_modes:
+                    append_automatic_region_groups(
+                        matched_positions,
+                        (
+                            "AU2_MATCHED_ATTENTION_ROI"
+                            if "AU2_MATCHED_ATTENTION_ROI"
+                            in direct_matched_original_modes
+                            else ""
+                        ),
+                        (
+                            "C2_MATCHED_ATTENTION_COMPLEMENT"
+                            if "C2_MATCHED_ATTENTION_COMPLEMENT"
+                            in direct_matched_original_modes
+                            else ""
+                        ),
+                        (
+                            "AU5_MATCHED_DILATED25_ATTENTION_ROI"
+                            if "AU5_MATCHED_DILATED25_ATTENTION_ROI"
+                            in direct_matched_dilated25_modes
+                            else ""
+                        ),
+                        (
+                            "C6_MATCHED_DILATED25_ATTENTION_COMPLEMENT"
+                            if "C6_MATCHED_DILATED25_ATTENTION_COMPLEMENT"
+                            in direct_matched_dilated25_modes
+                            else ""
+                        ),
+                    )
 
                 if (
                     compute_set & Settings.Classification.MANUAL_SUBSET_MODES
@@ -7804,9 +8025,23 @@ class FeatureManager:
         os.replace(temporary, workspace.feature_bank)
         metadata = {
             "fingerprint": fingerprint,
-            "schema": "simple-patient-feature-bank-cross-class-v6-same-slice-baseline",
+            "schema": "simple-patient-feature-bank-cross-class-v7-dilated25",
             "preprocessing_device": "cpu",
             "extractor_device": device.type,
+            "attention_support_expansion": {
+                "percent_linear": float(
+                    Settings.Classification.ATTENTION_SUPPORT_EXPANSION_PERCENT
+                ),
+                "scale_factor": float(
+                    1.0
+                    + Settings.Classification.ATTENTION_SUPPORT_EXPANSION_PERCENT
+                    / 100.0
+                ),
+                "definition": (
+                    "scale baseline AU support about its own centroid; "
+                    "clip to visible content; do not rewrite mask PNG files"
+                ),
+            },
             "modes": metadata_modes,
             "reused_modes": sorted(reusable_bank),
             # Retained for readers expecting the previous metadata field.
@@ -7825,11 +8060,15 @@ class FeatureManager:
                     "B2_ATTENTION_ELIGIBLE_FULL_IMAGE",
                     "AU1_ATTENTION_ROI",
                     "C1_ATTENTION_COMPLEMENT",
+                    "AU4_DILATED25_ATTENTION_ROI",
+                    "C5_DILATED25_ATTENTION_COMPLEMENT",
                 ],
                 "cross_class_matched": [
                     "B1_MATCHED_FULL_IMAGE",
                     "AU2_MATCHED_ATTENTION_ROI",
                     "C2_MATCHED_ATTENTION_COMPLEMENT",
+                    "AU5_MATCHED_DILATED25_ATTENTION_ROI",
+                    "C6_MATCHED_DILATED25_ATTENTION_COMPLEMENT",
                 ],
             },
             "elapsed": RuntimeManager.format_seconds(
@@ -8104,6 +8343,26 @@ class EvaluationManager:
                 "same_attention_eligible_slices_roi_vs_complement",
             ),
             (
+                "AU4_DILATED25_ATTENTION_ROI",
+                "AU1_ATTENTION_ROI",
+                "dilated25_roi_vs_original_roi_same_slices",
+            ),
+            (
+                "C1_ATTENTION_COMPLEMENT",
+                "C5_DILATED25_ATTENTION_COMPLEMENT",
+                "original_complement_vs_dilated25_complement_same_slices",
+            ),
+            (
+                "AU4_DILATED25_ATTENTION_ROI",
+                "B2_ATTENTION_ELIGIBLE_FULL_IMAGE",
+                "dilated25_roi_vs_full_image_same_slices",
+            ),
+            (
+                "AU4_DILATED25_ATTENTION_ROI",
+                "C5_DILATED25_ATTENTION_COMPLEMENT",
+                "dilated25_roi_vs_dilated25_complement_same_slices",
+            ),
+            (
                 "B2_ATTENTION_ELIGIBLE_FULL_IMAGE",
                 "B0_FULL_IMAGE",
                 "attention_eligible_selection_effect_on_full_image",
@@ -8122,6 +8381,26 @@ class EvaluationManager:
                 "B1_MATCHED_FULL_IMAGE",
                 "C2_MATCHED_ATTENTION_COMPLEMENT",
                 "cross_class_matched_full_image_vs_complement",
+            ),
+            (
+                "AU5_MATCHED_DILATED25_ATTENTION_ROI",
+                "AU2_MATCHED_ATTENTION_ROI",
+                "matched_dilated25_roi_vs_original_roi",
+            ),
+            (
+                "C2_MATCHED_ATTENTION_COMPLEMENT",
+                "C6_MATCHED_DILATED25_ATTENTION_COMPLEMENT",
+                "matched_original_complement_vs_dilated25_complement",
+            ),
+            (
+                "AU5_MATCHED_DILATED25_ATTENTION_ROI",
+                "B1_MATCHED_FULL_IMAGE",
+                "matched_dilated25_roi_vs_full_image",
+            ),
+            (
+                "AU5_MATCHED_DILATED25_ATTENTION_ROI",
+                "C6_MATCHED_DILATED25_ATTENTION_COMPLEMENT",
+                "matched_dilated25_roi_vs_dilated25_complement",
             ),
             (
                 "B0_FULL_IMAGE",
