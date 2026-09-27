@@ -1,7 +1,20 @@
 """Patient-level cardiac MRI CAD research pipeline.
 
 This version keeps the complete scientific workflow while presenting it through
-a smaller, ready experiment set. The non-negotiable guarantees are:
+a smaller, ready experiment set.
+
+The source code is ordered exactly as the pipeline runs:
+
+1. discover the dataset and restore compatible workspace artifacts;
+2. standardize images and audit image quality and manual masks;
+3. train and apply the patient-level cross-fitted Attention U-Net;
+4. review unresolved masks in the Kaggle-safe editor;
+5. build the balanced Sick-to-Normal matching cohort;
+6. extract frozen EfficientNet features and aggregate them by patient;
+7. run nested patient-level evaluation and paired AUC comparisons;
+8. expose simple CPU/GPU/Kaggle entry points.
+
+The non-negotiable scientific guarantees are:
 
 1. ``Directory_*`` is the patient identifier and never crosses validation folds.
 2. Attention U-Net is trained by patient-level cross-fitting with explicit
@@ -72,12 +85,11 @@ from tqdm.auto import tqdm
 
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
-PIPELINE_VERSION = "2026-09-25-clean-v3-same-slice-full-image-control"
+PIPELINE_VERSION = "2026-09-27-simplified-v4-same-functionality"
 
 
 def _as_float(value: Any, default: float = 0.0) -> float:
-
-
+    """Convert a value to a finite float, or return the supplied default."""
     try:
         result = float(value)
     except (TypeError, ValueError):
@@ -86,12 +98,12 @@ def _as_float(value: Any, default: float = 0.0) -> float:
 
 
 def _as_int(value: Any, default: int = 0) -> int:
+    """Convert a value to the nearest integer, or return the supplied default."""
     return int(round(_as_float(value, float(default))))
 
 
 def _default_dataset_path() -> Path:
-
-
+    """Find the dataset root in the environment, Kaggle, or the local fallback path."""
     env_value = os.environ.get("CAD_DATASET_PATH", "").strip()
     candidates: list[Path] = []
     if env_value:
@@ -105,6 +117,7 @@ def _default_dataset_path() -> Path:
     )
 
     def is_dataset_root(path: Path) -> bool:
+        """Perform the local is dataset root step used by the surrounding operation."""
         return path.is_dir() and (path / "Normal").is_dir() and (path / "Sick").is_dir()
 
     for candidate in candidates:
@@ -128,371 +141,30 @@ def _default_dataset_path() -> Path:
 
 
 def _default_workspace_path() -> Path:
+    """Return the default persistent workspace path for Kaggle or local execution."""
     if Path("/kaggle/working").exists():
         return Path("/kaggle/working/cad_attention_unet_workspace")
     return Path.cwd() / "cad_attention_unet_workspace"
 
 
 # -----------------------------------------------------------------------------
-# Configuration and persistent workspace contract
+# SETTINGS LOCATION
 # -----------------------------------------------------------------------------
-class PathSettings:
-    """Centralize dataset and workspace locations.
+# Each setting now lives at the top of the pipeline class that uses it.
+# This removes the extra global-configuration indirection and makes the file readable
+# from top to bottom without jumping between configuration classes.
 
-    By default Kaggle artifacts stay in
-    ``/kaggle/working/cad_attention_unet_workspace`` so every stage can reuse
-    files created by previous CPU or GPU sessions.
-    """
-
-    DATASET_PATH = _default_dataset_path()
-    WORKSPACE_ROOT = Path(
-        os.environ.get("CAD_WORKSPACE_ROOT", str(_default_workspace_path()))
-    )
-
-
-class RuntimeSettings:
-
-
-    ATTENTION_DEVICE = os.environ.get("CAD_ATTENTION_DEVICE", "cuda").strip().lower()
-    FEATURE_DEVICE = os.environ.get("CAD_FEATURE_DEVICE", "cpu").strip().lower()
-
-    RANDOM_SEED = 42
-    NUM_WORKERS = 0  
-    USE_AMP_ON_CUDA = True
-    USE_CHANNELS_LAST_ON_CUDA = True
-    CUDNN_BENCHMARK_ON_CUDA = True
-    DETERMINISTIC_ALGORITHMS = False
-    CPU_THREADS = max(1, min(8, os.cpu_count() or 1))
-    PNG_COMPRESSION = 9
-    IMAGE_RAM_CACHE_ITEMS = 2048
-
-
-class ImageSettings:
-
-
-    SEGMENTATION_SIZE = 256
-    CLASSIFICATION_SIZE = 224
-    STANDARDIZED_CONTENT_LONG_SIDE = 240
-
-
-    DARK_LINE_MAX_MEAN = 12.0
-    DARK_LINE_MAX_STD = 4.0
-    DARK_PIXEL_MAX_VALUE = 20
-    DARK_PIXEL_MIN_FRACTION = 0.98
-    MAX_CROP_FRACTION_PER_SIDE = 0.20
-    MIN_RETAINED_FRACTION = 0.60
-    MIN_PADDING_RUN = 2
-
-    ROBUST_LOWER_PERCENTILE = 1.0
-    ROBUST_UPPER_PERCENTILE = 99.0
-
-
-    REGION_LOWER_PERCENTILE = 1.0
-    REGION_UPPER_PERCENTILE = 99.0
-    REGION_MIN_PIXELS = 64
-    REGION_HISTOGRAM_BINS = 256
-    REGION_MIN_DYNAMIC_RANGE = 8.0 / 255.0
-
-    QUALITY_THUMBNAIL_SIZE = 128
-    QUALITY_MIN_DYNAMIC_RANGE = 12.0
-    QUALITY_MIN_LAPLACIAN_VARIANCE = 4.0
-    QUALITY_MAX_NOISE_RATIO = 0.30
-    QUALITY_PATIENT_BLUR_QUANTILE = 0.03
-    QUALITY_PATIENT_NOISE_QUANTILE = 0.97
-
-
-class SegmentationSettings:
-
-
-    FOLDS = 5
-    BASE_CHANNELS = 24
-    INPUT_CHANNELS = 3  
-    USE_2_5D = True
-
-    EPOCHS = 36
-    EARLY_STOPPING_PATIENCE = 8
-    LEARNING_RATE = 8e-4
-    WEIGHT_DECAY = 1e-4
-    LR_REDUCE_PATIENCE = 3
-    LR_REDUCE_FACTOR = 0.5
-    MIN_LEARNING_RATE = 1e-6
-
-
-    FOCAL_WEIGHT = 0.40
-    TVERSKY_WEIGHT = 0.60
-    FOCAL_GAMMA = 2.0
-    TVERSKY_ALPHA_FP = 0.65
-    TVERSKY_BETA_FN = 0.35
-    PRESENCE_LOSS_WEIGHT = 0.30
-
-
-    MANUAL_DRAWN_WEIGHT = 1.00
-    AUTO_CONFIRMED_WEIGHT = 0.72
-    NO_HEART_WEIGHT = 0.90
-    NEGATIVE_TARGET_FRACTION = 0.30
-
-    BATCH_SIZE_CUDA = 10
-    BATCH_SIZE_CPU = 3
-    INFERENCE_BATCH_SIZE_CUDA = 10
-    INFERENCE_BATCH_SIZE_CPU = 3
-
-
-    MIN_MANUAL_MASKS = 800
-    MANUAL_MIN_AREA_RATIO = 0.0005
-    MANUAL_MAX_AREA_RATIO = 0.98
-    VALIDATION_PATIENT_FRACTION = 0.20
-
-
-    AUGMENT_HORIZONTAL_FLIP = False
-    AUGMENT_ROTATION_DEGREES = 7.0
-    AUGMENT_TRANSLATION_FRACTION = 0.06
-    AUGMENT_SCALE_MIN = 0.92
-    AUGMENT_SCALE_MAX = 1.08
-    AUGMENT_GAMMA_MIN = 0.85
-    AUGMENT_GAMMA_MAX = 1.15
-    AUGMENT_NOISE_STD_MAX = 0.025
-    AUGMENT_BLUR_PROBABILITY = 0.15
-
-    CALIBRATION_THRESHOLDS = (
-        0.20,
-        0.25,
-        0.30,
-        0.35,
-        0.40,
-        0.45,
-        0.50,
-        0.55,
-        0.60,
-        0.65,
-        0.70,
-        0.75,
-    )
-    PRESENCE_CALIBRATION_THRESHOLDS = (
-        0.20,
-        0.25,
-        0.30,
-        0.35,
-        0.40,
-        0.45,
-        0.50,
-        0.55,
-        0.60,
-        0.65,
-        0.70,
-        0.75,
-        0.80,
-    )
-    DEFAULT_THRESHOLD = 0.50
-    DEFAULT_PRESENCE_THRESHOLD = 0.50
-    PRESENCE_SEGMENTATION_OVERRIDE_PEAK = 0.80
-    PREDICTION_MIN_AREA_RATIO = 0.003
-    PREDICTION_MAX_AREA_RATIO = 0.65
-    PREDICTION_MIN_PEAK_PROBABILITY = 0.50
-    REPAIR_THRESHOLD_OFFSETS = (-0.20, -0.15, -0.10, -0.05, 0.05, 0.10, 0.15, 0.20)
-    REPAIR_MAX_BOUNDARY_TOUCH = 0.35
-    REPAIR_MORPHOLOGY_KERNEL = 5
-    PRIOR_MAX_ROBUST_Z = 5.5
-
-
-    TTA_CONTRAST_FACTOR = 1.10
-    UNCERTAINTY_DISAGREEMENT_SCALE = 0.08
-
-    SUPPORT_DILATION_KERNEL = 15
-    SAVE_ALL_PREDICTED_MASKS = True
-
-
-class ClassificationSettings:
-    """Frozen feature extraction and patient-level classification settings.
-
-    The registry contains seven primary experiments plus four mask-validation
-    controls. ``B0`` remains the broad all-slice reference, while ``B2``, ``AU1``,
-    and ``C1`` form the direct same-slice comparison required to isolate the
-    effect of the automatic cardiac ROI from image-selection effects.
-    """
-
-    FEATURE_BATCH_SIZE_CUDA = 12
-    FEATURE_BATCH_SIZE_CPU = 4
-
-    FEATURE_FORWARD_BATCH_SIZE_CUDA = 32
-    FEATURE_FORWARD_BATCH_SIZE_CPU = 4
-
-    USE_IMAGENET_WEIGHTS = True
-    PCA_EXPLAINED_VARIANCE = 0.95
-    OUTER_FOLDS = 5
-    INNER_FOLDS = 3
-    C_GRID = (0.01, 0.1, 1.0, 10.0)
-    BOOTSTRAP_REPEATS = 2000
-
-    # B0 answers the broad contextual question on every dataset slice. The direct
-    # automatic-mask experiment is the B2/AU1/C1 triad: all three modes use the
-    # exact same images, removing source-image selection as a confounder while
-    # retaining each mode's intended full/ROI/complement preprocessing.
-    # B1/AU2/C2 repeat that logic on the Sick/Normal matched cohort.
-    PRIMARY_MODES = (
-        "B0_FULL_IMAGE",
-        "B2_ATTENTION_ELIGIBLE_FULL_IMAGE",
-        "AU1_ATTENTION_ROI",
-        "C1_ATTENTION_COMPLEMENT",
-        "B1_MATCHED_FULL_IMAGE",
-        "AU2_MATCHED_ATTENTION_ROI",
-        "C2_MATCHED_ATTENTION_COMPLEMENT",
-    )
-    VALIDATION_MODES = (
-        "M1_MANUAL_ROI",
-        "C3_MANUAL_COMPLEMENT",
-        "AU3_ATTENTION_ROI_MANUAL_SUBSET",
-        "C4_ATTENTION_COMPLEMENT_MANUAL_SUBSET",
-    )
-    MODES = PRIMARY_MODES + VALIDATION_MODES
-
-    # Existing .npz files in /kaggle/working use the historical keys below. The
-    # new B2 control has no historical equivalent, so it receives a new key while
-    # every pre-existing mode remains readable without recomputation.
-    LEGACY_MODE_ALIASES = {
-        "B0_FULL_IMAGE": "FULL_IMAGE",
-        "B2_ATTENTION_ELIGIBLE_FULL_IMAGE": "B2_ATTENTION_ELIGIBLE_FULL_IMAGE",
-        "AU1_ATTENTION_ROI": "AU1_ATTENTION_ROI",
-        "C1_ATTENTION_COMPLEMENT": "AU5_ATTENTION_COMPLEMENT",
-        "B1_MATCHED_FULL_IMAGE": "CROSS_CLASS_MATCHED_FULL_IMAGE",
-        "AU2_MATCHED_ATTENTION_ROI": "CROSS_CLASS_MATCHED_AU1_ATTENTION_ROI",
-        "C2_MATCHED_ATTENTION_COMPLEMENT": "CROSS_CLASS_MATCHED_AU5_ATTENTION_COMPLEMENT",
-        "M1_MANUAL_ROI": "AU6_MANUAL_ROI",
-        "C3_MANUAL_COMPLEMENT": "AU7_MANUAL_COMPLEMENT",
-        "AU3_ATTENTION_ROI_MANUAL_SUBSET": "AU8_ATTENTION_MATCHED_MANUAL_ROI",
-        "C4_ATTENTION_COMPLEMENT_MANUAL_SUBSET": "AU9_ATTENTION_MATCHED_MANUAL_COMPLEMENT",
-    }
-    LEGACY_STORAGE_MODES = (
-        "FULL_IMAGE",
-        "B2_ATTENTION_ELIGIBLE_FULL_IMAGE",
-        "AU1_ATTENTION_ROI",
-        "AU5_ATTENTION_COMPLEMENT",
-        "CROSS_CLASS_MATCHED_FULL_IMAGE",
-        "CROSS_CLASS_MATCHED_AU1_ATTENTION_ROI",
-        "CROSS_CLASS_MATCHED_AU5_ATTENTION_COMPLEMENT",
-        "AU6_MANUAL_ROI",
-        "AU7_MANUAL_COMPLEMENT",
-        "AU8_ATTENTION_MATCHED_MANUAL_ROI",
-        "AU9_ATTENTION_MATCHED_MANUAL_COMPLEMENT",
-    )
-
-    ATTENTION_ELIGIBLE_MODES = frozenset(
-        {
-            "B2_ATTENTION_ELIGIBLE_FULL_IMAGE",
-            "AU1_ATTENTION_ROI",
-            "C1_ATTENTION_COMPLEMENT",
-        }
-    )
-    MATCHED_MODES = frozenset(
-        {
-            "B1_MATCHED_FULL_IMAGE",
-            "AU2_MATCHED_ATTENTION_ROI",
-            "C2_MATCHED_ATTENTION_COMPLEMENT",
-        }
-    )
-    MANUAL_SUBSET_MODES = frozenset(VALIDATION_MODES)
-
-    MODE_DESCRIPTIONS = {
-        "B0_FULL_IMAGE": "Full-image contextual baseline on every dataset slice",
-        "B2_ATTENTION_ELIGIBLE_FULL_IMAGE": "Full image on exactly the AU1/C1 attention-eligible slices",
-        "AU1_ATTENTION_ROI": "Automatic Attention U-Net heart ROI on the same attention-eligible slices",
-        "C1_ATTENTION_COMPLEMENT": "Pixels outside the automatic heart ROI on the same attention-eligible slices",
-        "B1_MATCHED_FULL_IMAGE": "Full-image baseline on the expanded balanced Sick/Normal cohort",
-        "AU2_MATCHED_ATTENTION_ROI": "Automatic heart ROI on the expanded balanced matched cohort",
-        "C2_MATCHED_ATTENTION_COMPLEMENT": "Automatic-ROI complement on the expanded balanced matched cohort",
-        "M1_MANUAL_ROI": "Manual heart ROI on the annotated subset",
-        "C3_MANUAL_COMPLEMENT": "Complement of the manual ROI",
-        "AU3_ATTENTION_ROI_MANUAL_SUBSET": "Automatic ROI on the same manually annotated images",
-        "C4_ATTENTION_COMPLEMENT_MANUAL_SUBSET": "Automatic complement on the same manually annotated images",
-    }
-    MODE_COHORTS = {
-        "B0_FULL_IMAGE": "all_dataset_slices",
-        "B2_ATTENTION_ELIGIBLE_FULL_IMAGE": "attention_eligible_same_slices",
-        "AU1_ATTENTION_ROI": "attention_eligible_same_slices",
-        "C1_ATTENTION_COMPLEMENT": "attention_eligible_same_slices",
-        "B1_MATCHED_FULL_IMAGE": "cross_class_matched_same_slices",
-        "AU2_MATCHED_ATTENTION_ROI": "cross_class_matched_same_slices",
-        "C2_MATCHED_ATTENTION_COMPLEMENT": "cross_class_matched_same_slices",
-        "M1_MANUAL_ROI": "manual_positive_same_slices",
-        "C3_MANUAL_COMPLEMENT": "manual_positive_same_slices",
-        "AU3_ATTENTION_ROI_MANUAL_SUBSET": "manual_positive_same_slices",
-        "C4_ATTENTION_COMPLEMENT_MANUAL_SUBSET": "manual_positive_same_slices",
-    }
-
-
-class MatchingSettings:
-    """Settings for strict-core plus expanded Sick/Normal matching.
-
-    The old mutual-top-5 cohort is retained as an auditable core. The cohort used
-    by B1/AU2/C2 then adds unique one-to-one pairs that are close in the same
-    acquisition family. Expansion is driven mainly by more candidate neighbours
-    and larger diversity caps, rather than by removing anatomical constraints.
-    """
-
-    ENABLED = True
-    MIN_FAMILIES = 8
-    MAX_FAMILIES = 32
-    TARGET_IMAGES_PER_FAMILY = 1800
-    MIN_IMAGES_PER_CLASS_PER_FAMILY = 12
-    MIN_PATIENTS_PER_CLASS_PER_FAMILY = 2
-
-    # Strict core: reproduces the previous mutual-neighbour logic.
-    MUTUAL_NEIGHBORS = 5
-    CALIPER_MAD_MULTIPLIER = 2.5
-    CALIPER_QUANTILE = 0.90
-    MAX_SEQUENCE_POSITION_DIFFERENCE = 0.25
-    MAX_AREA_RATIO_DIFFERENCE = 0.20
-    MAX_MATCHES_PER_PATIENT_PER_FAMILY = 20
-    MAX_MATCHES_PER_SEQUENCE_GROUP = 5
-
-    # Expanded cohort. Every image is still used at most once and both classes
-    # remain exactly balanced. With the current dataset the default target is
-    # about 50% of eligible slices, instead of the previous ~13%.
-    TARGET_MATCHED_IMAGE_FRACTION = 0.50
-    EXTENDED_NEIGHBORS = 12
-    EXTENDED_CALIPER_MAD_MULTIPLIER = 3.5
-    EXTENDED_CALIPER_QUANTILE = 0.97
-    EXTENDED_MAX_CALIPER_MULTIPLIER = 1.18
-    EXTENDED_MAX_SEQUENCE_POSITION_DIFFERENCE = 0.25
-    EXTENDED_MAX_AREA_RATIO_DIFFERENCE = 0.20
-    EXTENDED_MAX_MATCHES_PER_PATIENT_PER_FAMILY = 60
-    EXTENDED_MAX_MATCHES_PER_SEQUENCE_GROUP = 15
-    EXTENDED_MAX_MATCHES_PER_SEQUENCE_PAIR = 12
-    EXTENDED_MAX_MATCHES_PER_PATIENT_PAIR = 60
-    PATIENT_TOTAL_CAP_MULTIPLIER = 1.70
-    EXTENDED_BALANCE_QUOTA_STEPS = 12
-    PRIORITIZE_CORE_SEQUENCE_PAIRS = True
-
-    PHASH_BLOCK_WEIGHT = 0.45
-    GEOMETRY_BLOCK_WEIGHT = 0.25
-    SEQUENCE_BLOCK_WEIGHT = 0.15
-    QUALITY_BLOCK_WEIGHT = 0.15
-
-
-class ReviewSettings:
-
-
-    NEW_IMAGES_PER_PATIENT = 10
-    PHASH_MAX_DISTANCE = 6
-    DEFAULT_LIMIT = 300
-    BRUSH_RADIUS = 8
-    UNCERTAINTY_MIN_SCORE = 0.18
-    PRESENCE_MARGIN = 0.15
-
-
-class Settings:
-
-
-    Paths = PathSettings
-    Runtime = RuntimeSettings
-    Image = ImageSettings
-    Segmentation = SegmentationSettings
-    Classification = ClassificationSettings
-    Matching = MatchingSettings
-    Review = ReviewSettings
 
 
 # -----------------------------------------------------------------------------
-# Runtime, data records, and atomic persistence
+# HOW TO READ THIS FILE
+# -----------------------------------------------------------------------------
+# Read the classes from top to bottom. Settings are placed at the start of the
+# class that consumes them, public methods describe complete pipeline actions,
+# and private methods implement the smaller algorithmic steps used by that action.
+
+# -----------------------------------------------------------------------------
+# SHARED INFRASTRUCTURE — runtime, records, and atomic persistence
 # -----------------------------------------------------------------------------
 class RuntimeManager:
     """Own device initialization at stage boundaries, never at import time.
@@ -502,9 +174,44 @@ class RuntimeManager:
     manual review, matching, or evaluation.
     """
 
+    # Runtime and device settings.
+    # Default device used for Attention U-Net training and inference.
+    ATTENTION_DEVICE = os.environ.get("CAD_ATTENTION_DEVICE", "cuda").strip().lower()
+
+    # Default device used for frozen EfficientNet feature extraction.
+    FEATURE_DEVICE = os.environ.get("CAD_FEATURE_DEVICE", "cpu").strip().lower()
+
+    # Shared seed that makes patient folds, sampling, and evaluation reproducible.
+    RANDOM_SEED = 42
+
+    # Number of PyTorch data-loader worker processes; zero is safest in Kaggle notebooks.
+    NUM_WORKERS = 0
+
+    # Use automatic mixed precision when a CUDA device is active.
+    USE_AMP_ON_CUDA = True
+
+    # Use channels-last tensor memory layout to improve CUDA throughput.
+    USE_CHANNELS_LAST_ON_CUDA = True
+
+    # Allow cuDNN to select fast kernels when deterministic mode is disabled.
+    CUDNN_BENCHMARK_ON_CUDA = True
+
+    # Request deterministic PyTorch algorithms when reproducibility is preferred over speed.
+    DETERMINISTIC_ALGORITHMS = False
+
+    # Maximum number of CPU threads used by PyTorch.
+    CPU_THREADS = max(1, min(8, os.cpu_count() or 1))
+
+    # Compression level used when masks and overlays are written as PNG files.
+    PNG_COMPRESSION = 9
+
+    # Maximum number of standardized images kept in the in-memory LRU cache.
+    IMAGE_RAM_CACHE_ITEMS = 2048
+
 
     @staticmethod
     def resolve_device(requested: str | None = None) -> torch.device:
+        """Validate a device request and return the matching PyTorch device."""
         requested = (requested or "cpu").strip().lower()
         if requested not in {"auto", "cpu", "cuda"}:
             raise ValueError("device must be 'auto', 'cpu', or 'cuda'.")
@@ -524,17 +231,16 @@ class RuntimeManager:
         seed: int | None = None,
         include_cuda: bool = False,
     ) -> None:
-
-
-        seed = int(Settings.Runtime.RANDOM_SEED if seed is None else seed)
+        """Seed Python, NumPy, and PyTorch for reproducible execution."""
+        seed = int(RuntimeManager.RANDOM_SEED if seed is None else seed)
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
-        torch.set_num_threads(Settings.Runtime.CPU_THREADS)
+        torch.set_num_threads(RuntimeManager.CPU_THREADS)
 
         try:
             torch.use_deterministic_algorithms(
-                bool(Settings.Runtime.DETERMINISTIC_ALGORITHMS), warn_only=True
+                bool(RuntimeManager.DETERMINISTIC_ALGORITHMS), warn_only=True
             )
         except Exception:
             pass
@@ -543,52 +249,71 @@ class RuntimeManager:
             torch.cuda.manual_seed_all(seed)
             if hasattr(torch.backends, "cudnn"):
                 torch.backends.cudnn.deterministic = bool(
-                    Settings.Runtime.DETERMINISTIC_ALGORITHMS
+                    RuntimeManager.DETERMINISTIC_ALGORITHMS
                 )
                 torch.backends.cudnn.benchmark = bool(
-                    Settings.Runtime.CUDNN_BENCHMARK_ON_CUDA
-                    and not Settings.Runtime.DETERMINISTIC_ALGORITHMS
+                    RuntimeManager.CUDNN_BENCHMARK_ON_CUDA
+                    and not RuntimeManager.DETERMINISTIC_ALGORITHMS
                 )
 
     @staticmethod
-    @contextlib.contextmanager
-    def device_scope(requested: str | None, stage_name: str):
-
-
+    def start_device_stage(requested: str | None, stage_name: str) -> torch.device:
+        """Initialize one CPU or GPU stage and return the selected device."""
+        # Resolve the requested device before any model or tensor is created.
         device = RuntimeManager.resolve_device(requested)
+        # Seed all libraries for the selected execution mode.
         RuntimeManager.seed_everything(include_cuda=device.type == "cuda")
+        # Clear stale CUDA allocations and reset peak-memory accounting.
         if device.type == "cuda":
             RuntimeManager.release(device)
             try:
                 torch.cuda.reset_peak_memory_stats(device)
             except Exception:
                 pass
+        # Report the device used by this isolated stage.
         print(f"[DEVICE] {stage_name}: {device.type}")
+        return device
+
+    @staticmethod
+    def finish_device_stage(device: torch.device, stage_name: str) -> None:
+        """Report resource use and release tensors after one device stage."""
+        # Print peak GPU memory when CUDA supplied this stage.
+        if device.type == "cuda":
+            try:
+                peak_gb = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+                print(f"[DEVICE] {stage_name}: peak GPU={peak_gb:.2f} GB")
+            except Exception:
+                pass
+        # Release Python and CUDA memory regardless of the stage result.
+        RuntimeManager.release(device)
+        print(f"[DEVICE] {stage_name}: resources released")
+
+    @staticmethod
+    @contextlib.contextmanager
+    def device_scope(requested: str | None, stage_name: str):
+        """Keep the original with-style device API for backward compatibility."""
+        # New pipeline methods call start_device_stage and finish_device_stage directly.
+        device = RuntimeManager.start_device_stage(requested, stage_name)
         try:
             yield device
         finally:
-            if device.type == "cuda":
-                try:
-                    peak_gb = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
-                    print(f"[DEVICE] {stage_name}: peak GPU={peak_gb:.2f} GB")
-                except Exception:
-                    pass
-            RuntimeManager.release(device)
-            print(f"[DEVICE] {stage_name}: resources released")
+            RuntimeManager.finish_device_stage(device, stage_name)
 
     @staticmethod
     def prepare_model(model: nn.Module, device: torch.device) -> nn.Module:
+        """Move a model to the selected device and optional CUDA memory layout."""
         model = model.to(device)
-        if device.type == "cuda" and Settings.Runtime.USE_CHANNELS_LAST_ON_CUDA:
+        if device.type == "cuda" and RuntimeManager.USE_CHANNELS_LAST_ON_CUDA:
             model = model.to(memory_format=torch.channels_last)
         return model
 
     @staticmethod
     def move_tensor(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
+        """Move a tensor to the selected device and optional CUDA memory layout."""
         tensor = tensor.to(device, non_blocking=device.type == "cuda")
         if (
             device.type == "cuda"
-            and Settings.Runtime.USE_CHANNELS_LAST_ON_CUDA
+            and RuntimeManager.USE_CHANNELS_LAST_ON_CUDA
             and tensor.ndim == 4
         ):
             tensor = tensor.contiguous(memory_format=torch.channels_last)
@@ -596,41 +321,44 @@ class RuntimeManager:
 
     @staticmethod
     def train_batch_size(device: torch.device) -> int:
+        """Train batch size for runtime and device management."""
         return (
-            Settings.Segmentation.BATCH_SIZE_CUDA
+            SegmentationManager.BATCH_SIZE_CUDA
             if device.type == "cuda"
-            else Settings.Segmentation.BATCH_SIZE_CPU
+            else SegmentationManager.BATCH_SIZE_CPU
         )
 
     @staticmethod
     def inference_batch_size(device: torch.device) -> int:
+        """Perform the inference batch size step for runtime and device management."""
         return (
-            Settings.Segmentation.INFERENCE_BATCH_SIZE_CUDA
+            SegmentationManager.INFERENCE_BATCH_SIZE_CUDA
             if device.type == "cuda"
-            else Settings.Segmentation.INFERENCE_BATCH_SIZE_CPU
+            else SegmentationManager.INFERENCE_BATCH_SIZE_CPU
         )
 
     @staticmethod
     def feature_batch_size(device: torch.device) -> int:
+        """Perform the feature batch size step for runtime and device management."""
         return (
-            Settings.Classification.FEATURE_BATCH_SIZE_CUDA
+            FeatureManager.FEATURE_BATCH_SIZE_CUDA
             if device.type == "cuda"
-            else Settings.Classification.FEATURE_BATCH_SIZE_CPU
+            else FeatureManager.FEATURE_BATCH_SIZE_CPU
         )
 
     @staticmethod
     def feature_forward_batch_size(device: torch.device) -> int:
+        """Perform the feature forward batch size step for runtime and device management."""
         return (
-            Settings.Classification.FEATURE_FORWARD_BATCH_SIZE_CUDA
+            FeatureManager.FEATURE_FORWARD_BATCH_SIZE_CUDA
             if device.type == "cuda"
-            else Settings.Classification.FEATURE_FORWARD_BATCH_SIZE_CPU
+            else FeatureManager.FEATURE_FORWARD_BATCH_SIZE_CPU
         )
 
     @staticmethod
     def autocast(device: torch.device):
-
-
-        enabled = bool(Settings.Runtime.USE_AMP_ON_CUDA and device.type == "cuda")
+        """Perform the autocast step for runtime and device management."""
+        enabled = bool(RuntimeManager.USE_AMP_ON_CUDA and device.type == "cuda")
         if not enabled:
             return contextlib.nullcontext()
         try:
@@ -640,7 +368,8 @@ class RuntimeManager:
 
     @staticmethod
     def grad_scaler(device: torch.device):
-        enabled = bool(Settings.Runtime.USE_AMP_ON_CUDA and device.type == "cuda")
+        """Perform the grad scaler step for runtime and device management."""
+        enabled = bool(RuntimeManager.USE_AMP_ON_CUDA and device.type == "cuda")
         try:
             return torch.amp.GradScaler("cuda", enabled=enabled)
         except (AttributeError, TypeError):
@@ -648,8 +377,7 @@ class RuntimeManager:
 
     @staticmethod
     def release(device: torch.device) -> None:
-
-
+        """Run garbage collection and release cached CUDA memory."""
         gc.collect()
         if device.type == "cuda" and torch.cuda.is_available():
             try:
@@ -660,6 +388,7 @@ class RuntimeManager:
 
     @staticmethod
     def format_seconds(seconds: float) -> str:
+        """Format seconds for runtime and device management."""
         seconds = max(0, int(round(seconds)))
         hours, seconds = divmod(seconds, 3600)
         minutes, seconds = divmod(seconds, 60)
@@ -672,52 +401,60 @@ class RuntimeManager:
 
 @dataclass(frozen=True)
 class Sample:
+    """Store the immutable identity, label, and segmentation fold of one MRI image."""
 
-
-    image_path: str
-    label: int
-    patient_id: str
-    series_id: str
-    image_token: str
-    segmentation_fold: int
+    image_path: str  # Absolute path of the MRI image.
+    label: int  # Patient CAD label: 0 for Normal and 1 for Sick.
+    patient_id: str  # Directory_* identifier used as the statistical unit.
+    series_id: str  # Immediate series proxy used for hierarchical aggregation.
+    image_token: str  # Stable workspace-safe identifier for this image.
+    segmentation_fold: int  # Patient-level fold used for OOF segmentation.
 
 
 @dataclass(frozen=True)
 class Workspace:
+    """Store every persistent directory and artifact path used by the pipeline."""
 
-
-    root: Path
-    manual_masks: Path
-    predicted_masks: Path
-    mask_overlays: Path
-    checkpoints: Path
-    outputs: Path
-    dataset_manifest: Path
-    quality_audit: Path
-    manual_audit: Path
-    manual_annotations: Path
-    prediction_audit: Path
-    prediction_parts_dir: Path
-    invalid_predictions: Path
-    review_history: Path
-    training_summary: Path
-    prediction_summary: Path
-    segmentation_metrics: Path
-    segmentation_metrics_summary: Path
-    cross_class_matching_manifest: Path
-    cross_class_matching_summary: Path
-    feature_bank: Path
-    feature_metadata: Path
-    results_csv: Path
-    predictions_dir: Path
+    root: Path  # Root directory shared by every pipeline stage.
+    manual_masks: Path  # Directory containing reviewed manual masks.
+    predicted_masks: Path  # Directory containing out-of-fold Attention masks.
+    mask_overlays: Path  # Directory containing visual manual-mask overlays.
+    checkpoints: Path  # Directory containing one Attention checkpoint per fold.
+    outputs: Path  # Directory containing simplified-pipeline tables and summaries.
+    dataset_manifest: Path  # CSV manifest containing every discovered image.
+    quality_audit: Path  # CSV table containing image-quality measurements.
+    manual_audit: Path  # CSV table containing accepted and rejected manual targets.
+    manual_annotations: Path  # CSV table containing explicit review labels.
+    prediction_audit: Path  # CSV table containing automatic-mask metadata.
+    prediction_parts_dir: Path  # Directory containing resumable fold-level prediction tables.
+    invalid_predictions: Path  # CSV queue containing unresolved automatic masks.
+    review_history: Path  # CSV log containing every editor action.
+    training_summary: Path  # JSON summary of Attention training and cache reuse.
+    prediction_summary: Path  # JSON summary of full-dataset Attention prediction.
+    segmentation_metrics: Path  # CSV table containing OOF segmentation metrics.
+    segmentation_metrics_summary: Path  # JSON summary of OOF segmentation quality.
+    cross_class_matching_manifest: Path  # CSV manifest containing matching decisions for every image.
+    cross_class_matching_summary: Path  # JSON summary of strict and extended matching.
+    feature_bank: Path  # Compressed NumPy archive containing patient-level features.
+    feature_metadata: Path  # JSON metadata and fingerprint for the feature bank.
+    results_csv: Path  # CSV table containing final experiment metrics.
+    predictions_dir: Path  # Directory containing patient-level OOF prediction tables.
 
 
 class FileManager:
+    """Create the workspace layout and read or write files atomically."""
+
+    # Default persistent workspace location.
+    # Persistent workspace reused by CPU and GPU sessions.
+    DEFAULT_WORKSPACE_ROOT = Path(
+        os.environ.get("CAD_WORKSPACE_ROOT", str(_default_workspace_path()))
+    )
 
 
     @staticmethod
     def create_workspace(root: Path | str | None = None) -> Workspace:
-        root = Path(root or Settings.Paths.WORKSPACE_ROOT)
+        """Create every persistent workspace directory and return all artifact paths."""
+        root = Path(root or FileManager.DEFAULT_WORKSPACE_ROOT)
         workspace = Workspace(
             root=root,
             manual_masks=root / "manual_masks",
@@ -759,6 +496,7 @@ class FileManager:
 
     @staticmethod
     def write_json(path: Path, payload: dict[str, Any]) -> None:
+        """Write json for atomic workspace persistence."""
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
         temporary.write_text(
@@ -769,6 +507,7 @@ class FileManager:
 
     @staticmethod
     def read_json(path: Path, default: Any = None) -> Any:
+        """Read json for atomic workspace persistence."""
         if not path.is_file():
             return default
         try:
@@ -778,6 +517,7 @@ class FileManager:
 
     @staticmethod
     def write_csv(path: Path, rows: Sequence[dict[str, Any]], fields: Sequence[str]) -> None:
+        """Write csv for atomic workspace persistence."""
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
         with temporary.open("w", newline="", encoding="utf-8") as handle:
@@ -789,6 +529,7 @@ class FileManager:
 
     @staticmethod
     def read_csv(path: Path) -> list[dict[str, str]]:
+        """Read csv for atomic workspace persistence."""
         if not path.is_file():
             return []
         with path.open(newline="", encoding="utf-8") as handle:
@@ -796,14 +537,13 @@ class FileManager:
 
     @staticmethod
     def write_png(path: Path, image: np.ndarray) -> None:
-
-
+        """Write png for atomic workspace persistence."""
         path.parent.mkdir(parents=True, exist_ok=True)
         array = np.asarray(image)
         ok, encoded = cv2.imencode(
             ".png",
             array,
-            [cv2.IMWRITE_PNG_COMPRESSION, int(Settings.Runtime.PNG_COMPRESSION)],
+            [cv2.IMWRITE_PNG_COMPRESSION, int(RuntimeManager.PNG_COMPRESSION)],
         )
         if not ok:
             raise RuntimeError(f"OpenCV could not encode PNG: {path}")
@@ -817,6 +557,7 @@ class FileManager:
 
     @staticmethod
     def sha256_file(path: Path) -> str:
+        """Perform the sha256 file step for atomic workspace persistence."""
         digest = hashlib.sha256()
         with path.open("rb") as handle:
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):
@@ -825,7 +566,7 @@ class FileManager:
 
 
 # -----------------------------------------------------------------------------
-# Dataset discovery and backward-compatible workspace import
+# PIPELINE STEP 1 — dataset discovery and workspace compatibility
 # -----------------------------------------------------------------------------
 class WorkspaceCompatibilityManager:
     """Reuse artifacts produced by earlier full or simplified notebooks.
@@ -834,7 +575,6 @@ class WorkspaceCompatibilityManager:
     rewritten, and no model is executed merely to import an older workspace.
     """
 
-
     LEGACY_FULL_REVIEW_MANIFEST = "attention_unet_full_review_manifest.csv"
     LEGACY_QUALITY_AUDIT = "attention_image_quality_audit.csv"
     LEGACY_REVIEW_HISTORY = "attention_unet_review_history.csv"
@@ -842,6 +582,7 @@ class WorkspaceCompatibilityManager:
 
     @staticmethod
     def _first_nonempty(row: dict[str, Any], *keys: str, default: Any = "") -> Any:
+        """Perform the first nonempty step for backward-compatible workspace import."""
         for key in keys:
             value = row.get(key, "")
             if value is not None and str(value).strip() != "":
@@ -854,8 +595,7 @@ class WorkspaceCompatibilityManager:
         source_row: dict[str, Any],
         workspace: Workspace,
     ) -> Path:
-
-
+        """Return the prediction path used by backward-compatible workspace import."""
         token = str(base_row["image_token"])
         expected = workspace.predicted_masks / f"{token}.png"
         source_value = str(source_row.get("predicted_attention_mask_path", "")).strip()
@@ -873,8 +613,7 @@ class WorkspaceCompatibilityManager:
         dataset_rows: Sequence[dict[str, Any]],
         workspace: Workspace,
     ) -> list[dict[str, Any]]:
-
-
+        """Normalize prediction rows for backward-compatible workspace import."""
         source_by_token = {
             str(row.get("image_token", "")).strip(): dict(row)
             for row in source_rows
@@ -978,8 +717,7 @@ class WorkspaceCompatibilityManager:
         dataset_rows: Sequence[dict[str, Any]],
         workspace: Workspace,
     ) -> list[dict[str, Any]]:
-
-
+        """Derive prediction rows from masks for backward-compatible workspace import."""
         invalid_tokens = {
             str(row.get("image_token", "")).strip()
             for row in FileManager.read_csv(workspace.invalid_predictions)
@@ -1039,8 +777,7 @@ class WorkspaceCompatibilityManager:
         workspace: Workspace,
         require_complete: bool = False,
     ) -> list[dict[str, Any]]:
-
-
+        """Ensure prediction audit for backward-compatible workspace import."""
         current_raw = FileManager.read_csv(workspace.prediction_audit)
         current = cls._normalize_prediction_rows(current_raw, dataset_rows, workspace)
 
@@ -1120,8 +857,7 @@ class WorkspaceCompatibilityManager:
         dataset_rows: Sequence[dict[str, Any]],
         workspace: Workspace,
     ) -> list[dict[str, Any]]:
-
-
+        """Ensure quality audit for backward-compatible workspace import."""
         current = FileManager.read_csv(workspace.quality_audit)
         current_tokens = {
             str(row.get("image_token", "")).strip()
@@ -1200,6 +936,7 @@ class WorkspaceCompatibilityManager:
 
     @classmethod
     def legacy_status(cls, workspace: Workspace) -> dict[str, Any]:
+        """Perform the legacy status step for backward-compatible workspace import."""
         return {
             "legacy_full_review_manifest": (
                 workspace.root / cls.LEGACY_FULL_REVIEW_MANIFEST
@@ -1220,11 +957,16 @@ class DatasetManager:
     deterministic and patient-level, preventing slice leakage across folds.
     """
 
+    # Default dataset location.
+    # Dataset root found from the environment, Kaggle locations, or the local fallback path.
+    DEFAULT_DATASET_PATH = _default_dataset_path()
+
 
     IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
 
     @staticmethod
     def _relative_token_path(image_path: Path) -> str:
+        """Return the relative token path used by dataset discovery and patient-level organization."""
         parts = image_path.parts
         for index, part in enumerate(parts):
             if str(part).startswith("Directory_"):
@@ -1233,8 +975,7 @@ class DatasetManager:
 
     @staticmethod
     def image_token(image_path: Path, patient_id: str, series_id: str) -> str:
-
-
+        """Perform the image token step for dataset discovery and patient-level organization."""
         relative = DatasetManager._relative_token_path(image_path)
         digest = hashlib.sha256(relative.encode("utf-8")).hexdigest()[:20]
         safe_series = str(series_id).replace("/", "__").replace("\\", "__").replace(" ", "_")
@@ -1247,8 +988,7 @@ class DatasetManager:
     def patient_folds(
         patients: dict[str, int] | Iterable[str],
     ) -> dict[str, int]:
-
-
+        """Perform the patient folds step for dataset discovery and patient-level organization."""
         if isinstance(patients, dict):
             groups: dict[int, list[str]] = defaultdict(list)
             for patient_id, label in patients.items():
@@ -1261,17 +1001,16 @@ class DatasetManager:
             ordered = sorted(
                 set(patient_ids),
                 key=lambda patient_id: hashlib.sha256(
-                    f"{Settings.Runtime.RANDOM_SEED}|segmentation-fold|{label}|{patient_id}".encode("utf-8")
+                    f"{RuntimeManager.RANDOM_SEED}|segmentation-fold|{label}|{patient_id}".encode("utf-8")
                 ).hexdigest(),
             )
             for index, patient_id in enumerate(ordered):
-                result[patient_id] = index % int(Settings.Segmentation.FOLDS)
+                result[patient_id] = index % int(SegmentationManager.FOLDS)
         return result
 
     @staticmethod
     def discover(dataset_path: Path | str, workspace: Workspace | None = None) -> list[Sample]:
-
-
+        """Scan Normal and Sick folders and create one patient-safe Sample per image."""
         dataset_path = Path(dataset_path)
         started = time.perf_counter()
         raw_rows: list[tuple[Path, int, str, str]] = []
@@ -1349,8 +1088,7 @@ class DatasetManager:
 
     @staticmethod
     def _natural_path_key(path: str) -> tuple[Any, ...]:
-
-
+        """Perform the natural path key step for dataset discovery and patient-level organization."""
         return tuple(
             int(part) if part.isdigit() else part.lower()
             for part in re.split(r"(\d+)", str(path))
@@ -1358,6 +1096,7 @@ class DatasetManager:
 
     @staticmethod
     def rows(samples: Sequence[Sample], workspace: Workspace) -> list[dict[str, Any]]:
+        """Expand samples with sequence neighbors and write the dataset manifest."""
         rows = [
             {
                 "manifest_index": index,
@@ -1401,7 +1140,7 @@ class DatasetManager:
 
 
 # -----------------------------------------------------------------------------
-# Label-independent preprocessing, image quality, and manual targets
+# PIPELINE STEP 2 — preprocessing, quality audit, and manual targets
 # -----------------------------------------------------------------------------
 class ImageProcessor:
     """Apply label-independent preprocessing consistently to every split.
@@ -1410,9 +1149,80 @@ class ImageProcessor:
     remain aligned and reusable in the current Kaggle workspace.
     """
 
+    # Image preprocessing and quality settings.
+    # Square image size used by the Attention U-Net and mask editor.
+    SEGMENTATION_SIZE = 256
+
+    # Square image size used by EfficientNet-B0.
+    CLASSIFICATION_SIZE = 224
+
+    # Longest content side before it is centered on the segmentation canvas.
+    STANDARDIZED_CONTENT_LONG_SIDE = 240
+
+    # Largest mean intensity allowed for a line to count as dark padding.
+    DARK_LINE_MAX_MEAN = 12.0
+
+    # Largest intensity standard deviation allowed for dark padding.
+    DARK_LINE_MAX_STD = 4.0
+
+    # Largest pixel value treated as dark while detecting padding.
+    DARK_PIXEL_MAX_VALUE = 20
+
+    # Minimum fraction of dark pixels required for a line to be padding.
+    DARK_PIXEL_MIN_FRACTION = 0.98
+
+    # Maximum fraction that automatic padding removal may crop from one side.
+    MAX_CROP_FRACTION_PER_SIDE = 0.20
+
+    # Minimum image fraction that must remain after automatic cropping.
+    MIN_RETAINED_FRACTION = 0.60
+
+    # Minimum consecutive dark lines required before padding is removed.
+    MIN_PADDING_RUN = 2
+
+    # Lower percentile used for robust whole-image intensity scaling.
+    ROBUST_LOWER_PERCENTILE = 1.0
+
+    # Upper percentile used for robust whole-image intensity scaling.
+    ROBUST_UPPER_PERCENTILE = 99.0
+
+    # Lower percentile used to normalize pixels inside an ROI or complement.
+    REGION_LOWER_PERCENTILE = 1.0
+
+    # Upper percentile used to normalize pixels inside an ROI or complement.
+    REGION_UPPER_PERCENTILE = 99.0
+
+    # Minimum visible pixels required before regional normalization is accepted.
+    REGION_MIN_PIXELS = 64
+
+    # Histogram resolution used by tensor-based regional normalization.
+    REGION_HISTOGRAM_BINS = 256
+
+    # Smallest safe denominator used during regional intensity scaling.
+    REGION_MIN_DYNAMIC_RANGE = 8.0 / 255.0
+
+    # Thumbnail size used to calculate blur, noise, and dynamic-range metrics.
+    QUALITY_THUMBNAIL_SIZE = 128
+
+    # Minimum robust intensity range required for a usable image.
+    QUALITY_MIN_DYNAMIC_RANGE = 12.0
+
+    # Global lower bound for the image sharpness score.
+    QUALITY_MIN_LAPLACIAN_VARIANCE = 4.0
+
+    # Global upper bound for the normalized noise score.
+    QUALITY_MAX_NOISE_RATIO = 0.30
+
+    # Patient-specific lower sharpness quantile used to detect blur.
+    QUALITY_PATIENT_BLUR_QUANTILE = 0.03
+
+    # Patient-specific upper noise quantile used to detect noisy frames.
+    QUALITY_PATIENT_NOISE_QUANTILE = 0.97
+
 
     @staticmethod
     def read_gray(path: Path | str) -> np.ndarray:
+        """Read gray for label-independent image preprocessing."""
         image = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
         if image is None:
             raise FileNotFoundError(f"OpenCV cannot read image: {path}")
@@ -1420,6 +1230,7 @@ class ImageProcessor:
 
     @staticmethod
     def scale_0_1(image: np.ndarray) -> np.ndarray:
+        """Scale 0 1 for label-independent image preprocessing."""
         image = np.asarray(image, dtype=np.float32)
         minimum = float(image.min())
         maximum = float(image.max())
@@ -1429,24 +1240,26 @@ class ImageProcessor:
 
     @staticmethod
     def _is_dark_uniform_line(line: np.ndarray) -> bool:
+        """Perform the is dark uniform line step for label-independent image preprocessing."""
         values = np.asarray(line, dtype=np.float32).reshape(-1)
         return bool(
             values.size
-            and float(values.mean()) <= Settings.Image.DARK_LINE_MAX_MEAN
-            and float(values.std()) <= Settings.Image.DARK_LINE_MAX_STD
-            and float(np.mean(values <= Settings.Image.DARK_PIXEL_MAX_VALUE))
-            >= Settings.Image.DARK_PIXEL_MIN_FRACTION
+            and float(values.mean()) <= ImageProcessor.DARK_LINE_MAX_MEAN
+            and float(values.std()) <= ImageProcessor.DARK_LINE_MAX_STD
+            and float(np.mean(values <= ImageProcessor.DARK_PIXEL_MAX_VALUE))
+            >= ImageProcessor.DARK_PIXEL_MIN_FRACTION
         )
 
     @staticmethod
     def detect_padding_bounds(image: np.ndarray) -> tuple[int, int, int, int]:
+        """Detect padding bounds for label-independent image preprocessing."""
         if image.ndim != 2:
             raise ValueError("The image must be a 2D grayscale array.")
         height, width = image.shape
-        min_height = max(8, int(np.ceil(height * Settings.Image.MIN_RETAINED_FRACTION)))
-        min_width = max(8, int(np.ceil(width * Settings.Image.MIN_RETAINED_FRACTION)))
-        max_vertical = int(np.floor(height * Settings.Image.MAX_CROP_FRACTION_PER_SIDE))
-        max_horizontal = int(np.floor(width * Settings.Image.MAX_CROP_FRACTION_PER_SIDE))
+        min_height = max(8, int(np.ceil(height * ImageProcessor.MIN_RETAINED_FRACTION)))
+        min_width = max(8, int(np.ceil(width * ImageProcessor.MIN_RETAINED_FRACTION)))
+        max_vertical = int(np.floor(height * ImageProcessor.MAX_CROP_FRACTION_PER_SIDE))
+        max_horizontal = int(np.floor(width * ImageProcessor.MAX_CROP_FRACTION_PER_SIDE))
 
         top = 0
         while top < max_vertical and height - top - 1 >= min_height and ImageProcessor._is_dark_uniform_line(image[top, :]):
@@ -1461,13 +1274,13 @@ class ImageProcessor:
         while right_crop < max_horizontal and width - left - right_crop - 1 >= min_width and ImageProcessor._is_dark_uniform_line(image[:, width - 1 - right_crop]):
             right_crop += 1
 
-        if top < Settings.Image.MIN_PADDING_RUN:
+        if top < ImageProcessor.MIN_PADDING_RUN:
             top = 0
-        if bottom_crop < Settings.Image.MIN_PADDING_RUN:
+        if bottom_crop < ImageProcessor.MIN_PADDING_RUN:
             bottom_crop = 0
-        if left < Settings.Image.MIN_PADDING_RUN:
+        if left < ImageProcessor.MIN_PADDING_RUN:
             left = 0
-        if right_crop < Settings.Image.MIN_PADDING_RUN:
+        if right_crop < ImageProcessor.MIN_PADDING_RUN:
             right_crop = 0
 
         bottom = height - bottom_crop
@@ -1478,10 +1291,11 @@ class ImageProcessor:
 
     @staticmethod
     def robust_scale(image: np.ndarray) -> tuple[np.ndarray, float, float]:
+        """Perform the robust scale step for label-independent image preprocessing."""
         image = np.asarray(image, dtype=np.float32)
         lower, upper = np.percentile(
             image,
-            [Settings.Image.ROBUST_LOWER_PERCENTILE, Settings.Image.ROBUST_UPPER_PERCENTILE],
+            [ImageProcessor.ROBUST_LOWER_PERCENTILE, ImageProcessor.ROBUST_UPPER_PERCENTILE],
         )
         lower, upper = float(lower), float(upper)
         if not np.isfinite(lower) or not np.isfinite(upper) or upper <= lower:
@@ -1493,8 +1307,9 @@ class ImageProcessor:
 
     @staticmethod
     def _canvas_geometry(height: int, width: int) -> tuple[int, int, int, int, float]:
-        size = Settings.Image.SEGMENTATION_SIZE
-        long_side = Settings.Image.STANDARDIZED_CONTENT_LONG_SIDE
+        """Perform the canvas geometry step for label-independent image preprocessing."""
+        size = ImageProcessor.SEGMENTATION_SIZE
+        long_side = ImageProcessor.STANDARDIZED_CONTENT_LONG_SIDE
         scale = float(long_side / max(height, width))
         resized_height = max(1, int(round(height * scale)))
         resized_width = max(1, int(round(width * scale)))
@@ -1510,6 +1325,7 @@ class ImageProcessor:
 
     @staticmethod
     def _to_canvas(image: np.ndarray) -> np.ndarray:
+        """Perform the to canvas step for label-independent image preprocessing."""
         image = np.asarray(image, dtype=np.float32)
         height, width = image.shape
         resized_height, resized_width, top, left, scale = ImageProcessor._canvas_geometry(height, width)
@@ -1519,7 +1335,7 @@ class ImageProcessor:
         else:
             resized = image
         canvas = np.zeros(
-            (Settings.Image.SEGMENTATION_SIZE, Settings.Image.SEGMENTATION_SIZE),
+            (ImageProcessor.SEGMENTATION_SIZE, ImageProcessor.SEGMENTATION_SIZE),
             dtype=np.float32,
         )
         canvas[top : top + resized_height, left : left + resized_width] = np.clip(resized, 0.0, 1.0)
@@ -1527,9 +1343,10 @@ class ImageProcessor:
 
     @staticmethod
     def _padding_canvas(height: int, width: int) -> np.ndarray:
+        """Perform the padding canvas step for label-independent image preprocessing."""
         resized_height, resized_width, top, left, _ = ImageProcessor._canvas_geometry(height, width)
         canvas = np.ones(
-            (Settings.Image.SEGMENTATION_SIZE, Settings.Image.SEGMENTATION_SIZE),
+            (ImageProcessor.SEGMENTATION_SIZE, ImageProcessor.SEGMENTATION_SIZE),
             dtype=np.float32,
         )
         canvas[top : top + resized_height, left : left + resized_width] = 0.0
@@ -1537,8 +1354,7 @@ class ImageProcessor:
 
     @staticmethod
     def standardize(image: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-
-
+        """Crop padding, scale intensities, and center an image on the fixed canvas."""
         top, bottom, left, right = ImageProcessor.detect_padding_bounds(image)
         cropped = image[top:bottom, left:right]
         if cropped.size == 0:
@@ -1555,17 +1371,17 @@ class ImageProcessor:
 
     @staticmethod
     def standardized_uint8(path: Path | str) -> np.ndarray:
-
-
+        """Perform the standardized uint8 step for label-independent image preprocessing."""
         image = ImageProcessor.read_gray(path)
         robust, _, _, _ = ImageProcessor.standardize(image)
         return np.clip(np.round(robust * 255.0), 0, 255).astype(np.uint8)
 
     @staticmethod
     def classifier_views(path: Path | str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Perform the classifier views step for label-independent image preprocessing."""
         image = ImageProcessor.read_gray(path)
         robust, _, raw, content = ImageProcessor.standardize(image)
-        size = Settings.Image.CLASSIFICATION_SIZE
+        size = ImageProcessor.CLASSIFICATION_SIZE
         robust_224 = cv2.resize(robust, (size, size), interpolation=cv2.INTER_AREA)
         raw_224 = cv2.resize(raw, (size, size), interpolation=cv2.INTER_AREA)
         content_224 = cv2.resize(content, (size, size), interpolation=cv2.INTER_NEAREST)
@@ -1577,6 +1393,7 @@ class ImageProcessor:
 
     @staticmethod
     def perceptual_hash(image: np.ndarray) -> str:
+        """Perform the perceptual hash step for label-independent image preprocessing."""
         resized = cv2.resize(image, (32, 32), interpolation=cv2.INTER_AREA)
         values = cv2.dct(resized.astype(np.float32))[:8, :8].reshape(-1)
         median = float(np.median(values[1:]))
@@ -1588,29 +1405,31 @@ class ImageProcessor:
 
 
 class ImageCache:
-
+    """Keep a bounded in-memory cache of standardized images."""
 
     _cache: OrderedDict[str, np.ndarray] = OrderedDict()
 
     @classmethod
     def get(cls, path: str) -> np.ndarray:
+        """Return get for standardized-image caching."""
         if path in cls._cache:
             value = cls._cache.pop(path)
             cls._cache[path] = value
             return value.copy()
         value = ImageProcessor.standardized_uint8(path)
         cls._cache[path] = value
-        while len(cls._cache) > Settings.Runtime.IMAGE_RAM_CACHE_ITEMS:
+        while len(cls._cache) > RuntimeManager.IMAGE_RAM_CACHE_ITEMS:
             cls._cache.popitem(last=False)
         return value.copy()
 
     @classmethod
     def clear(cls) -> None:
+        """Clear clear for standardized-image caching."""
         cls._cache.clear()
 
 
 class QualityManager:
-
+    """Measure image quality and build the reusable quality audit."""
 
     FIELDS = (
         "image_token",
@@ -1631,6 +1450,7 @@ class QualityManager:
 
     @staticmethod
     def _metrics(row: dict[str, Any]) -> dict[str, Any]:
+        """Perform the metrics step for image-quality auditing."""
         image = ImageProcessor.read_gray(row["image_path"])
         robust, _, raw, content = ImageProcessor.standardize(image)
         coordinates = np.argwhere(content > 0.5)
@@ -1643,7 +1463,7 @@ class QualityManager:
             }
         top, left = coordinates.min(axis=0)
         bottom, right = coordinates.max(axis=0) + 1
-        size = Settings.Image.QUALITY_THUMBNAIL_SIZE
+        size = ImageProcessor.QUALITY_THUMBNAIL_SIZE
         robust_thumb = cv2.resize(
             robust[top:bottom, left:right], (size, size), interpolation=cv2.INTER_AREA
         )
@@ -1667,6 +1487,7 @@ class QualityManager:
 
     @staticmethod
     def build(rows: Sequence[dict[str, Any]], workspace: Workspace, refresh: bool = False) -> dict[str, dict[str, Any]]:
+        """Build or reuse the complete image-quality audit."""
         existing = {
             row.get("image_token", ""): row
             for row in FileManager.read_csv(workspace.quality_audit)
@@ -1716,24 +1537,24 @@ class QualityManager:
             noise = np.asarray([_as_float(row.get("noise_ratio"), np.nan) for row in patient_rows])
             finite_sharp = sharp[np.isfinite(sharp)]
             finite_noise = noise[np.isfinite(noise)]
-            blur_threshold = float(Settings.Image.QUALITY_MIN_LAPLACIAN_VARIANCE)
-            noise_threshold = float(Settings.Image.QUALITY_MAX_NOISE_RATIO)
+            blur_threshold = float(ImageProcessor.QUALITY_MIN_LAPLACIAN_VARIANCE)
+            noise_threshold = float(ImageProcessor.QUALITY_MAX_NOISE_RATIO)
             if len(finite_sharp) >= 5:
                 blur_threshold = max(
                     blur_threshold,
-                    float(np.quantile(finite_sharp, Settings.Image.QUALITY_PATIENT_BLUR_QUANTILE)),
+                    float(np.quantile(finite_sharp, ImageProcessor.QUALITY_PATIENT_BLUR_QUANTILE)),
                 )
             if len(finite_noise) >= 5:
                 noise_threshold = min(
                     noise_threshold,
-                    float(np.quantile(finite_noise, Settings.Image.QUALITY_PATIENT_NOISE_QUANTILE)),
+                    float(np.quantile(finite_noise, ImageProcessor.QUALITY_PATIENT_NOISE_QUANTILE)),
                 )
             for record in patient_rows:
                 sharpness = float(record.get("sharpness", np.nan))
                 noise_ratio = float(record.get("noise_ratio", np.nan))
                 dynamic_range = float(record.get("dynamic_range", np.nan))
                 reasons = []
-                if not np.isfinite(dynamic_range) or dynamic_range < Settings.Image.QUALITY_MIN_DYNAMIC_RANGE:
+                if not np.isfinite(dynamic_range) or dynamic_range < ImageProcessor.QUALITY_MIN_DYNAMIC_RANGE:
                     reasons.append("low_dynamic_range")
                 if not np.isfinite(sharpness) or sharpness < blur_threshold:
                     reasons.append("blurred")
@@ -1756,7 +1577,6 @@ class MaskManager:
     A non-empty heart mask, a valid no-heart frame, and an unusable frame have
     different meanings. They are never inferred from an accidentally empty PNG.
     """
-
 
     HEART_PRESENT = "HEART_PRESENT"
     NO_HEART_VISIBLE = "NO_HEART_VISIBLE"
@@ -1792,16 +1612,18 @@ class MaskManager:
 
     @staticmethod
     def read_binary(path: Path | str, size: int | None = None) -> np.ndarray:
+        """Read binary for manual target and mask auditing."""
         mask = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
         if mask is None:
             raise FileNotFoundError(f"Mask cannot be read: {path}")
-        size = int(size or Settings.Image.SEGMENTATION_SIZE)
+        size = int(size or ImageProcessor.SEGMENTATION_SIZE)
         if mask.shape != (size, size):
             mask = cv2.resize(mask, (size, size), interpolation=cv2.INTER_NEAREST)
         return (mask > 127).astype(np.uint8)
 
     @staticmethod
     def manual_qc(path: Path | str) -> dict[str, Any]:
+        """Perform the manual qc step for manual target and mask auditing."""
         path = Path(path)
         if not path.is_file():
             return {"exists": 0, "usable": 0, "area_ratio": np.nan, "reason": "missing"}
@@ -1810,9 +1632,9 @@ class MaskManager:
         except Exception:
             return {"exists": 1, "usable": 0, "area_ratio": np.nan, "reason": "unreadable"}
         area = float(mask.mean())
-        if area < Settings.Segmentation.MANUAL_MIN_AREA_RATIO:
+        if area < SegmentationManager.MANUAL_MIN_AREA_RATIO:
             reason = "empty_or_nearly_empty"
-        elif area > Settings.Segmentation.MANUAL_MAX_AREA_RATIO:
+        elif area > SegmentationManager.MANUAL_MAX_AREA_RATIO:
             reason = "nearly_full"
         else:
             reason = ""
@@ -1820,8 +1642,7 @@ class MaskManager:
 
     @staticmethod
     def manual_audit_refresh_reason(workspace: Workspace) -> str:
-
-
+        """Perform the manual audit refresh reason step for manual target and mask auditing."""
         path = workspace.manual_audit
         if not path.is_file():
             return "missing_manual_audit"
@@ -1865,8 +1686,7 @@ class MaskManager:
 
     @staticmethod
     def annotation_map(workspace: Workspace) -> dict[str, dict[str, Any]]:
-
-
+        """Perform the annotation map step for manual target and mask auditing."""
         result: dict[str, dict[str, Any]] = {}
         for row in FileManager.read_csv(workspace.manual_annotations):
             token = str(row.get("image_token", "")).strip()
@@ -1876,13 +1696,14 @@ class MaskManager:
 
     @staticmethod
     def _default_weight(target_type: str, source: str) -> float:
+        """Perform the default weight step for manual target and mask auditing."""
         target_type = str(target_type).upper()
         source = str(source).lower()
         if target_type == MaskManager.NO_HEART_VISIBLE:
-            return float(Settings.Segmentation.NO_HEART_WEIGHT)
+            return float(SegmentationManager.NO_HEART_WEIGHT)
         if "auto" in source:
-            return float(Settings.Segmentation.AUTO_CONFIRMED_WEIGHT)
-        return float(Settings.Segmentation.MANUAL_DRAWN_WEIGHT)
+            return float(SegmentationManager.AUTO_CONFIRMED_WEIGHT)
+        return float(SegmentationManager.MANUAL_DRAWN_WEIGHT)
 
     @staticmethod
     def set_annotation(
@@ -1893,6 +1714,7 @@ class MaskManager:
         sample_weight: float | None = None,
         note: str = "",
     ) -> None:
+        """Set annotation for manual target and mask auditing."""
         target_type = str(target_type).strip().upper()
         if target_type not in MaskManager.VALID_TARGET_TYPES:
             raise ValueError(f"Unknown annotation type: {target_type}")
@@ -1920,6 +1742,7 @@ class MaskManager:
 
     @staticmethod
     def remove_annotation(workspace: Workspace, image_token: str) -> None:
+        """Remove annotation for manual target and mask auditing."""
         records = MaskManager.annotation_map(workspace)
         records.pop(str(image_token), None)
         FileManager.write_csv(
@@ -1933,8 +1756,7 @@ class MaskManager:
         rows: Sequence[dict[str, Any]],
         workspace: Workspace,
     ) -> dict[str, Any]:
-
-
+        """Register existing manual masks as heart present for manual target and mask auditing."""
         by_token = {
             str(row.get("image_token", "")).strip(): dict(row)
             for row in rows
@@ -1985,7 +1807,7 @@ class MaskManager:
                 "series_id": str(row.get("series_id", "")),
                 "target_type": MaskManager.HEART_PRESENT,
                 "source": "existing_manual_on_review",
-                "sample_weight": float(Settings.Segmentation.MANUAL_DRAWN_WEIGHT),
+                "sample_weight": float(SegmentationManager.MANUAL_DRAWN_WEIGHT),
                 "note": (
                     "Existing non-empty manual PNG registered automatically "
                     "when review was opened; the mask file itself was not rewritten."
@@ -2023,9 +1845,8 @@ class MaskManager:
         workspace: Workspace,
         minimum_masks: int | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-
-
-        minimum_masks = int(minimum_masks or Settings.Segmentation.MIN_MANUAL_MASKS)
+        """Validate explicit segmentation targets and return accepted training rows."""
+        minimum_masks = int(minimum_masks or SegmentationManager.MIN_MANUAL_MASKS)
         by_token = {str(row["image_token"]): dict(row) for row in rows}
         manual_files = {path.stem: path for path in workspace.manual_masks.glob("*.png")}
         annotations = MaskManager.annotation_map(workspace)
@@ -2083,14 +1904,14 @@ class MaskManager:
                     FileManager.write_png(
                         path,
                         np.zeros(
-                            (Settings.Image.SEGMENTATION_SIZE, Settings.Image.SEGMENTATION_SIZE),
+                            (ImageProcessor.SEGMENTATION_SIZE, ImageProcessor.SEGMENTATION_SIZE),
                             dtype=np.uint8,
                         ),
                     )
                     mask_qc = MaskManager.manual_qc(path)
                 if not np.isfinite(_as_float(mask_qc.get("area_ratio"), np.nan)):
                     reasons.append("unreadable_negative_mask")
-                elif _as_float(mask_qc.get("area_ratio"), 1.0) >= Settings.Segmentation.MANUAL_MIN_AREA_RATIO:
+                elif _as_float(mask_qc.get("area_ratio"), 1.0) >= SegmentationManager.MANUAL_MIN_AREA_RATIO:
                     reasons.append("no_heart_annotation_has_nonempty_mask")
             elif target_type == MaskManager.UNUSABLE:
                 unusable_count += 1
@@ -2179,11 +2000,11 @@ class MaskManager:
             "targets_per_patient": dict(sorted(patient_counts.items())),
             "positive_masks_per_fold": {
                 str(fold): int(fold_positive_counts.get(fold, 0))
-                for fold in range(Settings.Segmentation.FOLDS)
+                for fold in range(SegmentationManager.FOLDS)
             },
             "negative_masks_per_fold": {
                 str(fold): int(fold_negative_counts.get(fold, 0))
-                for fold in range(Settings.Segmentation.FOLDS)
+                for fold in range(SegmentationManager.FOLDS)
             },
             "audit": str(workspace.manual_audit),
             "annotations": str(workspace.manual_annotations),
@@ -2202,25 +2023,26 @@ class MaskManager:
             )
         missing_folds = [
             fold
-            for fold in range(Settings.Segmentation.FOLDS)
+            for fold in range(SegmentationManager.FOLDS)
             if fold_positive_counts.get(fold, 0) == 0
         ]
         if missing_folds:
             raise RuntimeError(
                 f"No valid HEART_PRESENT masks exist in folds {missing_folds}."
             )
-        if len(positive_patient_counts) < Settings.Segmentation.FOLDS + 1:
+        if len(positive_patient_counts) < SegmentationManager.FOLDS + 1:
             raise RuntimeError("Too few patients have positive masks for cross-fitting.")
         return accepted, summary
 
 
 # -----------------------------------------------------------------------------
-# 2.5D Attention U-Net and leakage-safe out-of-fold inference
+# PIPELINE STEP 3 — 2.5D Attention U-Net and leakage-safe OOF inference
 # -----------------------------------------------------------------------------
 class AttentionConvBlock(nn.Module):
-
+    """Apply two normalized convolution layers inside the Attention U-Net."""
 
     def __init__(self, in_channels: int, out_channels: int):
+        """Initialize the values required for the Attention U-Net convolution block."""
         super().__init__()
         groups = next(group for group in (8, 4, 2, 1) if out_channels % group == 0)
         self.block = nn.Sequential(
@@ -2233,13 +2055,15 @@ class AttentionConvBlock(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the neural-network forward pass and return its output tensors."""
         return self.block(x)
 
 
 class AttentionGate(nn.Module):
-
+    """Weight an encoder skip connection using decoder context."""
 
     def __init__(self, gating_channels: int, skip_channels: int, inter_channels: int):
+        """Initialize the values required for the Attention U-Net skip gate."""
         super().__init__()
         groups = next(group for group in (8, 4, 2, 1) if inter_channels % group == 0)
         self.gating = nn.Sequential(
@@ -2257,18 +2081,23 @@ class AttentionGate(nn.Module):
         )
 
     def forward(self, gating: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+        """Run the neural-network forward pass and return its output tensors."""
         gating = F.interpolate(gating, size=skip.shape[-2:], mode="bilinear", align_corners=False)
         return skip * self.weight(self.gating(gating) + self.skip(skip))
 
 
 class AttentionUpBlock(nn.Module):
+    """Upsample decoder features, gate the skip connection, and refine the result."""
+
     def __init__(self, in_channels: int, skip_channels: int, out_channels: int):
+        """Initialize the values required for the Attention U-Net decoder block."""
         super().__init__()
         self.up = nn.Conv2d(in_channels, out_channels, 1, bias=False)
         self.gate = AttentionGate(out_channels, skip_channels, max(1, out_channels // 2))
         self.refine = AttentionConvBlock(out_channels + skip_channels, out_channels)
 
     def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+        """Run the neural-network forward pass and return its output tensors."""
         x = F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False)
         x = self.up(x)
         return self.refine(torch.cat([x, self.gate(x, skip)], dim=1))
@@ -2281,15 +2110,15 @@ class AttentionUNet(nn.Module):
     suppresses false positive masks on localizers or frames without visible heart.
     """
 
-
     def __init__(
         self,
         base_channels: int | None = None,
         input_channels: int | None = None,
     ):
+        """Initialize the values required for the 2.5D segmentation network."""
         super().__init__()
-        base = int(base_channels or Settings.Segmentation.BASE_CHANNELS)
-        input_channels = int(input_channels or Settings.Segmentation.INPUT_CHANNELS)
+        base = int(base_channels or SegmentationManager.BASE_CHANNELS)
+        input_channels = int(input_channels or SegmentationManager.INPUT_CHANNELS)
         self.input_channels = input_channels
         self.encoder1 = AttentionConvBlock(input_channels, base)
         self.encoder2 = AttentionConvBlock(base, base * 2)
@@ -2312,6 +2141,7 @@ class AttentionUNet(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run the neural-network forward pass and return its output tensors."""
         e1 = self.encoder1(x)
         e2 = self.encoder2(self.pool(e1))
         e3 = self.encoder3(self.pool(e2))
@@ -2326,24 +2156,28 @@ class AttentionUNet(nn.Module):
 
 
 class SegmentationDataset(Dataset):
-
+    """Load manual segmentation targets and optional training augmentation."""
 
     def __init__(self, rows: Sequence[dict[str, Any]], augment: bool, seed: int):
+        """Initialize the values required for segmentation training data loading."""
         self.rows = list(rows)
         self.augment = bool(augment)
         self.seed = int(seed)
         self.epoch = 0
 
     def set_epoch(self, epoch: int) -> None:
+        """Set epoch for segmentation training data loading."""
         self.epoch = int(epoch)
 
     def __len__(self) -> int:
+        """Return the number of rows available through this dataset-like object."""
         return len(self.rows)
 
     @staticmethod
     def _image_stack(row: dict[str, Any]) -> np.ndarray:
+        """Perform the image stack step for segmentation training data loading."""
         current = str(row["image_path"])
-        if Settings.Segmentation.USE_2_5D:
+        if SegmentationManager.USE_2_5D:
             paths = (
                 str(row.get("previous_image_path") or current),
                 current,
@@ -2357,6 +2191,7 @@ class SegmentationDataset(Dataset):
         )
 
     def __getitem__(self, index: int):
+        """Load and return one item identified by its integer index."""
         row = self.rows[index]
         image = self._image_stack(row)
         mask = MaskManager.read_binary(row["manual_mask_path"]).astype(np.float32)
@@ -2365,24 +2200,24 @@ class SegmentationDataset(Dataset):
 
         if self.augment:
             rng = np.random.default_rng(self.seed + self.epoch * 1_000_003 + index)
-            if Settings.Segmentation.AUGMENT_HORIZONTAL_FLIP and rng.random() < 0.5:
+            if SegmentationManager.AUGMENT_HORIZONTAL_FLIP and rng.random() < 0.5:
                 image = np.flip(image, axis=2).copy()
                 mask = np.fliplr(mask).copy()
 
-            size = Settings.Image.SEGMENTATION_SIZE
+            size = ImageProcessor.SEGMENTATION_SIZE
             angle = float(
                 rng.uniform(
-                    -Settings.Segmentation.AUGMENT_ROTATION_DEGREES,
-                    Settings.Segmentation.AUGMENT_ROTATION_DEGREES,
+                    -SegmentationManager.AUGMENT_ROTATION_DEGREES,
+                    SegmentationManager.AUGMENT_ROTATION_DEGREES,
                 )
             )
             scale = float(
                 rng.uniform(
-                    Settings.Segmentation.AUGMENT_SCALE_MIN,
-                    Settings.Segmentation.AUGMENT_SCALE_MAX,
+                    SegmentationManager.AUGMENT_SCALE_MIN,
+                    SegmentationManager.AUGMENT_SCALE_MAX,
                 )
             )
-            shift = Settings.Segmentation.AUGMENT_TRANSLATION_FRACTION * size
+            shift = SegmentationManager.AUGMENT_TRANSLATION_FRACTION * size
             tx, ty = map(float, rng.uniform(-shift, shift, size=2))
             matrix = cv2.getRotationMatrix2D((size / 2, size / 2), angle, scale)
             matrix[:, 2] += (tx, ty)
@@ -2411,20 +2246,20 @@ class SegmentationDataset(Dataset):
 
             gamma = float(
                 rng.uniform(
-                    Settings.Segmentation.AUGMENT_GAMMA_MIN,
-                    Settings.Segmentation.AUGMENT_GAMMA_MAX,
+                    SegmentationManager.AUGMENT_GAMMA_MIN,
+                    SegmentationManager.AUGMENT_GAMMA_MAX,
                 )
             )
             contrast = float(rng.uniform(0.90, 1.10))
             brightness = float(rng.uniform(-0.04, 0.04))
             image = np.power(np.clip(image, 0.0, 1.0), gamma)
             image = np.clip(image * contrast + brightness, 0.0, 1.0)
-            if rng.random() < Settings.Segmentation.AUGMENT_BLUR_PROBABILITY:
+            if rng.random() < SegmentationManager.AUGMENT_BLUR_PROBABILITY:
                 image = np.stack(
                     [cv2.GaussianBlur(channel, (3, 3), 0) for channel in image],
                     axis=0,
                 )
-            noise_std = float(rng.uniform(0.0, Settings.Segmentation.AUGMENT_NOISE_STD_MAX))
+            noise_std = float(rng.uniform(0.0, SegmentationManager.AUGMENT_NOISE_STD_MAX))
             if noise_std > 0:
                 image = np.clip(
                     image + rng.normal(0.0, noise_std, size=image.shape).astype(np.float32),
@@ -2442,13 +2277,18 @@ class SegmentationDataset(Dataset):
 
 
 class SegmentationInferenceDataset(Dataset):
+    """Load image stacks for deterministic segmentation inference."""
+
     def __init__(self, rows: Sequence[dict[str, Any]]):
+        """Initialize the values required for segmentation inference data loading."""
         self.rows = list(rows)
 
     def __len__(self) -> int:
+        """Return the number of rows available through this dataset-like object."""
         return len(self.rows)
 
     def __getitem__(self, index: int):
+        """Load and return one item identified by its integer index."""
         image = SegmentationDataset._image_stack(self.rows[index])
         return torch.from_numpy(np.ascontiguousarray(image)).float(), int(index)
 
@@ -2459,6 +2299,196 @@ class SegmentationManager:
     Each patient's predicted mask comes from a model that excluded that patient
     from training and threshold calibration. This is the central leakage barrier.
     """
+
+    # Attention U-Net training, calibration, and prediction settings.
+    # Number of patient-level folds used for leakage-safe Attention U-Net cross-fitting.
+    FOLDS = 5
+
+    # Number of channels in the first Attention U-Net encoder block.
+    BASE_CHANNELS = 24
+
+    # Number of input channels; three channels represent previous, current, and next frames.
+    INPUT_CHANNELS = 3
+
+    # Use neighboring frames as 2.5D context for each segmentation prediction.
+    USE_2_5D = True
+
+    # Maximum number of training epochs for each cross-fitting fold.
+    EPOCHS = 36
+
+    # Epochs without improvement allowed before training stops.
+    EARLY_STOPPING_PATIENCE = 8
+
+    # Initial AdamW learning rate.
+    LEARNING_RATE = 8e-4
+
+    # AdamW weight-decay strength.
+    WEIGHT_DECAY = 1e-4
+
+    # Validation plateaus allowed before the learning rate is reduced.
+    LR_REDUCE_PATIENCE = 3
+
+    # Factor multiplied into the learning rate after a plateau.
+    LR_REDUCE_FACTOR = 0.5
+
+    # Smallest learning rate allowed by the scheduler.
+    MIN_LEARNING_RATE = 1e-6
+
+    # Contribution of focal loss to the segmentation loss.
+    FOCAL_WEIGHT = 0.40
+
+    # Contribution of Tversky loss to the segmentation loss.
+    TVERSKY_WEIGHT = 0.60
+
+    # Focusing exponent used by focal loss.
+    FOCAL_GAMMA = 2.0
+
+    # False-positive penalty used by Tversky loss.
+    TVERSKY_ALPHA_FP = 0.65
+
+    # False-negative penalty used by Tversky loss.
+    TVERSKY_BETA_FN = 0.35
+
+    # Contribution of the heart-presence classification head to total loss.
+    PRESENCE_LOSS_WEIGHT = 0.30
+
+    # Training weight for a manually drawn or corrected heart mask.
+    MANUAL_DRAWN_WEIGHT = 1.00
+
+    # Training weight for an automatic mask confirmed by a human reviewer.
+    AUTO_CONFIRMED_WEIGHT = 0.72
+
+    # Training weight for an explicit no-heart-visible target.
+    NO_HEART_WEIGHT = 0.90
+
+    # Desired sampling fraction for explicit no-heart targets.
+    NEGATIVE_TARGET_FRACTION = 0.30
+
+    # Training batch size used on CUDA.
+    BATCH_SIZE_CUDA = 10
+
+    # Training batch size used on CPU.
+    BATCH_SIZE_CPU = 3
+
+    # Segmentation inference batch size used on CUDA.
+    INFERENCE_BATCH_SIZE_CUDA = 10
+
+    # Segmentation inference batch size used on CPU.
+    INFERENCE_BATCH_SIZE_CPU = 3
+
+    # Minimum accepted HEART_PRESENT masks required before training starts.
+    MIN_MANUAL_MASKS = 800
+
+    # Smallest non-empty manual-mask area accepted as a heart target.
+    MANUAL_MIN_AREA_RATIO = 0.0005
+
+    # Largest manual-mask area accepted before it is considered nearly full.
+    MANUAL_MAX_AREA_RATIO = 0.98
+
+    # Fraction of non-test patients reserved for fold-level validation.
+    VALIDATION_PATIENT_FRACTION = 0.20
+
+    # Allow horizontal flips during training augmentation.
+    AUGMENT_HORIZONTAL_FLIP = False
+
+    # Maximum absolute random rotation used during augmentation.
+    AUGMENT_ROTATION_DEGREES = 7.0
+
+    # Maximum translation as a fraction of the canvas size.
+    AUGMENT_TRANSLATION_FRACTION = 0.06
+
+    # Smallest random geometric scale used during augmentation.
+    AUGMENT_SCALE_MIN = 0.92
+
+    # Largest random geometric scale used during augmentation.
+    AUGMENT_SCALE_MAX = 1.08
+
+    # Smallest random gamma correction used during augmentation.
+    AUGMENT_GAMMA_MIN = 0.85
+
+    # Largest random gamma correction used during augmentation.
+    AUGMENT_GAMMA_MAX = 1.15
+
+    # Largest Gaussian-noise standard deviation used during augmentation.
+    AUGMENT_NOISE_STD_MAX = 0.025
+
+    # Probability of applying a small Gaussian blur during augmentation.
+    AUGMENT_BLUR_PROBABILITY = 0.15
+
+    # Candidate mask thresholds evaluated only on fold-level validation patients.
+    CALIBRATION_THRESHOLDS = (
+        0.20,
+        0.25,
+        0.30,
+        0.35,
+        0.40,
+        0.45,
+        0.50,
+        0.55,
+        0.60,
+        0.65,
+        0.70,
+        0.75,
+    )
+
+    # Candidate heart-presence thresholds evaluated on validation patients.
+    PRESENCE_CALIBRATION_THRESHOLDS = (
+        0.20,
+        0.25,
+        0.30,
+        0.35,
+        0.40,
+        0.45,
+        0.50,
+        0.55,
+        0.60,
+        0.65,
+        0.70,
+        0.75,
+        0.80,
+    )
+
+    # Fallback mask threshold when calibration cannot select one.
+    DEFAULT_THRESHOLD = 0.50
+
+    # Fallback heart-presence threshold when calibration cannot select one.
+    DEFAULT_PRESENCE_THRESHOLD = 0.50
+
+    # Peak segmentation probability that can override a negative presence prediction.
+    PRESENCE_SEGMENTATION_OVERRIDE_PEAK = 0.80
+
+    # Smallest automatic mask area considered anatomically usable.
+    PREDICTION_MIN_AREA_RATIO = 0.003
+
+    # Largest automatic mask area considered anatomically usable.
+    PREDICTION_MAX_AREA_RATIO = 0.65
+
+    # Minimum peak probability required for an automatic mask.
+    PREDICTION_MIN_PEAK_PROBABILITY = 0.50
+
+    # Threshold changes tested when the initial automatic mask is invalid.
+    REPAIR_THRESHOLD_OFFSETS = (-0.20, -0.15, -0.10, -0.05, 0.05, 0.10, 0.15, 0.20)
+
+    # Largest fraction of mask pixels allowed to touch the image boundary.
+    REPAIR_MAX_BOUNDARY_TOUCH = 0.35
+
+    # Kernel size used to close small gaps in thresholded masks.
+    REPAIR_MORPHOLOGY_KERNEL = 5
+
+    # Largest robust geometry deviation allowed from the training-mask prior.
+    PRIOR_MAX_ROBUST_Z = 5.5
+
+    # Contrast factor used for photometric test-time augmentation.
+    TTA_CONTRAST_FACTOR = 1.10
+
+    # TTA disagreement value mapped to maximum normalized disagreement.
+    UNCERTAINTY_DISAGREEMENT_SCALE = 0.08
+
+    # Kernel used to expand a mask before ROI and complement feature extraction.
+    SUPPORT_DILATION_KERNEL = 15
+
+    # Write every predicted mask, including valid masks, to the workspace.
+    SAVE_ALL_PREDICTED_MASKS = True
 
 
     PREDICTION_FIELDS = (
@@ -2492,10 +2522,12 @@ class SegmentationManager:
 
     @staticmethod
     def _checkpoint_path(workspace: Workspace, fold: int) -> Path:
+        """Return the checkpoint path used by cross-fitted segmentation."""
         return workspace.checkpoints / f"attention_unet_fold_{int(fold)}.pt"
 
     @staticmethod
     def _torch_load(path: Path) -> Any:
+        """Perform the torch load step for cross-fitted segmentation."""
         try:
             return torch.load(str(path), map_location="cpu", weights_only=False)
         except TypeError:
@@ -2503,6 +2535,7 @@ class SegmentationManager:
 
     @staticmethod
     def _dice_from_logits(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """Perform the dice from logits step for cross-fitted segmentation."""
         probability = torch.sigmoid(logits)
         intersection = (probability * targets).sum(dim=(1, 2, 3))
         denominator = probability.sum(dim=(1, 2, 3)) + targets.sum(dim=(1, 2, 3))
@@ -2516,12 +2549,11 @@ class SegmentationManager:
         presence_targets: torch.Tensor,
         sample_weights: torch.Tensor,
     ) -> torch.Tensor:
-
-
+        """Perform the loss step for cross-fitted segmentation."""
         probability = torch.sigmoid(logits)
         bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
         pt = probability * targets + (1.0 - probability) * (1.0 - targets)
-        focal = ((1.0 - pt).pow(Settings.Segmentation.FOCAL_GAMMA) * bce).mean(
+        focal = ((1.0 - pt).pow(SegmentationManager.FOCAL_GAMMA) * bce).mean(
             dim=(1, 2, 3)
         )
 
@@ -2530,13 +2562,13 @@ class SegmentationManager:
         fn = ((1.0 - probability) * targets).sum(dim=(1, 2, 3))
         tversky = (tp + 1e-6) / (
             tp
-            + Settings.Segmentation.TVERSKY_ALPHA_FP * fp
-            + Settings.Segmentation.TVERSKY_BETA_FN * fn
+            + SegmentationManager.TVERSKY_ALPHA_FP * fp
+            + SegmentationManager.TVERSKY_BETA_FN * fn
             + 1e-6
         )
         segmentation_per_sample = (
-            Settings.Segmentation.FOCAL_WEIGHT * focal
-            + Settings.Segmentation.TVERSKY_WEIGHT * (1.0 - tversky)
+            SegmentationManager.FOCAL_WEIGHT * focal
+            + SegmentationManager.TVERSKY_WEIGHT * (1.0 - tversky)
         )
 
         sample_weights = sample_weights.float().clamp_min(1e-3)
@@ -2547,28 +2579,29 @@ class SegmentationManager:
             presence_logits.float(), presence_targets.float(), reduction="none"
         )
         presence_loss = (presence_loss * sample_weights).sum() / sample_weights.sum().clamp_min(1e-6)
-        return segmentation_loss + Settings.Segmentation.PRESENCE_LOSS_WEIGHT * presence_loss
+        return segmentation_loss + SegmentationManager.PRESENCE_LOSS_WEIGHT * presence_loss
 
     @staticmethod
     def _manual_fingerprint(rows: Sequence[dict[str, Any]], fold: int) -> str:
+        """Perform the manual fingerprint step for cross-fitted segmentation."""
         payload = {
             "schema": "simple-attention-2p5d-presence-v3",
             "fold": int(fold),
-            "size": Settings.Image.SEGMENTATION_SIZE,
-            "input_channels": Settings.Segmentation.INPUT_CHANNELS,
-            "use_2_5d": Settings.Segmentation.USE_2_5D,
-            "base_channels": Settings.Segmentation.BASE_CHANNELS,
-            "epochs": Settings.Segmentation.EPOCHS,
-            "learning_rate": Settings.Segmentation.LEARNING_RATE,
-            "weight_decay": Settings.Segmentation.WEIGHT_DECAY,
+            "size": ImageProcessor.SEGMENTATION_SIZE,
+            "input_channels": SegmentationManager.INPUT_CHANNELS,
+            "use_2_5d": SegmentationManager.USE_2_5D,
+            "base_channels": SegmentationManager.BASE_CHANNELS,
+            "epochs": SegmentationManager.EPOCHS,
+            "learning_rate": SegmentationManager.LEARNING_RATE,
+            "weight_decay": SegmentationManager.WEIGHT_DECAY,
             "loss": {
-                "focal": Settings.Segmentation.FOCAL_WEIGHT,
-                "tversky": Settings.Segmentation.TVERSKY_WEIGHT,
-                "presence": Settings.Segmentation.PRESENCE_LOSS_WEIGHT,
-                "alpha_fp": Settings.Segmentation.TVERSKY_ALPHA_FP,
-                "beta_fn": Settings.Segmentation.TVERSKY_BETA_FN,
+                "focal": SegmentationManager.FOCAL_WEIGHT,
+                "tversky": SegmentationManager.TVERSKY_WEIGHT,
+                "presence": SegmentationManager.PRESENCE_LOSS_WEIGHT,
+                "alpha_fp": SegmentationManager.TVERSKY_ALPHA_FP,
+                "beta_fn": SegmentationManager.TVERSKY_BETA_FN,
             },
-            "seed": Settings.Runtime.RANDOM_SEED,
+            "seed": RuntimeManager.RANDOM_SEED,
         }
         digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8"))
         for row in sorted(rows, key=lambda item: item["image_token"]):
@@ -2586,10 +2619,11 @@ class SegmentationManager:
 
     @staticmethod
     def _validation_patients(patient_ids: Iterable[str], target_fold: int) -> set[str]:
+        """Perform the validation patients step for cross-fitted segmentation."""
         ordered = sorted(
             set(map(str, patient_ids)),
             key=lambda patient_id: hashlib.sha256(
-                f"{Settings.Runtime.RANDOM_SEED}|validation|{target_fold}|{patient_id}".encode(
+                f"{RuntimeManager.RANDOM_SEED}|validation|{target_fold}|{patient_id}".encode(
                     "utf-8"
                 )
             ).hexdigest(),
@@ -2599,7 +2633,7 @@ class SegmentationManager:
             int(
                 round(
                     len(ordered)
-                    * Settings.Segmentation.VALIDATION_PATIENT_FRACTION
+                    * SegmentationManager.VALIDATION_PATIENT_FRACTION
                 )
             ),
         )
@@ -2612,8 +2646,7 @@ class SegmentationManager:
         validation_patients: set[str],
         target_fold: int,
     ) -> set[str]:
-
-
+        """Ensure presence coverage for cross-fitted segmentation."""
         patients = sorted({str(row["patient_id"]) for row in rows})
         has_label: dict[int, set[str]] = {0: set(), 1: set()}
         for row in rows:
@@ -2623,10 +2656,11 @@ class SegmentationManager:
         validation = set(validation_patients)
 
         def ordered(values: set[str], salt: str) -> list[str]:
+            """Perform the local ordered step used by the surrounding operation."""
             return sorted(
                 values,
                 key=lambda patient: hashlib.sha256(
-                    f"{Settings.Runtime.RANDOM_SEED}|{target_fold}|{salt}|{patient}".encode(
+                    f"{RuntimeManager.RANDOM_SEED}|{target_fold}|{salt}|{patient}".encode(
                         "utf-8"
                     )
                 ).hexdigest(),
@@ -2670,8 +2704,7 @@ class SegmentationManager:
         rows: Sequence[dict[str, Any]],
         seed: int,
     ) -> WeightedRandomSampler:
-
-
+        """Perform the training sampler step for cross-fitted segmentation."""
         rows = list(rows)
         series_by_patient: dict[str, set[str]] = defaultdict(set)
         clusters_by_series: dict[tuple[str, str], set[str]] = defaultdict(set)
@@ -2702,7 +2735,7 @@ class SegmentationManager:
         positive = labels_array == 1
         negative = labels_array == 0
         if positive.any() and negative.any():
-            target_negative = float(Settings.Segmentation.NEGATIVE_TARGET_FRACTION)
+            target_negative = float(SegmentationManager.NEGATIVE_TARGET_FRACTION)
             target_positive = 1.0 - target_negative
             base[positive] *= target_positive / max(base[positive].sum(), 1e-12)
             base[negative] *= target_negative / max(base[negative].sum(), 1e-12)
@@ -2719,6 +2752,7 @@ class SegmentationManager:
 
     @staticmethod
     def _mask_features(mask: np.ndarray) -> dict[str, float]:
+        """Perform the mask features step for cross-fitted segmentation."""
         mask = (np.asarray(mask) > 0).astype(np.uint8)
         area, boundary = SegmentationManager._mask_geometry(mask)
         if not mask.any():
@@ -2743,6 +2777,7 @@ class SegmentationManager:
 
     @staticmethod
     def _geometry_prior(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
+        """Perform the geometry prior step for cross-fitted segmentation."""
         features = []
         for row in rows:
             if _as_int(row.get("heart_present"), 1) != 1:
@@ -2773,6 +2808,7 @@ class SegmentationManager:
 
     @staticmethod
     def _prior_deviation(mask: np.ndarray, prior: dict[str, Any] | None) -> float:
+        """Perform the prior deviation step for cross-fitted segmentation."""
         if not prior or _as_int(prior.get("count"), 0) < 5 or not np.asarray(mask).any():
             return 0.0
         features = SegmentationManager._mask_features(mask)
@@ -2786,6 +2822,7 @@ class SegmentationManager:
 
     @staticmethod
     def _balanced_accuracy(labels: np.ndarray, predictions: np.ndarray) -> float:
+        """Perform the balanced accuracy step for cross-fitted segmentation."""
         labels = np.asarray(labels, dtype=np.int64)
         predictions = np.asarray(predictions, dtype=np.int64)
         values = []
@@ -2802,6 +2839,7 @@ class SegmentationManager:
         device: torch.device,
         geometry_prior: dict[str, Any],
     ) -> dict[str, Any]:
+        """Calibrate threshold for cross-fitted segmentation."""
         probabilities: list[np.ndarray] = []
         targets: list[np.ndarray] = []
         presence_probabilities: list[float] = []
@@ -2826,11 +2864,11 @@ class SegmentationManager:
         labels_array = np.asarray(presence_targets, dtype=np.int64)
         presence_array = np.asarray(presence_probabilities, dtype=np.float64)
         best_presence = {
-            "threshold": Settings.Segmentation.DEFAULT_PRESENCE_THRESHOLD,
+            "threshold": SegmentationManager.DEFAULT_PRESENCE_THRESHOLD,
             "balanced_accuracy": 0.0,
         }
         if len(np.unique(labels_array)) >= 2:
-            for threshold in Settings.Segmentation.PRESENCE_CALIBRATION_THRESHOLDS:
+            for threshold in SegmentationManager.PRESENCE_CALIBRATION_THRESHOLDS:
                 prediction = (presence_array >= threshold).astype(np.int64)
                 balanced = SegmentationManager._balanced_accuracy(
                     labels_array, prediction
@@ -2851,7 +2889,7 @@ class SegmentationManager:
             best_presence["balanced_accuracy"] = 1.0
 
         best = None
-        for threshold in Settings.Segmentation.CALIBRATION_THRESHOLDS:
+        for threshold in SegmentationManager.CALIBRATION_THRESHOLDS:
             by_patient: dict[str, list[float]] = defaultdict(list)
             invalid = 0
             for probability, target, target_presence, patient_id in zip(
@@ -2896,7 +2934,7 @@ class SegmentationManager:
                 best = candidate
 
         result = best or {
-            "threshold": Settings.Segmentation.DEFAULT_THRESHOLD,
+            "threshold": SegmentationManager.DEFAULT_THRESHOLD,
             "patient_balanced_segmentation_score": 0.0,
             "invalid_rate_positive": 1.0,
             "score": -1.0,
@@ -2917,14 +2955,13 @@ class SegmentationManager:
         device: torch.device,
         force: bool = False,
     ) -> dict[int, Path]:
-
-
+        """Train or reuse one Attention U-Net checkpoint per patient-level fold."""
         RuntimeManager.seed_everything(include_cuda=device.type == "cuda")
         checkpoint_map: dict[int, Path] = {}
         fold_summaries = []
         all_patients = sorted({str(row["patient_id"]) for row in accepted_rows})
 
-        for fold in range(Settings.Segmentation.FOLDS):
+        for fold in range(SegmentationManager.FOLDS):
             fold_started = time.perf_counter()
             checkpoint_path = SegmentationManager._checkpoint_path(workspace, fold)
             non_test_rows = [
@@ -2991,44 +3028,44 @@ class SegmentationManager:
             train_dataset = SegmentationDataset(
                 train_rows,
                 augment=True,
-                seed=Settings.Runtime.RANDOM_SEED + fold * 1000,
+                seed=RuntimeManager.RANDOM_SEED + fold * 1000,
             )
             validation_dataset = SegmentationDataset(
                 validation_rows,
                 augment=False,
-                seed=Settings.Runtime.RANDOM_SEED,
+                seed=RuntimeManager.RANDOM_SEED,
             )
             train_sampler = SegmentationManager._training_sampler(
-                train_rows, Settings.Runtime.RANDOM_SEED + fold
+                train_rows, RuntimeManager.RANDOM_SEED + fold
             )
             train_loader = DataLoader(
                 train_dataset,
                 batch_size=RuntimeManager.train_batch_size(device),
                 sampler=train_sampler,
                 shuffle=False,
-                num_workers=Settings.Runtime.NUM_WORKERS,
+                num_workers=RuntimeManager.NUM_WORKERS,
                 pin_memory=device.type == "cuda",
             )
             validation_loader = DataLoader(
                 validation_dataset,
                 batch_size=RuntimeManager.inference_batch_size(device),
                 shuffle=False,
-                num_workers=Settings.Runtime.NUM_WORKERS,
+                num_workers=RuntimeManager.NUM_WORKERS,
                 pin_memory=device.type == "cuda",
             )
 
             model = RuntimeManager.prepare_model(AttentionUNet(), device)
             optimizer = torch.optim.AdamW(
                 model.parameters(),
-                lr=Settings.Segmentation.LEARNING_RATE,
-                weight_decay=Settings.Segmentation.WEIGHT_DECAY,
+                lr=SegmentationManager.LEARNING_RATE,
+                weight_decay=SegmentationManager.WEIGHT_DECAY,
             )
             scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                 optimizer,
                 mode="max",
-                factor=Settings.Segmentation.LR_REDUCE_FACTOR,
-                patience=Settings.Segmentation.LR_REDUCE_PATIENCE,
-                min_lr=Settings.Segmentation.MIN_LEARNING_RATE,
+                factor=SegmentationManager.LR_REDUCE_FACTOR,
+                patience=SegmentationManager.LR_REDUCE_PATIENCE,
+                min_lr=SegmentationManager.MIN_LEARNING_RATE,
             )
             scaler = RuntimeManager.grad_scaler(device)
             best_state = None
@@ -3037,7 +3074,7 @@ class SegmentationManager:
             patience = 0
             history = []
 
-            for epoch in range(1, Settings.Segmentation.EPOCHS + 1):
+            for epoch in range(1, SegmentationManager.EPOCHS + 1):
                 train_dataset.set_epoch(epoch)
                 model.train()
                 train_losses = []
@@ -3167,7 +3204,7 @@ class SegmentationManager:
                     patience = 0
                 else:
                     patience += 1
-                    if patience >= Settings.Segmentation.EARLY_STOPPING_PATIENCE:
+                    if patience >= SegmentationManager.EARLY_STOPPING_PATIENCE:
                         print(f"  early stopping after epoch {epoch}.")
                         break
 
@@ -3183,8 +3220,8 @@ class SegmentationManager:
                 "state_dict": best_state,
                 "fingerprint": fingerprint,
                 "fold": fold,
-                "base_channels": Settings.Segmentation.BASE_CHANNELS,
-                "input_channels": Settings.Segmentation.INPUT_CHANNELS,
+                "base_channels": SegmentationManager.BASE_CHANNELS,
+                "input_channels": SegmentationManager.INPUT_CHANNELS,
                 "best_epoch": best_epoch,
                 "best_selection_metric": best_metric,
                 "calibration": calibration,
@@ -3253,8 +3290,9 @@ class SegmentationManager:
 
     @staticmethod
     def load_checkpoint_map(workspace: Workspace) -> dict[int, Path]:
+        """Load checkpoint map for cross-fitted segmentation."""
         result = {}
-        for fold in range(Settings.Segmentation.FOLDS):
+        for fold in range(SegmentationManager.FOLDS):
             path = SegmentationManager._checkpoint_path(workspace, fold)
             if not path.is_file():
                 raise FileNotFoundError(
@@ -3268,8 +3306,9 @@ class SegmentationManager:
         accepted_rows: Sequence[dict[str, Any]],
         workspace: Workspace,
     ) -> dict[int, Path] | None:
+        """Perform the compatible checkpoint map step for cross-fitted segmentation."""
         result: dict[int, Path] = {}
-        for fold in range(Settings.Segmentation.FOLDS):
+        for fold in range(SegmentationManager.FOLDS):
             checkpoint_path = SegmentationManager._checkpoint_path(workspace, fold)
             if not checkpoint_path.is_file():
                 return None
@@ -3292,6 +3331,7 @@ class SegmentationManager:
 
     @staticmethod
     def _largest_component(mask: np.ndarray) -> np.ndarray:
+        """Perform the largest component step for cross-fitted segmentation."""
         binary = (np.asarray(mask) > 0).astype(np.uint8)
         if not binary.any():
             return binary
@@ -3305,6 +3345,7 @@ class SegmentationManager:
 
     @staticmethod
     def _mask_geometry(mask: np.ndarray) -> tuple[float, float]:
+        """Perform the mask geometry step for cross-fitted segmentation."""
         mask = (np.asarray(mask) > 0).astype(np.uint8)
         area = float(mask.mean())
         if not mask.any():
@@ -3321,8 +3362,9 @@ class SegmentationManager:
 
     @staticmethod
     def _candidate_mask(probability: np.ndarray, threshold: float) -> np.ndarray:
+        """Perform the candidate mask step for cross-fitted segmentation."""
         mask = (probability >= float(threshold)).astype(np.uint8)
-        kernel_size = int(Settings.Segmentation.REPAIR_MORPHOLOGY_KERNEL)
+        kernel_size = int(SegmentationManager.REPAIR_MORPHOLOGY_KERNEL)
         if kernel_size > 1:
             kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
             mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
@@ -3334,19 +3376,20 @@ class SegmentationManager:
         probability: np.ndarray,
         geometry_prior: dict[str, Any] | None = None,
     ) -> tuple[bool, str]:
+        """Validate mask for cross-fitted segmentation."""
         area, boundary = SegmentationManager._mask_geometry(mask)
         peak = float(np.max(probability))
         reasons = []
-        if area < Settings.Segmentation.PREDICTION_MIN_AREA_RATIO:
+        if area < SegmentationManager.PREDICTION_MIN_AREA_RATIO:
             reasons.append("area_too_small")
-        if area > Settings.Segmentation.PREDICTION_MAX_AREA_RATIO:
+        if area > SegmentationManager.PREDICTION_MAX_AREA_RATIO:
             reasons.append("area_too_large")
-        if peak < Settings.Segmentation.PREDICTION_MIN_PEAK_PROBABILITY:
+        if peak < SegmentationManager.PREDICTION_MIN_PEAK_PROBABILITY:
             reasons.append("low_peak_probability")
-        if boundary > Settings.Segmentation.REPAIR_MAX_BOUNDARY_TOUCH:
+        if boundary > SegmentationManager.REPAIR_MAX_BOUNDARY_TOUCH:
             reasons.append("touches_boundary")
         prior_deviation = SegmentationManager._prior_deviation(mask, geometry_prior)
-        if prior_deviation > Settings.Segmentation.PRIOR_MAX_ROBUST_Z:
+        if prior_deviation > SegmentationManager.PRIOR_MAX_ROBUST_Z:
             reasons.append("geometry_outlier")
         return not reasons, ";".join(reasons)
 
@@ -3356,12 +3399,11 @@ class SegmentationManager:
         threshold: float,
         geometry_prior: dict[str, Any] | None = None,
     ) -> tuple[np.ndarray, bool, str, float, str, float]:
-
-
+        """Repair probability for cross-fitted segmentation."""
         candidates = []
         thresholds = [threshold] + [
             float(np.clip(threshold + offset, 0.05, 0.95))
-            for offset in Settings.Segmentation.REPAIR_THRESHOLD_OFFSETS
+            for offset in SegmentationManager.REPAIR_THRESHOLD_OFFSETS
         ]
         for candidate_threshold in sorted(set(thresholds)):
             mask = SegmentationManager._candidate_mask(
@@ -3421,19 +3463,20 @@ class SegmentationManager:
     def _prediction_fingerprint(
         rows: Sequence[dict[str, Any]], checkpoint_map: dict[int, Path]
     ) -> str:
+        """Perform the prediction fingerprint step for cross-fitted segmentation."""
         digest = hashlib.sha256()
         settings_payload = {
             "schema": "simple-predictions-2p5d-presence-v5",
-            "thresholds": Settings.Segmentation.CALIBRATION_THRESHOLDS,
-            "presence_thresholds": Settings.Segmentation.PRESENCE_CALIBRATION_THRESHOLDS,
+            "thresholds": SegmentationManager.CALIBRATION_THRESHOLDS,
+            "presence_thresholds": SegmentationManager.PRESENCE_CALIBRATION_THRESHOLDS,
             "area": [
-                Settings.Segmentation.PREDICTION_MIN_AREA_RATIO,
-                Settings.Segmentation.PREDICTION_MAX_AREA_RATIO,
+                SegmentationManager.PREDICTION_MIN_AREA_RATIO,
+                SegmentationManager.PREDICTION_MAX_AREA_RATIO,
             ],
-            "repair_offsets": Settings.Segmentation.REPAIR_THRESHOLD_OFFSETS,
-            "tta_contrast": Settings.Segmentation.TTA_CONTRAST_FACTOR,
-            "presence_override_peak": Settings.Segmentation.PRESENCE_SEGMENTATION_OVERRIDE_PEAK,
-            "prior_z": Settings.Segmentation.PRIOR_MAX_ROBUST_Z,
+            "repair_offsets": SegmentationManager.REPAIR_THRESHOLD_OFFSETS,
+            "tta_contrast": SegmentationManager.TTA_CONTRAST_FACTOR,
+            "presence_override_peak": SegmentationManager.PRESENCE_SEGMENTATION_OVERRIDE_PEAK,
+            "prior_z": SegmentationManager.PRIOR_MAX_ROBUST_Z,
         }
         digest.update(json.dumps(settings_payload, sort_keys=True).encode("utf-8"))
         digest.update(str(len(rows)).encode("ascii"))
@@ -3457,6 +3500,7 @@ class SegmentationManager:
         workspace: Workspace,
         checkpoint_map: dict[int, Path],
     ) -> list[dict[str, Any]] | None:
+        """Load cached predictions for cross-fitted segmentation."""
         fingerprint = SegmentationManager._prediction_fingerprint(
             rows, checkpoint_map
         )
@@ -3488,6 +3532,7 @@ class SegmentationManager:
     def _prediction_part_paths(
         workspace: Workspace, fold: int
     ) -> tuple[Path, Path]:
+        """Return the prediction part paths used by cross-fitted segmentation."""
         csv_path = workspace.prediction_parts_dir / f"fold_{int(fold)}.csv"
         json_path = workspace.prediction_parts_dir / f"fold_{int(fold)}.json"
         return csv_path, json_path
@@ -3498,16 +3543,17 @@ class SegmentationManager:
         fold_rows: Sequence[dict[str, Any]],
         checkpoint_path: Path,
     ) -> str:
+        """Perform the prediction part fingerprint step for cross-fitted segmentation."""
         digest = hashlib.sha256()
         payload = {
             "schema": "simple-prediction-part-2p5d-presence-v5",
             "fold": int(fold),
-            "thresholds": Settings.Segmentation.CALIBRATION_THRESHOLDS,
-            "presence_thresholds": Settings.Segmentation.PRESENCE_CALIBRATION_THRESHOLDS,
-            "repair_offsets": Settings.Segmentation.REPAIR_THRESHOLD_OFFSETS,
-            "morphology": Settings.Segmentation.REPAIR_MORPHOLOGY_KERNEL,
-            "tta_contrast": Settings.Segmentation.TTA_CONTRAST_FACTOR,
-            "presence_override_peak": Settings.Segmentation.PRESENCE_SEGMENTATION_OVERRIDE_PEAK,
+            "thresholds": SegmentationManager.CALIBRATION_THRESHOLDS,
+            "presence_thresholds": SegmentationManager.PRESENCE_CALIBRATION_THRESHOLDS,
+            "repair_offsets": SegmentationManager.REPAIR_THRESHOLD_OFFSETS,
+            "morphology": SegmentationManager.REPAIR_MORPHOLOGY_KERNEL,
+            "tta_contrast": SegmentationManager.TTA_CONTRAST_FACTOR,
+            "presence_override_peak": SegmentationManager.PRESENCE_SEGMENTATION_OVERRIDE_PEAK,
         }
         digest.update(json.dumps(payload, sort_keys=True).encode("utf-8"))
         digest.update(FileManager.sha256_file(checkpoint_path).encode("ascii"))
@@ -3530,6 +3576,7 @@ class SegmentationManager:
         prior_deviation: float,
         final_valid: bool,
     ) -> tuple[float, float, float]:
+        """Perform the uncertainty metrics step for cross-fitted segmentation."""
         probability = np.clip(probability.astype(np.float64), 1e-6, 1.0 - 1e-6)
         entropy = -(
             probability * np.log(probability)
@@ -3546,7 +3593,7 @@ class SegmentationManager:
         disagreement_normalized = min(
             1.0,
             disagreement
-            / max(Settings.Segmentation.UNCERTAINTY_DISAGREEMENT_SCALE, 1e-6),
+            / max(SegmentationManager.UNCERTAINTY_DISAGREEMENT_SCALE, 1e-6),
         )
         presence_ambiguity = max(
             0.0,
@@ -3556,7 +3603,7 @@ class SegmentationManager:
         prior_normalized = min(
             1.0,
             float(prior_deviation)
-            / max(Settings.Segmentation.PRIOR_MAX_ROBUST_Z, 1e-6),
+            / max(SegmentationManager.PRIOR_MAX_ROBUST_Z, 1e-6),
         )
         uncertainty = (
             0.35 * mean_entropy
@@ -3572,8 +3619,7 @@ class SegmentationManager:
         prediction_rows: Sequence[dict[str, Any]],
         dataset_rows: Sequence[dict[str, Any]],
     ) -> None:
-
-
+        """Apply sequence consistency for cross-fitted segmentation."""
         base_by_token = {
             str(row["image_token"]): row for row in dataset_rows
         }
@@ -3591,6 +3637,7 @@ class SegmentationManager:
             groups[group].append(prediction)
 
         def pair_inconsistency(first: dict[str, Any], second: dict[str, Any]) -> float:
+            """Perform the local pair inconsistency step used by the surrounding operation."""
             first_present = _as_int(first.get("attention_heart_present"), 1)
             second_present = _as_int(second.get("attention_heart_present"), 1)
             if first_present != second_present:
@@ -3645,8 +3692,7 @@ class SegmentationManager:
         workspace: Workspace,
         prediction_rows: Sequence[dict[str, Any]],
     ) -> dict[str, Any]:
-
-
+        """Evaluate oof segmentation for cross-fitted segmentation."""
         predictions = {
             str(row.get("image_token", "")): row for row in prediction_rows
         }
@@ -3750,6 +3796,7 @@ class SegmentationManager:
         negative = [row for row in metrics if _as_int(row["heart_present"], 1) == 0]
 
         def patient_balanced(rows: Sequence[dict[str, Any]], key: str) -> float:
+            """Perform the local patient balanced step used by the surrounding operation."""
             by_patient: dict[str, list[float]] = defaultdict(list)
             for row in rows:
                 value = _as_float(row.get(key), np.nan)
@@ -3776,7 +3823,7 @@ class SegmentationManager:
                     np.mean(
                         [
                             row["predicted_area_ratio"]
-                            < Settings.Segmentation.PREDICTION_MIN_AREA_RATIO
+                            < SegmentationManager.PREDICTION_MIN_AREA_RATIO
                             for row in negative
                         ]
                     )
@@ -3812,8 +3859,7 @@ class SegmentationManager:
         checkpoint_map: dict[int, Path] | None = None,
         force: bool = False,
     ) -> list[dict[str, Any]]:
-
-
+        """Generate or reuse exactly one out-of-fold mask for every dataset image."""
         checkpoint_map = checkpoint_map or SegmentationManager.load_checkpoint_map(
             workspace
         )
@@ -3837,7 +3883,7 @@ class SegmentationManager:
         reused_folds: list[int] = []
         computed_folds: list[int] = []
 
-        for fold in range(Settings.Segmentation.FOLDS):
+        for fold in range(SegmentationManager.FOLDS):
             fold_indices = [
                 index
                 for index, row in enumerate(rows)
@@ -3893,7 +3939,7 @@ class SegmentationManager:
                     ]
                 reused_folds.append(fold)
                 print(
-                    f"[ATTENTION] Fold {fold}: rezultat per-fold 2.5D reused."
+                    f"[ATTENTION] Fold {fold}: cached 2.5D per-fold result reused."
                 )
                 continue
 
@@ -3901,12 +3947,12 @@ class SegmentationManager:
             model = AttentionUNet(
                 base_channels=int(
                     checkpoint.get(
-                        "base_channels", Settings.Segmentation.BASE_CHANNELS
+                        "base_channels", SegmentationManager.BASE_CHANNELS
                     )
                 ),
                 input_channels=int(
                     checkpoint.get(
-                        "input_channels", Settings.Segmentation.INPUT_CHANNELS
+                        "input_channels", SegmentationManager.INPUT_CHANNELS
                     )
                 ),
             )
@@ -3915,13 +3961,13 @@ class SegmentationManager:
             calibration = checkpoint.get("calibration", {}) or {}
             threshold = float(
                 calibration.get(
-                    "threshold", Settings.Segmentation.DEFAULT_THRESHOLD
+                    "threshold", SegmentationManager.DEFAULT_THRESHOLD
                 )
             )
             presence_threshold = float(
                 calibration.get(
                     "presence_threshold",
-                    Settings.Segmentation.DEFAULT_PRESENCE_THRESHOLD,
+                    SegmentationManager.DEFAULT_PRESENCE_THRESHOLD,
                 )
             )
             geometry_prior = checkpoint.get("geometry_prior", {}) or {}
@@ -3930,7 +3976,7 @@ class SegmentationManager:
                 SegmentationInferenceDataset(fold_rows),
                 batch_size=RuntimeManager.inference_batch_size(device),
                 shuffle=False,
-                num_workers=Settings.Runtime.NUM_WORKERS,
+                num_workers=RuntimeManager.NUM_WORKERS,
                 pin_memory=device.type == "cuda",
             )
             print(
@@ -3949,7 +3995,7 @@ class SegmentationManager:
                     original_probability = torch.sigmoid(logits)[:, 0]
                     original_presence = torch.sigmoid(presence_logits)
 
-                    factor = float(Settings.Segmentation.TTA_CONTRAST_FACTOR)
+                    factor = float(SegmentationManager.TTA_CONTRAST_FACTOR)
                     tta_images = torch.clamp(
                         (images - 0.5) * factor + 0.5, 0.0, 1.0
                     )
@@ -3986,7 +4032,7 @@ class SegmentationManager:
                         heart_present = bool(
                             presence_probability >= presence_threshold
                             or float(probability.max())
-                            >= Settings.Segmentation.PRESENCE_SEGMENTATION_OVERRIDE_PEAK
+                            >= SegmentationManager.PRESENCE_SEGMENTATION_OVERRIDE_PEAK
                         )
                         initial_mask = SegmentationManager._candidate_mask(
                             probability, threshold
@@ -4043,7 +4089,7 @@ class SegmentationManager:
                         )
                         mask_path = Path(row["predicted_attention_mask_path"])
                         if (
-                            Settings.Segmentation.SAVE_ALL_PREDICTED_MASKS
+                            SegmentationManager.SAVE_ALL_PREDICTED_MASKS
                             or not final_valid
                         ):
                             FileManager.write_png(
@@ -4149,7 +4195,7 @@ class SegmentationManager:
             ),
             "uncertain_above_review_threshold": sum(
                 _as_float(row.get("attention_uncertainty_score"), 0.0)
-                >= Settings.Review.UNCERTAINTY_MIN_SCORE
+                >= ReviewManager.UNCERTAINTY_MIN_SCORE
                 for row in final_results
             ),
             "invalid_final": len(invalid_rows),
@@ -4172,19 +4218,22 @@ class SegmentationManager:
 
 
 # -----------------------------------------------------------------------------
-# Manual review and annotation editor
+# PIPELINE STEP 4 — manual review and annotation editor
 # -----------------------------------------------------------------------------
 class HammingBKTree:
-
+    """Search perceptual hashes by Hamming distance without scanning every hash."""
 
     def __init__(self):
+        """Initialize the values required for perceptual-hash similarity search."""
         self.root: tuple[int, dict[int, Any]] | None = None
 
     @staticmethod
     def distance(first: int, second: int) -> int:
+        """Calculate distance for perceptual-hash similarity search."""
         return int(first ^ second).bit_count()
 
     def add(self, value: int) -> None:
+        """Add add for perceptual-hash similarity search."""
         value = int(value)
         if self.root is None:
             self.root = (value, {})
@@ -4199,6 +4248,7 @@ class HammingBKTree:
             node_value, children = child
 
     def has_near(self, value: int, maximum_distance: int) -> bool:
+        """Perform the has near step for perceptual-hash similarity search."""
         if self.root is None:
             return False
         stack = [self.root]
@@ -4220,6 +4270,25 @@ class ReviewManager:
     uncertain, empty, novel, manual, or all currently UNLABELED images.
     """
 
+    # Manual-review queue and editor settings.
+    # Default maximum novel review candidates selected per patient.
+    NEW_IMAGES_PER_PATIENT = 10
+
+    # Largest Hamming distance considered similar to an already annotated image.
+    PHASH_MAX_DISTANCE = 6
+
+    # Default number of images placed in a manual-review queue.
+    DEFAULT_LIMIT = 300
+
+    # Default editor brush radius in segmentation-canvas pixels.
+    BRUSH_RADIUS = 8
+
+    # Minimum automatic uncertainty score used by the uncertain review scope.
+    UNCERTAINTY_MIN_SCORE = 0.18
+
+    # Distance from the presence threshold considered ambiguous.
+    PRESENCE_MARGIN = 0.15
+
 
     HISTORY_FIELDS = (
         "timestamp_utc",
@@ -4239,6 +4308,7 @@ class ReviewManager:
         dataset_rows: Sequence[dict[str, Any]],
         workspace: Workspace,
     ) -> list[dict[str, Any]]:
+        """Merge rows for manual-review queue construction."""
         quality = {
             row["image_token"]: row
             for row in FileManager.read_csv(workspace.quality_audit)
@@ -4274,8 +4344,7 @@ class ReviewManager:
 
     @staticmethod
     def _normalize_target_type(value: Any) -> str:
-
-
+        """Normalize target type for manual-review queue construction."""
         target = str(value or "").strip().upper()
         if target in {"", "UNLABELED", "NONE", "NAN"}:
             return ""
@@ -4283,16 +4352,19 @@ class ReviewManager:
 
     @staticmethod
     def _row_target_type(row: dict[str, Any]) -> str:
+        """Perform the row target type step for manual-review queue construction."""
         return ReviewManager._normalize_target_type(
             row.get("manual_annotation_type", row.get("target_type", ""))
         )
 
     @staticmethod
     def _is_unlabeled(row: dict[str, Any]) -> bool:
+        """Perform the is unlabeled step for manual-review queue construction."""
         return ReviewManager._row_target_type(row) == ""
 
     @staticmethod
     def _reviewed_tokens(workspace: Workspace, review_round: int) -> set[str]:
+        """Perform the reviewed tokens step for manual-review queue construction."""
         return {
             row.get("image_token", "")
             for row in FileManager.read_csv(workspace.review_history)
@@ -4306,7 +4378,9 @@ class ReviewManager:
         per_patient: int,
         seed: int,
     ) -> list[dict[str, Any]]:
+        """Perform the round robin step for manual-review queue construction."""
         def priority(row: dict[str, Any]):
+            """Perform the local priority step used by the surrounding operation."""
             explicit_priority = row.get("review_priority", "")
             if str(explicit_priority).strip() != "":
                 primary = _as_float(explicit_priority, 0.0)
@@ -4379,15 +4453,14 @@ class ReviewManager:
         seed: int = 42,
         review_round: int = 1,
     ) -> list[dict[str, Any]]:
-
-
+        """Create a patient-balanced queue containing only eligible unlabeled images."""
         scope = str(scope).lower()
         allowed = {"invalid", "uncertain", "empty", "novel", "manual", "all"}
         if scope not in allowed:
             raise ValueError(
                 "scope must be invalid/uncertain/empty/novel/manual/all."
             )
-        limit = int(Settings.Review.DEFAULT_LIMIT if limit is None else limit)
+        limit = int(ReviewManager.DEFAULT_LIMIT if limit is None else limit)
         all_rows = ReviewManager._merge_rows(dataset_rows, workspace)
         target_counts: dict[str, int] = defaultdict(int)
         for row in all_rows:
@@ -4418,10 +4491,10 @@ class ReviewManager:
                 candidates,
                 limit=max(1, limit),
                 per_patient=max(
-                    Settings.Review.NEW_IMAGES_PER_PATIENT,
+                    ReviewManager.NEW_IMAGES_PER_PATIENT,
                     int(math.ceil(limit / max(1, len({r['patient_id'] for r in candidates}))))
                     if candidates
-                    else Settings.Review.NEW_IMAGES_PER_PATIENT,
+                    else ReviewManager.NEW_IMAGES_PER_PATIENT,
                 ),
                 seed=seed,
             )
@@ -4442,15 +4515,15 @@ class ReviewManager:
                 )
                 presence_threshold = _as_float(
                     row.get("attention_presence_threshold"),
-                    Settings.Segmentation.DEFAULT_PRESENCE_THRESHOLD,
+                    SegmentationManager.DEFAULT_PRESENCE_THRESHOLD,
                 )
                 near_presence_boundary = bool(
                     np.isfinite(presence)
                     and abs(presence - presence_threshold)
-                    <= Settings.Review.PRESENCE_MARGIN
+                    <= ReviewManager.PRESENCE_MARGIN
                 )
                 if (
-                    uncertainty < Settings.Review.UNCERTAINTY_MIN_SCORE
+                    uncertainty < ReviewManager.UNCERTAINTY_MIN_SCORE
                     and not near_presence_boundary
                     and _as_int(row.get("attention_valid_final"), 1) == 1
                 ):
@@ -4462,10 +4535,10 @@ class ReviewManager:
                 candidates,
                 limit=max(1, limit),
                 per_patient=max(
-                    Settings.Review.NEW_IMAGES_PER_PATIENT,
+                    ReviewManager.NEW_IMAGES_PER_PATIENT,
                     int(math.ceil(limit / max(1, len({r['patient_id'] for r in candidates}))))
                     if candidates
-                    else Settings.Review.NEW_IMAGES_PER_PATIENT,
+                    else ReviewManager.NEW_IMAGES_PER_PATIENT,
                 ),
                 seed=seed,
             )
@@ -4488,10 +4561,10 @@ class ReviewManager:
                 candidates,
                 limit=max(1, limit),
                 per_patient=max(
-                    Settings.Review.NEW_IMAGES_PER_PATIENT,
+                    ReviewManager.NEW_IMAGES_PER_PATIENT,
                     int(math.ceil(limit / max(1, len({r['patient_id'] for r in candidates}))))
                     if candidates
-                    else Settings.Review.NEW_IMAGES_PER_PATIENT,
+                    else ReviewManager.NEW_IMAGES_PER_PATIENT,
                 ),
                 seed=seed,
             )
@@ -4566,7 +4639,7 @@ class ReviewManager:
                     excluded["missing_phash"] += 1
                     continue
                 if tree.has_near(
-                    int(phash, 16), Settings.Review.PHASH_MAX_DISTANCE
+                    int(phash, 16), ReviewManager.PHASH_MAX_DISTANCE
                 ):
                     excluded["similar_to_annotated"] += 1
                     continue
@@ -4577,7 +4650,7 @@ class ReviewManager:
             candidates = ReviewManager._round_robin(
                 candidates,
                 limit=max(1, limit),
-                per_patient=Settings.Review.NEW_IMAGES_PER_PATIENT,
+                per_patient=ReviewManager.NEW_IMAGES_PER_PATIENT,
                 seed=seed,
             )
             print(f"[REVIEW novel] excluded={dict(excluded)}")
@@ -4610,6 +4683,7 @@ class ReviewManager:
         position: int,
         queue_size: int,
     ) -> None:
+        """Record log for manual-review queue construction."""
         history = FileManager.read_csv(workspace.review_history)
         history.append(
             {
@@ -4640,7 +4714,6 @@ class MaskEditor:
     when a later review queue is constructed.
     """
 
-
     def __init__(
         self,
         rows: Sequence[dict[str, Any]],
@@ -4650,6 +4723,7 @@ class MaskEditor:
         review_round: int = 1,
         review_scope: str = "invalid",
     ):
+        """Initialize the values required for interactive mask editing."""
         import ipywidgets as widgets
 
         annotations = MaskManager.annotation_map(workspace)
@@ -4704,6 +4778,7 @@ class MaskEditor:
             tooltip: str,
             button_style: str = "",
         ):
+            """Perform the local compact button step used by the surrounding operation."""
             return widgets.Button(
                 description=description,
                 tooltip=tooltip,
@@ -4796,6 +4871,7 @@ class MaskEditor:
         self.load_current()
 
     def _safe(self, action: str, function) -> None:
+        """Perform the safe step for interactive mask editing."""
         try:
             function()
         except Exception as error:
@@ -4804,6 +4880,7 @@ class MaskEditor:
             print("[EDITOR ERROR]", message)
 
     def _set_controls_disabled(self, disabled: bool) -> None:
+        """Set controls disabled for interactive mask editing."""
         for control in (
             self.previous_button,
             self.next_button,
@@ -4821,8 +4898,7 @@ class MaskEditor:
             control.disabled = bool(disabled)
 
     def _advance_after_target(self, message: str) -> None:
-
-
+        """Perform the advance after target step for interactive mask editing."""
         if not self.rows:
             return
         completed_index = int(self.index)
@@ -4844,12 +4920,14 @@ class MaskEditor:
         )
 
     def _brush_changed(self, change: dict[str, Any]) -> None:
+        """Perform the brush changed step for interactive mask editing."""
         self.brush_radius = int(change["new"])
         if self.image is not None:
             self.render()
 
     @staticmethod
     def _image_uri(rgb: np.ndarray) -> str:
+        """Perform the image uri step for interactive mask editing."""
         array = np.clip(np.round(rgb * 255.0), 0, 255).astype(np.uint8)
         ok, encoded = cv2.imencode(".png", cv2.cvtColor(array, cv2.COLOR_RGB2BGR))
         if not ok:
@@ -4858,6 +4936,7 @@ class MaskEditor:
 
     @staticmethod
     def _mask_uri(mask: np.ndarray) -> str:
+        """Perform the mask uri step for interactive mask editing."""
         binary = (np.asarray(mask) > 0).astype(np.uint8)
         bgra = np.zeros((*binary.shape, 4), dtype=np.uint8)
         foreground = binary * 255
@@ -4869,6 +4948,7 @@ class MaskEditor:
         return "data:image/png;base64," + base64.b64encode(encoded.tobytes()).decode("ascii")
 
     def load_current(self) -> None:
+        """Load current for interactive mask editing."""
         row = self.rows[self.index]
         auto_path = Path(row["predicted_attention_mask_path"])
         if not auto_path.is_file():
@@ -4885,6 +4965,7 @@ class MaskEditor:
         self.update_status()
 
     def render(self) -> None:
+        """Perform the render step for interactive mask editing."""
         row = self.rows[self.index]
         target_type = (
             ReviewManager._normalize_target_type(
@@ -4898,7 +4979,7 @@ class MaskEditor:
         canvas_id = f"cad_canvas_{self.widget_id}"
         keyboard_sink_id = f"cad_keyboard_sink_{self.widget_id}"
         placeholder = f"CAD_MASK_SYNC_{self.widget_id}"
-        size = Settings.Image.SEGMENTATION_SIZE
+        size = ImageProcessor.SEGMENTATION_SIZE
         html = f"""
         <div style="font-family:Arial,sans-serif;max-width:900px">
           <div style="margin-bottom:6px;font-size:14px">
@@ -5137,8 +5218,7 @@ class MaskEditor:
             display(Javascript(js))
 
     def _shortcut_script(self) -> str:
-
-
+        """Perform the shortcut script step for interactive mask editing."""
         placeholder = f"CAD_SHORTCUT_SYNC_{self.widget_id}"
         keyboard_sink_id = f"cad_keyboard_sink_{self.widget_id}"
         controller_key = "__cadMaskEditorKeyboardController"
@@ -5317,8 +5397,7 @@ class MaskEditor:
         """
 
     def _shortcut_sync_changed(self, change: dict[str, Any]) -> None:
-
-
+        """Perform the shortcut sync changed step for interactive mask editing."""
         payload = str(change.get("new", "") or "").strip()
         if not self.rows:
             return
@@ -5374,6 +5453,7 @@ class MaskEditor:
             self._shortcut_busy = False
 
     def _mask_sync_changed(self, change: dict[str, Any]) -> None:
+        """Perform the mask sync changed step for interactive mask editing."""
         value = change.get("new", "")
         if not value:
             return
@@ -5393,18 +5473,20 @@ class MaskEditor:
                 binary = (decoded > 127).astype(np.uint8)
             self.mask = cv2.resize(
                 binary,
-                (Settings.Image.SEGMENTATION_SIZE, Settings.Image.SEGMENTATION_SIZE),
+                (ImageProcessor.SEGMENTATION_SIZE, ImageProcessor.SEGMENTATION_SIZE),
                 interpolation=cv2.INTER_NEAREST,
             ).astype(np.uint8)
         except Exception as error:
             print("[EDITOR WARNING] Mask synchronization failed:", error)
 
     def _sync_python_mask(self) -> None:
+        """Perform the sync python mask step for interactive mask editing."""
         value = self._mask_uri(self.mask).split(",", 1)[1]
         if self.mask_sync.value != value:
             self.mask_sync.value = value
 
     def update_status(self, prefix: str = "") -> None:
+        """Update status for interactive mask editing."""
         if not self.rows:
             self.status.value = (
                 "<span style='margin-left:12px'><b>Review complete.</b> "
@@ -5438,6 +5520,7 @@ class MaskEditor:
         action: str,
         sample_weight: float | None = None,
     ) -> None:
+        """Write target for interactive mask editing."""
         row = self.rows[self.index]
         binary = (np.asarray(mask) > 0).astype(np.uint8)
         path = Path(row["manual_mask_path"])
@@ -5475,7 +5558,8 @@ class MaskEditor:
         self.mask = binary.copy()
 
     def save(self) -> None:
-        if float((self.mask > 0).mean()) < Settings.Segmentation.MANUAL_MIN_AREA_RATIO:
+        """Save save for interactive mask editing."""
+        if float((self.mask > 0).mean()) < SegmentationManager.MANUAL_MIN_AREA_RATIO:
             raise ValueError(
                 "The mask is empty. Use No heart [H] for a valid image "
                 "without a visible heart, or Unusable [U] for blur/noise/localizer frames."
@@ -5485,17 +5569,19 @@ class MaskEditor:
             MaskManager.HEART_PRESENT,
             source="human_drawn_or_corrected",
             action="save_manual_heart_present",
-            sample_weight=Settings.Segmentation.MANUAL_DRAWN_WEIGHT,
+            sample_weight=SegmentationManager.MANUAL_DRAWN_WEIGHT,
         )
         self.update_status("Saved HEART_PRESENT; weight=1.00.")
         print("[EDITOR]", self.rows[self.index]["manual_mask_path"], "| HEART_PRESENT")
 
     def save_next(self) -> None:
+        """Save next for interactive mask editing."""
         self.save()
         self._advance_after_target("Saved HEART_PRESENT.")
 
     def accept_auto(self) -> None:
-        if float((self.auto_mask > 0).mean()) < Settings.Segmentation.MANUAL_MIN_AREA_RATIO:
+        """Perform the accept auto step for interactive mask editing."""
+        if float((self.auto_mask > 0).mean()) < SegmentationManager.MANUAL_MIN_AREA_RATIO:
             raise ValueError(
                 "The automatic mask is empty; use No heart [H], not Auto OK."
             )
@@ -5504,24 +5590,26 @@ class MaskEditor:
             MaskManager.HEART_PRESENT,
             source="human_confirmed_auto",
             action="accept_auto_and_save",
-            sample_weight=Settings.Segmentation.AUTO_CONFIRMED_WEIGHT,
+            sample_weight=SegmentationManager.AUTO_CONFIRMED_WEIGHT,
         )
         self._advance_after_target(
-            f"Auto saved HEART_PRESENT; weight={Settings.Segmentation.AUTO_CONFIRMED_WEIGHT:.2f}."
+            f"Auto saved HEART_PRESENT; weight={SegmentationManager.AUTO_CONFIRMED_WEIGHT:.2f}."
         )
 
     def mark_no_heart(self) -> None:
+        """Mark no heart for interactive mask editing."""
         empty = np.zeros_like(self.auto_mask, dtype=np.uint8)
         self._write_target(
             empty,
             MaskManager.NO_HEART_VISIBLE,
             source="human_no_heart_visible",
             action="mark_no_heart_visible",
-            sample_weight=Settings.Segmentation.NO_HEART_WEIGHT,
+            sample_weight=SegmentationManager.NO_HEART_WEIGHT,
         )
         self._advance_after_target("Saved NO_HEART_VISIBLE negative target.")
 
     def mark_unusable(self) -> None:
+        """Mark unusable for interactive mask editing."""
         row = self.rows[self.index]
         Path(row["manual_mask_path"]).unlink(missing_ok=True)
         MaskManager.set_annotation(
@@ -5544,6 +5632,7 @@ class MaskEditor:
         self._advance_after_target("Marked UNUSABLE; excluded from training.")
 
     def skip(self) -> None:
+        """Perform the skip step for interactive mask editing."""
         ReviewManager.log(
             self.workspace,
             self.rows[self.index],
@@ -5556,6 +5645,7 @@ class MaskEditor:
         self.next()
 
     def reset_to_auto(self) -> None:
+        """Reset to auto for interactive mask editing."""
         self.base_mask = self.auto_mask.copy()
         self.mask = self.auto_mask.copy()
         self._sync_python_mask()
@@ -5563,6 +5653,7 @@ class MaskEditor:
         self.update_status("Automatic mask restored.")
 
     def reset_to_image(self) -> None:
+        """Reset to image for interactive mask editing."""
         self.base_mask = np.zeros_like(self.auto_mask)
         self.mask = np.zeros_like(self.auto_mask)
         self._sync_python_mask()
@@ -5570,6 +5661,7 @@ class MaskEditor:
         self.update_status("All overlays hidden; not saved yet.")
 
     def clear_editable(self) -> None:
+        """Clear editable for interactive mask editing."""
         self.base_mask = self.auto_mask.copy()
         self.mask = np.zeros_like(self.auto_mask)
         self._sync_python_mask()
@@ -5577,6 +5669,7 @@ class MaskEditor:
         self.update_status("Editable mask cleared; auto remains as guide.")
 
     def delete_manual(self) -> None:
+        """Delete manual for interactive mask editing."""
         row = self.rows[self.index]
         Path(row["manual_mask_path"]).unlink(missing_ok=True)
         MaskManager.remove_annotation(self.workspace, str(row["image_token"]))
@@ -5598,6 +5691,7 @@ class MaskEditor:
         self.update_status("Manual target and annotation deleted.")
 
     def next(self) -> None:
+        """Perform the next step for interactive mask editing."""
         if not self.rows:
             return
         if self.index < len(self.rows) - 1:
@@ -5607,6 +5701,7 @@ class MaskEditor:
             self.update_status("End of queue.")
 
     def previous(self) -> None:
+        """Perform the previous step for interactive mask editing."""
         if not self.rows:
             return
         if self.index > 0:
@@ -5614,145 +5709,16 @@ class MaskEditor:
             self.load_current()
 
     def show(self):
+        """Display the editor controls and install its keyboard shortcuts."""
         display(self.controls)
         display(Javascript(self._shortcut_script()))
         return self
 
 
+
 # -----------------------------------------------------------------------------
-# Frozen feature extraction, confounder matching, and patient aggregation
+# PIPELINE STEP 5 — Cross-class Sick-to-Normal matching
 # -----------------------------------------------------------------------------
-class FeatureDataset(Dataset):
-
-
-    def __init__(self, rows: Sequence[dict[str, Any]]):
-        self.rows = list(rows)
-
-    def __len__(self) -> int:
-        return len(self.rows)
-
-    def __getitem__(self, index: int):
-        row = self.rows[index]
-        robust, raw, content = ImageProcessor.classifier_views(row["image_path"])
-        attention_path = Path(row["predicted_attention_mask_path"])
-        if attention_path.is_file():
-            attention = MaskManager.read_binary(
-                attention_path, size=Settings.Image.CLASSIFICATION_SIZE
-            ).astype(np.float32)
-        else:
-            attention = np.zeros(
-                (Settings.Image.CLASSIFICATION_SIZE, Settings.Image.CLASSIFICATION_SIZE),
-                dtype=np.float32,
-            )
-        manual_path = Path(row["manual_mask_path"])
-        if manual_path.is_file():
-            manual = MaskManager.read_binary(
-                manual_path, size=Settings.Image.CLASSIFICATION_SIZE
-            ).astype(np.float32)
-        else:
-            manual = np.zeros_like(attention)
-
-        robust_tensor = torch.from_numpy(np.stack([robust] * 3)).float()
-        raw_tensor = torch.from_numpy(np.stack([raw] * 3)).float()
-        return (
-            robust_tensor,
-            raw_tensor,
-            torch.from_numpy(content).unsqueeze(0).float(),
-            torch.from_numpy(attention).unsqueeze(0).float(),
-            torch.from_numpy(manual).unsqueeze(0).float(),
-            int(index),
-        )
-
-
-class FrozenEfficientNet(nn.Module):
-
-
-    def __init__(self):
-        super().__init__()
-        weights = (
-            EfficientNet_B0_Weights.IMAGENET1K_V1
-            if Settings.Classification.USE_IMAGENET_WEIGHTS
-            else None
-        )
-        try:
-            model = efficientnet_b0(weights=weights)
-        except Exception as error:
-            raise RuntimeError(
-                "EfficientNet-B0 weights could not be loaded. "
-                "Enable Internet in Kaggle or place the weights in the Torch cache. "
-                f"Original error: {type(error).__name__}: {error}"
-            ) from error
-        model.classifier = nn.Identity()
-        for parameter in model.parameters():
-            parameter.requires_grad_(False)
-        self.model = model.eval()
-        self.register_buffer(
-            "mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
-        )
-        self.register_buffer(
-            "std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
-        )
-
-    def forward(self, images: torch.Tensor) -> torch.Tensor:
-        images = (images.float() - self.mean) / self.std
-        return self.model(images)
-
-
-class StreamingPatientPool:
-
-
-    def __init__(self, modes: Sequence[str]):
-        self.modes = tuple(modes)
-        self.series_data: dict[str, dict[tuple[str, str], list[Any]]] = {
-            mode: {} for mode in self.modes
-        }
-        self.source_slices: dict[str, int] = defaultdict(int)
-
-    def add(
-        self,
-        mode: str,
-        embeddings: np.ndarray,
-        rows: Sequence[dict[str, Any]],
-    ) -> None:
-        embeddings = np.asarray(embeddings, dtype=np.float32)
-        for embedding, row in zip(embeddings, rows):
-            key = (str(row["patient_id"]), str(row["series_id"]))
-            entry = self.series_data[mode].get(key)
-            if entry is None:
-                entry = [np.zeros_like(embedding, dtype=np.float32), 0, int(row["label"])]
-                self.series_data[mode][key] = entry
-            if int(entry[2]) != int(row["label"]):
-                raise RuntimeError(f"Inconsistent labels for patient {row['patient_id']}.")
-            entry[0] += embedding
-            entry[1] += 1
-            self.source_slices[mode] += 1
-
-    def finalize(self, mode: str) -> dict[str, Any]:
-        patient_series: dict[str, list[np.ndarray]] = defaultdict(list)
-        patient_labels: dict[str, int] = {}
-        for (patient_id, _series_id), (embedding_sum, count, label) in self.series_data[mode].items():
-            patient_series[patient_id].append(embedding_sum / max(1, count))
-            patient_labels[patient_id] = int(label)
-        patients = sorted(patient_series)
-        if not patients:
-            raise RuntimeError(
-                f"Mode {mode} contains no patients. For M1/C3/AU3/C4, "
-                "inspect [FEATURE BANK][MANUAL] and the manual-audit schema; "
-                "legacy audits are rebuilt automatically."
-            )
-        X = np.stack(
-            [np.mean(np.stack(patient_series[patient]), axis=0) for patient in patients]
-        ).astype(np.float32)
-        y = np.asarray([patient_labels[patient] for patient in patients], dtype=np.int64)
-        return {
-            "X": X,
-            "y": y,
-            "patient_ids": np.asarray(patients),
-            "source_slices": int(self.source_slices[mode]),
-            "series_proxies": int(len(self.series_data[mode])),
-        }
-
-
 class CrossClassMatchingManager:
     """Construct a balanced Sick/Normal sensitivity cohort in two stages.
 
@@ -5761,6 +5727,100 @@ class CrossClassMatchingManager:
     Extended candidates must still satisfy sequence-position and mask-area gates,
     a family-specific distance caliper, per-patient caps, and per-sequence caps.
     """
+
+    # Strict-core and extended Sick-to-Normal matching settings.
+    # Enable the Sick-to-Normal cross-class matching stage.
+    ENABLED = True
+
+    # Minimum number of acquisition-family clusters.
+    MIN_FAMILIES = 8
+
+    # Maximum number of acquisition-family clusters.
+    MAX_FAMILIES = 32
+
+    # Approximate eligible images represented by one acquisition family.
+    TARGET_IMAGES_PER_FAMILY = 1800
+
+    # Minimum images from each class required for a shared family.
+    MIN_IMAGES_PER_CLASS_PER_FAMILY = 12
+
+    # Minimum patients from each class required for a shared family.
+    MIN_PATIENTS_PER_CLASS_PER_FAMILY = 2
+
+    # Top-neighbor count used by the strict reciprocal matching core.
+    MUTUAL_NEIGHBORS = 5
+
+    # Robust MAD multiplier used for the strict-core distance caliper.
+    CALIPER_MAD_MULTIPLIER = 2.5
+
+    # Upper distance quantile used for the strict-core caliper.
+    CALIPER_QUANTILE = 0.90
+
+    # Largest normalized sequence-position difference for strict pairs.
+    MAX_SEQUENCE_POSITION_DIFFERENCE = 0.25
+
+    # Largest automatic-mask area difference for strict pairs.
+    MAX_AREA_RATIO_DIFFERENCE = 0.20
+
+    # Strict-core cap for one patient inside one acquisition family.
+    MAX_MATCHES_PER_PATIENT_PER_FAMILY = 20
+
+    # Strict-core cap for one sequence group inside one family.
+    MAX_MATCHES_PER_SEQUENCE_GROUP = 5
+
+    # Target fraction of eligible images included in the balanced matched cohort.
+    TARGET_MATCHED_IMAGE_FRACTION = 0.50
+
+    # Top-neighbor count used to construct the extended candidate graph.
+    EXTENDED_NEIGHBORS = 12
+
+    # Robust MAD multiplier used for the extended distance caliper.
+    EXTENDED_CALIPER_MAD_MULTIPLIER = 3.5
+
+    # Upper distance quantile used for the extended caliper.
+    EXTENDED_CALIPER_QUANTILE = 0.97
+
+    # Largest extended caliper relative to the strict-core caliper.
+    EXTENDED_MAX_CALIPER_MULTIPLIER = 1.18
+
+    # Largest sequence-position difference for extended pairs.
+    EXTENDED_MAX_SEQUENCE_POSITION_DIFFERENCE = 0.25
+
+    # Largest automatic-mask area difference for extended pairs.
+    EXTENDED_MAX_AREA_RATIO_DIFFERENCE = 0.20
+
+    # Extended-stage cap for one patient inside one family.
+    EXTENDED_MAX_MATCHES_PER_PATIENT_PER_FAMILY = 60
+
+    # Extended-stage cap for one sequence group inside one family.
+    EXTENDED_MAX_MATCHES_PER_SEQUENCE_GROUP = 15
+
+    # Extended-stage cap for one Sick/Normal sequence-pair combination.
+    EXTENDED_MAX_MATCHES_PER_SEQUENCE_PAIR = 12
+
+    # Extended-stage cap for one Sick/Normal patient pair.
+    EXTENDED_MAX_MATCHES_PER_PATIENT_PAIR = 60
+
+    # Multiplier controlling the total matched-image cap per patient.
+    PATIENT_TOTAL_CAP_MULTIPLIER = 1.70
+
+    # Number of gradually relaxed patient quotas used by extended matching.
+    EXTENDED_BALANCE_QUOTA_STEPS = 12
+
+    # Prefer sequence pairs already represented in the strict core.
+    PRIORITIZE_CORE_SEQUENCE_PAIRS = True
+
+    # Descriptor weight assigned to perceptual-hash similarity.
+    PHASH_BLOCK_WEIGHT = 0.45
+
+    # Descriptor weight assigned to automatic-mask geometry.
+    GEOMETRY_BLOCK_WEIGHT = 0.25
+
+    # Descriptor weight assigned to normalized sequence position.
+    SEQUENCE_BLOCK_WEIGHT = 0.15
+
+    # Descriptor weight assigned to image-quality measurements.
+    QUALITY_BLOCK_WEIGHT = 0.15
 
     MANIFEST_FIELDS = (
         "image_token",
@@ -5795,46 +5855,48 @@ class CrossClassMatchingManager:
 
     @staticmethod
     def _settings_payload() -> dict[str, Any]:
+        """Perform the settings payload step for balanced Sick-to-Normal matching."""
         return {
             "schema": "cross-class-matching-v2-core-plus-extended",
-            "min_families": Settings.Matching.MIN_FAMILIES,
-            "max_families": Settings.Matching.MAX_FAMILIES,
-            "target_images_per_family": Settings.Matching.TARGET_IMAGES_PER_FAMILY,
-            "minimum_images_per_class_per_family": Settings.Matching.MIN_IMAGES_PER_CLASS_PER_FAMILY,
-            "minimum_patients_per_class_per_family": Settings.Matching.MIN_PATIENTS_PER_CLASS_PER_FAMILY,
-            "core_mutual_neighbors": Settings.Matching.MUTUAL_NEIGHBORS,
-            "core_caliper_mad_multiplier": Settings.Matching.CALIPER_MAD_MULTIPLIER,
-            "core_caliper_quantile": Settings.Matching.CALIPER_QUANTILE,
-            "maximum_sequence_position_difference": Settings.Matching.MAX_SEQUENCE_POSITION_DIFFERENCE,
-            "maximum_area_ratio_difference": Settings.Matching.MAX_AREA_RATIO_DIFFERENCE,
-            "core_maximum_matches_per_patient_per_family": Settings.Matching.MAX_MATCHES_PER_PATIENT_PER_FAMILY,
-            "core_maximum_matches_per_sequence_group": Settings.Matching.MAX_MATCHES_PER_SEQUENCE_GROUP,
-            "target_matched_image_fraction": Settings.Matching.TARGET_MATCHED_IMAGE_FRACTION,
-            "extended_neighbors": Settings.Matching.EXTENDED_NEIGHBORS,
-            "extended_caliper_mad_multiplier": Settings.Matching.EXTENDED_CALIPER_MAD_MULTIPLIER,
-            "extended_caliper_quantile": Settings.Matching.EXTENDED_CALIPER_QUANTILE,
-            "extended_max_caliper_multiplier": Settings.Matching.EXTENDED_MAX_CALIPER_MULTIPLIER,
-            "extended_maximum_sequence_position_difference": Settings.Matching.EXTENDED_MAX_SEQUENCE_POSITION_DIFFERENCE,
-            "extended_maximum_area_ratio_difference": Settings.Matching.EXTENDED_MAX_AREA_RATIO_DIFFERENCE,
-            "extended_maximum_matches_per_patient_per_family": Settings.Matching.EXTENDED_MAX_MATCHES_PER_PATIENT_PER_FAMILY,
-            "extended_maximum_matches_per_sequence_group": Settings.Matching.EXTENDED_MAX_MATCHES_PER_SEQUENCE_GROUP,
-            "extended_maximum_matches_per_sequence_pair": Settings.Matching.EXTENDED_MAX_MATCHES_PER_SEQUENCE_PAIR,
-            "extended_maximum_matches_per_patient_pair": Settings.Matching.EXTENDED_MAX_MATCHES_PER_PATIENT_PAIR,
-            "patient_total_cap_multiplier": Settings.Matching.PATIENT_TOTAL_CAP_MULTIPLIER,
-            "prioritize_core_sequence_pairs": Settings.Matching.PRIORITIZE_CORE_SEQUENCE_PAIRS,
+            "min_families": CrossClassMatchingManager.MIN_FAMILIES,
+            "max_families": CrossClassMatchingManager.MAX_FAMILIES,
+            "target_images_per_family": CrossClassMatchingManager.TARGET_IMAGES_PER_FAMILY,
+            "minimum_images_per_class_per_family": CrossClassMatchingManager.MIN_IMAGES_PER_CLASS_PER_FAMILY,
+            "minimum_patients_per_class_per_family": CrossClassMatchingManager.MIN_PATIENTS_PER_CLASS_PER_FAMILY,
+            "core_mutual_neighbors": CrossClassMatchingManager.MUTUAL_NEIGHBORS,
+            "core_caliper_mad_multiplier": CrossClassMatchingManager.CALIPER_MAD_MULTIPLIER,
+            "core_caliper_quantile": CrossClassMatchingManager.CALIPER_QUANTILE,
+            "maximum_sequence_position_difference": CrossClassMatchingManager.MAX_SEQUENCE_POSITION_DIFFERENCE,
+            "maximum_area_ratio_difference": CrossClassMatchingManager.MAX_AREA_RATIO_DIFFERENCE,
+            "core_maximum_matches_per_patient_per_family": CrossClassMatchingManager.MAX_MATCHES_PER_PATIENT_PER_FAMILY,
+            "core_maximum_matches_per_sequence_group": CrossClassMatchingManager.MAX_MATCHES_PER_SEQUENCE_GROUP,
+            "target_matched_image_fraction": CrossClassMatchingManager.TARGET_MATCHED_IMAGE_FRACTION,
+            "extended_neighbors": CrossClassMatchingManager.EXTENDED_NEIGHBORS,
+            "extended_caliper_mad_multiplier": CrossClassMatchingManager.EXTENDED_CALIPER_MAD_MULTIPLIER,
+            "extended_caliper_quantile": CrossClassMatchingManager.EXTENDED_CALIPER_QUANTILE,
+            "extended_max_caliper_multiplier": CrossClassMatchingManager.EXTENDED_MAX_CALIPER_MULTIPLIER,
+            "extended_maximum_sequence_position_difference": CrossClassMatchingManager.EXTENDED_MAX_SEQUENCE_POSITION_DIFFERENCE,
+            "extended_maximum_area_ratio_difference": CrossClassMatchingManager.EXTENDED_MAX_AREA_RATIO_DIFFERENCE,
+            "extended_maximum_matches_per_patient_per_family": CrossClassMatchingManager.EXTENDED_MAX_MATCHES_PER_PATIENT_PER_FAMILY,
+            "extended_maximum_matches_per_sequence_group": CrossClassMatchingManager.EXTENDED_MAX_MATCHES_PER_SEQUENCE_GROUP,
+            "extended_maximum_matches_per_sequence_pair": CrossClassMatchingManager.EXTENDED_MAX_MATCHES_PER_SEQUENCE_PAIR,
+            "extended_maximum_matches_per_patient_pair": CrossClassMatchingManager.EXTENDED_MAX_MATCHES_PER_PATIENT_PAIR,
+            "patient_total_cap_multiplier": CrossClassMatchingManager.PATIENT_TOTAL_CAP_MULTIPLIER,
+            "prioritize_core_sequence_pairs": CrossClassMatchingManager.PRIORITIZE_CORE_SEQUENCE_PAIRS,
             "block_weights": {
-                "phash": Settings.Matching.PHASH_BLOCK_WEIGHT,
-                "geometry": Settings.Matching.GEOMETRY_BLOCK_WEIGHT,
-                "sequence": Settings.Matching.SEQUENCE_BLOCK_WEIGHT,
-                "quality": Settings.Matching.QUALITY_BLOCK_WEIGHT,
+                "phash": CrossClassMatchingManager.PHASH_BLOCK_WEIGHT,
+                "geometry": CrossClassMatchingManager.GEOMETRY_BLOCK_WEIGHT,
+                "sequence": CrossClassMatchingManager.SEQUENCE_BLOCK_WEIGHT,
+                "quality": CrossClassMatchingManager.QUALITY_BLOCK_WEIGHT,
             },
-            "random_seed": Settings.Runtime.RANDOM_SEED,
+            "random_seed": RuntimeManager.RANDOM_SEED,
         }
 
     @staticmethod
     def _fingerprint(
         dataset_rows: Sequence[dict[str, Any]], workspace: Workspace
     ) -> str:
+        """Build fingerprint for balanced Sick-to-Normal matching."""
         digest = hashlib.sha256(
             json.dumps(
                 CrossClassMatchingManager._settings_payload(), sort_keys=True
@@ -5855,6 +5917,7 @@ class CrossClassMatchingManager:
 
     @staticmethod
     def _sequence_position(row: dict[str, Any]) -> float:
+        """Perform the sequence position step for balanced Sick-to-Normal matching."""
         length = max(1, _as_int(row.get("sequence_length"), 1))
         index = int(np.clip(_as_int(row.get("sequence_index"), 0), 0, length - 1))
         if length <= 1:
@@ -5863,6 +5926,7 @@ class CrossClassMatchingManager:
 
     @staticmethod
     def _phash_bits(value: str) -> np.ndarray:
+        """Perform the phash bits step for balanced Sick-to-Normal matching."""
         number = int(str(value), 16)
         return np.asarray(
             [(number >> shift) & 1 for shift in range(63, -1, -1)],
@@ -5871,6 +5935,7 @@ class CrossClassMatchingManager:
 
     @staticmethod
     def _robust_standardize(values: np.ndarray) -> np.ndarray:
+        """Perform the robust standardize step for balanced Sick-to-Normal matching."""
         values = np.asarray(values, dtype=np.float32).copy()
         if values.ndim == 1:
             values = values[:, None]
@@ -5886,6 +5951,7 @@ class CrossClassMatchingManager:
 
     @staticmethod
     def _descriptor(rows: Sequence[dict[str, Any]]) -> np.ndarray:
+        """Perform the descriptor step for balanced Sick-to-Normal matching."""
         phash = np.stack(
             [CrossClassMatchingManager._phash_bits(row["perceptual_hash"]) for row in rows]
         )
@@ -5925,17 +5991,18 @@ class CrossClassMatchingManager:
         )
 
         def block_scale(weight: float, dimensions: int) -> float:
+            """Perform the local block scale step used by the surrounding operation."""
             return math.sqrt(max(float(weight), 0.0) / max(1, int(dimensions)))
 
         descriptor = np.concatenate(
             [
-                phash * block_scale(Settings.Matching.PHASH_BLOCK_WEIGHT, phash.shape[1]),
+                phash * block_scale(CrossClassMatchingManager.PHASH_BLOCK_WEIGHT, phash.shape[1]),
                 geometry
-                * block_scale(Settings.Matching.GEOMETRY_BLOCK_WEIGHT, geometry.shape[1]),
+                * block_scale(CrossClassMatchingManager.GEOMETRY_BLOCK_WEIGHT, geometry.shape[1]),
                 sequence
-                * block_scale(Settings.Matching.SEQUENCE_BLOCK_WEIGHT, sequence.shape[1]),
+                * block_scale(CrossClassMatchingManager.SEQUENCE_BLOCK_WEIGHT, sequence.shape[1]),
                 quality
-                * block_scale(Settings.Matching.QUALITY_BLOCK_WEIGHT, quality.shape[1]),
+                * block_scale(CrossClassMatchingManager.QUALITY_BLOCK_WEIGHT, quality.shape[1]),
             ],
             axis=1,
         )
@@ -5945,6 +6012,7 @@ class CrossClassMatchingManager:
     def _merge_rows(
         dataset_rows: Sequence[dict[str, Any]], workspace: Workspace
     ) -> list[dict[str, Any]]:
+        """Merge rows for balanced Sick-to-Normal matching."""
         quality = {
             str(row.get("image_token", "")): row
             for row in FileManager.read_csv(workspace.quality_audit)
@@ -5979,6 +6047,7 @@ class CrossClassMatchingManager:
 
     @staticmethod
     def _eligibility_reason(row: dict[str, Any]) -> str:
+        """Perform the eligibility reason step for balanced Sick-to-Normal matching."""
         reasons: list[str] = []
         if _as_int(row.get("quality_valid"), 0) != 1:
             reasons.append("quality_invalid")
@@ -5988,7 +6057,7 @@ class CrossClassMatchingManager:
             reasons.append("heart_not_visible")
         if (
             _as_float(row.get("attention_area_ratio"), 0.0)
-            < Settings.Segmentation.PREDICTION_MIN_AREA_RATIO
+            < SegmentationManager.PREDICTION_MIN_AREA_RATIO
         ):
             reasons.append("attention_area_too_small")
         if not str(row.get("perceptual_hash", "")).strip():
@@ -5999,30 +6068,32 @@ class CrossClassMatchingManager:
 
     @staticmethod
     def _family_count(number_of_images: int) -> int:
+        """Perform the family count step for balanced Sick-to-Normal matching."""
         estimate = int(
             math.ceil(
                 number_of_images
-                / max(1, Settings.Matching.TARGET_IMAGES_PER_FAMILY)
+                / max(1, CrossClassMatchingManager.TARGET_IMAGES_PER_FAMILY)
             )
         )
         count = int(
             np.clip(
                 estimate,
-                Settings.Matching.MIN_FAMILIES,
-                Settings.Matching.MAX_FAMILIES,
+                CrossClassMatchingManager.MIN_FAMILIES,
+                CrossClassMatchingManager.MAX_FAMILIES,
             )
         )
         return max(2, min(count, number_of_images))
 
     @staticmethod
     def _family_is_shared(rows: Sequence[dict[str, Any]]) -> bool:
+        """Perform the family is shared step for balanced Sick-to-Normal matching."""
         for label in (0, 1):
             class_rows = [row for row in rows if _as_int(row.get("label"), -1) == label]
-            if len(class_rows) < Settings.Matching.MIN_IMAGES_PER_CLASS_PER_FAMILY:
+            if len(class_rows) < CrossClassMatchingManager.MIN_IMAGES_PER_CLASS_PER_FAMILY:
                 return False
             if (
                 len({str(row.get("patient_id", "")) for row in class_rows})
-                < Settings.Matching.MIN_PATIENTS_PER_CLASS_PER_FAMILY
+                < CrossClassMatchingManager.MIN_PATIENTS_PER_CLASS_PER_FAMILY
             ):
                 return False
         return True
@@ -6033,6 +6104,7 @@ class CrossClassMatchingManager:
         mad_multiplier: float,
         quantile: float,
     ) -> float:
+        """Perform the robust caliper step for balanced Sick-to-Normal matching."""
         values = np.asarray(list(distances), dtype=np.float64)
         values = values[np.isfinite(values)]
         if not len(values):
@@ -6050,15 +6122,16 @@ class CrossClassMatchingManager:
         normal_row: dict[str, Any],
         extended: bool,
     ) -> bool:
+        """Perform the edge passes anatomical gates step for balanced Sick-to-Normal matching."""
         sequence_limit = (
-            Settings.Matching.EXTENDED_MAX_SEQUENCE_POSITION_DIFFERENCE
+            CrossClassMatchingManager.EXTENDED_MAX_SEQUENCE_POSITION_DIFFERENCE
             if extended
-            else Settings.Matching.MAX_SEQUENCE_POSITION_DIFFERENCE
+            else CrossClassMatchingManager.MAX_SEQUENCE_POSITION_DIFFERENCE
         )
         area_limit = (
-            Settings.Matching.EXTENDED_MAX_AREA_RATIO_DIFFERENCE
+            CrossClassMatchingManager.EXTENDED_MAX_AREA_RATIO_DIFFERENCE
             if extended
-            else Settings.Matching.MAX_AREA_RATIO_DIFFERENCE
+            else CrossClassMatchingManager.MAX_AREA_RATIO_DIFFERENCE
         )
         if (
             abs(
@@ -6089,6 +6162,7 @@ class CrossClassMatchingManager:
         tuple[str, str],
         tuple[str, str],
     ]:
+        """Perform the pair keys step for balanced Sick-to-Normal matching."""
         sick_patient = str(sick_row["patient_id"])
         normal_patient = str(normal_row["patient_id"])
         sick_sequence = str(
@@ -6112,6 +6186,7 @@ class CrossClassMatchingManager:
         workspace: Workspace,
         force: bool = False,
     ) -> list[dict[str, Any]]:
+        """Build or reuse the strict-core plus extended balanced matching manifest."""
         fingerprint = CrossClassMatchingManager._fingerprint(dataset_rows, workspace)
         old_summary = FileManager.read_json(workspace.cross_class_matching_summary, {}) or {}
         old_manifest = FileManager.read_csv(workspace.cross_class_matching_manifest)
@@ -6131,8 +6206,8 @@ class CrossClassMatchingManager:
             )
             return old_manifest
 
-        if not Settings.Matching.ENABLED:
-            raise RuntimeError("Cross-class matching is disabled in Settings.Matching.")
+        if not CrossClassMatchingManager.ENABLED:
+            raise RuntimeError("Cross-class matching is disabled in CrossClassMatchingManager.")
 
         merged = CrossClassMatchingManager._merge_rows(dataset_rows, workspace)
         manifest_by_token: dict[str, dict[str, Any]] = {}
@@ -6192,7 +6267,7 @@ class CrossClassMatchingManager:
         batch_size = min(4096, max(256, len(eligible_rows) // 10))
         clusterer = MiniBatchKMeans(
             n_clusters=family_count,
-            random_state=Settings.Runtime.RANDOM_SEED,
+            random_state=RuntimeManager.RANDOM_SEED,
             batch_size=batch_size,
             n_init=5,
             max_iter=200,
@@ -6232,7 +6307,7 @@ class CrossClassMatchingManager:
         requested_target_pairs = int(
             round(
                 len(eligible_rows)
-                * float(Settings.Matching.TARGET_MATCHED_IMAGE_FRACTION)
+                * float(CrossClassMatchingManager.TARGET_MATCHED_IMAGE_FRACTION)
                 / 2.0
             )
         )
@@ -6250,12 +6325,12 @@ class CrossClassMatchingManager:
         }
         patient_total_caps = {
             label: max(
-                Settings.Matching.EXTENDED_MAX_MATCHES_PER_PATIENT_PER_FAMILY,
+                CrossClassMatchingManager.EXTENDED_MAX_MATCHES_PER_PATIENT_PER_FAMILY,
                 int(
                     math.ceil(
                         requested_target_pairs
                         / max(1, len(patients_by_label[label]))
-                        * Settings.Matching.PATIENT_TOTAL_CAP_MULTIPLIER
+                        * CrossClassMatchingManager.PATIENT_TOTAL_CAP_MULTIPLIER
                     )
                 ),
             )
@@ -6294,10 +6369,10 @@ class CrossClassMatchingManager:
             normal_descriptor = descriptor[normal_positions]
             sick_descriptor = descriptor[sick_positions]
             extended_sick_to_normal = min(
-                int(Settings.Matching.EXTENDED_NEIGHBORS), len(normal_positions)
+                int(CrossClassMatchingManager.EXTENDED_NEIGHBORS), len(normal_positions)
             )
             extended_normal_to_sick = min(
-                int(Settings.Matching.EXTENDED_NEIGHBORS), len(sick_positions)
+                int(CrossClassMatchingManager.EXTENDED_NEIGHBORS), len(sick_positions)
             )
 
             normal_model = NearestNeighbors(
@@ -6354,8 +6429,8 @@ class CrossClassMatchingManager:
                 reciprocal = rank_from_sick is not None and rank_from_normal is not None
                 is_core = bool(
                     reciprocal
-                    and rank_from_sick <= Settings.Matching.MUTUAL_NEIGHBORS
-                    and rank_from_normal <= Settings.Matching.MUTUAL_NEIGHBORS
+                    and rank_from_sick <= CrossClassMatchingManager.MUTUAL_NEIGHBORS
+                    and rank_from_normal <= CrossClassMatchingManager.MUTUAL_NEIGHBORS
                     and CrossClassMatchingManager._edge_passes_anatomical_gates(
                         sick_row, normal_row, extended=False
                     )
@@ -6386,18 +6461,18 @@ class CrossClassMatchingManager:
 
             core_caliper = CrossClassMatchingManager._robust_caliper(
                 [edge["distance"] for edge in core_edges],
-                Settings.Matching.CALIPER_MAD_MULTIPLIER,
-                Settings.Matching.CALIPER_QUANTILE,
+                CrossClassMatchingManager.CALIPER_MAD_MULTIPLIER,
+                CrossClassMatchingManager.CALIPER_QUANTILE,
             )
             extended_caliper = CrossClassMatchingManager._robust_caliper(
                 [edge["distance"] for edge in all_edges],
-                Settings.Matching.EXTENDED_CALIPER_MAD_MULTIPLIER,
-                Settings.Matching.EXTENDED_CALIPER_QUANTILE,
+                CrossClassMatchingManager.EXTENDED_CALIPER_MAD_MULTIPLIER,
+                CrossClassMatchingManager.EXTENDED_CALIPER_QUANTILE,
             )
             if np.isfinite(core_caliper):
                 maximum_extended = (
                     float(core_caliper)
-                    * float(Settings.Matching.EXTENDED_MAX_CALIPER_MULTIPLIER)
+                    * float(CrossClassMatchingManager.EXTENDED_MAX_CALIPER_MULTIPLIER)
                 )
                 if np.isfinite(extended_caliper):
                     extended_caliper = max(
@@ -6429,6 +6504,7 @@ class CrossClassMatchingManager:
             stage: str,
             patient_quota: dict[int, int] | None = None,
         ) -> bool:
+            """Perform the local can select step used by the surrounding operation."""
             family = int(edge["family"])
             sick_row = eligible_rows[int(edge["sick_global"])]
             normal_row = eligible_rows[int(edge["normal_global"])]
@@ -6445,11 +6521,11 @@ class CrossClassMatchingManager:
                 sequence_pair_key,
             ) = CrossClassMatchingManager._pair_keys(sick_row, normal_row, family)
             if stage == "core_mutual":
-                patient_family_limit = Settings.Matching.MAX_MATCHES_PER_PATIENT_PER_FAMILY
-                sequence_limit = Settings.Matching.MAX_MATCHES_PER_SEQUENCE_GROUP
+                patient_family_limit = CrossClassMatchingManager.MAX_MATCHES_PER_PATIENT_PER_FAMILY
+                sequence_limit = CrossClassMatchingManager.MAX_MATCHES_PER_SEQUENCE_GROUP
             else:
-                patient_family_limit = Settings.Matching.EXTENDED_MAX_MATCHES_PER_PATIENT_PER_FAMILY
-                sequence_limit = Settings.Matching.EXTENDED_MAX_MATCHES_PER_SEQUENCE_GROUP
+                patient_family_limit = CrossClassMatchingManager.EXTENDED_MAX_MATCHES_PER_PATIENT_PER_FAMILY
+                sequence_limit = CrossClassMatchingManager.EXTENDED_MAX_MATCHES_PER_SEQUENCE_GROUP
             if (
                 patient_family_counts[sick_patient_key] >= patient_family_limit
                 or patient_family_counts[normal_patient_key] >= patient_family_limit
@@ -6460,9 +6536,9 @@ class CrossClassMatchingManager:
             if stage != "core_mutual":
                 if (
                     patient_pair_counts[patient_pair_key]
-                    >= Settings.Matching.EXTENDED_MAX_MATCHES_PER_PATIENT_PAIR
+                    >= CrossClassMatchingManager.EXTENDED_MAX_MATCHES_PER_PATIENT_PAIR
                     or sequence_pair_counts[sequence_pair_key]
-                    >= Settings.Matching.EXTENDED_MAX_MATCHES_PER_SEQUENCE_PAIR
+                    >= CrossClassMatchingManager.EXTENDED_MAX_MATCHES_PER_SEQUENCE_PAIR
                 ):
                     return False
                 for row in (sick_row, normal_row):
@@ -6478,6 +6554,7 @@ class CrossClassMatchingManager:
             return True
 
         def select_edge(edge: dict[str, Any], stage: str) -> None:
+            """Select edge for balanced Sick-to-Normal matching."""
             nonlocal pair_number, core_pair_count, extended_pair_count
             family = int(edge["family"])
             sick_row = eligible_rows[int(edge["sick_global"])]
@@ -6630,8 +6707,8 @@ class CrossClassMatchingManager:
                 seeded = int(sequence_pair in core_sequence_pairs)
                 rank_sick = edge.get("rank_from_sick")
                 rank_normal = edge.get("rank_from_normal")
-                rank_sum = int(rank_sick or Settings.Matching.EXTENDED_NEIGHBORS + 1) + int(
-                    rank_normal or Settings.Matching.EXTENDED_NEIGHBORS + 1
+                rank_sum = int(rank_sick or CrossClassMatchingManager.EXTENDED_NEIGHBORS + 1) + int(
+                    rank_normal or CrossClassMatchingManager.EXTENDED_NEIGHBORS + 1
                 )
                 candidates.append(
                     {
@@ -6646,7 +6723,7 @@ class CrossClassMatchingManager:
                 key=lambda item: (
                     0
                     if (
-                        Settings.Matching.PRIORITIZE_CORE_SEQUENCE_PAIRS
+                        CrossClassMatchingManager.PRIORITIZE_CORE_SEQUENCE_PAIRS
                         and item["seeded"]
                     )
                     else 1,
@@ -6671,7 +6748,7 @@ class CrossClassMatchingManager:
                     np.linspace(
                         starting_quota,
                         max_cap,
-                        max(2, int(Settings.Matching.EXTENDED_BALANCE_QUOTA_STEPS)),
+                        max(2, int(CrossClassMatchingManager.EXTENDED_BALANCE_QUOTA_STEPS)),
                     )
                 ).astype(int)
             )
@@ -6713,10 +6790,10 @@ class CrossClassMatchingManager:
                             **edge,
                             "seeded": int(sequence_pair in core_sequence_pairs),
                             "rank_sum": int(
-                                rank_sick or Settings.Matching.EXTENDED_NEIGHBORS + 1
+                                rank_sick or CrossClassMatchingManager.EXTENDED_NEIGHBORS + 1
                             )
                             + int(
-                                rank_normal or Settings.Matching.EXTENDED_NEIGHBORS + 1
+                                rank_normal or CrossClassMatchingManager.EXTENDED_NEIGHBORS + 1
                             ),
                             "normalized_distance": float(edge["distance"])
                             / max(float(extended_caliper), 1e-9),
@@ -6726,7 +6803,7 @@ class CrossClassMatchingManager:
                     key=lambda item: (
                         0
                         if (
-                            Settings.Matching.PRIORITIZE_CORE_SEQUENCE_PAIRS
+                            CrossClassMatchingManager.PRIORITIZE_CORE_SEQUENCE_PAIRS
                             and item["seeded"]
                         )
                         else 1,
@@ -6932,6 +7009,7 @@ class CrossClassMatchingManager:
         manifest: Sequence[dict[str, Any]],
         core_only: bool = False,
     ) -> set[str]:
+        """Perform the selected tokens step for balanced Sick-to-Normal matching."""
         field = (
             "selected_for_core_matched_cohort"
             if core_only
@@ -6943,6 +7021,146 @@ class CrossClassMatchingManager:
             if _as_int(row.get(field), 0) == 1
         }
 
+# -----------------------------------------------------------------------------
+# PIPELINE STEP 6 — Frozen feature extraction and patient aggregation
+# -----------------------------------------------------------------------------
+class FeatureDataset(Dataset):
+    """Load full-image, automatic-mask, and manual-mask tensors for feature extraction."""
+
+    def __init__(self, rows: Sequence[dict[str, Any]]):
+        """Initialize the values required for feature-extraction data loading."""
+        self.rows = list(rows)
+
+    def __len__(self) -> int:
+        """Return the number of rows available through this dataset-like object."""
+        return len(self.rows)
+
+    def __getitem__(self, index: int):
+        """Load and return one item identified by its integer index."""
+        row = self.rows[index]
+        robust, raw, content = ImageProcessor.classifier_views(row["image_path"])
+        attention_path = Path(row["predicted_attention_mask_path"])
+        if attention_path.is_file():
+            attention = MaskManager.read_binary(
+                attention_path, size=ImageProcessor.CLASSIFICATION_SIZE
+            ).astype(np.float32)
+        else:
+            attention = np.zeros(
+                (ImageProcessor.CLASSIFICATION_SIZE, ImageProcessor.CLASSIFICATION_SIZE),
+                dtype=np.float32,
+            )
+        manual_path = Path(row["manual_mask_path"])
+        if manual_path.is_file():
+            manual = MaskManager.read_binary(
+                manual_path, size=ImageProcessor.CLASSIFICATION_SIZE
+            ).astype(np.float32)
+        else:
+            manual = np.zeros_like(attention)
+
+        robust_tensor = torch.from_numpy(np.stack([robust] * 3)).float()
+        raw_tensor = torch.from_numpy(np.stack([raw] * 3)).float()
+        return (
+            robust_tensor,
+            raw_tensor,
+            torch.from_numpy(content).unsqueeze(0).float(),
+            torch.from_numpy(attention).unsqueeze(0).float(),
+            torch.from_numpy(manual).unsqueeze(0).float(),
+            int(index),
+        )
+
+
+class FrozenEfficientNet(nn.Module):
+    """Expose pretrained EfficientNet-B0 as a frozen embedding extractor."""
+
+    def __init__(self):
+        """Initialize the values required for frozen EfficientNet feature extraction."""
+        super().__init__()
+        weights = (
+            EfficientNet_B0_Weights.IMAGENET1K_V1
+            if FeatureManager.USE_IMAGENET_WEIGHTS
+            else None
+        )
+        try:
+            model = efficientnet_b0(weights=weights)
+        except Exception as error:
+            raise RuntimeError(
+                "EfficientNet-B0 weights could not be loaded. "
+                "Enable Internet in Kaggle or place the weights in the Torch cache. "
+                f"Original error: {type(error).__name__}: {error}"
+            ) from error
+        model.classifier = nn.Identity()
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
+        self.model = model.eval()
+        self.register_buffer(
+            "mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        )
+        self.register_buffer(
+            "std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+        )
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        """Run the neural-network forward pass and return its output tensors."""
+        images = (images.float() - self.mean) / self.std
+        return self.model(images)
+
+
+class StreamingPatientPool:
+    """Aggregate slice embeddings first by series and then by patient."""
+
+    def __init__(self, modes: Sequence[str]):
+        """Initialize the values required for series and patient feature aggregation."""
+        self.modes = tuple(modes)
+        self.series_data: dict[str, dict[tuple[str, str], list[Any]]] = {
+            mode: {} for mode in self.modes
+        }
+        self.source_slices: dict[str, int] = defaultdict(int)
+
+    def add(
+        self,
+        mode: str,
+        embeddings: np.ndarray,
+        rows: Sequence[dict[str, Any]],
+    ) -> None:
+        """Add add for series and patient feature aggregation."""
+        embeddings = np.asarray(embeddings, dtype=np.float32)
+        for embedding, row in zip(embeddings, rows):
+            key = (str(row["patient_id"]), str(row["series_id"]))
+            entry = self.series_data[mode].get(key)
+            if entry is None:
+                entry = [np.zeros_like(embedding, dtype=np.float32), 0, int(row["label"])]
+                self.series_data[mode][key] = entry
+            if int(entry[2]) != int(row["label"]):
+                raise RuntimeError(f"Inconsistent labels for patient {row['patient_id']}.")
+            entry[0] += embedding
+            entry[1] += 1
+            self.source_slices[mode] += 1
+
+    def finalize(self, mode: str) -> dict[str, Any]:
+        """Finalize finalize for series and patient feature aggregation."""
+        patient_series: dict[str, list[np.ndarray]] = defaultdict(list)
+        patient_labels: dict[str, int] = {}
+        for (patient_id, _series_id), (embedding_sum, count, label) in self.series_data[mode].items():
+            patient_series[patient_id].append(embedding_sum / max(1, count))
+            patient_labels[patient_id] = int(label)
+        patients = sorted(patient_series)
+        if not patients:
+            raise RuntimeError(
+                f"Mode {mode} contains no patients. For M1/C3/AU3/C4, "
+                "inspect [FEATURE BANK][MANUAL] and the manual-audit schema; "
+                "legacy audits are rebuilt automatically."
+            )
+        X = np.stack(
+            [np.mean(np.stack(patient_series[patient]), axis=0) for patient in patients]
+        ).astype(np.float32)
+        y = np.asarray([patient_labels[patient] for patient in patients], dtype=np.int64)
+        return {
+            "X": X,
+            "y": y,
+            "patient_ids": np.asarray(patients),
+            "source_slices": int(self.source_slices[mode]),
+            "series_proxies": int(len(self.series_data[mode])),
+        }
 
 class FeatureManager:
     """Create patient-level EfficientNet feature banks for all registered modes.
@@ -6951,16 +7169,134 @@ class FeatureManager:
     enter the frozen network, and historical .npz keys are retained for reuse.
     """
 
+    # Frozen feature extraction and experiment-registry settings.
+    # Outer data-loader batch size for feature preparation on CUDA.
+    FEATURE_BATCH_SIZE_CUDA = 12
+
+    # Outer data-loader batch size for feature preparation on CPU.
+    FEATURE_BATCH_SIZE_CPU = 4
+
+    # Maximum number of prepared images sent through EfficientNet at once on CUDA.
+    FEATURE_FORWARD_BATCH_SIZE_CUDA = 32
+
+    # Maximum number of prepared images sent through EfficientNet at once on CPU.
+    FEATURE_FORWARD_BATCH_SIZE_CPU = 4
+
+    # Load ImageNet-pretrained EfficientNet-B0 weights.
+    USE_IMAGENET_WEIGHTS = True
+
+    # Main full-image, automatic-ROI, complement, and matched-cohort experiments.
+    PRIMARY_MODES = (
+        "B0_FULL_IMAGE",
+        "B2_ATTENTION_ELIGIBLE_FULL_IMAGE",
+        "AU1_ATTENTION_ROI",
+        "C1_ATTENTION_COMPLEMENT",
+        "B1_MATCHED_FULL_IMAGE",
+        "AU2_MATCHED_ATTENTION_ROI",
+        "C2_MATCHED_ATTENTION_COMPLEMENT",
+    )
+
+    # Manual-mask reference experiments used to validate automatic masks.
+    VALIDATION_MODES = (
+        "M1_MANUAL_ROI",
+        "C3_MANUAL_COMPLEMENT",
+        "AU3_ATTENTION_ROI_MANUAL_SUBSET",
+        "C4_ATTENTION_COMPLEMENT_MANUAL_SUBSET",
+    )
+
+    # Complete ordered list of experiments evaluated by the pipeline.
+    MODES = PRIMARY_MODES + VALIDATION_MODES
+
+    # Mapping from readable experiment names to historical cache keys.
+    LEGACY_MODE_ALIASES = {
+        "B0_FULL_IMAGE": "FULL_IMAGE",
+        "B2_ATTENTION_ELIGIBLE_FULL_IMAGE": "B2_ATTENTION_ELIGIBLE_FULL_IMAGE",
+        "AU1_ATTENTION_ROI": "AU1_ATTENTION_ROI",
+        "C1_ATTENTION_COMPLEMENT": "AU5_ATTENTION_COMPLEMENT",
+        "B1_MATCHED_FULL_IMAGE": "CROSS_CLASS_MATCHED_FULL_IMAGE",
+        "AU2_MATCHED_ATTENTION_ROI": "CROSS_CLASS_MATCHED_AU1_ATTENTION_ROI",
+        "C2_MATCHED_ATTENTION_COMPLEMENT": "CROSS_CLASS_MATCHED_AU5_ATTENTION_COMPLEMENT",
+        "M1_MANUAL_ROI": "AU6_MANUAL_ROI",
+        "C3_MANUAL_COMPLEMENT": "AU7_MANUAL_COMPLEMENT",
+        "AU3_ATTENTION_ROI_MANUAL_SUBSET": "AU8_ATTENTION_MATCHED_MANUAL_ROI",
+        "C4_ATTENTION_COMPLEMENT_MANUAL_SUBSET": "AU9_ATTENTION_MATCHED_MANUAL_COMPLEMENT",
+    }
+
+    # Historical storage keys retained for backward-compatible feature banks.
+    LEGACY_STORAGE_MODES = (
+        "FULL_IMAGE",
+        "B2_ATTENTION_ELIGIBLE_FULL_IMAGE",
+        "AU1_ATTENTION_ROI",
+        "AU5_ATTENTION_COMPLEMENT",
+        "CROSS_CLASS_MATCHED_FULL_IMAGE",
+        "CROSS_CLASS_MATCHED_AU1_ATTENTION_ROI",
+        "CROSS_CLASS_MATCHED_AU5_ATTENTION_COMPLEMENT",
+        "AU6_MANUAL_ROI",
+        "AU7_MANUAL_COMPLEMENT",
+        "AU8_ATTENTION_MATCHED_MANUAL_ROI",
+        "AU9_ATTENTION_MATCHED_MANUAL_COMPLEMENT",
+    )
+
+    # Experiments that must use the exact same attention-eligible source slices.
+    ATTENTION_ELIGIBLE_MODES = frozenset(
+        {
+            "B2_ATTENTION_ELIGIBLE_FULL_IMAGE",
+            "AU1_ATTENTION_ROI",
+            "C1_ATTENTION_COMPLEMENT",
+        }
+    )
+
+    # Experiments that must use the exact same cross-class matched source slices.
+    MATCHED_MODES = frozenset(
+        {
+            "B1_MATCHED_FULL_IMAGE",
+            "AU2_MATCHED_ATTENTION_ROI",
+            "C2_MATCHED_ATTENTION_COMPLEMENT",
+        }
+    )
+
+    # Experiments restricted to accepted positive manual-mask images.
+    MANUAL_SUBSET_MODES = frozenset(VALIDATION_MODES)
+
+    # Human-readable explanation of every experiment.
+    MODE_DESCRIPTIONS = {
+        "B0_FULL_IMAGE": "Full-image contextual baseline on every dataset slice",
+        "B2_ATTENTION_ELIGIBLE_FULL_IMAGE": "Full image on exactly the AU1/C1 attention-eligible slices",
+        "AU1_ATTENTION_ROI": "Automatic Attention U-Net heart ROI on the same attention-eligible slices",
+        "C1_ATTENTION_COMPLEMENT": "Pixels outside the automatic heart ROI on the same attention-eligible slices",
+        "B1_MATCHED_FULL_IMAGE": "Full-image baseline on the expanded balanced Sick/Normal cohort",
+        "AU2_MATCHED_ATTENTION_ROI": "Automatic heart ROI on the expanded balanced matched cohort",
+        "C2_MATCHED_ATTENTION_COMPLEMENT": "Automatic-ROI complement on the expanded balanced matched cohort",
+        "M1_MANUAL_ROI": "Manual heart ROI on the annotated subset",
+        "C3_MANUAL_COMPLEMENT": "Complement of the manual ROI",
+        "AU3_ATTENTION_ROI_MANUAL_SUBSET": "Automatic ROI on the same manually annotated images",
+        "C4_ATTENTION_COMPLEMENT_MANUAL_SUBSET": "Automatic complement on the same manually annotated images",
+    }
+
+    # Named source cohort used by every experiment.
+    MODE_COHORTS = {
+        "B0_FULL_IMAGE": "all_dataset_slices",
+        "B2_ATTENTION_ELIGIBLE_FULL_IMAGE": "attention_eligible_same_slices",
+        "AU1_ATTENTION_ROI": "attention_eligible_same_slices",
+        "C1_ATTENTION_COMPLEMENT": "attention_eligible_same_slices",
+        "B1_MATCHED_FULL_IMAGE": "cross_class_matched_same_slices",
+        "AU2_MATCHED_ATTENTION_ROI": "cross_class_matched_same_slices",
+        "C2_MATCHED_ATTENTION_COMPLEMENT": "cross_class_matched_same_slices",
+        "M1_MANUAL_ROI": "manual_positive_same_slices",
+        "C3_MANUAL_COMPLEMENT": "manual_positive_same_slices",
+        "AU3_ATTENTION_ROI_MANUAL_SUBSET": "manual_positive_same_slices",
+        "C4_ATTENTION_COMPLEMENT_MANUAL_SUBSET": "manual_positive_same_slices",
+    }
+
 
     @staticmethod
     def _region_normalize(images: torch.Tensor, masks: torch.Tensor) -> torch.Tensor:
-
-
+        """Perform the region normalize step for feature-bank construction."""
         if masks.ndim == 3:
             masks = masks.unsqueeze(1)
         visible = masks > 0.5
         batch_size = images.shape[0]
-        bins = int(Settings.Image.REGION_HISTOGRAM_BINS)
+        bins = int(ImageProcessor.REGION_HISTOGRAM_BINS)
         mask_flat = visible[:, 0].reshape(batch_size, -1)
         counts = mask_flat.sum(dim=1).long()
         values = images[:, 0].float().clamp(0.0, 1.0)
@@ -6972,14 +7308,14 @@ class FeatureManager:
         safe_counts = counts.clamp_min(1)
         lower_rank = (
             torch.floor(
-                Settings.Image.REGION_LOWER_PERCENTILE / 100.0
+                ImageProcessor.REGION_LOWER_PERCENTILE / 100.0
                 * (safe_counts - 1).float()
             ).long()
             + 1
         )
         upper_rank = (
             torch.floor(
-                Settings.Image.REGION_UPPER_PERCENTILE / 100.0
+                ImageProcessor.REGION_UPPER_PERCENTILE / 100.0
                 * (safe_counts - 1).float()
             ).long()
             + 1
@@ -6989,18 +7325,19 @@ class FeatureManager:
         lower = lower_bin.float().view(-1, 1, 1, 1) / float(bins - 1)
         upper = upper_bin.float().view(-1, 1, 1, 1) / float(bins - 1)
         valid = (
-            (counts >= Settings.Image.REGION_MIN_PIXELS)
+            (counts >= ImageProcessor.REGION_MIN_PIXELS)
             & (upper[:, 0, 0, 0] > lower[:, 0, 0, 0])
         )
         scaled = (images.float() - lower) / (upper - lower).clamp_min(
-            Settings.Image.REGION_MIN_DYNAMIC_RANGE
+            ImageProcessor.REGION_MIN_DYNAMIC_RANGE
         )
         scaled = scaled.clamp(0.0, 1.0) * visible.float()
         return scaled * valid.view(-1, 1, 1, 1).float()
 
     @staticmethod
     def _support(mask: torch.Tensor, content: torch.Tensor) -> torch.Tensor:
-        kernel = int(Settings.Segmentation.SUPPORT_DILATION_KERNEL)
+        """Perform the support step for feature-bank construction."""
+        kernel = int(SegmentationManager.SUPPORT_DILATION_KERNEL)
         support = F.max_pool2d(
             (mask > 0.5).float(), kernel_size=kernel, stride=1, padding=kernel // 2
         )
@@ -7011,8 +7348,7 @@ class FeatureManager:
         workspace: Workspace,
         verbose: bool = False,
     ) -> set[str]:
-
-
+        """Perform the accepted manual tokens step for feature-bank construction."""
         audit_rows = FileManager.read_csv(workspace.manual_audit)
         accepted: set[str] = set()
         explicit_positive = 0
@@ -7117,6 +7453,7 @@ class FeatureManager:
 
     @staticmethod
     def _validate_cohort_alignment(bank: dict[str, dict[str, Any]]) -> None:
+        """Validate cohort alignment for feature-bank construction."""
         FeatureManager._assert_same_cohort(
             bank,
             (
@@ -7150,21 +7487,22 @@ class FeatureManager:
     def _feature_fingerprint(
         rows: Sequence[dict[str, Any]], workspace: Workspace
     ) -> str:
+        """Perform the feature fingerprint step for feature-bank construction."""
         prediction_summary = FileManager.read_json(workspace.prediction_summary, {}) or {}
         digest = hashlib.sha256()
         payload = {
             "schema": "simple-patient-feature-bank-cross-class-v6-same-slice-baseline",
-            "modes": Settings.Classification.LEGACY_STORAGE_MODES,
+            "modes": FeatureManager.LEGACY_STORAGE_MODES,
             "prediction_fingerprint": prediction_summary.get("fingerprint", ""),
-            "support_dilation": Settings.Segmentation.SUPPORT_DILATION_KERNEL,
-            "imagenet_weights": Settings.Classification.USE_IMAGENET_WEIGHTS,
-            "classification_size": Settings.Image.CLASSIFICATION_SIZE,
+            "support_dilation": SegmentationManager.SUPPORT_DILATION_KERNEL,
+            "imagenet_weights": FeatureManager.USE_IMAGENET_WEIGHTS,
+            "classification_size": ImageProcessor.CLASSIFICATION_SIZE,
             "quality_thresholds": {
-                "dynamic_range": Settings.Image.QUALITY_MIN_DYNAMIC_RANGE,
-                "laplacian_variance": Settings.Image.QUALITY_MIN_LAPLACIAN_VARIANCE,
-                "noise_ratio": Settings.Image.QUALITY_MAX_NOISE_RATIO,
-                "patient_blur_quantile": Settings.Image.QUALITY_PATIENT_BLUR_QUANTILE,
-                "patient_noise_quantile": Settings.Image.QUALITY_PATIENT_NOISE_QUANTILE,
+                "dynamic_range": ImageProcessor.QUALITY_MIN_DYNAMIC_RANGE,
+                "laplacian_variance": ImageProcessor.QUALITY_MIN_LAPLACIAN_VARIANCE,
+                "noise_ratio": ImageProcessor.QUALITY_MAX_NOISE_RATIO,
+                "patient_blur_quantile": ImageProcessor.QUALITY_PATIENT_BLUR_QUANTILE,
+                "patient_noise_quantile": ImageProcessor.QUALITY_PATIENT_NOISE_QUANTILE,
             },
         }
         digest.update(json.dumps(payload, sort_keys=True).encode("utf-8"))
@@ -7211,7 +7549,7 @@ class FeatureManager:
         with np.load(workspace.feature_bank, allow_pickle=False) as archive:
             available = set(archive.files)
             for mode in modes:
-                legacy_mode = Settings.Classification.LEGACY_MODE_ALIASES[mode]
+                legacy_mode = FeatureManager.LEGACY_MODE_ALIASES[mode]
                 candidates = tuple(dict.fromkeys((mode, legacy_mode)))
                 storage_mode = None
                 partial_candidates: list[str] = []
@@ -7260,9 +7598,10 @@ class FeatureManager:
 
     @staticmethod
     def load(workspace: Workspace) -> dict[str, dict[str, Any]]:
+        """Load load for feature-bank construction."""
         return FeatureManager._load_modes(
             workspace,
-            Settings.Classification.MODES,
+            FeatureManager.MODES,
             allow_missing=False,
         )
 
@@ -7307,14 +7646,14 @@ class FeatureManager:
         try:
             previous = FeatureManager._load_modes(
                 workspace,
-                Settings.Classification.MODES,
+                FeatureManager.MODES,
                 allow_missing=True,
             )
         except Exception:
             return None
 
         b2_mode = "B2_ATTENTION_ELIGIBLE_FULL_IMAGE"
-        required_pre_b2_modes = set(Settings.Classification.MODES) - {b2_mode}
+        required_pre_b2_modes = set(FeatureManager.MODES) - {b2_mode}
         if not required_pre_b2_modes.issubset(previous):
             return None
 
@@ -7330,15 +7669,15 @@ class FeatureManager:
 
         reusable = dict(previous)
         if matching_changed:
-            for mode in Settings.Classification.MATCHED_MODES:
+            for mode in FeatureManager.MATCHED_MODES:
                 reusable.pop(mode, None)
 
         missing_modes = [
-            mode for mode in Settings.Classification.MODES if mode not in reusable
+            mode for mode in FeatureManager.MODES if mode not in reusable
         ]
         allowed_missing = {b2_mode}
         if matching_changed:
-            allowed_missing.update(Settings.Classification.MATCHED_MODES)
+            allowed_missing.update(FeatureManager.MATCHED_MODES)
         if not set(missing_modes).issubset(allowed_missing):
             return None
 
@@ -7354,8 +7693,7 @@ class FeatureManager:
         workspace: Workspace,
         fingerprint: str | None = None,
     ) -> dict[str, dict[str, Any]] | None:
-
-
+        """Load compatible cache for feature-bank construction."""
         fingerprint = fingerprint or FeatureManager._feature_fingerprint(
             dataset_rows, workspace
         )
@@ -7385,7 +7723,7 @@ class FeatureManager:
         device: torch.device,
         force: bool = False,
     ) -> dict[str, dict[str, Any]]:
-
+        """Build or safely reuse every registered patient-level feature-bank mode."""
         fingerprint = FeatureManager._feature_fingerprint(dataset_rows, workspace)
         reusable_bank: dict[str, dict[str, Any]] | None = None
         if not force:
@@ -7445,7 +7783,7 @@ class FeatureManager:
                 and _as_int(row.get("attention_heart_present"), 1) == 1
                 and _as_int(row.get("quality_valid"), 0) == 1
                 and _as_float(row.get("attention_area_ratio"), 0.0)
-                >= Settings.Segmentation.PREDICTION_MIN_AREA_RATIO
+                >= SegmentationManager.PREDICTION_MIN_AREA_RATIO
             )
             row["keep_manual_matched"] = int(
                 row["image_token"] in accepted_manual
@@ -7458,7 +7796,7 @@ class FeatureManager:
         reusable_bank = dict(reusable_bank or {})
         modes_to_compute = tuple(
             mode
-            for mode in Settings.Classification.MODES
+            for mode in FeatureManager.MODES
             if mode not in reusable_bank
         )
         if not modes_to_compute:
@@ -7470,13 +7808,13 @@ class FeatureManager:
 
         requires_all_rows = "B0_FULL_IMAGE" in compute_set
         requires_attention_rows = bool(
-            compute_set & Settings.Classification.ATTENTION_ELIGIBLE_MODES
+            compute_set & FeatureManager.ATTENTION_ELIGIBLE_MODES
         )
         requires_matched_rows = bool(
-            compute_set & Settings.Classification.MATCHED_MODES
+            compute_set & FeatureManager.MATCHED_MODES
         )
         requires_manual_rows = bool(
-            compute_set & Settings.Classification.MANUAL_SUBSET_MODES
+            compute_set & FeatureManager.MANUAL_SUBSET_MODES
         )
 
         if not requires_all_rows:
@@ -7506,7 +7844,7 @@ class FeatureManager:
             FeatureDataset(rows),
             batch_size=RuntimeManager.feature_batch_size(device),
             shuffle=False,
-            num_workers=Settings.Runtime.NUM_WORKERS,
+            num_workers=RuntimeManager.NUM_WORKERS,
             pin_memory=device.type == "cuda",
         )
         pool = StreamingPatientPool(modes_to_compute)
@@ -7534,6 +7872,7 @@ class FeatureManager:
         def encode_groups(
             groups: list[tuple[str, torch.Tensor, list[dict[str, Any]]]],
         ) -> None:
+            """Perform the local encode groups step used by the surrounding operation."""
             valid_groups = [
                 (mode, images, selected_rows)
                 for mode, images, selected_rows in groups
@@ -7703,7 +8042,7 @@ class FeatureManager:
                             )
 
                 if (
-                    compute_set & Settings.Classification.MANUAL_SUBSET_MODES
+                    compute_set & FeatureManager.MANUAL_SUBSET_MODES
                     and manual_positions
                 ):
                     positions = torch.as_tensor(manual_positions, dtype=torch.long)
@@ -7765,7 +8104,7 @@ class FeatureManager:
         bank = dict(reusable_bank)
         bank.update(computed_bank)
         missing_modes = [
-            mode for mode in Settings.Classification.MODES if mode not in bank
+            mode for mode in FeatureManager.MODES if mode not in bank
         ]
         if missing_modes:
             raise RuntimeError(
@@ -7776,9 +8115,9 @@ class FeatureManager:
 
         arrays: dict[str, np.ndarray] = {}
         metadata_modes: dict[str, dict[str, Any]] = {}
-        for mode in Settings.Classification.MODES:
+        for mode in FeatureManager.MODES:
             values = bank[mode]
-            storage_mode = Settings.Classification.LEGACY_MODE_ALIASES[mode]
+            storage_mode = FeatureManager.LEGACY_MODE_ALIASES[mode]
             arrays[f"{storage_mode}__X"] = values["X"]
             arrays[f"{storage_mode}__y"] = values["y"]
             arrays[f"{storage_mode}__patient_ids"] = values["patient_ids"].astype("U")
@@ -7789,8 +8128,8 @@ class FeatureManager:
                 [values["series_proxies"]], dtype=np.int64
             )
             metadata_modes[mode] = {
-                "description": Settings.Classification.MODE_DESCRIPTIONS[mode],
-                "cohort": Settings.Classification.MODE_COHORTS[mode],
+                "description": FeatureManager.MODE_DESCRIPTIONS[mode],
+                "cohort": FeatureManager.MODE_COHORTS[mode],
                 "storage_key": storage_mode,
                 "patients": int(len(values["patient_ids"])),
                 "source_slices": int(values["source_slices"]),
@@ -7813,12 +8152,12 @@ class FeatureManager:
             "reused_static_modes": sorted(
                 mode
                 for mode in reusable_bank
-                if mode not in Settings.Classification.MATCHED_MODES
+                if mode not in FeatureManager.MATCHED_MODES
             ),
             "recomputed_modes": sorted(computed_bank),
             "incremental_rebuild": bool(reusable_bank),
             "matched_only_rebuild": (
-                set(computed_bank) == set(Settings.Classification.MATCHED_MODES)
+                set(computed_bank) == set(FeatureManager.MATCHED_MODES)
             ),
             "same_slice_controls": {
                 "attention_eligible": [
@@ -7851,7 +8190,7 @@ class FeatureManager:
 
 
 # -----------------------------------------------------------------------------
-# Nested patient-level evaluation and paired sensitivity comparisons
+# PIPELINE STEP 7 — patient-level evaluation and paired comparisons
 # -----------------------------------------------------------------------------
 class EvaluationManager:
     """Run nested patient-level cross-validation with train-only transforms.
@@ -7860,16 +8199,33 @@ class EvaluationManager:
     fitted inside training data. Final scores are strictly out of fold.
     """
 
+    # Nested patient-level evaluation settings.
+    # Fraction of training-fold variance retained by PCA.
+    PCA_EXPLAINED_VARIANCE = 0.95
+
+    # Maximum number of patient-level outer folds used for final OOF evaluation.
+    OUTER_FOLDS = 5
+
+    # Maximum number of inner folds used to choose regularization and thresholds.
+    INNER_FOLDS = 3
+
+    # Candidate inverse-regularization strengths for logistic regression.
+    C_GRID = (0.01, 0.1, 1.0, 10.0)
+
+    # Number of patient-level bootstrap samples used for confidence intervals.
+    BOOTSTRAP_REPEATS = 2000
+
 
     @staticmethod
     def _pipeline(c_value: float) -> SklearnPipeline:
+        """Perform the pipeline step for nested patient-level evaluation."""
         return SklearnPipeline(
             [
                 ("scale", StandardScaler()),
                 (
                     "pca",
                     PCA(
-                        n_components=Settings.Classification.PCA_EXPLAINED_VARIANCE,
+                        n_components=EvaluationManager.PCA_EXPLAINED_VARIANCE,
                         svd_solver="full",
                     ),
                 ),
@@ -7880,7 +8236,7 @@ class EvaluationManager:
                         class_weight="balanced",
                         solver="liblinear",
                         max_iter=5000,
-                        random_state=Settings.Runtime.RANDOM_SEED,
+                        random_state=RuntimeManager.RANDOM_SEED,
                     ),
                 ),
             ]
@@ -7888,6 +8244,7 @@ class EvaluationManager:
 
     @staticmethod
     def _youden_threshold(labels: np.ndarray, scores: np.ndarray) -> float:
+        """Perform the youden threshold step for nested patient-level evaluation."""
         fpr, tpr, thresholds = roc_curve(labels, scores)
         finite = np.isfinite(thresholds)
         if not np.any(finite):
@@ -7897,13 +8254,14 @@ class EvaluationManager:
 
     @staticmethod
     def _select_c_and_threshold(X: np.ndarray, y: np.ndarray, seed: int) -> tuple[float, float]:
+        """Select c and threshold for nested patient-level evaluation."""
         class_counts = np.bincount(y, minlength=2)
-        n_splits = min(Settings.Classification.INNER_FOLDS, int(class_counts.min()))
+        n_splits = min(EvaluationManager.INNER_FOLDS, int(class_counts.min()))
         if n_splits < 2:
             return 1.0, 0.5
         splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
         best_c, best_auc, best_scores = 1.0, -np.inf, None
-        for c_value in Settings.Classification.C_GRID:
+        for c_value in EvaluationManager.C_GRID:
             scores = np.full(len(y), np.nan, dtype=np.float64)
             for train_index, valid_index in splitter.split(X, y):
                 model = EvaluationManager._pipeline(c_value)
@@ -7917,16 +8275,17 @@ class EvaluationManager:
 
     @staticmethod
     def _fold_map(reference: dict[str, Any]) -> dict[str, int]:
+        """Perform the fold map step for nested patient-level evaluation."""
         patients = np.asarray(reference["patient_ids"]).astype(str)
         labels = np.asarray(reference["y"], dtype=np.int64)
         class_counts = np.bincount(labels, minlength=2)
-        n_splits = min(Settings.Classification.OUTER_FOLDS, int(class_counts.min()))
+        n_splits = min(EvaluationManager.OUTER_FOLDS, int(class_counts.min()))
         if n_splits < 2:
             raise RuntimeError("At least two patients are required in each class.")
         splitter = StratifiedKFold(
             n_splits=n_splits,
             shuffle=True,
-            random_state=Settings.Runtime.RANDOM_SEED,
+            random_state=RuntimeManager.RANDOM_SEED,
         )
         mapping = {}
         for fold, (_, valid_index) in enumerate(splitter.split(np.zeros(len(labels)), labels), start=1):
@@ -7936,6 +8295,7 @@ class EvaluationManager:
 
     @staticmethod
     def _auc_ci(labels: np.ndarray, scores: np.ndarray, repeats: int, seed: int) -> tuple[float, float]:
+        """Perform the auc ci step for nested patient-level evaluation."""
         rng = np.random.default_rng(seed)
         values = []
         for _ in range(int(repeats)):
@@ -7949,12 +8309,13 @@ class EvaluationManager:
 
     @staticmethod
     def _metrics(labels: np.ndarray, scores: np.ndarray, predictions: np.ndarray) -> dict[str, float]:
+        """Perform the metrics step for nested patient-level evaluation."""
         tn, fp, fn, tp = confusion_matrix(labels, predictions, labels=[0, 1]).ravel()
         ci_low, ci_high = EvaluationManager._auc_ci(
             labels,
             scores,
-            Settings.Classification.BOOTSTRAP_REPEATS,
-            Settings.Runtime.RANDOM_SEED + 9000,
+            EvaluationManager.BOOTSTRAP_REPEATS,
+            RuntimeManager.RANDOM_SEED + 9000,
         )
         return {
             "auc": float(roc_auc_score(labels, scores)),
@@ -7974,6 +8335,7 @@ class EvaluationManager:
         repeats: int,
         seed: int,
     ) -> dict[str, Any]:
+        """Perform the paired auc difference step for nested patient-level evaluation."""
         merged = first.merge(second, on=["patient_id", "true_label"], suffixes=("_first", "_second"))
         labels = merged["true_label"].to_numpy(dtype=np.int64)
         first_scores = merged["score_first"].to_numpy(dtype=np.float64)
@@ -8007,11 +8369,12 @@ class EvaluationManager:
     # training fold. The held-out patients are used once, only for OOF scoring.
     @staticmethod
     def evaluate(bank: dict[str, dict[str, Any]], workspace: Workspace) -> pd.DataFrame:
+        """Create out-of-fold patient predictions, metrics, and paired AUC comparisons."""
         fold_map = EvaluationManager._fold_map(bank["B0_FULL_IMAGE"])
         summary_rows = []
         prediction_tables: dict[str, pd.DataFrame] = {}
 
-        for mode in Settings.Classification.MODES:
+        for mode in FeatureManager.MODES:
             values = bank[mode]
             X = np.asarray(values["X"], dtype=np.float32)
             y = np.asarray(values["y"], dtype=np.int64)
@@ -8036,7 +8399,7 @@ class EvaluationManager:
                         "The matched cohort is too sparse; inspect the matching summary."
                     )
                 best_c, threshold = EvaluationManager._select_c_and_threshold(
-                    X[train_index], y[train_index], Settings.Runtime.RANDOM_SEED + int(fold)
+                    X[train_index], y[train_index], RuntimeManager.RANDOM_SEED + int(fold)
                 )
                 model = EvaluationManager._pipeline(best_c)
                 model.fit(X[train_index], y[train_index])
@@ -8067,11 +8430,11 @@ class EvaluationManager:
                     "mode": mode,
                     "experiment_group": (
                         "primary"
-                        if mode in Settings.Classification.PRIMARY_MODES
+                        if mode in FeatureManager.PRIMARY_MODES
                         else "mask_validation"
                     ),
-                    "description": Settings.Classification.MODE_DESCRIPTIONS[mode],
-                    "cohort": Settings.Classification.MODE_COHORTS[mode],
+                    "description": FeatureManager.MODE_DESCRIPTIONS[mode],
+                    "cohort": FeatureManager.MODE_COHORTS[mode],
                     "patients": len(patients),
                     "source_slices": values["source_slices"],
                     "series_proxies": values["series_proxies"],
@@ -8152,8 +8515,8 @@ class EvaluationManager:
             comparison = EvaluationManager._paired_auc_difference(
                 prediction_tables[first_mode],
                 prediction_tables[second_mode],
-                Settings.Classification.BOOTSTRAP_REPEATS,
-                Settings.Runtime.RANDOM_SEED + len(comparisons) * 100,
+                EvaluationManager.BOOTSTRAP_REPEATS,
+                RuntimeManager.RANDOM_SEED + len(comparisons) * 100,
             )
             comparisons.append(
                 {
@@ -8171,7 +8534,7 @@ class EvaluationManager:
 
 
 # -----------------------------------------------------------------------------
-# Public pipeline interface and Kaggle execution stages
+# PIPELINE STEP 8 — public interface and Kaggle execution stages
 # -----------------------------------------------------------------------------
 class CADPipeline:
     """Small public interface over the persisted CPU/GPU research stages.
@@ -8180,7 +8543,6 @@ class CADPipeline:
     stage checks its fingerprinted cache before CUDA or EfficientNet is initialized.
     """
 
-
     def __init__(
         self,
         dataset_path: Path | str | None = None,
@@ -8188,14 +8550,15 @@ class CADPipeline:
         attention_device: str | None = None,
         feature_device: str | None = None,
     ):
+        """Initialize the values required for public pipeline orchestration."""
         RuntimeManager.seed_everything(include_cuda=False)
-        self.dataset_path = Path(dataset_path or Settings.Paths.DATASET_PATH)
+        self.dataset_path = Path(dataset_path or DatasetManager.DEFAULT_DATASET_PATH)
         self.workspace = FileManager.create_workspace(workspace_root)
         self.attention_device = (
-            attention_device or Settings.Runtime.ATTENTION_DEVICE
+            attention_device or RuntimeManager.ATTENTION_DEVICE
         ).strip().lower()
         self.feature_device = (
-            feature_device or Settings.Runtime.FEATURE_DEVICE
+            feature_device or RuntimeManager.FEATURE_DEVICE
         ).strip().lower()
         for name, value in (
             ("attention_device", self.attention_device),
@@ -8216,20 +8579,19 @@ class CADPipeline:
 
 
     def prepare(self) -> list[dict[str, Any]]:
-
-
+        """Discover images and build the sequence-aware dataset rows."""
         self.samples = DatasetManager.discover(self.dataset_path, self.workspace)
         self.dataset_rows = DatasetManager.rows(self.samples, self.workspace)
         return self.dataset_rows
 
     def _rows(self) -> list[dict[str, Any]]:
+        """Perform the rows step for public pipeline orchestration."""
         if self.dataset_rows is None:
             return self.prepare()
         return self.dataset_rows
 
     def audit_quality(self, refresh: bool = False) -> dict[str, dict[str, Any]]:
-
-
+        """Audit quality for public pipeline orchestration."""
         return QualityManager.build(self._rows(), self.workspace, refresh=refresh)
 
     def audit_manual_masks(
@@ -8237,8 +8599,7 @@ class CADPipeline:
         refresh_quality: bool = False,
         minimum_masks: int | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-
-
+        """Audit manual masks for public pipeline orchestration."""
         quality = self.audit_quality(refresh=refresh_quality)
         return MaskManager.audit_manual_masks(
             self._rows(), quality, self.workspace, minimum_masks=minimum_masks
@@ -8252,8 +8613,7 @@ class CADPipeline:
         refresh_quality: bool = False,
         device: str | None = None,
     ) -> dict[int, Path]:
-
-
+        """Audit manual targets, then train or reuse cross-fitted Attention checkpoints."""
         accepted, manual_summary = self.audit_manual_masks(
             refresh_quality=refresh_quality,
             minimum_masks=minimum_masks,
@@ -8275,13 +8635,16 @@ class CADPipeline:
                 FileManager.write_json(self.workspace.training_summary, summary)
                 return cached_checkpoints
 
+        # Initialize the requested compute stage only after all cache checks pass.
         requested = device or self.attention_device
-        with RuntimeManager.device_scope(
-            requested, "Attention U-Net training"
-        ) as compute_device:
+        stage_name = "Attention U-Net training"
+        compute_device = RuntimeManager.start_device_stage(requested, stage_name)
+        try:
             checkpoints = SegmentationManager.train_crossfit(
                 accepted, self.workspace, compute_device, force=force
             )
+        finally:
+            RuntimeManager.finish_device_stage(compute_device, stage_name)
 
         summary = FileManager.read_json(self.workspace.training_summary, {}) or {}
         summary["manual_mask_audit"] = manual_summary
@@ -8293,8 +8656,7 @@ class CADPipeline:
         force: bool = False,
         device: str | None = None,
     ) -> list[dict[str, Any]]:
-
-
+        """Generate or reuse full-dataset out-of-fold Attention masks."""
         rows = self._rows()
         checkpoints = SegmentationManager.load_checkpoint_map(self.workspace)
         if not force:
@@ -8311,17 +8673,21 @@ class CADPipeline:
                 )
                 return cached
 
+        # Initialize the requested device only when prediction must be recomputed.
         requested = device or self.attention_device
-        with RuntimeManager.device_scope(
-            requested, "Attention U-Net prediction"
-        ) as compute_device:
-            return SegmentationManager.predict_all(
+        stage_name = "Attention U-Net prediction"
+        compute_device = RuntimeManager.start_device_stage(requested, stage_name)
+        try:
+            predictions = SegmentationManager.predict_all(
                 rows,
                 self.workspace,
                 compute_device,
                 checkpoint_map=checkpoints,
                 force=force,
             )
+        finally:
+            RuntimeManager.finish_device_stage(compute_device, stage_name)
+        return predictions
 
 
     def open_editor(
@@ -8333,8 +8699,7 @@ class CADPipeline:
         review_round: int = 1,
         seed: int = 42,
     ) -> MaskEditor:
-
-
+        """Prepare compatibility files and open one manual-review queue."""
         rows = self._rows()
 
 
@@ -8360,7 +8725,7 @@ class CADPipeline:
             queue,
             self.workspace,
             start_index=start_index,
-            brush_radius=brush_radius or Settings.Review.BRUSH_RADIUS,
+            brush_radius=brush_radius or ReviewManager.BRUSH_RADIUS,
             review_round=review_round,
             review_scope=scope,
         )
@@ -8371,8 +8736,7 @@ class CADPipeline:
         self,
         force: bool = False,
     ) -> list[dict[str, Any]]:
-
-
+        """Prepare required audits and build the balanced matching cohort."""
         rows = self._rows()
         imported_quality = WorkspaceCompatibilityManager.ensure_quality_audit(
             rows, self.workspace
@@ -8396,8 +8760,7 @@ class CADPipeline:
         force: bool = False,
         device: str | None = None,
     ) -> dict[str, dict[str, Any]]:
-
-
+        """Prepare required artifacts and build or reuse patient feature modes."""
         rows = self._rows()
 
 
@@ -8427,32 +8790,33 @@ class CADPipeline:
                 )
                 return cached
 
+        # Initialize EfficientNet only after cache and audit checks are complete.
         requested = device or self.feature_device
-        with RuntimeManager.device_scope(
-            requested, "EfficientNet feature extraction"
-        ) as compute_device:
-            return FeatureManager.build(
+        stage_name = "EfficientNet feature extraction"
+        compute_device = RuntimeManager.start_device_stage(requested, stage_name)
+        try:
+            feature_bank = FeatureManager.build(
                 rows, self.workspace, compute_device, force=force
             )
+        finally:
+            RuntimeManager.finish_device_stage(compute_device, stage_name)
+        return feature_bank
 
 
     def evaluate(self) -> pd.DataFrame:
-
-
+        """Load the feature bank and run patient-level evaluation."""
         bank = FeatureManager.load(self.workspace)
         return EvaluationManager.evaluate(bank, self.workspace)
 
     def backup(self, name: str = "cad_attention_workspace_backup") -> Path:
-
-
+        """Perform the backup step for public pipeline orchestration."""
         destination = self.workspace.root.parent / name
         archive = Path(shutil.make_archive(str(destination), "zip", self.workspace.root))
         print("[BACKUP]", archive)
         return archive
 
     def status(self) -> dict[str, Any]:
-
-
+        """Perform the status step for public pipeline orchestration."""
         matching_summary = FileManager.read_json(
             self.workspace.cross_class_matching_summary, {}
         ) or {}
@@ -8502,7 +8866,7 @@ class CADPipeline:
 
 RuntimeManager.seed_everything(include_cuda=False)
 print(f"[PIPELINE] Version: {PIPELINE_VERSION}")
-print("[PIPELINE] Classes loaded without initializing CUDA.")
+print("[PIPELINE] Simplified classes loaded without initializing CUDA.")
 print("[PIPELINE] 2.5D context, explicit negatives, and core+extended Sick↔Normal matching are active.")
 print("[PIPELINE] Legacy manual-audit migration for M1/C3/AU3/C4 is active.")
 print("[PIPELINE] The editor locally blocks Kaggle's context menu during right-click erasing.")
@@ -8512,8 +8876,7 @@ print("[PIPELINE] CPU is the default; device='cuda' is passed only to the reques
 
 
 def _execution_banner(title: str) -> None:
-
-
+    """Print a visible banner before one public pipeline stage starts."""
     line = "=" * 88
     print(f"\n{line}\n{title}\n{line}")
 
@@ -8524,8 +8887,7 @@ def create_pipeline(
     attention_device: str = "cuda",
     feature_device: str = "cpu",
 ) -> CADPipeline:
-
-
+    """Create a pipeline instance with explicit dataset, workspace, and device choices."""
     return CADPipeline(
         dataset_path=dataset_path,
         workspace_root=workspace_root,
@@ -8547,8 +8909,7 @@ def run_complete_pipeline(
     create_backup: bool = False,
     backup_name: str = "cad_attention_workspace_backup",
 ) -> dict[str, Any]:
-
-
+    """Run every pipeline stage in the required order and return all outputs."""
     _execution_banner("COMPLETE RUN — CPU initialization and manifest")
     pipeline = create_pipeline(
         dataset_path=dataset_path,
@@ -8616,8 +8977,7 @@ def run_review_block(
     review_round: int = 1,
     seed: int = 42,
 ) -> MaskEditor | None:
-
-
+    """Open one manual-review queue and return its interactive editor."""
     scope = str(scope).strip().lower()
     _execution_banner(f"MANUAL REVIEW ON CPU — scope={scope}")
 
@@ -8682,8 +9042,7 @@ def run_after_review_pipeline(
     create_backup: bool = False,
     backup_name: str = "cad_attention_workspace_after_review",
 ) -> dict[str, Any]:
-
-
+    """Retrain affected stages after review and rerun final evaluation."""
     attention_device = attention_device or pipeline.attention_device
     feature_device = feature_device or pipeline.feature_device
 
@@ -8736,6 +9095,7 @@ def run_after_review_pipeline(
 
 
 def run_prepare(pipeline: CADPipeline) -> list[dict[str, Any]]:
+    """Run dataset discovery and print the current workspace status."""
     dataset_rows = pipeline.prepare()
     pipeline.status()
     return dataset_rows
@@ -8746,6 +9106,7 @@ def run_audit(
     refresh: bool = False,
     minimum_masks: int | None = None,
 ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    """Run image-quality and manual-mask audits and return their records."""
     quality_by_token = pipeline.audit_quality(refresh=refresh)
     accepted_manual_masks, manual_summary = pipeline.audit_manual_masks(
         refresh_quality=False,
@@ -8762,6 +9123,7 @@ def run_attention_training(
     refresh_quality: bool = False,
     device: str | None = None,
 ) -> dict[int, Path]:
+    """Run the public Attention U-Net training entry point."""
     return pipeline.train_attention(
         force=force,
         minimum_masks=minimum_masks,
@@ -8775,6 +9137,7 @@ def run_attention_prediction(
     force: bool = False,
     device: str | None = None,
 ) -> list[dict[str, Any]]:
+    """Run the public Attention U-Net prediction entry point."""
     predictions = pipeline.generate_attention_masks(force=force, device=device)
     print("Attention predictions:", len(predictions))
     return predictions
@@ -8784,6 +9147,7 @@ def run_cross_class_matching(
     pipeline: CADPipeline,
     force: bool = False,
 ) -> list[dict[str, Any]]:
+    """Build the cross-class matching manifest and print its summary."""
     manifest = pipeline.build_cross_class_matching(force=force)
     summary = FileManager.read_json(
         pipeline.workspace.cross_class_matching_summary, {}
@@ -8797,6 +9161,7 @@ def run_feature_bank(
     force: bool = False,
     device: str | None = None,
 ) -> dict[str, dict[str, Any]]:
+    """Build the feature bank and print one concise summary per mode."""
     feature_bank = pipeline.build_feature_bank(force=force, device=device)
     summary = {
         mode: {
@@ -8811,6 +9176,7 @@ def run_feature_bank(
 
 
 def run_evaluation(pipeline: CADPipeline) -> pd.DataFrame:
+    """Run patient-level evaluation and print the result table."""
     results = pipeline.evaluate()
     print(results.to_string(index=False))
     return results
@@ -8822,8 +9188,7 @@ def run_kaggle_cpu_stage(
     refresh_quality: bool = False,
     minimum_masks: int | None = None,
 ) -> dict[str, Any]:
-
-
+    """Run the initial Kaggle CPU manifest and audit stage."""
     _execution_banner("KAGGLE CPU — MANIFEST + AUDIT")
     pipeline = create_pipeline(
         dataset_path=dataset_path,
@@ -8861,8 +9226,7 @@ def run_kaggle_gpu_stage(
     refresh_quality: bool = False,
     minimum_masks: int | None = None,
 ) -> dict[str, Any]:
-
-
+    """Run Kaggle GPU training and out-of-fold mask prediction."""
     if not torch.cuda.is_available():
         raise RuntimeError(
             "A GPU is unavailable. In Kaggle choose "
@@ -8919,8 +9283,7 @@ def run_kaggle_cpu_final_stage(
     review_round: int = 1,
     review_seed: int = 42,
 ) -> dict[str, Any]:
-
-
+    """Run matching, review, evaluation, or status on Kaggle CPU."""
     action = str(action).strip().lower()
     if action not in {"matching", "evaluate", "review", "status"}:
         raise ValueError(
@@ -8989,8 +9352,7 @@ def run_kaggle_cpu_final_stage(
 
 
 def main() -> None:
-
-
+    """Parse command-line arguments and dispatch the requested pipeline stage."""
     import argparse
 
     parser = argparse.ArgumentParser(
@@ -9167,6 +9529,7 @@ def main() -> None:
 
 
 def _running_in_notebook() -> bool:
+    """Return True when execution is inside Jupyter or Kaggle rather than a terminal."""
     try:
         shell = get_ipython()  
     except Exception:
