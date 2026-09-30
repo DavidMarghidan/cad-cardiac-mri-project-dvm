@@ -5,20 +5,27 @@ its own Kaggle accelerator mode:
 
 1. ``Pipeline.cpu_prepare()`` — Accelerator: None
    Scan the dataset, build patient-safe sequence rows, measure image quality, audit
-   the manual targets, and save only the current hand-off tables.
+   the manual targets, and write the current CPU-to-GPU hand-off tables.
 2. ``Pipeline.gpu_attention()`` — Accelerator: GPU
-   Load the prepared rows, train all five patient-level Attention U-Nets, generate
-   every out-of-fold mask, and delete the temporary checkpoints.
+   Train all five patient-level Attention U-Nets and generate every out-of-fold mask.
 3. ``Pipeline.review()`` — Accelerator: None, optional
-   Open the HTML editor using the saved OOF masks. Manual PNG masks and explicit
-   labels are the only permanent research data.
+   Open the HTML editor using the saved OOF masks.
 4. ``Pipeline.cpu_final()`` — Accelerator: None
    Rebuild matching, frozen EfficientNet features, nested patient-level evaluation,
    and paired AUC comparisons. Results are displayed directly in Kaggle.
 
-The folder ``current_run/`` is only a hand-off between the CPU, GPU, and final CPU
-sessions. ``cpu_prepare()`` replaces it, and ``cpu_final()`` removes it after a
-successful evaluation. Therefore no run history accumulates.
+Generated files under ``current_run/`` are preserved by default. Nothing is deleted
+unless ``reset_files=True`` is passed explicitly:
+
+- ``cpu_prepare(reset_files=True)`` clears the complete generated run first;
+- ``gpu_attention(reset_files=True)`` clears only old Attention masks, checkpoints,
+  and prediction metadata before retraining;
+- ``cpu_final(reset_files=True)`` deletes ``current_run/`` only after a successful
+  final evaluation.
+
+Manual masks and ``manual_annotation_labels.csv`` are never removed by these reset
+options. The same filenames are overwritten when a stage regenerates its own output,
+so the workspace stores the latest run rather than an accumulating run history.
 
 Scientific safeguards remain unchanged: patient-level folds, genuinely out-of-fold
 masks, same-slice controls, balanced matched cohorts, and patient-level evaluation.
@@ -91,8 +98,9 @@ ANNOTATION_FIELDS = (
 class DataStage:
     """CPU preparation plus the small shared file helpers used by later stages.
 
-    ``current_run/`` contains only the active CPU→GPU→CPU hand-off. It is replaced
-    before a new preparation and removed after a successful final evaluation.
+    ``current_run/`` contains the latest CPU→GPU→CPU hand-off. It is preserved by
+    default and is cleared only when a public pipeline call receives
+    ``reset_files=True``.
     """
 
     image_cache = OrderedDict()  # in-memory only; discarded when the run ends
@@ -253,10 +261,10 @@ class DataStage:
         if minutes:
             return f"{minutes}m {seconds:02d}s"
         return f"{seconds}s"
-    # Only manual masks and their labels live in /kaggle/working.
-    # Every other path belongs to a new temporary directory and disappears with the session.
-    # Build the shared Kaggle workspace. Only manual masks and labels live outside
-    # current_run/, so they survive after the current experiment is deleted.
+    # Build the shared Kaggle workspace used across CPU and GPU sessions.
+    # Manual masks and labels live outside current_run/ and are never reset here.
+    # Generated files inside current_run/ are also preserved unless reset_files=True
+    # is passed to one of the public Pipeline methods.
     @staticmethod
     def create_workspace(workspace_root=None):
         root=Path(workspace_root or DataStage._default_workspace_path())
@@ -283,7 +291,8 @@ class DataStage:
         workspace.checkpoints.mkdir(parents=True, exist_ok=True)
         return workspace
 
-    # Start a new experiment without touching manual masks or their labels.
+    # Explicitly clear all generated files without touching manual masks or labels.
+    # This helper is called only when reset_files=True.
     @staticmethod
     def reset_current_run(workspace):
         shutil.rmtree(workspace.current, ignore_errors=True)
@@ -291,7 +300,8 @@ class DataStage:
         workspace.predicted_masks.mkdir(parents=True, exist_ok=True)
         workspace.checkpoints.mkdir(parents=True, exist_ok=True)
 
-    # Rerunning only the GPU stage must never mix old and new OOF predictions.
+    # Explicitly clear only generated Attention outputs before retraining.
+    # This helper is called only when reset_files=True.
     @staticmethod
     def reset_attention_outputs(workspace):
         shutil.rmtree(workspace.predicted_masks, ignore_errors=True)
@@ -300,7 +310,8 @@ class DataStage:
         workspace.checkpoints.mkdir(parents=True, exist_ok=True)
         workspace.prediction_audit.unlink(missing_ok=True)
 
-    # Delete every generated hand-off after successful final evaluation.
+    # Explicitly remove the generated hand-off after final evaluation.
+    # This helper is called only when reset_files=True.
     @staticmethod
     def remove_current_run(workspace):
         shutil.rmtree(workspace.current, ignore_errors=True)
@@ -315,6 +326,18 @@ class DataStage:
         for mask_path in workspace.manual_masks.glob("*.png"):
             latest=max(latest, mask_path.stat().st_mtime_ns)
         return latest > reference_path.stat().st_mtime_ns
+
+    # Confirm that the saved OOF table was produced after the current preparation
+    # and after every checkpoint that currently exists. This prevents an old audit
+    # from being used if a preserved GPU rerun stopped before finishing prediction.
+    @staticmethod
+    def attention_outputs_are_current(workspace):
+        if not workspace.accepted_targets.is_file() or not workspace.prediction_audit.is_file():
+            return False
+        newest_input=workspace.accepted_targets.stat().st_mtime_ns
+        for checkpoint in workspace.checkpoints.glob("attention_unet_fold_*.pt"):
+            newest_input=max(newest_input, checkpoint.stat().st_mtime_ns)
+        return workspace.prediction_audit.stat().st_mtime_ns >= newest_input
     # JSON is used only for the current matching hand-off and is never historical.
     @staticmethod
     def write_json(path, payload):
@@ -6095,17 +6118,27 @@ class Pipeline:
     # 1. CPU PREPARATION — Kaggle Accelerator: None
     # -------------------------------------------------------------------------
     @staticmethod
-    def cpu_prepare(dataset_path=None, workspace_root=None, minimum_masks=None):
-        """Rebuild the dataset, quality audit, and accepted manual targets on CPU."""
+    def cpu_prepare(
+        dataset_path=None,
+        workspace_root=None,
+        minimum_masks=None,
+        reset_files=False,
+    ):
+        """Rebuild CPU preparation; preserve existing files unless explicitly reset."""
         line="=" * 88
         print(f"\n{line}\nCARDIAC MRI CAD — 1/3 CPU PREPARATION\n{line}")
 
         DataStage.seed_everything(include_cuda=False)
         workspace=DataStage.create_workspace(workspace_root)
 
-        # A new preparation defines a new experiment. Delete every generated file
-        # from the previous run, but preserve manual_masks/ and the label CSV.
-        DataStage.reset_current_run(workspace)
+        # Default behavior is non-destructive. Existing generated files remain until
+        # this stage overwrites files with the same names. Set reset_files=True only
+        # when a completely clean current_run/ directory is required.
+        if reset_files:
+            DataStage.reset_current_run(workspace)
+            print("[FILES] reset_files=True: previous current_run/ files were removed.")
+        else:
+            print("[FILES] reset_files=False: existing current_run/ files are preserved.")
         dataset_path=Path(dataset_path or DataStage._default_dataset_path())
 
         # Dataset rows include deterministic patient folds and previous/current/next
@@ -6154,8 +6187,8 @@ class Pipeline:
     # 2. GPU ATTENTION — Kaggle Accelerator: GPU
     # -------------------------------------------------------------------------
     @staticmethod
-    def gpu_attention(workspace_root=None):
-        """Train five cross-fitted Attention U-Nets and save all OOF masks."""
+    def gpu_attention(workspace_root=None, reset_files=False):
+        """Retrain Attention U-Nets; preserve prior files unless explicitly reset."""
         line="=" * 88
         print(f"\n{line}\nCARDIAC MRI CAD — 2/3 GPU ATTENTION\n{line}")
 
@@ -6173,9 +6206,14 @@ class Pipeline:
                 "and run Pipeline.cpu_prepare() again before training."
             )
 
-        # Never combine predictions from different trainings. Only the current manual
-        # targets and the current CPU preparation are used.
-        DataStage.reset_attention_outputs(workspace)
+        # Training always starts from new model weights. With reset_files=False the
+        # previous files remain until the new folds overwrite them. The final OOF CSV
+        # is written only after every image has been predicted.
+        if reset_files:
+            DataStage.reset_attention_outputs(workspace)
+            print("[FILES] reset_files=True: previous Attention outputs were removed.")
+        else:
+            print("[FILES] reset_files=False: previous Attention files are preserved until overwritten.")
 
         device=DataStage.start_device_stage("cuda", "Attention U-Net training + OOF prediction")
         try:
@@ -6195,9 +6233,8 @@ class Pipeline:
                 device,
                 "Attention U-Net training + OOF prediction",
             )
-            # Checkpoints are useful only while producing the current OOF masks.
-            # Remove them even when training/prediction stops with an error.
-            shutil.rmtree(workspace.checkpoints, ignore_errors=True)
+            # Checkpoints are intentionally preserved. They are deleted only by an
+            # explicit reset_files=True call in a later stage.
 
         summary={
             "images": len(predictions),
@@ -6239,6 +6276,11 @@ class Pipeline:
                 "OOF masks are missing. Run Pipeline.cpu_prepare() and "
                 "Pipeline.gpu_attention() first."
             )
+        if not DataStage.attention_outputs_are_current(workspace):
+            raise RuntimeError(
+                "The saved OOF outputs are older than the current CPU preparation or "
+                "checkpoint files. Run Pipeline.gpu_attention() again."
+            )
 
         DataStage.register_existing_manual_masks(rows, workspace)
         try:
@@ -6274,8 +6316,8 @@ class Pipeline:
     # 3. FINAL CPU — Kaggle Accelerator: None
     # -------------------------------------------------------------------------
     @staticmethod
-    def cpu_final(workspace_root=None):
-        """Rebuild matching/features/evaluation on CPU and display the final tables."""
+    def cpu_final(workspace_root=None, reset_files=False):
+        """Run final CPU evaluation; keep generated files unless explicitly reset."""
         line="=" * 88
         print(f"\n{line}\nCARDIAC MRI CAD — 3/3 FINAL CPU EVALUATION\n{line}")
 
@@ -6287,6 +6329,11 @@ class Pipeline:
             raise RuntimeError(
                 "Prepared rows or OOF predictions are missing. Run "
                 "Pipeline.cpu_prepare() and Pipeline.gpu_attention() first."
+            )
+        if not DataStage.attention_outputs_are_current(workspace):
+            raise RuntimeError(
+                "The saved OOF outputs are older than the current CPU preparation or "
+                "checkpoint files. Run Pipeline.gpu_attention() again."
             )
         if DataStage.manual_data_changed_after(workspace, workspace.accepted_targets):
             raise RuntimeError(
@@ -6333,16 +6380,20 @@ class Pipeline:
             "comparisons": comparisons,
         }
 
-        # Final tables already live in the notebook output. Remove all generated data
-        # so the workspace again contains only manual masks and manual labels.
-        DataStage.remove_current_run(workspace)
-        print("[CLEANUP] current_run/ removed. Only manual masks and labels remain.")
+        # Keep the generated hand-off by default so evaluation or review can be rerun
+        # without repeating the GPU stage. Explicit cleanup is available when desired.
+        if reset_files:
+            DataStage.remove_current_run(workspace)
+            print("[FILES] reset_files=True: current_run/ was removed after evaluation.")
+        else:
+            print(f"[FILES] reset_files=False: generated files remain in {workspace.current}")
         return output
 
 
 # Importing definitions never allocates CUDA memory.
 DataStage.seed_everything(include_cuda=False)
-print("[PIPELINE] 1. Accelerator None  -> Pipeline.cpu_prepare()")
-print("[PIPELINE] 2. Accelerator GPU   -> Pipeline.gpu_attention()")
+print("[PIPELINE] 1. Accelerator None  -> Pipeline.cpu_prepare(reset_files=False)")
+print("[PIPELINE] 2. Accelerator GPU   -> Pipeline.gpu_attention(reset_files=False)")
 print("[PIPELINE] 3. Accelerator None  -> optional Pipeline.review()")
-print("[PIPELINE] 4. Accelerator None  -> Pipeline.cpu_final()")
+print("[PIPELINE] 4. Accelerator None  -> Pipeline.cpu_final(reset_files=False)")
+print("[FILES] Nothing is deleted unless reset_files=True is passed explicitly.")
