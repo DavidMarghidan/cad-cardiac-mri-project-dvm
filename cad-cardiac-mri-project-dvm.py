@@ -15,7 +15,9 @@ its own Kaggle accelerator mode:
    and paired AUC comparisons. Results are displayed directly in Kaggle.
 
 Generated files under ``current_run/`` are preserved by default. Nothing is deleted
-unless ``reset_files=True`` is passed explicitly:
+unless ``reset_files=True`` is passed explicitly. CPU/GPU hand-offs are validated with
+content fingerprints, not file modification times, so restarting a Kaggle session does
+not create a false "manual data changed" error:
 
 - ``cpu_prepare(reset_files=True)`` clears the complete generated run first;
 - ``gpu_attention(reset_files=True)`` clears only old Attention masks, checkpoints,
@@ -78,7 +80,8 @@ Sample=namedtuple("Sample", "image_path label patient_id series_id image_token s
 Workspace=namedtuple(
     "Workspace",
     "root current manual_masks manual_annotations dataset_manifest quality_audit "
-    "manual_audit accepted_targets predicted_masks prediction_audit checkpoints "
+    "manual_audit accepted_targets manual_snapshot predicted_masks prediction_audit "
+    "checkpoints attention_state attention_in_progress "
     "cross_class_matching_manifest cross_class_matching_summary",
 )
 
@@ -278,9 +281,14 @@ class DataStage:
             quality_audit=current / "image_quality.csv",
             manual_audit=current / "manual_targets_audit.csv",
             accepted_targets=current / "accepted_training_targets.csv",
+            # Snapshot of the exact manual masks and labels used by CPU preparation.
+            manual_snapshot=current / "manual_data_snapshot.json",
             predicted_masks=current / "predicted_attention_masks",
             prediction_audit=current / "attention_oof_predictions.csv",
             checkpoints=current / "temporary_checkpoints",
+            # One completed-run record plus a marker that survives interrupted GPU runs.
+            attention_state=current / "attention_run.json",
+            attention_in_progress=current / "attention_run_in_progress.json",
             cross_class_matching_manifest=current / "matching.csv",
             cross_class_matching_summary=current / "matching_summary.json",
         )
@@ -309,6 +317,8 @@ class DataStage:
         workspace.predicted_masks.mkdir(parents=True, exist_ok=True)
         workspace.checkpoints.mkdir(parents=True, exist_ok=True)
         workspace.prediction_audit.unlink(missing_ok=True)
+        workspace.attention_state.unlink(missing_ok=True)
+        workspace.attention_in_progress.unlink(missing_ok=True)
 
     # Explicitly remove the generated hand-off after final evaluation.
     # This helper is called only when reset_files=True.
@@ -316,28 +326,90 @@ class DataStage:
     def remove_current_run(workspace):
         shutil.rmtree(workspace.current, ignore_errors=True)
 
-    # Detect a manual edit made after CPU preparation. This prevents a user from
-    # accidentally training or evaluating with stale target tables after review.
+    # Hash a file by content. Timestamps are deliberately ignored because Kaggle may
+    # change them when /kaggle/working is restored in a new accelerator session.
     @staticmethod
-    def manual_data_changed_after(workspace, reference_path):
-        if not reference_path.is_file():
-            return True
-        latest=workspace.manual_annotations.stat().st_mtime_ns if workspace.manual_annotations.is_file() else 0
-        for mask_path in workspace.manual_masks.glob("*.png"):
-            latest=max(latest, mask_path.stat().st_mtime_ns)
-        return latest > reference_path.stat().st_mtime_ns
+    def file_sha256(path):
+        digest=hashlib.sha256()
+        with Path(path).open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
 
-    # Confirm that the saved OOF table was produced after the current preparation
-    # and after every checkpoint that currently exists. This prevents an old audit
-    # from being used if a preserved GPU rerun stopped before finishing prediction.
+    # Fingerprint exactly the persistent information a reviewer can change:
+    # manual_annotation_labels.csv plus every manual PNG name and byte content.
+    @staticmethod
+    def manual_data_fingerprint(workspace):
+        digest=hashlib.sha256(b"cad-manual-data-v1")
+        labels_exist=workspace.manual_annotations.is_file()
+        digest.update(b"labels-present=" + str(int(labels_exist)).encode("ascii"))
+        if labels_exist:
+            digest.update(DataStage.file_sha256(workspace.manual_annotations).encode("ascii"))
+
+        mask_paths=sorted(workspace.manual_masks.glob("*.png"), key=lambda path: path.name)
+        for mask_path in mask_paths:
+            digest.update(mask_path.name.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(DataStage.file_sha256(mask_path).encode("ascii"))
+
+        return {
+            "schema": "cad-manual-data-v1",
+            "fingerprint": digest.hexdigest(),
+            "manual_mask_files": len(mask_paths),
+            "manual_labels_present": labels_exist,
+        }
+
+    # Save the content snapshot only after CPU preparation has completed successfully.
+    @staticmethod
+    def save_manual_data_snapshot(workspace):
+        snapshot=DataStage.manual_data_fingerprint(workspace)
+        DataStage.write_json(workspace.manual_snapshot, snapshot)
+        return snapshot
+
+    # Detect a real manual edit after CPU preparation. Touching/copying unchanged files
+    # no longer invalidates the GPU stage because only content is compared.
+    @staticmethod
+    def manual_data_changed_after(workspace, reference_path=None):
+        saved=DataStage.read_json(workspace.manual_snapshot, {}) or {}
+        saved_fingerprint=str(saved.get("fingerprint", "")).strip()
+        if not saved_fingerprint:
+            return True
+        current=DataStage.manual_data_fingerprint(workspace)
+        return current["fingerprint"] != saved_fingerprint
+
+    # Fingerprint the exact CPU hand-off consumed by Attention training.
+    @staticmethod
+    def preparation_fingerprint(workspace):
+        if not workspace.dataset_manifest.is_file() or not workspace.accepted_targets.is_file():
+            return ""
+        snapshot=DataStage.read_json(workspace.manual_snapshot, {}) or {}
+        manual_fingerprint=str(snapshot.get("fingerprint", "")).strip()
+        if not manual_fingerprint:
+            return ""
+        payload={
+            "schema": "cad-cpu-handoff-v1",
+            "dataset_manifest": DataStage.file_sha256(workspace.dataset_manifest),
+            "accepted_targets": DataStage.file_sha256(workspace.accepted_targets),
+            "manual_data": manual_fingerprint,
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+
+    # Confirm that OOF predictions belong to the current CPU hand-off. A marker left by
+    # an interrupted GPU run prevents stale outputs from being mistaken for completion.
     @staticmethod
     def attention_outputs_are_current(workspace):
-        if not workspace.accepted_targets.is_file() or not workspace.prediction_audit.is_file():
+        if workspace.attention_in_progress.is_file():
             return False
-        newest_input=workspace.accepted_targets.stat().st_mtime_ns
-        for checkpoint in workspace.checkpoints.glob("attention_unet_fold_*.pt"):
-            newest_input=max(newest_input, checkpoint.stat().st_mtime_ns)
-        return workspace.prediction_audit.stat().st_mtime_ns >= newest_input
+        if not workspace.prediction_audit.is_file():
+            return False
+        state=DataStage.read_json(workspace.attention_state, {}) or {}
+        expected=DataStage.preparation_fingerprint(workspace)
+        if not expected or state.get("preparation_fingerprint") != expected:
+            return False
+        predictions=DataStage.read_csv(workspace.prediction_audit)
+        return len(predictions) == DataStage._as_int(state.get("images"), -1)
     # JSON is used only for the current matching hand-off and is never historical.
     @staticmethod
     def write_json(path, payload):
@@ -6169,10 +6241,19 @@ class Pipeline:
             accepted[0].keys(),
         )
 
+        # Store a content fingerprint after every mask/label write is complete. This is
+        # the CPU→GPU contract and remains valid across Kaggle session restarts.
+        manual_snapshot=DataStage.save_manual_data_snapshot(workspace)
+
         print("\n[MANUAL TARGETS]")
         display(pd.DataFrame([manual_summary]))
         print(f"[PERSISTENT] manual masks: {workspace.manual_masks}")
         print(f"[PERSISTENT] manual labels: {workspace.manual_annotations}")
+        print(
+            "[HAND-OFF] manual content snapshot: "
+            f"{manual_snapshot['manual_mask_files']} masks, "
+            f"fingerprint={manual_snapshot['fingerprint'][:12]}..."
+        )
         print(f"[HAND-OFF] current run: {workspace.current}")
         print("[NEXT] Enable a Kaggle GPU, restart, run the definitions cell, then run Pipeline.gpu_attention().")
 
@@ -6202,8 +6283,16 @@ class Pipeline:
             )
         if DataStage.manual_data_changed_after(workspace, workspace.accepted_targets):
             raise RuntimeError(
-                "Manual masks or labels changed after CPU preparation. Disable the GPU "
-                "and run Pipeline.cpu_prepare() again before training."
+                "The manual masks/labels do not match the CPU-preparation snapshot, or "
+                "the snapshot was created by an older notebook version. Disable the GPU "
+                "and run Pipeline.cpu_prepare() once with this fixed notebook."
+            )
+
+        preparation_fingerprint=DataStage.preparation_fingerprint(workspace)
+        if not preparation_fingerprint:
+            raise RuntimeError(
+                "The CPU hand-off fingerprint is missing. Disable the GPU and run "
+                "Pipeline.cpu_prepare() once with this fixed notebook."
             )
 
         # Training always starts from new model weights. With reset_files=False the
@@ -6214,6 +6303,17 @@ class Pipeline:
             print("[FILES] reset_files=True: previous Attention outputs were removed.")
         else:
             print("[FILES] reset_files=False: previous Attention files are preserved until overwritten.")
+
+        # The marker makes an interrupted run explicit instead of relying on mtimes.
+        gpu_run_id=uuid.uuid4().hex
+        DataStage.write_json(
+            workspace.attention_in_progress,
+            {
+                "schema": "cad-attention-run-v1",
+                "run_id": gpu_run_id,
+                "preparation_fingerprint": preparation_fingerprint,
+            },
+        )
 
         device=DataStage.start_device_stage("cuda", "Attention U-Net training + OOF prediction")
         try:
@@ -6228,6 +6328,18 @@ class Pipeline:
                 device,
                 checkpoints,
             )
+
+            # Commit the completed GPU hand-off only after every OOF row was written.
+            DataStage.write_json(
+                workspace.attention_state,
+                {
+                    "schema": "cad-attention-run-v1",
+                    "run_id": gpu_run_id,
+                    "preparation_fingerprint": preparation_fingerprint,
+                    "images": len(predictions),
+                },
+            )
+            workspace.attention_in_progress.unlink(missing_ok=True)
         finally:
             DataStage.finish_device_stage(
                 device,
@@ -6337,8 +6449,8 @@ class Pipeline:
             )
         if DataStage.manual_data_changed_after(workspace, workspace.accepted_targets):
             raise RuntimeError(
-                "Manual masks or labels changed after the current models were prepared. "
-                "Run Pipeline.cpu_prepare() and Pipeline.gpu_attention() again."
+                "Manual mask or label content changed after CPU preparation. Run "
+                "Pipeline.cpu_prepare() and Pipeline.gpu_attention() again."
             )
         if len(predictions) != len(rows):
             raise RuntimeError(
@@ -6397,3 +6509,4 @@ print("[PIPELINE] 2. Accelerator GPU   -> Pipeline.gpu_attention(reset_files=Fal
 print("[PIPELINE] 3. Accelerator None  -> optional Pipeline.review()")
 print("[PIPELINE] 4. Accelerator None  -> Pipeline.cpu_final(reset_files=False)")
 print("[FILES] Nothing is deleted unless reset_files=True is passed explicitly.")
+print("[VALIDATION] CPU/GPU hand-offs use content fingerprints, not file timestamps.")
