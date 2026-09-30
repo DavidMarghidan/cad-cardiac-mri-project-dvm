@@ -4,3 +4,5 @@
 /.idea
 /.vs
 /__pycache__
+/.vscode
+/cad_attention_unet_workspace
