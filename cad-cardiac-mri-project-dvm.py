@@ -4986,7 +4986,6 @@ class MatchingStage:
         selected_fraction_eligible=len(selected) / max(1, len(eligible_rows))
         selected_fraction_dataset=len(selected) / max(1, len(dataset_rows))
         summary={
-            "fingerprint": fingerprint,
             **MatchingStage.matching_settings_payload(),
             "dataset_images": len(dataset_rows),
             "eligible_images": len(eligible_rows),
