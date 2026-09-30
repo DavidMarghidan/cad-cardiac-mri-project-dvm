@@ -1,33 +1,20 @@
-"""Very simple stateless cardiac MRI CAD research pipeline.
+"""Simple stage-based cardiac MRI CAD research pipeline.
 
-ONLY TWO THINGS ARE PERSISTENT
-==============================
-1. ``manual_masks/`` — masks drawn or corrected by the reviewer.
-2. ``manual_annotation_labels.csv`` — HEART_PRESENT / NO_HEART_VISIBLE / UNUSABLE labels.
+The file is intentionally organized like the research workflow, not like a software
+framework. Only manual masks and explicit labels persist between runs. Everything
+else is rebuilt from scratch and displayed in Kaggle.
 
-Everything else is rebuilt from scratch every time ``run_pipeline()`` is called:
-- dataset manifest and image-quality audit;
-- all five Attention U-Net models;
-- all out-of-fold automatic masks;
-- Sick/Normal matching;
-- all EfficientNet features;
-- nested patient-level evaluation and paired AUC comparisons.
+PIPELINE
+1. DataStage       -> dataset, preprocessing, quality, manual targets
+2. AttentionStage  -> five patient-level cross-fit Attention U-Nets + OOF masks
+3. ReviewStage     -> optional HTML review of unresolved masks
+4. MatchingStage   -> balanced Sick/Normal acquisition matching
+5. FeatureStage    -> frozen EfficientNet features for all 11 experiments
+6. EvaluationStage -> nested patient-level classification + paired AUC tests
+7. Pipeline        -> the two commands a user normally calls
 
-RESEARCH PIPELINE
-=================
-1. Discover patients and assign patient-level folds.
-2. Preprocess images and validate the persistent manual targets.
-3. Train five patient-level cross-fitted 2.5D Attention U-Nets.
-4. Predict one genuinely out-of-fold mask for every image.
-5. Optionally inspect/correct masks with the HTML editor.
-6. Match Sick and Normal slices inside comparable acquisition families.
-7. Extract frozen EfficientNet features for all 11 experiments.
-8. Aggregate by patient and run nested patient-level evaluation.
-
-The code intentionally avoids a software-framework architecture. Functions are
-placed in research order, values that are used once are written directly beside
-the operation they control, and classes remain only where PyTorch or the HTML
-editor genuinely requires object state.
+Scientific safeguards remain unchanged: patient-level folds, out-of-fold masks,
+same-slice controls, matched cohorts, and patient-level evaluation.
 """
 
 import base64
@@ -45,7 +32,6 @@ import tempfile
 import uuid
 from collections import OrderedDict, defaultdict, namedtuple
 from pathlib import Path
-
 import cv2
 import numpy as np
 import pandas as pd
@@ -73,184 +59,7 @@ from tqdm.auto import tqdm
 
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
-PIPELINE_VERSION="2026-09-30-stateless-research-v1"
-
-
-# Convert CSV/string values safely before numeric comparisons.
-def _as_float(value, default=0.0):
-    try:
-        result=float(value)
-    except (TypeError, ValueError):
-        return float(default)
-    return result if np.isfinite(result) else float(default)
-
-
-# Convert CSV/string values safely to an integer.
-def _as_int(value, default=0):
-    return int(round(_as_float(value, float(default))))
-
-
-# Find the CAD dataset in Kaggle, an environment override, or the local fallback.
-def _default_dataset_path():
-    env_value=os.environ.get("CAD_DATASET_PATH", "").strip()
-    candidates=[]
-    if env_value:
-        candidates.append(Path(env_value))
-    candidates.extend(
-        [
-            Path("/kaggle/input/cad-cardiac-mri-dataset"),
-            Path("/kaggle/input/datasets/danialsharifrazi/cad-cardiac-mri-dataset"),
-            Path(r"C:\F\_Develop\AI\Datasets\CAD Cardiac MRI Dataset"),
-        ]
-    )
-
-    def is_dataset_root(path):
-        return path.is_dir() and (path / "Normal").is_dir() and (path / "Sick").is_dir()
-
-    for candidate in candidates:
-        if is_dataset_root(candidate):
-            return candidate
-
-    kaggle_input=Path("/kaggle/input")
-    if kaggle_input.is_dir():
-        for current_root, directory_names, _ in os.walk(kaggle_input):
-            current=Path(current_root)
-            try:
-                depth=len(current.relative_to(kaggle_input).parts)
-            except ValueError:
-                depth=99
-            if {"Normal", "Sick"}.issubset(set(directory_names)):
-                return current
-            if depth >= 3:
-                directory_names[:]=[]
-
-    return candidates[0] if candidates else Path.cwd() / "CAD Cardiac MRI Dataset"
-
-
-# Choose the persistent workspace shared by CPU and GPU Kaggle sessions.
-def _default_workspace_path():
-    if Path("/kaggle/working").exists():
-        return Path("/kaggle/working/cad_attention_unet_workspace")
-    return Path.cwd() / "cad_attention_unet_workspace"
-
-
-# =============================================================================
-# SHARED BASICS — small utilities used by several research steps
-# =============================================================================
-# Keep this section intentionally short. Research-specific code starts below.
-
-
-# Shared seed that makes patient folds, sampling, and evaluation reproducible.
-RANDOM_SEED=42
-
-
-
-# Seed Python, NumPy and PyTorch so patient folds and training are reproducible.
-def seed_everything(seed=None, include_cuda=False):
-    seed=int(RANDOM_SEED if seed is None else seed)
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.set_num_threads(max(1, min(8, os.cpu_count() or 1)))
-    if include_cuda:
-        torch.cuda.manual_seed_all(seed)
-        # Deterministic algorithms were disabled in the researched runs; cuDNN
-        # may therefore choose its fastest kernel for the current GPU shapes.
-        torch.backends.cudnn.deterministic=False
-        torch.backends.cudnn.benchmark=True
-
-# Initialize only the CPU/GPU resources needed by the current research stage.
-def start_device_stage(requested, stage_name):
-    # A stage chooses CPU or CUDA only when it starts. Importing this file never
-    # allocates GPU memory, which is important when moving between Kaggle sessions.
-    requested=(requested or "cpu").strip().lower()
-    if requested == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA was requested but is unavailable. Enable a Kaggle GPU.")
-    if requested not in {"cpu", "cuda", "auto"}:
-        raise ValueError("device must be 'cpu', 'cuda', or 'auto'.")
-    if requested == "auto":
-        requested="cuda" if torch.cuda.is_available() else "cpu"
-    device=torch.device(requested)
-    seed_everything(include_cuda=device.type == "cuda")
-    if device.type == "cuda":
-        release_device(device)
-        try:
-            torch.cuda.reset_peak_memory_stats(device)
-        except Exception:
-            pass
-    print(f"[DEVICE] {stage_name}: {device.type}")
-    return device
-
-
-# Report peak GPU memory when relevant, then release stage resources.
-def finish_device_stage(device, stage_name):
-    # Print peak GPU memory when CUDA supplied this stage.
-    if device.type == "cuda":
-        try:
-            peak_gb=torch.cuda.max_memory_allocated(device) / (1024 ** 3)
-            print(f"[DEVICE] {stage_name}: peak GPU={peak_gb:.2f} GB")
-        except Exception:
-            pass
-    # Release Python and CUDA memory regardless of the stage result.
-    release_device(device)
-    print(f"[DEVICE] {stage_name}: resources released")
-
-
-# Move a neural model to the selected device and efficient CUDA memory layout.
-def prepare_model(model, device):
-    model=model.to(device)
-    if device.type == "cuda":
-        model=model.to(memory_format=torch.channels_last)
-    return model
-
-# Move a tensor to the active stage device without changing its values.
-def move_tensor(tensor, device):
-    tensor=tensor.to(device, non_blocking=device.type == "cuda")
-    if device.type == "cuda" and tensor.ndim == 4:
-        tensor=tensor.contiguous(memory_format=torch.channels_last)
-    return tensor
-
-# Use mixed precision only on CUDA; CPU execution remains ordinary float32.
-def autocast(device):
-    enabled=device.type == "cuda"
-    if not enabled:
-        return contextlib.nullcontext()
-    try:
-        return torch.autocast(device_type="cuda", dtype=torch.float16)
-    except (AttributeError, TypeError):
-        return torch.cuda.amp.autocast(enabled=True)
-
-# Create the AMP gradient scaler used by GPU Attention U-Net training.
-def grad_scaler(device):
-    enabled=device.type == "cuda"
-    try:
-        return torch.amp.GradScaler("cuda", enabled=enabled)
-    except (AttributeError, TypeError):
-        return torch.cuda.amp.GradScaler(enabled=enabled)
-
-# Free Python/CUDA caches between folds and between Kaggle stages.
-def release_device(device):
-    gc.collect()
-    if device.type == "cuda" and torch.cuda.is_available():
-        try:
-            torch.cuda.synchronize(device)
-        except Exception:
-            pass
-        torch.cuda.empty_cache()
-
-# Format stage timing for concise console output.
-def format_seconds(seconds):
-    seconds=max(0, int(round(seconds)))
-    hours, seconds=divmod(seconds, 3600)
-    minutes, seconds=divmod(seconds, 60)
-    if hours:
-        return f"{hours}h {minutes:02d}m {seconds:02d}s"
-    if minutes:
-        return f"{minutes}m {seconds:02d}s"
-    return f"{seconds}s"
-
-
-# Lightweight records keep paths explicit without custom data classes.
+# Stable records used to pass rows between stages.
 Sample=namedtuple("Sample", "image_path label patient_id series_id image_token segmentation_fold")
 Workspace=namedtuple(
     "Workspace",
@@ -260,984 +69,1101 @@ Workspace=namedtuple(
     "feature_bank feature_metadata",
 )
 
-
-# Only manual masks and their labels live in /kaggle/working.
-# Every other path belongs to a new temporary directory and disappears with the session.
-def create_workspace(manual_root=None):
-    manual_root=Path(manual_root or _default_workspace_path())
-    manual_masks=manual_root / "manual_masks"
-    manual_labels=manual_root / "manual_annotation_labels.csv"
-    manual_masks.mkdir(parents=True, exist_ok=True)
-
-    # A fresh temporary workspace guarantees that training, predictions, matching,
-    # features, and evaluation are recomputed on every run instead of reused.
-    root=Path(tempfile.mkdtemp(prefix="cad_research_run_"))
-    outputs=root / "outputs"
-    workspace=Workspace(
-        root=root,
-        manual_masks=manual_masks,
-        predicted_masks=root / "predicted_attention_masks",
-        mask_overlays=root / "mask_overlays",
-        checkpoints=root / "checkpoints",
-        outputs=outputs,
-        dataset_manifest=root / "dataset_manifest.csv",
-        quality_audit=root / "image_quality.csv",
-        manual_audit=root / "manual_audit.csv",
-        manual_annotations=manual_labels,
-        prediction_audit=root / "attention_predictions.csv",
-        prediction_parts_dir=outputs / "prediction_parts",
-        review_history=root / "review_history.csv",
-        prediction_summary=root / "prediction_summary.json",
-        cross_class_matching_manifest=root / "matching.csv",
-        cross_class_matching_summary=root / "matching_summary.json",
-        feature_bank=root / "feature_bank.npz",
-        feature_metadata=root / "feature_metadata.json",
-    )
-    for folder in (root, outputs, workspace.predicted_masks, workspace.mask_overlays,
-                   workspace.checkpoints, workspace.prediction_parts_dir):
-        folder.mkdir(parents=True, exist_ok=True)
-    return workspace
-
-
-# JSON is used only inside the temporary run directory.
-def write_json(path, payload):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str), encoding="utf-8")
-
-
-# Read cache metadata; return a simple fallback when the file is absent/corrupt.
-def read_json(path, default=None):
-    if not path.is_file():
-        return default
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return default
-
-# Write persistent audit/label tables that later stages must reuse.
-def write_csv(path, rows, fields):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(fields), extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows({field: row.get(field, "") for field in fields} for row in rows)
-
-
-# Read a persisted audit/label table as ordinary dictionaries.
-def read_csv(path):
-    if not path.is_file():
-        return []
-    with path.open(newline="", encoding="utf-8") as handle:
-        return list(csv.DictReader(handle))
-
-# Save manual or OOF binary masks used by later pipeline stages.
-def write_png(path, image):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    ok = cv2.imwrite(str(path), np.asarray(image), [cv2.IMWRITE_PNG_COMPRESSION, 9])
-    if not ok:
-        raise RuntimeError(f"OpenCV could not write PNG: {path}")
-
-
-# Hash masks/checkpoints so cache reuse is tied to their actual contents.
-
-
-# -----------------------------------------------------------------------------
-# STEP 1 — DATASET: patient IDs, folds, slice sequence, and persistent paths
-# -----------------------------------------------------------------------------
-
-
-# Load the GPU prediction table and optionally require one OOF mask per image.
-
-
-# Create a stable image identifier from its patient-relative path.
-def image_token(image_path, patient_id, series_id):
-    # Hash the path starting at Directory_* so tokens remain stable if the dataset
-    # is mounted under a different Kaggle/local root.
-    parts=image_path.parts
-    patient_index=next(
-        (i for i, part in enumerate(parts) if str(part).startswith("Directory_")),
-        None,
-    )
-    if patient_index is None:
-        raise ValueError(f"Path does not contain Directory_*: {image_path}")
-    relative="/".join(map(str, parts[patient_index:]))
-    digest=hashlib.sha256(relative.encode("utf-8")).hexdigest()[:20]
-    safe_series=str(series_id).replace("/", "__").replace("\\", "__").replace(" ", "_")
-    return f"{patient_id}__{safe_series}__{digest}"
-
-# Fold assignment is derived only from patient identity and class label.
-# No image-level random split is permitted because thousands of correlated
-# slices from one patient would otherwise leak into both train and validation.
-def patient_folds(
-    patients,
-):
-    if isinstance(patients, dict):
-        groups=defaultdict(list)
-        for patient_id, label in patients.items():
-            groups[int(label)].append(str(patient_id))
-    else:
-        groups={0: list(map(str, patients))}
-
-    result={}
-    for label, patient_ids in sorted(groups.items()):
-        ordered=sorted(
-            set(patient_ids),
-            key=lambda patient_id: hashlib.sha256(
-                f"{RANDOM_SEED}|segmentation-fold|{label}|{patient_id}".encode("utf-8")
-            ).hexdigest(),
-        )
-        for index, patient_id in enumerate(ordered):
-            result[patient_id]=index % int(FOLDS)
-    return result
-
-# Scan Normal/Sick folders and create one record per MRI slice.
-def discover_dataset(dataset_path, workspace=None):
-    dataset_path=Path(dataset_path)
-    started=time.perf_counter()
-    raw_rows=[]
-    patient_to_label={}
-
-    for class_name, label in (("Normal", 0), ("Sick", 1)):
-        class_path=dataset_path / class_name
-        if not class_path.is_dir():
-            raise FileNotFoundError(f"Missing directory: {class_path}")
-
-        for patient_path in sorted(class_path.iterdir()):
-            if not patient_path.is_dir() or not patient_path.name.lower().startswith("directory_"):
-                continue
-            patient_id=patient_path.name
-            old_label=patient_to_label.get(patient_id)
-            if old_label is not None and old_label != label:
-                raise RuntimeError(f"{patient_id} appears in both classes.")
-            patient_to_label[patient_id]=label
-
-
-            for image_path in sorted(patient_path.iterdir()):
-                if image_path.is_file() and image_path.suffix.lower() in {".png", ".jpg", ".jpeg"}:
-                    raw_rows.append((image_path, label, patient_id, f"{patient_id}/__ROOT__"))
-
-
-            for series_path in sorted(path for path in patient_path.iterdir() if path.is_dir()):
-                series_id=f"{patient_id}/{series_path.name}"
-                for image_path in sorted(series_path.rglob("*")):
-                    if image_path.is_file() and image_path.suffix.lower() in {".png", ".jpg", ".jpeg"}:
-                        raw_rows.append((image_path, label, patient_id, series_id))
-
-    if not raw_rows:
-        raise RuntimeError(f"No images were found in {dataset_path}")
-
-    folds=patient_folds(patient_to_label)
-    samples=[
-        Sample(
-            image_path=str(path),
-            label=int(label),
-            patient_id=patient_id,
-            series_id=series_id,
-            image_token=image_token(path, patient_id, series_id),
-            segmentation_fold=int(folds[patient_id]),
-        )
-        for path, label, patient_id, series_id in raw_rows
-    ]
-
-    if len({sample.image_token for sample in samples}) != len(samples):
-        raise RuntimeError("Duplicate image tokens were generated.")
-
-    rows=[
-        {
-            "manifest_index": index,
-            "image_token": sample.image_token,
-            "image_path": sample.image_path,
-            "label": sample.label,
-            "patient_id": sample.patient_id,
-            "series_id": sample.series_id,
-            "segmentation_fold": sample.segmentation_fold,
-            "manual_mask_path": str((workspace.manual_masks if workspace else Path("manual_masks")) / f"{sample.image_token}.png"),
-            "predicted_attention_mask_path": str((workspace.predicted_masks if workspace else Path("predicted_attention_masks")) / f"{sample.image_token}.png"),
-        }
-        for index, sample in enumerate(samples)
-    ]
-    if workspace is not None:
-        write_csv(workspace.dataset_manifest, rows, rows[0].keys())
-
-    print("[DATA] Patients:", len(patient_to_label))
-    print("[DATA] Normal:", sum(label == 0 for label in patient_to_label.values()))
-    print("[DATA] Sick:", sum(label == 1 for label in patient_to_label.values()))
-    print("[DATA] Images:", len(samples))
-    print("[DATA] Series proxies:", len({sample.series_id for sample in samples}))
-    print("[DATA] Scan time:", format_seconds(time.perf_counter() - started))
-    return samples
-
-# Sort slice filenames numerically (img2 before img10) when building sequence context.
-def natural_path_key(path):
-    return tuple(
-        int(part) if part.isdigit() else part.lower()
-        for part in re.split(r"(\d+)", str(path))
-    )
-
-# Add sequence neighbours so 2.5D Attention uses previous/current/next frames.
-def build_dataset_rows(samples, workspace):
-    rows=[
-        {
-            "manifest_index": index,
-            "image_token": sample.image_token,
-            "image_path": sample.image_path,
-            "label": sample.label,
-            "patient_id": sample.patient_id,
-            "series_id": sample.series_id,
-            "segmentation_fold": sample.segmentation_fold,
-            "manual_mask_path": str(workspace.manual_masks / f"{sample.image_token}.png"),
-            "predicted_attention_mask_path": str(workspace.predicted_masks / f"{sample.image_token}.png"),
-        }
-        for index, sample in enumerate(samples)
-    ]
-
-
-    by_sequence_group=defaultdict(list)
-    for index, row in enumerate(rows):
-
-
-        parent=str(Path(row["image_path"]).parent)
-        sequence_group=f"{row['series_id']}::{parent}"
-        row["sequence_group_id"]=sequence_group
-        by_sequence_group[sequence_group].append(index)
-    for indices in by_sequence_group.values():
-        ordered=sorted(
-            indices,
-            key=lambda index: natural_path_key(rows[index]["image_path"]),
-        )
-        for position, row_index in enumerate(ordered):
-            previous_index=ordered[max(0, position - 1)]
-            next_index=ordered[min(len(ordered) - 1, position + 1)]
-            rows[row_index]["sequence_index"]=int(position)
-            rows[row_index]["sequence_length"]=int(len(ordered))
-            rows[row_index]["previous_image_path"]=rows[previous_index]["image_path"]
-            rows[row_index]["next_image_path"]=rows[next_index]["image_path"]
-
-    if rows:
-        write_csv(workspace.dataset_manifest, rows, rows[0].keys())
-    return rows
-
-
-# -----------------------------------------------------------------------------
-# STEP 2 — MANUAL TARGETS: preprocessing, image quality, and mask audit
-# -----------------------------------------------------------------------------
-# --- Image processing ---------------------------------------------------------------
-
-# Image preprocessing and quality settings.
-# Square image size used by the Attention U-Net and mask editor.
-SEGMENTATION_SIZE=256
-
-# Square image size used by EfficientNet-B0.
-CLASSIFICATION_SIZE=224
-
-
-# Read gray.
-def read_gray(path):
-    image=cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
-    if image is None:
-        raise FileNotFoundError(f"OpenCV cannot read image: {path}")
-    return image
-
-
-# Detect near-black, low-variance border lines that are safe to treat as scanner padding.
-def is_dark_uniform_line(line):
-    values=np.asarray(line, dtype=np.float32).reshape(-1)
-    return bool(
-        values.size
-        and float(values.mean()) <= 12.0
-        and float(values.std()) <= 4.0
-        and float(np.mean(values <= 20))
-        >= 0.98
-    )
-
-# Find conservative crop bounds without using CAD labels or model outputs.
-def detect_padding_bounds(image):
-    if image.ndim != 2:
-        raise ValueError("The image must be a 2D grayscale array.")
-    height, width=image.shape
-    # Padding removal is deliberately conservative: at least 60% of each
-    # original dimension must remain, and at most 20% is removed from one side.
-    min_height=max(8, int(np.ceil(height * 0.60)))
-    min_width=max(8, int(np.ceil(width * 0.60)))
-    max_vertical=int(np.floor(height * 0.20))
-    max_horizontal=int(np.floor(width * 0.20))
-
-    top=0
-    while top < max_vertical and height - top - 1 >= min_height and is_dark_uniform_line(image[top, :]):
-        top +=1
-    bottom_crop=0
-    while bottom_crop < max_vertical and height - top - bottom_crop - 1 >= min_height and is_dark_uniform_line(image[height - 1 - bottom_crop, :]):
-        bottom_crop +=1
-    left=0
-    while left < max_horizontal and width - left - 1 >= min_width and is_dark_uniform_line(image[:, left]):
-        left +=1
-    right_crop=0
-    while right_crop < max_horizontal and width - left - right_crop - 1 >= min_width and is_dark_uniform_line(image[:, width - 1 - right_crop]):
-        right_crop +=1
-
-    if top < 2:
-        top=0
-    if bottom_crop < 2:
-        bottom_crop=0
-    if left < 2:
-        left=0
-    if right_crop < 2:
-        right_crop=0
-
-    bottom=height - bottom_crop
-    right=width - right_crop
-    if bottom - top < min_height or right - left < min_width:
-        return 0, height, 0, width
-    return int(top), int(bottom), int(left), int(right)
-
-# Scale intensities with 1st/99th percentiles so isolated extremes do not dominate.
-def robust_scale(image):
-    image=np.asarray(image, dtype=np.float32)
-    lower, upper=np.percentile(
-        image,
-        [1.0, 99.0],
-    )
-    lower, upper=float(lower), float(upper)
-    if not np.isfinite(lower) or not np.isfinite(upper) or upper <= lower:
-        lower, upper=float(image.min()), float(image.max())
-    if upper <= lower:
-        return np.zeros_like(image, dtype=np.float32), lower, upper
-    scaled=np.clip(image, lower, upper)
-    return ((scaled - lower) / (upper - lower)).astype(np.float32), lower, upper
-
-# Compute the resize and centering geometry used by both images and masks.
-def canvas_geometry(height, width):
-    size=SEGMENTATION_SIZE
-    long_side=240
-    scale=float(long_side / max(height, width))
-    resized_height=max(1, int(round(height * scale)))
-    resized_width=max(1, int(round(width * scale)))
-    if height >= width:
-        resized_height=long_side
-    else:
-        resized_width=long_side
-    resized_height=min(resized_height, size)
-    resized_width=min(resized_width, size)
-    top=(size - resized_height) // 2
-    left=(size - resized_width) // 2
-    return resized_height, resized_width, top, left, scale
-
-# Resize one image while preserving aspect ratio and center it on the fixed canvas.
-def to_canvas(image):
-    image=np.asarray(image, dtype=np.float32)
-    height, width=image.shape
-    resized_height, resized_width, top, left, scale=canvas_geometry(height, width)
-    if (resized_height, resized_width) != (height, width):
-        interpolation=cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
-        resized=cv2.resize(image, (resized_width, resized_height), interpolation=interpolation)
-    else:
-        resized=image
-    canvas=np.zeros(
-        (SEGMENTATION_SIZE, SEGMENTATION_SIZE),
-        dtype=np.float32,
-    )
-    canvas[top : top + resized_height, left : left + resized_width]=np.clip(resized, 0.0, 1.0)
-    return canvas
-
-
-# Remove only dark padding, robust-scale intensities, and center content on 256×256.
-def standardize_image(image):
-    top, bottom, left, right=detect_padding_bounds(image)
-    cropped=image[top:bottom, left:right]
-    if cropped.size == 0:
-        raise RuntimeError("Automatic cropping produced an empty image.")
-    robust, _, _=robust_scale(cropped)
-    # A second min-max view is kept because the original research pipeline used it
-    # when checking preprocessing consistency, while classifiers use robust/raw views.
-    cropped_float=cropped.astype(np.float32)
-    low=float(cropped_float.min())
-    high=float(cropped_float.max())
-    minmax=(cropped_float - low) / (high - low) if high > low else np.zeros_like(cropped_float)
-    raw=cropped_float / 255.0
-    robust_canvas=to_canvas(robust)
-    minmax_canvas=to_canvas(minmax)
-    raw_canvas=to_canvas(raw)
-    resized_height, resized_width, top_pad, left_pad, _=canvas_geometry(*cropped.shape)
-    content=np.zeros((SEGMENTATION_SIZE, SEGMENTATION_SIZE), dtype=np.float32)
-    content[top_pad:top_pad + resized_height, left_pad:left_pad + resized_width]=1.0
-    return robust_canvas, minmax_canvas, raw_canvas, content
-
-# Return the canonical 256×256 robust-scaled image used by Attention U-Net.
-def standardized_uint8(path):
-    image=read_gray(path)
-    robust, _, _, _=standardize_image(image)
-    return np.clip(np.round(robust * 255.0), 0, 255).astype(np.uint8)
-
-# Create the robust/raw/content views later combined with ROI or complement masks.
-def classifier_views(path):
-    image=read_gray(path)
-    robust, _, raw, content=standardize_image(image)
-    size=CLASSIFICATION_SIZE
-    robust_224=cv2.resize(robust, (size, size), interpolation=cv2.INTER_AREA)
-    raw_224=cv2.resize(raw, (size, size), interpolation=cv2.INTER_AREA)
-    content_224=cv2.resize(content, (size, size), interpolation=cv2.INTER_NEAREST)
-    return (
-        robust_224.astype(np.float32),
-        raw_224.astype(np.float32),
-        (content_224 > 0.5).astype(np.float32),
-    )
-
-# Build a compact appearance hash used for duplicate-aware review and matching.
-def perceptual_hash(image):
-    resized=cv2.resize(image, (32, 32), interpolation=cv2.INTER_AREA)
-    values=cv2.dct(resized.astype(np.float32))[:8, :8].reshape(-1)
-    median=float(np.median(values[1:]))
-    bits=values > median
-    number=0
-    for bit in bits:
-        number=(number << 1) | int(bool(bit))
-    return f"{number:016x}"
-
-
-# A small in-memory cache avoids decoding the same neighbouring MRI frames repeatedly.
-IMAGE_CACHE=OrderedDict()
-
-
-# Reuse recently standardized slices to avoid repeating OpenCV preprocessing.
-def get_cached_image(path):
-    if path in IMAGE_CACHE:
-        value=IMAGE_CACHE.pop(path)
-        IMAGE_CACHE[path]=value
-        return value.copy()
-    value=standardized_uint8(path)
-    IMAGE_CACHE[path]=value
-    while len(IMAGE_CACHE) > 2048:
-        IMAGE_CACHE.popitem(last=False)
-    return value.copy()
-
-
-# Release standardized-image RAM between expensive stages.
-def clear_image_cache():
-    IMAGE_CACHE.clear()
-
-
-
-# Measure sharpness, noise, dynamic range, and perceptual hash for one slice.
-def image_quality_metrics(row):
-    image=read_gray(row["image_path"])
-    robust, _, raw, content=standardize_image(image)
-    coordinates=np.argwhere(content > 0.5)
-    if not len(coordinates):
-        return {
-            "perceptual_hash": "",
-            "sharpness": np.nan,
-            "noise_ratio": np.nan,
-            "dynamic_range": np.nan,
-        }
-    top, left=coordinates.min(axis=0)
-    bottom, right=coordinates.max(axis=0) + 1
-    size=128
-    robust_thumb=cv2.resize(
-        robust[top:bottom, left:right], (size, size), interpolation=cv2.INTER_AREA
-    )
-    raw_thumb=cv2.resize(
-        raw[top:bottom, left:right], (size, size), interpolation=cv2.INTER_AREA
-    )
-    robust_u8=np.clip(np.round(robust_thumb * 255.0), 0, 255).astype(np.uint8)
-    raw_255=np.clip(raw_thumb * 255.0, 0.0, 255.0).astype(np.float32)
-    sharpness=float(cv2.Laplacian(robust_u8, cv2.CV_32F).var())
-    residual=raw_255 - cv2.GaussianBlur(raw_255, (3, 3), 0)
-    residual_median=float(np.median(residual))
-    noise_sigma=float(np.median(np.abs(residual - residual_median)) / 0.6744897501960817)
-    lower, upper=np.percentile(raw_255, [5.0, 95.0])
-    dynamic_range=float(max(upper - lower, 0.0))
-    return {
-        "perceptual_hash": perceptual_hash(robust_u8),
-        "sharpness": sharpness,
-        "noise_ratio": float(noise_sigma / max(dynamic_range, 1.0)),
-        "dynamic_range": dynamic_range,
-    }
-
-# Measure blur/noise/dynamic range and reuse unchanged image measurements.
-def build_quality_audit(rows, workspace, refresh=False):
-    existing={
-        row.get("image_token", ""): row
-        for row in read_csv(workspace.quality_audit)
-    }
-    records=[]
-    started=time.perf_counter()
-    for index, row in enumerate(rows, start=1):
-        path=Path(row["image_path"])
-        file_stat=path.stat() if path.is_file() else None
-        size_bytes=file_stat.st_size if file_stat is not None else -1
-        mtime_ns=file_stat.st_mtime_ns if file_stat is not None else -1
-        old=existing.get(row["image_token"], {})
-        reusable=(
-            not refresh
-            and old
-            and old.get("image_path") == str(path)
-            and _as_int(old.get("image_size_bytes"), -2) == int(size_bytes)
-            and _as_int(old.get("image_mtime_ns"), -2) == int(mtime_ns)
-            and old.get("perceptual_hash")
-        )
-        if reusable:
-            record=dict(old)
-        else:
-            metrics=image_quality_metrics(row)
-            record={
-                "image_token": row["image_token"],
-                "image_path": str(path),
-                "patient_id": row["patient_id"],
-                "series_id": row["series_id"],
-                "image_size_bytes": int(size_bytes),
-                "image_mtime_ns": int(mtime_ns),
-                **metrics,
-            }
-        records.append(record)
-        if index == 1 or index % 5000 == 0 or index == len(rows):
-            print(
-                f"[QUALITY] {index}/{len(rows)} | "
-                f"{format_seconds(time.perf_counter() - started)}"
-            )
-
-    by_patient=defaultdict(list)
-    for record in records:
-        by_patient[str(record["patient_id"])].append(record)
-
-    for patient_rows in by_patient.values():
-        sharp=np.asarray([_as_float(row.get("sharpness"), np.nan) for row in patient_rows])
-        noise=np.asarray([_as_float(row.get("noise_ratio"), np.nan) for row in patient_rows])
-        finite_sharp=sharp[np.isfinite(sharp)]
-        finite_noise=noise[np.isfinite(noise)]
-        blur_threshold=float(4.0)
-        noise_threshold=float(0.30)
-        if len(finite_sharp) >= 5:
-            blur_threshold=max(
-                blur_threshold,
-                float(np.quantile(finite_sharp, 0.03)),
-            )
-        if len(finite_noise) >= 5:
-            noise_threshold=min(
-                noise_threshold,
-                float(np.quantile(finite_noise, 0.97)),
-            )
-        for record in patient_rows:
-            sharpness=float(record.get("sharpness", np.nan))
-            noise_ratio=float(record.get("noise_ratio", np.nan))
-            dynamic_range=float(record.get("dynamic_range", np.nan))
-            reasons=[]
-            if not np.isfinite(dynamic_range) or dynamic_range < 12.0:
-                reasons.append("low_dynamic_range")
-            if not np.isfinite(sharpness) or sharpness < blur_threshold:
-                reasons.append("blurred")
-            if not np.isfinite(noise_ratio) or noise_ratio > noise_threshold:
-                reasons.append("noisy")
-            record["patient_blur_threshold"]=blur_threshold
-            record["patient_noise_threshold"]=noise_threshold
-            record["quality_valid"]=int(not reasons)
-            record["quality_reason"]=";".join(reasons)
-
-    write_csv(workspace.quality_audit, records, records[0].keys())
-    valid=sum(int(row["quality_valid"]) for row in records)
-    print(f"[QUALITY] valid={valid}/{len(records)} | {workspace.quality_audit}")
-    return {str(row["image_token"]): row for row in records}
-
-
-HEART_PRESENT="HEART_PRESENT"
-NO_HEART_VISIBLE="NO_HEART_VISIBLE"
-UNUSABLE="UNUSABLE"
-VALID_TARGET_TYPES={HEART_PRESENT, NO_HEART_VISIBLE, UNUSABLE}
-
-ANNOTATION_FIELDS=(
-    "timestamp_utc",
-    "image_token",
-    "patient_id",
-    "series_id",
-    "target_type",
-    "source",
-    "sample_weight",
-    "note",
+# Manual target labels are semantic values, not experiment settings.
+HEART_PRESENT = "HEART_PRESENT"
+NO_HEART_VISIBLE = "NO_HEART_VISIBLE"
+UNUSABLE = "UNUSABLE"
+VALID_TARGET_TYPES = {HEART_PRESENT, NO_HEART_VISIBLE, UNUSABLE}
+ANNOTATION_FIELDS = (
+    "timestamp_utc", "image_token", "patient_id", "series_id",
+    "target_type", "source", "sample_weight", "note",
 )
 
+# =============================================================================
+# STAGE 1 — DATASET, PREPROCESSING, QUALITY, AND MANUAL TARGETS
+# =============================================================================
+class DataStage:
+    """Everything needed before neural training.
 
-# Read binary mask.
-def read_binary_mask(path, size=None):
-    mask=cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
-    if mask is None:
-        raise FileNotFoundError(f"Mask cannot be read: {path}")
-    size=int(size or SEGMENTATION_SIZE)
-    if mask.shape != (size, size):
-        mask=cv2.resize(mask, (size, size), interpolation=cv2.INTER_NEAREST)
-    return (mask > 127).astype(np.uint8)
+    No audit/history file is reused. The dataset and quality measurements are rebuilt
+    every run. Only manual PNG masks and manual labels are persistent.
+    """
 
-# Check whether a saved manual mask is readable and has a plausible non-trivial area.
-def manual_mask_qc(path):
-    path=Path(path)
-    if not path.is_file():
-        return {"exists": 0, "usable": 0, "area_ratio": np.nan, "reason": "missing"}
-    try:
-        mask=read_binary_mask(path)
-    except Exception:
-        return {"exists": 1, "usable": 0, "area_ratio": np.nan, "reason": "unreadable"}
-    area=float(mask.mean())
-    if area < MANUAL_MIN_AREA_RATIO:
-        reason="empty_or_nearly_empty"
-    elif area > 0.98:
-        reason="nearly_full"
-    else:
-        reason=""
-    return {"exists": 1, "usable": int(not reason), "area_ratio": area, "reason": reason}
+    image_cache = OrderedDict()  # in-memory only; discarded when the run ends
 
-# Detect whether labels or manual PNGs changed after the last manual-target audit.
-
-# Load annotations.
-def load_annotations(workspace):
-    result={}
-    for row in read_csv(workspace.manual_annotations):
-        token=str(row.get("image_token", "")).strip()
-        if token:
-            result[token]=dict(row)
-    return result
-
-# Use lower weight for confirmed-auto masks while preserving explicit negatives.
-def default_target_weight(target_type, source):
-    target_type=str(target_type).upper()
-    source=str(source).lower()
-    if target_type == NO_HEART_VISIBLE:
-        return float(NO_HEART_WEIGHT)
-    if "auto" in source:
-        return float(AUTO_CONFIRMED_WEIGHT)
-    return float(MANUAL_DRAWN_WEIGHT)
-
-# Persist one reviewer decision so later GPU runs can reuse it as a training target.
-def set_annotation(
-    workspace,
-    row,
-    target_type,
-    source,
-    sample_weight=None,
-    note="",
-):
-    target_type=str(target_type).strip().upper()
-    if target_type not in VALID_TARGET_TYPES:
-        raise ValueError(f"Unknown annotation type: {target_type}")
-    records=load_annotations(workspace)
-    weight=(
-        default_target_weight(target_type, source)
-        if sample_weight is None
-        else float(sample_weight)
-    )
-    records[str(row["image_token"])]={
-        "timestamp_utc": pd.Timestamp.utcnow().isoformat(),
-        "image_token": str(row["image_token"]),
-        "patient_id": str(row.get("patient_id", "")),
-        "series_id": str(row.get("series_id", "")),
-        "target_type": target_type,
-        "source": str(source),
-        "sample_weight": float(weight),
-        "note": str(note),
-    }
-    write_csv(
-        workspace.manual_annotations,
-        [records[token] for token in sorted(records)],
-        ANNOTATION_FIELDS,
-    )
-
-# Remove annotation.
-def remove_annotation(workspace, image_token):
-    records=load_annotations(workspace)
-    records.pop(str(image_token), None)
-    write_csv(
-        workspace.manual_annotations,
-        [records[token] for token in sorted(records)],
-        ANNOTATION_FIELDS,
-    )
-
-# Register existing manual masks.
-def register_existing_manual_masks(
-    rows,
-    workspace,
-):
-    by_token={
-        str(row.get("image_token", "")).strip(): dict(row)
-        for row in rows
-        if str(row.get("image_token", "")).strip()
-    }
-    annotations=load_annotations(workspace)
-    manual_files=sorted(workspace.manual_masks.glob("*.png"))
-    timestamp=pd.Timestamp.utcnow().isoformat()
-
-    summary={
-        "timestamp_utc": timestamp,
-        "manual_png_files": len(manual_files),
-        "registered_heart_present": 0,
-        "already_explicitly_labeled": 0,
-        "skipped_empty_or_invalid": 0,
-        "skipped_token_absent_from_dataset": 0,
-        "reason_counts": {},
-        "annotations_path": str(workspace.manual_annotations),
-    }
-    reason_counts=defaultdict(int)
-
-    for mask_path in manual_files:
-        token=str(mask_path.stem)
-        row=by_token.get(token)
-        if row is None:
-            summary["skipped_token_absent_from_dataset"] +=1
-            reason_counts["token_absent_from_dataset"] +=1
-            continue
-
-        existing=annotations.get(token, {})
-        existing_target=str(existing.get("target_type", "")).strip().upper()
-        if existing_target in VALID_TARGET_TYPES:
-            summary["already_explicitly_labeled"] +=1
-            reason_counts[f"already_{existing_target.lower()}"] +=1
-            continue
-
-        mask_qc=manual_mask_qc(mask_path)
-        if not bool(mask_qc.get("usable", 0)):
-            summary["skipped_empty_or_invalid"] +=1
-            reason=str(mask_qc.get("reason", "") or "invalid_manual_mask")
-            reason_counts[reason] +=1
-            continue
-
-        annotations[token]={
-            "timestamp_utc": timestamp,
-            "image_token": token,
-            "patient_id": str(row.get("patient_id", "")),
-            "series_id": str(row.get("series_id", "")),
-            "target_type": HEART_PRESENT,
-            "source": "existing_manual_on_review",
-            "sample_weight": float(MANUAL_DRAWN_WEIGHT),
-            "note": (
-                "Existing non-empty manual PNG registered automatically "
-                "when review was opened; the mask file itself was not rewritten."
-            ),
-        }
-        summary["registered_heart_present"] +=1
-        reason_counts["registered_heart_present"] +=1
-
-
-    if summary["registered_heart_present"] > 0 or not workspace.manual_annotations.is_file():
-        write_csv(
-            workspace.manual_annotations,
-            [annotations[token] for token in sorted(annotations)],
-            ANNOTATION_FIELDS,
+    # Convert CSV/string values safely before numeric comparisons.
+    @staticmethod
+    def _as_float(value, default=0.0):
+        try:
+            result=float(value)
+        except (TypeError, ValueError):
+            return float(default)
+        return result if np.isfinite(result) else float(default)
+    # Convert CSV/string values safely to an integer.
+    @staticmethod
+    def _as_int(value, default=0):
+        return int(round(DataStage._as_float(value, float(default))))
+    # Find the CAD dataset in Kaggle, an environment override, or the local fallback.
+    @staticmethod
+    def _default_dataset_path():
+        env_value=os.environ.get("CAD_DATASET_PATH", "").strip()
+        candidates=[]
+        if env_value:
+            candidates.append(Path(env_value))
+        candidates.extend(
+            [
+                Path("/kaggle/input/cad-cardiac-mri-dataset"),
+                Path("/kaggle/input/datasets/danialsharifrazi/cad-cardiac-mri-dataset"),
+                Path(r"C:\F\_Develop\AI\Datasets\CAD Cardiac MRI Dataset"),
+            ]
         )
 
-    summary["reason_counts"]=dict(sorted(reason_counts.items()))
-    write_json(
-        workspace.outputs / "review_manual_target_registration.json",
-        summary,
-    )
-    print(
-        "[REVIEW][EXISTING MASKS] "
-        f"registered HEART_PRESENT={summary['registered_heart_present']}, "
-        f"already labeled={summary['already_explicitly_labeled']}, "
-        f"empty/invalid={summary['skipped_empty_or_invalid']}, "
-        f"token missing={summary['skipped_token_absent_from_dataset']}"
-    )
-    return summary
+        def is_dataset_root(path):
+            return path.is_dir() and (path / "Normal").is_dir() and (path / "Sick").is_dir()
 
-# Validate explicit HEART_PRESENT/NO_HEART_VISIBLE/UNUSABLE targets for training.
-def audit_manual_masks(
-    rows,
-    quality,
-    workspace,
-    minimum_masks=None,
-):
-    # The research pipeline was trained only after at least 800 positive manual masks
-    # survived quality/mask QC. The caller may override this only for diagnostics.
-    minimum_masks=int(minimum_masks or 800)
-    by_token={str(row["image_token"]): dict(row) for row in rows}
-    manual_files={path.stem: path for path in workspace.manual_masks.glob("*.png")}
-    annotations=load_annotations(workspace)
-    candidate_tokens=sorted(set(manual_files) | set(annotations))
+        for candidate in candidates:
+            if is_dataset_root(candidate):
+                return candidate
 
-    accepted=[]
-    audit=[]
-    patient_counts=defaultdict(int)
-    positive_patient_counts=defaultdict(int)
-    fold_positive_counts=defaultdict(int)
-    fold_negative_counts=defaultdict(int)
-    positive_count=0
-    negative_count=0
-    unusable_count=0
+        kaggle_input=Path("/kaggle/input")
+        if kaggle_input.is_dir():
+            for current_root, directory_names, _ in os.walk(kaggle_input):
+                current=Path(current_root)
+                try:
+                    depth=len(current.relative_to(kaggle_input).parts)
+                except ValueError:
+                    depth=99
+                if {"Normal", "Sick"}.issubset(set(directory_names)):
+                    return current
+                if depth >= 3:
+                    directory_names[:]=[]
 
-    for token in candidate_tokens:
-        row=by_token.get(token)
-        path=manual_files.get(token, workspace.manual_masks / f"{token}.png")
-        annotation=annotations.get(token, {})
-        if row is None:
+        return candidates[0] if candidates else Path.cwd() / "CAD Cardiac MRI Dataset"
+    # Choose the persistent workspace shared by CPU and GPU Kaggle sessions.
+    @staticmethod
+    def _default_workspace_path():
+        if Path("/kaggle/working").exists():
+            return Path("/kaggle/working/cad_attention_unet_workspace")
+        return Path.cwd() / "cad_attention_unet_workspace"
+    # Seed Python, NumPy and PyTorch so patient folds and training are reproducible.
+    @staticmethod
+    def seed_everything(seed=None, include_cuda=False):
+        seed=int(42 if seed is None else seed)
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.set_num_threads(max(1, min(8, os.cpu_count() or 1)))
+        if include_cuda:
+            torch.cuda.manual_seed_all(seed)
+            # Deterministic algorithms were disabled in the researched runs; cuDNN
+            # may therefore choose its fastest kernel for the current GPU shapes.
+            torch.backends.cudnn.deterministic=False
+            torch.backends.cudnn.benchmark=True
+    # Initialize only the CPU/GPU resources needed by the current research stage.
+    @staticmethod
+    def start_device_stage(requested, stage_name):
+        # A stage chooses CPU or CUDA only when it starts. Importing this file never
+        # allocates GPU memory, which is important when moving between Kaggle sessions.
+        requested=(requested or "cpu").strip().lower()
+        if requested == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested but is unavailable. Enable a Kaggle GPU.")
+        if requested not in {"cpu", "cuda", "auto"}:
+            raise ValueError("device must be 'cpu', 'cuda', or 'auto'.")
+        if requested == "auto":
+            requested="cuda" if torch.cuda.is_available() else "cpu"
+        device=torch.device(requested)
+        DataStage.seed_everything(include_cuda=device.type == "cuda")
+        if device.type == "cuda":
+            DataStage.release_device(device)
+            try:
+                torch.cuda.reset_peak_memory_stats(device)
+            except Exception:
+                pass
+        print(f"[DEVICE] {stage_name}: {device.type}")
+        return device
+    # Report peak GPU memory when relevant, then release stage resources.
+    @staticmethod
+    def finish_device_stage(device, stage_name):
+        # Print peak GPU memory when CUDA supplied this stage.
+        if device.type == "cuda":
+            try:
+                peak_gb=torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+                print(f"[DEVICE] {stage_name}: peak GPU={peak_gb:.2f} GB")
+            except Exception:
+                pass
+        # Release Python and CUDA memory regardless of the stage result.
+        DataStage.release_device(device)
+        print(f"[DEVICE] {stage_name}: resources released")
+    # Move a neural model to the selected device and efficient CUDA memory layout.
+    @staticmethod
+    def prepare_model(model, device):
+        model=model.to(device)
+        if device.type == "cuda":
+            model=model.to(memory_format=torch.channels_last)
+        return model
+    # Move a tensor to the active stage device without changing its values.
+    @staticmethod
+    def move_tensor(tensor, device):
+        tensor=tensor.to(device, non_blocking=device.type == "cuda")
+        if device.type == "cuda" and tensor.ndim == 4:
+            tensor=tensor.contiguous(memory_format=torch.channels_last)
+        return tensor
+    # Use mixed precision only on CUDA; CPU execution remains ordinary float32.
+    @staticmethod
+    def autocast(device):
+        enabled=device.type == "cuda"
+        if not enabled:
+            return contextlib.nullcontext()
+        try:
+            return torch.autocast(device_type="cuda", dtype=torch.float16)
+        except (AttributeError, TypeError):
+            return torch.cuda.amp.autocast(enabled=True)
+    # Create the AMP gradient scaler used by GPU Attention U-Net training.
+    @staticmethod
+    def grad_scaler(device):
+        enabled=device.type == "cuda"
+        try:
+            return torch.amp.GradScaler("cuda", enabled=enabled)
+        except (AttributeError, TypeError):
+            return torch.cuda.amp.GradScaler(enabled=enabled)
+    # Free Python/CUDA caches between folds and between Kaggle stages.
+    @staticmethod
+    def release_device(device):
+        gc.collect()
+        if device.type == "cuda" and torch.cuda.is_available():
+            try:
+                torch.cuda.synchronize(device)
+            except Exception:
+                pass
+            torch.cuda.empty_cache()
+    # Format stage timing for concise console output.
+    @staticmethod
+    def format_seconds(seconds):
+        seconds=max(0, int(round(seconds)))
+        hours, seconds=divmod(seconds, 3600)
+        minutes, seconds=divmod(seconds, 60)
+        if hours:
+            return f"{hours}h {minutes:02d}m {seconds:02d}s"
+        if minutes:
+            return f"{minutes}m {seconds:02d}s"
+        return f"{seconds}s"
+    # Only manual masks and their labels live in /kaggle/working.
+    # Every other path belongs to a new temporary directory and disappears with the session.
+    @staticmethod
+    def create_workspace(manual_root=None):
+        manual_root=Path(manual_root or DataStage._default_workspace_path())
+        manual_masks=manual_root / "manual_masks"
+        manual_labels=manual_root / "manual_annotation_labels.csv"
+        manual_masks.mkdir(parents=True, exist_ok=True)
+
+        # A fresh temporary workspace guarantees that training, predictions, matching,
+        # features, and evaluation are recomputed on every run instead of reused.
+        root=Path(tempfile.mkdtemp(prefix="cad_research_run_"))
+        outputs=root / "outputs"
+        workspace=Workspace(
+            root=root,
+            manual_masks=manual_masks,
+            predicted_masks=root / "predicted_attention_masks",
+            mask_overlays=root / "mask_overlays",
+            checkpoints=root / "checkpoints",
+            outputs=outputs,
+            dataset_manifest=root / "dataset_manifest.csv",
+            quality_audit=root / "image_quality.csv",
+            manual_audit=root / "manual_audit.csv",
+            manual_annotations=manual_labels,
+            prediction_audit=root / "attention_predictions.csv",
+            prediction_parts_dir=outputs / "prediction_parts",
+            review_history=root / "review_history.csv",
+            prediction_summary=root / "prediction_summary.json",
+            cross_class_matching_manifest=root / "matching.csv",
+            cross_class_matching_summary=root / "matching_summary.json",
+            feature_bank=root / "feature_bank.npz",
+            feature_metadata=root / "feature_metadata.json",
+        )
+        for folder in (root, outputs, workspace.predicted_masks, workspace.mask_overlays,
+                       workspace.checkpoints, workspace.prediction_parts_dir):
+            folder.mkdir(parents=True, exist_ok=True)
+        return workspace
+    # JSON is used only inside the temporary run directory.
+    @staticmethod
+    def write_json(path, payload):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str), encoding="utf-8")
+    # Read cache metadata; return a simple fallback when the file is absent/corrupt.
+    @staticmethod
+    def read_json(path, default=None):
+        if not path.is_file():
+            return default
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return default
+    # Write persistent audit/label tables that later stages must reuse.
+    @staticmethod
+    def write_csv(path, rows, fields):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(fields), extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows({field: row.get(field, "") for field in fields} for row in rows)
+    # Read a persisted audit/label table as ordinary dictionaries.
+    @staticmethod
+    def read_csv(path):
+        if not path.is_file():
+            return []
+        with path.open(newline="", encoding="utf-8") as handle:
+            return list(csv.DictReader(handle))
+    # Save manual or OOF binary masks used by later pipeline stages.
+    @staticmethod
+    def write_png(path, image):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        ok = cv2.imwrite(str(path), np.asarray(image), [cv2.IMWRITE_PNG_COMPRESSION, 9])
+        if not ok:
+            raise RuntimeError(f"OpenCV could not write PNG: {path}")
+    # Create a stable image identifier from its patient-relative path.
+    @staticmethod
+    def image_token(image_path, patient_id, series_id):
+        # Hash the path starting at Directory_* so tokens remain stable if the dataset
+        # is mounted under a different Kaggle/local root.
+        parts=image_path.parts
+        patient_index=next(
+            (i for i, part in enumerate(parts) if str(part).startswith("Directory_")),
+            None,
+        )
+        if patient_index is None:
+            raise ValueError(f"Path does not contain Directory_*: {image_path}")
+        relative="/".join(map(str, parts[patient_index:]))
+        digest=hashlib.sha256(relative.encode("utf-8")).hexdigest()[:20]
+        safe_series=str(series_id).replace("/", "__").replace("\\", "__").replace(" ", "_")
+        return f"{patient_id}__{safe_series}__{digest}"
+    # Fold assignment is derived only from patient identity and class label.
+    # No image-level random split is permitted because thousands of correlated
+    # slices from one patient would otherwise leak into both train and validation.
+    @staticmethod
+    def patient_folds(
+        patients,
+    ):
+        if isinstance(patients, dict):
+            groups=defaultdict(list)
+            for patient_id, label in patients.items():
+                groups[int(label)].append(str(patient_id))
+        else:
+            groups={0: list(map(str, patients))}
+
+        result={}
+        for label, patient_ids in sorted(groups.items()):
+            ordered=sorted(
+                set(patient_ids),
+                key=lambda patient_id: hashlib.sha256(
+                    f"{42}|segmentation-fold|{label}|{patient_id}".encode("utf-8")
+                ).hexdigest(),
+            )
+            for index, patient_id in enumerate(ordered):
+                result[patient_id]=index % int(5)
+        return result
+    # Scan Normal/Sick folders and create one record per MRI slice.
+    @staticmethod
+    def discover_dataset(dataset_path, workspace=None):
+        dataset_path=Path(dataset_path)
+        started=time.perf_counter()
+        raw_rows=[]
+        patient_to_label={}
+
+        for class_name, label in (("Normal", 0), ("Sick", 1)):
+            class_path=dataset_path / class_name
+            if not class_path.is_dir():
+                raise FileNotFoundError(f"Missing directory: {class_path}")
+
+            for patient_path in sorted(class_path.iterdir()):
+                if not patient_path.is_dir() or not patient_path.name.lower().startswith("directory_"):
+                    continue
+                patient_id=patient_path.name
+                old_label=patient_to_label.get(patient_id)
+                if old_label is not None and old_label != label:
+                    raise RuntimeError(f"{patient_id} appears in both classes.")
+                patient_to_label[patient_id]=label
+
+
+                for image_path in sorted(patient_path.iterdir()):
+                    if image_path.is_file() and image_path.suffix.lower() in {".png", ".jpg", ".jpeg"}:
+                        raw_rows.append((image_path, label, patient_id, f"{patient_id}/__ROOT__"))
+
+
+                for series_path in sorted(path for path in patient_path.iterdir() if path.is_dir()):
+                    series_id=f"{patient_id}/{series_path.name}"
+                    for image_path in sorted(series_path.rglob("*")):
+                        if image_path.is_file() and image_path.suffix.lower() in {".png", ".jpg", ".jpeg"}:
+                            raw_rows.append((image_path, label, patient_id, series_id))
+
+        if not raw_rows:
+            raise RuntimeError(f"No images were found in {dataset_path}")
+
+        folds=DataStage.patient_folds(patient_to_label)
+        samples=[
+            Sample(
+                image_path=str(path),
+                label=int(label),
+                patient_id=patient_id,
+                series_id=series_id,
+                image_token=DataStage.image_token(path, patient_id, series_id),
+                segmentation_fold=int(folds[patient_id]),
+            )
+            for path, label, patient_id, series_id in raw_rows
+        ]
+
+        if len({sample.image_token for sample in samples}) != len(samples):
+            raise RuntimeError("Duplicate image tokens were generated.")
+
+        rows=[
+            {
+                "manifest_index": index,
+                "image_token": sample.image_token,
+                "image_path": sample.image_path,
+                "label": sample.label,
+                "patient_id": sample.patient_id,
+                "series_id": sample.series_id,
+                "segmentation_fold": sample.segmentation_fold,
+                "manual_mask_path": str((workspace.manual_masks if workspace else Path("manual_masks")) / f"{sample.image_token}.png"),
+                "predicted_attention_mask_path": str((workspace.predicted_masks if workspace else Path("predicted_attention_masks")) / f"{sample.image_token}.png"),
+            }
+            for index, sample in enumerate(samples)
+        ]
+        if workspace is not None:
+            DataStage.write_csv(workspace.dataset_manifest, rows, rows[0].keys())
+
+        print("[DATA] Patients:", len(patient_to_label))
+        print("[DATA] Normal:", sum(label == 0 for label in patient_to_label.values()))
+        print("[DATA] Sick:", sum(label == 1 for label in patient_to_label.values()))
+        print("[DATA] Images:", len(samples))
+        print("[DATA] Series proxies:", len({sample.series_id for sample in samples}))
+        print("[DATA] Scan time:", DataStage.format_seconds(time.perf_counter() - started))
+        return samples
+    # Sort slice filenames numerically (img2 before img10) when building sequence context.
+    @staticmethod
+    def natural_path_key(path):
+        return tuple(
+            int(part) if part.isdigit() else part.lower()
+            for part in re.split(r"(\d+)", str(path))
+        )
+    # Add sequence neighbours so 2.5D Attention uses previous/current/next frames.
+    @staticmethod
+    def build_dataset_rows(samples, workspace):
+        rows=[
+            {
+                "manifest_index": index,
+                "image_token": sample.image_token,
+                "image_path": sample.image_path,
+                "label": sample.label,
+                "patient_id": sample.patient_id,
+                "series_id": sample.series_id,
+                "segmentation_fold": sample.segmentation_fold,
+                "manual_mask_path": str(workspace.manual_masks / f"{sample.image_token}.png"),
+                "predicted_attention_mask_path": str(workspace.predicted_masks / f"{sample.image_token}.png"),
+            }
+            for index, sample in enumerate(samples)
+        ]
+
+
+        by_sequence_group=defaultdict(list)
+        for index, row in enumerate(rows):
+
+
+            parent=str(Path(row["image_path"]).parent)
+            sequence_group=f"{row['series_id']}::{parent}"
+            row["sequence_group_id"]=sequence_group
+            by_sequence_group[sequence_group].append(index)
+        for indices in by_sequence_group.values():
+            ordered=sorted(
+                indices,
+                key=lambda index: DataStage.natural_path_key(rows[index]["image_path"]),
+            )
+            for position, row_index in enumerate(ordered):
+                previous_index=ordered[max(0, position - 1)]
+                next_index=ordered[min(len(ordered) - 1, position + 1)]
+                rows[row_index]["sequence_index"]=int(position)
+                rows[row_index]["sequence_length"]=int(len(ordered))
+                rows[row_index]["previous_image_path"]=rows[previous_index]["image_path"]
+                rows[row_index]["next_image_path"]=rows[next_index]["image_path"]
+
+        if rows:
+            DataStage.write_csv(workspace.dataset_manifest, rows, rows[0].keys())
+        return rows
+    # Read gray.
+    @staticmethod
+    def read_gray(path):
+        image=cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+        if image is None:
+            raise FileNotFoundError(f"OpenCV cannot read image: {path}")
+        return image
+    # Detect near-black, low-variance border lines that are safe to treat as scanner padding.
+    @staticmethod
+    def is_dark_uniform_line(line):
+        values=np.asarray(line, dtype=np.float32).reshape(-1)
+        return bool(
+            values.size
+            and float(values.mean()) <= 12.0
+            and float(values.std()) <= 4.0
+            and float(np.mean(values <= 20))
+            >= 0.98
+        )
+    # Find conservative crop bounds without using CAD labels or model outputs.
+    @staticmethod
+    def detect_padding_bounds(image):
+        if image.ndim != 2:
+            raise ValueError("The image must be a 2D grayscale array.")
+        height, width=image.shape
+        # Padding removal is deliberately conservative: at least 60% of each
+        # original dimension must remain, and at most 20% is removed from one side.
+        min_height=max(8, int(np.ceil(height * 0.60)))
+        min_width=max(8, int(np.ceil(width * 0.60)))
+        max_vertical=int(np.floor(height * 0.20))
+        max_horizontal=int(np.floor(width * 0.20))
+
+        top=0
+        while top < max_vertical and height - top - 1 >= min_height and DataStage.is_dark_uniform_line(image[top, :]):
+            top +=1
+        bottom_crop=0
+        while bottom_crop < max_vertical and height - top - bottom_crop - 1 >= min_height and DataStage.is_dark_uniform_line(image[height - 1 - bottom_crop, :]):
+            bottom_crop +=1
+        left=0
+        while left < max_horizontal and width - left - 1 >= min_width and DataStage.is_dark_uniform_line(image[:, left]):
+            left +=1
+        right_crop=0
+        while right_crop < max_horizontal and width - left - right_crop - 1 >= min_width and DataStage.is_dark_uniform_line(image[:, width - 1 - right_crop]):
+            right_crop +=1
+
+        if top < 2:
+            top=0
+        if bottom_crop < 2:
+            bottom_crop=0
+        if left < 2:
+            left=0
+        if right_crop < 2:
+            right_crop=0
+
+        bottom=height - bottom_crop
+        right=width - right_crop
+        if bottom - top < min_height or right - left < min_width:
+            return 0, height, 0, width
+        return int(top), int(bottom), int(left), int(right)
+    # Scale intensities with 1st/99th percentiles so isolated extremes do not dominate.
+    @staticmethod
+    def robust_scale(image):
+        image=np.asarray(image, dtype=np.float32)
+        lower, upper=np.percentile(
+            image,
+            [1.0, 99.0],
+        )
+        lower, upper=float(lower), float(upper)
+        if not np.isfinite(lower) or not np.isfinite(upper) or upper <= lower:
+            lower, upper=float(image.min()), float(image.max())
+        if upper <= lower:
+            return np.zeros_like(image, dtype=np.float32), lower, upper
+        scaled=np.clip(image, lower, upper)
+        return ((scaled - lower) / (upper - lower)).astype(np.float32), lower, upper
+    # Compute the resize and centering geometry used by both images and masks.
+    @staticmethod
+    def canvas_geometry(height, width):
+        size=256
+        long_side=240
+        scale=float(long_side / max(height, width))
+        resized_height=max(1, int(round(height * scale)))
+        resized_width=max(1, int(round(width * scale)))
+        if height >= width:
+            resized_height=long_side
+        else:
+            resized_width=long_side
+        resized_height=min(resized_height, size)
+        resized_width=min(resized_width, size)
+        top=(size - resized_height) // 2
+        left=(size - resized_width) // 2
+        return resized_height, resized_width, top, left, scale
+    # Resize one image while preserving aspect ratio and center it on the fixed canvas.
+    @staticmethod
+    def to_canvas(image):
+        image=np.asarray(image, dtype=np.float32)
+        height, width=image.shape
+        resized_height, resized_width, top, left, scale=DataStage.canvas_geometry(height, width)
+        if (resized_height, resized_width) != (height, width):
+            interpolation=cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
+            resized=cv2.resize(image, (resized_width, resized_height), interpolation=interpolation)
+        else:
+            resized=image
+        canvas=np.zeros(
+            (256, 256),
+            dtype=np.float32,
+        )
+        canvas[top : top + resized_height, left : left + resized_width]=np.clip(resized, 0.0, 1.0)
+        return canvas
+    # Remove only dark padding, robust-scale intensities, and center content on 256×256.
+    @staticmethod
+    def standardize_image(image):
+        top, bottom, left, right=DataStage.detect_padding_bounds(image)
+        cropped=image[top:bottom, left:right]
+        if cropped.size == 0:
+            raise RuntimeError("Automatic cropping produced an empty image.")
+        robust, _, _=DataStage.robust_scale(cropped)
+        # A second min-max view is kept because the original research pipeline used it
+        # when checking preprocessing consistency, while classifiers use robust/raw views.
+        cropped_float=cropped.astype(np.float32)
+        low=float(cropped_float.min())
+        high=float(cropped_float.max())
+        minmax=(cropped_float - low) / (high - low) if high > low else np.zeros_like(cropped_float)
+        raw=cropped_float / 255.0
+        robust_canvas=DataStage.to_canvas(robust)
+        minmax_canvas=DataStage.to_canvas(minmax)
+        raw_canvas=DataStage.to_canvas(raw)
+        resized_height, resized_width, top_pad, left_pad, _=DataStage.canvas_geometry(*cropped.shape)
+        content=np.zeros((256, 256), dtype=np.float32)
+        content[top_pad:top_pad + resized_height, left_pad:left_pad + resized_width]=1.0
+        return robust_canvas, minmax_canvas, raw_canvas, content
+    # Return the canonical 256×256 robust-scaled image used by Attention U-Net.
+    @staticmethod
+    def standardized_uint8(path):
+        image=DataStage.read_gray(path)
+        robust, _, _, _=DataStage.standardize_image(image)
+        return np.clip(np.round(robust * 255.0), 0, 255).astype(np.uint8)
+    # Create the robust/raw/content views later combined with ROI or complement masks.
+    @staticmethod
+    def classifier_views(path):
+        image=DataStage.read_gray(path)
+        robust, _, raw, content=DataStage.standardize_image(image)
+        size=224
+        robust_224=cv2.resize(robust, (size, size), interpolation=cv2.INTER_AREA)
+        raw_224=cv2.resize(raw, (size, size), interpolation=cv2.INTER_AREA)
+        content_224=cv2.resize(content, (size, size), interpolation=cv2.INTER_NEAREST)
+        return (
+            robust_224.astype(np.float32),
+            raw_224.astype(np.float32),
+            (content_224 > 0.5).astype(np.float32),
+        )
+    # Build a compact appearance hash used for duplicate-aware review and matching.
+    @staticmethod
+    def perceptual_hash(image):
+        resized=cv2.resize(image, (32, 32), interpolation=cv2.INTER_AREA)
+        values=cv2.dct(resized.astype(np.float32))[:8, :8].reshape(-1)
+        median=float(np.median(values[1:]))
+        bits=values > median
+        number=0
+        for bit in bits:
+            number=(number << 1) | int(bool(bit))
+        return f"{number:016x}"
+    # Reuse recently standardized slices to avoid repeating OpenCV preprocessing.
+    @staticmethod
+    def get_cached_image(path):
+        if path in DataStage.image_cache:
+            value=DataStage.image_cache.pop(path)
+            DataStage.image_cache[path]=value
+            return value.copy()
+        value=DataStage.standardized_uint8(path)
+        DataStage.image_cache[path]=value
+        while len(DataStage.image_cache) > 2048:
+            DataStage.image_cache.popitem(last=False)
+        return value.copy()
+    # Release standardized-image RAM between expensive stages.
+    @staticmethod
+    def clear_image_cache():
+        DataStage.image_cache.clear()
+    # Measure sharpness, noise, dynamic range, and perceptual hash for one slice.
+    @staticmethod
+    def image_quality_metrics(row):
+        image=DataStage.read_gray(row["image_path"])
+        robust, _, raw, content=DataStage.standardize_image(image)
+        coordinates=np.argwhere(content > 0.5)
+        if not len(coordinates):
+            return {
+                "perceptual_hash": "",
+                "sharpness": np.nan,
+                "noise_ratio": np.nan,
+                "dynamic_range": np.nan,
+            }
+        top, left=coordinates.min(axis=0)
+        bottom, right=coordinates.max(axis=0) + 1
+        size=128
+        robust_thumb=cv2.resize(
+            robust[top:bottom, left:right], (size, size), interpolation=cv2.INTER_AREA
+        )
+        raw_thumb=cv2.resize(
+            raw[top:bottom, left:right], (size, size), interpolation=cv2.INTER_AREA
+        )
+        robust_u8=np.clip(np.round(robust_thumb * 255.0), 0, 255).astype(np.uint8)
+        raw_255=np.clip(raw_thumb * 255.0, 0.0, 255.0).astype(np.float32)
+        sharpness=float(cv2.Laplacian(robust_u8, cv2.CV_32F).var())
+        residual=raw_255 - cv2.GaussianBlur(raw_255, (3, 3), 0)
+        residual_median=float(np.median(residual))
+        noise_sigma=float(np.median(np.abs(residual - residual_median)) / 0.6744897501960817)
+        lower, upper=np.percentile(raw_255, [5.0, 95.0])
+        dynamic_range=float(max(upper - lower, 0.0))
+        return {
+            "perceptual_hash": DataStage.perceptual_hash(robust_u8),
+            "sharpness": sharpness,
+            "noise_ratio": float(noise_sigma / max(dynamic_range, 1.0)),
+            "dynamic_range": dynamic_range,
+        }
+    # Measure blur/noise/dynamic range and reuse unchanged image measurements.
+    @staticmethod
+    def build_quality_audit(rows, workspace, refresh=False):
+        existing={
+            row.get("image_token", ""): row
+            for row in DataStage.read_csv(workspace.quality_audit)
+        }
+        records=[]
+        started=time.perf_counter()
+        for index, row in enumerate(rows, start=1):
+            path=Path(row["image_path"])
+            file_stat=path.stat() if path.is_file() else None
+            size_bytes=file_stat.st_size if file_stat is not None else -1
+            mtime_ns=file_stat.st_mtime_ns if file_stat is not None else -1
+            old=existing.get(row["image_token"], {})
+            reusable=(
+                not refresh
+                and old
+                and old.get("image_path") == str(path)
+                and DataStage._as_int(old.get("image_size_bytes"), -2) == int(size_bytes)
+                and DataStage._as_int(old.get("image_mtime_ns"), -2) == int(mtime_ns)
+                and old.get("perceptual_hash")
+            )
+            if reusable:
+                record=dict(old)
+            else:
+                metrics=DataStage.image_quality_metrics(row)
+                record={
+                    "image_token": row["image_token"],
+                    "image_path": str(path),
+                    "patient_id": row["patient_id"],
+                    "series_id": row["series_id"],
+                    "image_size_bytes": int(size_bytes),
+                    "image_mtime_ns": int(mtime_ns),
+                    **metrics,
+                }
+            records.append(record)
+            if index == 1 or index % 5000 == 0 or index == len(rows):
+                print(
+                    f"[QUALITY] {index}/{len(rows)} | "
+                    f"{DataStage.format_seconds(time.perf_counter() - started)}"
+                )
+
+        by_patient=defaultdict(list)
+        for record in records:
+            by_patient[str(record["patient_id"])].append(record)
+
+        for patient_rows in by_patient.values():
+            sharp=np.asarray([DataStage._as_float(row.get("sharpness"), np.nan) for row in patient_rows])
+            noise=np.asarray([DataStage._as_float(row.get("noise_ratio"), np.nan) for row in patient_rows])
+            finite_sharp=sharp[np.isfinite(sharp)]
+            finite_noise=noise[np.isfinite(noise)]
+            blur_threshold=float(4.0)
+            noise_threshold=float(0.30)
+            if len(finite_sharp) >= 5:
+                blur_threshold=max(
+                    blur_threshold,
+                    float(np.quantile(finite_sharp, 0.03)),
+                )
+            if len(finite_noise) >= 5:
+                noise_threshold=min(
+                    noise_threshold,
+                    float(np.quantile(finite_noise, 0.97)),
+                )
+            for record in patient_rows:
+                sharpness=float(record.get("sharpness", np.nan))
+                noise_ratio=float(record.get("noise_ratio", np.nan))
+                dynamic_range=float(record.get("dynamic_range", np.nan))
+                reasons=[]
+                if not np.isfinite(dynamic_range) or dynamic_range < 12.0:
+                    reasons.append("low_dynamic_range")
+                if not np.isfinite(sharpness) or sharpness < blur_threshold:
+                    reasons.append("blurred")
+                if not np.isfinite(noise_ratio) or noise_ratio > noise_threshold:
+                    reasons.append("noisy")
+                record["patient_blur_threshold"]=blur_threshold
+                record["patient_noise_threshold"]=noise_threshold
+                record["quality_valid"]=int(not reasons)
+                record["quality_reason"]=";".join(reasons)
+
+        DataStage.write_csv(workspace.quality_audit, records, records[0].keys())
+        valid=sum(int(row["quality_valid"]) for row in records)
+        print(f"[QUALITY] valid={valid}/{len(records)} | {workspace.quality_audit}")
+        return {str(row["image_token"]): row for row in records}
+    # Read binary mask.
+    @staticmethod
+    def read_binary_mask(path, size=None):
+        mask=cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            raise FileNotFoundError(f"Mask cannot be read: {path}")
+        size=int(size or 256)
+        if mask.shape != (size, size):
+            mask=cv2.resize(mask, (size, size), interpolation=cv2.INTER_NEAREST)
+        return (mask > 127).astype(np.uint8)
+    # Check whether a saved manual mask is readable and has a plausible non-trivial area.
+    @staticmethod
+    def manual_mask_qc(path):
+        path=Path(path)
+        if not path.is_file():
+            return {"exists": 0, "usable": 0, "area_ratio": np.nan, "reason": "missing"}
+        try:
+            mask=DataStage.read_binary_mask(path)
+        except Exception:
+            return {"exists": 1, "usable": 0, "area_ratio": np.nan, "reason": "unreadable"}
+        area=float(mask.mean())
+        if area < 0.0005:
+            reason="empty_or_nearly_empty"
+        elif area > 0.98:
+            reason="nearly_full"
+        else:
+            reason=""
+        return {"exists": 1, "usable": int(not reason), "area_ratio": area, "reason": reason}
+    # Load annotations.
+    @staticmethod
+    def load_annotations(workspace):
+        result={}
+        for row in DataStage.read_csv(workspace.manual_annotations):
+            token=str(row.get("image_token", "")).strip()
+            if token:
+                result[token]=dict(row)
+        return result
+    # Use lower weight for confirmed-auto masks while preserving explicit negatives.
+    @staticmethod
+    def default_target_weight(target_type, source):
+        target_type=str(target_type).upper()
+        source=str(source).lower()
+        if target_type == NO_HEART_VISIBLE:
+            return float(0.90)
+        if "auto" in source:
+            return float(0.72)
+        return float(1.0)
+    # Persist one reviewer decision so later GPU runs can reuse it as a training target.
+    @staticmethod
+    def set_annotation(
+        workspace,
+        row,
+        target_type,
+        source,
+        sample_weight=None,
+        note="",
+    ):
+        target_type=str(target_type).strip().upper()
+        if target_type not in VALID_TARGET_TYPES:
+            raise ValueError(f"Unknown annotation type: {target_type}")
+        records=DataStage.load_annotations(workspace)
+        weight=(
+            DataStage.default_target_weight(target_type, source)
+            if sample_weight is None
+            else float(sample_weight)
+        )
+        records[str(row["image_token"])]={
+            "timestamp_utc": pd.Timestamp.utcnow().isoformat(),
+            "image_token": str(row["image_token"]),
+            "patient_id": str(row.get("patient_id", "")),
+            "series_id": str(row.get("series_id", "")),
+            "target_type": target_type,
+            "source": str(source),
+            "sample_weight": float(weight),
+            "note": str(note),
+        }
+        DataStage.write_csv(
+            workspace.manual_annotations,
+            [records[token] for token in sorted(records)],
+            ANNOTATION_FIELDS,
+        )
+    # Remove annotation.
+    @staticmethod
+    def remove_annotation(workspace, image_token):
+        records=DataStage.load_annotations(workspace)
+        records.pop(str(image_token), None)
+        DataStage.write_csv(
+            workspace.manual_annotations,
+            [records[token] for token in sorted(records)],
+            ANNOTATION_FIELDS,
+        )
+    # Register existing manual masks.
+    @staticmethod
+    def register_existing_manual_masks(
+        rows,
+        workspace,
+    ):
+        by_token={
+            str(row.get("image_token", "")).strip(): dict(row)
+            for row in rows
+            if str(row.get("image_token", "")).strip()
+        }
+        annotations=DataStage.load_annotations(workspace)
+        manual_files=sorted(workspace.manual_masks.glob("*.png"))
+        timestamp=pd.Timestamp.utcnow().isoformat()
+
+        summary={
+            "timestamp_utc": timestamp,
+            "manual_png_files": len(manual_files),
+            "registered_heart_present": 0,
+            "already_explicitly_labeled": 0,
+            "skipped_empty_or_invalid": 0,
+            "skipped_token_absent_from_dataset": 0,
+            "reason_counts": {},
+            "annotations_path": str(workspace.manual_annotations),
+        }
+        reason_counts=defaultdict(int)
+
+        for mask_path in manual_files:
+            token=str(mask_path.stem)
+            row=by_token.get(token)
+            if row is None:
+                summary["skipped_token_absent_from_dataset"] +=1
+                reason_counts["token_absent_from_dataset"] +=1
+                continue
+
+            existing=annotations.get(token, {})
+            existing_target=str(existing.get("target_type", "")).strip().upper()
+            if existing_target in VALID_TARGET_TYPES:
+                summary["already_explicitly_labeled"] +=1
+                reason_counts[f"already_{existing_target.lower()}"] +=1
+                continue
+
+            mask_qc=DataStage.manual_mask_qc(mask_path)
+            if not bool(mask_qc.get("usable", 0)):
+                summary["skipped_empty_or_invalid"] +=1
+                reason=str(mask_qc.get("reason", "") or "invalid_manual_mask")
+                reason_counts[reason] +=1
+                continue
+
+            annotations[token]={
+                "timestamp_utc": timestamp,
+                "image_token": token,
+                "patient_id": str(row.get("patient_id", "")),
+                "series_id": str(row.get("series_id", "")),
+                "target_type": HEART_PRESENT,
+                "source": "existing_manual_on_review",
+                "sample_weight": float(1.0),
+                "note": (
+                    "Existing non-empty manual PNG registered automatically "
+                    "when review was opened; the mask file itself was not rewritten."
+                ),
+            }
+            summary["registered_heart_present"] +=1
+            reason_counts["registered_heart_present"] +=1
+
+
+        if summary["registered_heart_present"] > 0 or not workspace.manual_annotations.is_file():
+            DataStage.write_csv(
+                workspace.manual_annotations,
+                [annotations[token] for token in sorted(annotations)],
+                ANNOTATION_FIELDS,
+            )
+
+        summary["reason_counts"]=dict(sorted(reason_counts.items()))
+        DataStage.write_json(
+            workspace.outputs / "review_manual_target_registration.json",
+            summary,
+        )
+        print(
+            "[REVIEW][EXISTING MASKS] "
+            f"registered HEART_PRESENT={summary['registered_heart_present']}, "
+            f"already labeled={summary['already_explicitly_labeled']}, "
+            f"empty/invalid={summary['skipped_empty_or_invalid']}, "
+            f"token missing={summary['skipped_token_absent_from_dataset']}"
+        )
+        return summary
+    # Validate explicit HEART_PRESENT/NO_HEART_VISIBLE/UNUSABLE targets for training.
+    @staticmethod
+    def audit_manual_masks(
+        rows,
+        quality,
+        workspace,
+        minimum_masks=None,
+    ):
+        # The research pipeline was trained only after at least 800 positive manual masks
+        # survived quality/mask QC. The caller may override this only for diagnostics.
+        minimum_masks=int(minimum_masks or 800)
+        by_token={str(row["image_token"]): dict(row) for row in rows}
+        manual_files={path.stem: path for path in workspace.manual_masks.glob("*.png")}
+        annotations=DataStage.load_annotations(workspace)
+        candidate_tokens=sorted(set(manual_files) | set(annotations))
+
+        accepted=[]
+        audit=[]
+        patient_counts=defaultdict(int)
+        positive_patient_counts=defaultdict(int)
+        fold_positive_counts=defaultdict(int)
+        fold_negative_counts=defaultdict(int)
+        positive_count=0
+        negative_count=0
+        unusable_count=0
+
+        for token in candidate_tokens:
+            row=by_token.get(token)
+            path=manual_files.get(token, workspace.manual_masks / f"{token}.png")
+            annotation=annotations.get(token, {})
+            if row is None:
+                audit.append(
+                    {
+                        "image_token": token,
+                        "manual_mask_path": str(path),
+                        "status": "REJECTED",
+                        "target_type": annotation.get("target_type", ""),
+                        "reason": "token_absent_from_dataset",
+                    }
+                )
+                continue
+
+            mask_qc=DataStage.manual_mask_qc(path)
+            target_type=str(annotation.get("target_type", "")).strip().upper()
+            source=str(annotation.get("source", "")).strip()
+            if not target_type:
+                if mask_qc["usable"]:
+                    target_type=HEART_PRESENT
+                    source="legacy_nonempty_manual"
+                else:
+                    target_type="UNLABELED_EMPTY"
+                    source="legacy_unlabeled"
+
+            quality_row=quality.get(token, {})
+            quality_valid=DataStage._as_int(quality_row.get("quality_valid"), 0) == 1
+            reasons=[]
+            heart_present=""
+
+            if target_type == HEART_PRESENT:
+                heart_present=1
+                if not mask_qc["usable"]:
+                    reasons.append(mask_qc["reason"] or "missing_positive_mask")
+            elif target_type == NO_HEART_VISIBLE:
+                heart_present=0
+                if not path.is_file():
+                    DataStage.write_png(
+                        path,
+                        np.zeros(
+                            (256, 256),
+                            dtype=np.uint8,
+                        ),
+                    )
+                    mask_qc=DataStage.manual_mask_qc(path)
+                if not np.isfinite(DataStage._as_float(mask_qc.get("area_ratio"), np.nan)):
+                    reasons.append("unreadable_negative_mask")
+                elif DataStage._as_float(mask_qc.get("area_ratio"), 1.0) >= 0.0005:
+                    reasons.append("no_heart_annotation_has_nonempty_mask")
+            elif target_type == UNUSABLE:
+                unusable_count +=1
+                reasons.append("explicitly_unusable")
+            else:
+                reasons.append("empty_mask_without_explicit_no_heart_label")
+
+            if target_type != UNUSABLE and not quality_valid:
+                reasons.append(str(quality_row.get("quality_reason", "quality_invalid")))
+
+            if target_type == UNUSABLE:
+                status="EXCLUDED"
+            else:
+                status="ACCEPTED" if not reasons else "REJECTED"
+
+            sample_weight=DataStage._as_float(
+                annotation.get("sample_weight"),
+                DataStage.default_target_weight(target_type, source),
+            )
             audit.append(
                 {
                     "image_token": token,
+                    "patient_id": row["patient_id"],
+                    "series_id": row["series_id"],
                     "manual_mask_path": str(path),
-                    "status": "REJECTED",
-                    "target_type": annotation.get("target_type", ""),
-                    "reason": "token_absent_from_dataset",
+                    "status": status,
+                    "target_type": target_type,
+                    "heart_present": heart_present,
+                    "annotation_source": source,
+                    "sample_weight": sample_weight,
+                    "area_ratio": mask_qc.get("area_ratio", np.nan),
+                    "quality_valid": quality_row.get("quality_valid", 0),
+                    "quality_reason": quality_row.get("quality_reason", ""),
+                    "reason": ";".join(filter(None, reasons)),
                 }
             )
-            continue
 
-        mask_qc=manual_mask_qc(path)
-        target_type=str(annotation.get("target_type", "")).strip().upper()
-        source=str(annotation.get("source", "")).strip()
-        if not target_type:
-            if mask_qc["usable"]:
-                target_type=HEART_PRESENT
-                source="legacy_nonempty_manual"
+            if status != "ACCEPTED":
+                continue
+            row.update(
+                {
+                    "manual_mask_path": str(path),
+                    "manual_mask_area_ratio": float(DataStage._as_float(mask_qc.get("area_ratio"), 0.0)),
+                    "quality_valid": 1,
+                    "perceptual_hash": quality_row.get("perceptual_hash", ""),
+                    "segmentation_target_type": target_type,
+                    "heart_present": int(heart_present),
+                    "sample_weight": float(sample_weight),
+                    "annotation_source": source,
+                }
+            )
+            accepted.append(row)
+            patient_counts[str(row["patient_id"])] +=1
+            fold=int(row["segmentation_fold"])
+            if int(heart_present) == 1:
+                positive_count +=1
+                positive_patient_counts[str(row["patient_id"])] +=1
+                fold_positive_counts[fold] +=1
             else:
-                target_type="UNLABELED_EMPTY"
-                source="legacy_unlabeled"
+                negative_count +=1
+                fold_negative_counts[fold] +=1
 
-        quality_row=quality.get(token, {})
-        quality_valid=_as_int(quality_row.get("quality_valid"), 0) == 1
-        reasons=[]
-        heart_present=""
-
-        if target_type == HEART_PRESENT:
-            heart_present=1
-            if not mask_qc["usable"]:
-                reasons.append(mask_qc["reason"] or "missing_positive_mask")
-        elif target_type == NO_HEART_VISIBLE:
-            heart_present=0
-            if not path.is_file():
-                write_png(
-                    path,
-                    np.zeros(
-                        (SEGMENTATION_SIZE, SEGMENTATION_SIZE),
-                        dtype=np.uint8,
-                    ),
-                )
-                mask_qc=manual_mask_qc(path)
-            if not np.isfinite(_as_float(mask_qc.get("area_ratio"), np.nan)):
-                reasons.append("unreadable_negative_mask")
-            elif _as_float(mask_qc.get("area_ratio"), 1.0) >= MANUAL_MIN_AREA_RATIO:
-                reasons.append("no_heart_annotation_has_nonempty_mask")
-        elif target_type == UNUSABLE:
-            unusable_count +=1
-            reasons.append("explicitly_unusable")
-        else:
-            reasons.append("empty_mask_without_explicit_no_heart_label")
-
-        if target_type != UNUSABLE and not quality_valid:
-            reasons.append(str(quality_row.get("quality_reason", "quality_invalid")))
-
-        if target_type == UNUSABLE:
-            status="EXCLUDED"
-        else:
-            status="ACCEPTED" if not reasons else "REJECTED"
-
-        sample_weight=_as_float(
-            annotation.get("sample_weight"),
-            default_target_weight(target_type, source),
+        DataStage.write_csv(workspace.manual_audit, audit, audit[0].keys())
+        rejected=sum(row.get("status") == "REJECTED" for row in audit)
+        excluded=sum(row.get("status") == "EXCLUDED" for row in audit)
+        unlabeled_empty=sum(
+            "without_explicit_no_heart" in str(row.get("reason", "")) for row in audit
         )
-        audit.append(
-            {
-                "image_token": token,
-                "patient_id": row["patient_id"],
-                "series_id": row["series_id"],
-                "manual_mask_path": str(path),
-                "status": status,
-                "target_type": target_type,
-                "heart_present": heart_present,
-                "annotation_source": source,
-                "sample_weight": sample_weight,
-                "area_ratio": mask_qc.get("area_ratio", np.nan),
-                "quality_valid": quality_row.get("quality_valid", 0),
-                "quality_reason": quality_row.get("quality_reason", ""),
-                "reason": ";".join(filter(None, reasons)),
-            }
+        blur_or_noise=sum(
+            row.get("status") == "REJECTED" and bool(row.get("quality_reason"))
+            for row in audit
+        )
+        summary={
+            "manual_png_files": len(manual_files),
+            "explicit_annotations": len(annotations),
+            "accepted_training_targets": len(accepted),
+            "accepted_heart_present": positive_count,
+            "accepted_no_heart_visible": negative_count,
+            "explicit_unusable": unusable_count,
+            "rejected_targets": rejected,
+            "excluded_targets": excluded,
+            "rejected_unlabeled_empty_masks": unlabeled_empty,
+            "rejected_blur_or_noise": blur_or_noise,
+            "patients_with_training_targets": len(patient_counts),
+            "patients_with_positive_masks": len(positive_patient_counts),
+            "targets_per_patient": dict(sorted(patient_counts.items())),
+            "positive_masks_per_fold": {
+                str(fold): int(fold_positive_counts.get(fold, 0))
+                for fold in range(5)
+            },
+            "negative_masks_per_fold": {
+                str(fold): int(fold_negative_counts.get(fold, 0))
+                for fold in range(5)
+            },
+            "audit": str(workspace.manual_audit),
+            "annotations": str(workspace.manual_annotations),
+        }
+        print(
+            "[MANUAL MASKS] "
+            f"heart_present={positive_count}, no_heart={negative_count}, "
+            f"rejected={rejected}, unusable={unusable_count}, "
+            f"patients={len(patient_counts)}"
         )
 
-        if status != "ACCEPTED":
-            continue
-        row.update(
-            {
-                "manual_mask_path": str(path),
-                "manual_mask_area_ratio": float(_as_float(mask_qc.get("area_ratio"), 0.0)),
-                "quality_valid": 1,
-                "perceptual_hash": quality_row.get("perceptual_hash", ""),
-                "segmentation_target_type": target_type,
-                "heart_present": int(heart_present),
-                "sample_weight": float(sample_weight),
-                "annotation_source": source,
-            }
-        )
-        accepted.append(row)
-        patient_counts[str(row["patient_id"])] +=1
-        fold=int(row["segmentation_fold"])
-        if int(heart_present) == 1:
-            positive_count +=1
-            positive_patient_counts[str(row["patient_id"])] +=1
-            fold_positive_counts[fold] +=1
-        else:
-            negative_count +=1
-            fold_negative_counts[fold] +=1
+        if positive_count < minimum_masks:
+            raise RuntimeError(
+                f"Only {positive_count} valid HEART_PRESENT masks remain, below the minimum of "
+                f"{minimum_masks}. See {workspace.manual_audit}"
+            )
+        missing_folds=[
+            fold
+            for fold in range(5)
+            if fold_positive_counts.get(fold, 0) == 0
+        ]
+        if missing_folds:
+            raise RuntimeError(
+                f"No valid HEART_PRESENT masks exist in folds {missing_folds}."
+            )
+        if len(positive_patient_counts) < 5 + 1:
+            raise RuntimeError("Too few patients have positive masks for cross-fitting.")
+        return accepted, summary
 
-    write_csv(workspace.manual_audit, audit, audit[0].keys())
-    rejected=sum(row.get("status") == "REJECTED" for row in audit)
-    excluded=sum(row.get("status") == "EXCLUDED" for row in audit)
-    unlabeled_empty=sum(
-        "without_explicit_no_heart" in str(row.get("reason", "")) for row in audit
-    )
-    blur_or_noise=sum(
-        row.get("status") == "REJECTED" and bool(row.get("quality_reason"))
-        for row in audit
-    )
-    summary={
-        "manual_png_files": len(manual_files),
-        "explicit_annotations": len(annotations),
-        "accepted_training_targets": len(accepted),
-        "accepted_heart_present": positive_count,
-        "accepted_no_heart_visible": negative_count,
-        "explicit_unusable": unusable_count,
-        "rejected_targets": rejected,
-        "excluded_targets": excluded,
-        "rejected_unlabeled_empty_masks": unlabeled_empty,
-        "rejected_blur_or_noise": blur_or_noise,
-        "patients_with_training_targets": len(patient_counts),
-        "patients_with_positive_masks": len(positive_patient_counts),
-        "targets_per_patient": dict(sorted(patient_counts.items())),
-        "positive_masks_per_fold": {
-            str(fold): int(fold_positive_counts.get(fold, 0))
-            for fold in range(FOLDS)
-        },
-        "negative_masks_per_fold": {
-            str(fold): int(fold_negative_counts.get(fold, 0))
-            for fold in range(FOLDS)
-        },
-        "audit": str(workspace.manual_audit),
-        "annotations": str(workspace.manual_annotations),
-    }
-    print(
-        "[MANUAL MASKS] "
-        f"heart_present={positive_count}, no_heart={negative_count}, "
-        f"rejected={rejected}, unusable={unusable_count}, "
-        f"patients={len(patient_counts)}"
-    )
-
-    if positive_count < minimum_masks:
-        raise RuntimeError(
-            f"Only {positive_count} valid HEART_PRESENT masks remain, below the minimum of "
-            f"{minimum_masks}. See {workspace.manual_audit}"
-        )
-    missing_folds=[
-        fold
-        for fold in range(FOLDS)
-        if fold_positive_counts.get(fold, 0) == 0
-    ]
-    if missing_folds:
-        raise RuntimeError(
-            f"No valid HEART_PRESENT masks exist in folds {missing_folds}."
-        )
-    if len(positive_patient_counts) < FOLDS + 1:
-        raise RuntimeError("Too few patients have positive masks for cross-fitting.")
-    return accepted, summary
-
-
-# -----------------------------------------------------------------------------
-# STEP 3 — ATTENTION U-NET: patient-level cross-fitting and OOF masks
-# -----------------------------------------------------------------------------
-# For fold k, patients assigned to k are absent from model fitting AND calibration.
-# Therefore every saved mask for those patients is genuinely out-of-fold.  Manual
-# target changes invalidate only the affected checkpoint fingerprints.
+# =============================================================================
+# STAGE 2 — ATTENTION U-NET: MODEL + OOF SEGMENTATION
+# =============================================================================
+# These small classes are required by PyTorch. They are implementation details of
+# AttentionStage, not separate pipeline-management layers.
 class AttentionConvBlock(nn.Module):
     """Apply two normalized convolution layers inside the Attention U-Net."""
 
@@ -1255,8 +1181,6 @@ class AttentionConvBlock(nn.Module):
 
     def forward(self, x):
         return self.block(x)
-
-
 class AttentionGate(nn.Module):
     """Weight an encoder skip connection using decoder context."""
 
@@ -1280,8 +1204,6 @@ class AttentionGate(nn.Module):
     def forward(self, gating, skip):
         gating=F.interpolate(gating, size=skip.shape[-2:], mode="bilinear", align_corners=False)
         return skip * self.weight(self.gating(gating) + self.skip(skip))
-
-
 class AttentionUpBlock(nn.Module):
     """Upsample decoder features, gate the skip connection, and refine the result."""
 
@@ -1295,8 +1217,6 @@ class AttentionUpBlock(nn.Module):
         x=F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False)
         x=self.up(x)
         return self.refine(torch.cat([x, self.gate(x, skip)], dim=1))
-
-
 class AttentionUNet(nn.Module):
     """2.5D Attention U-Net with segmentation and heart-presence heads.
 
@@ -1309,8 +1229,8 @@ class AttentionUNet(nn.Module):
         base_channels=None,
         input_channels=None,):
         super().__init__()
-        base=int(base_channels or BASE_CHANNELS)
-        input_channels=int(input_channels or INPUT_CHANNELS)
+        base=int(base_channels or 24)  # 24 channels in the first U-Net block
+        input_channels=int(input_channels or 3)  # previous/current/next = 2.5D input
         self.input_channels=input_channels
         self.encoder1=AttentionConvBlock(input_channels, base)
         self.encoder2=AttentionConvBlock(base, base * 2)
@@ -1344,8 +1264,6 @@ class AttentionUNet(nn.Module):
         d2=self.decoder2(d3, e2)
         d1=self.decoder1(d2, e1)
         return self.output(d1), presence_logits
-
-
 class SegmentationDataset(Dataset):
     """Load manual segmentation targets and optional training augmentation."""
 
@@ -1371,16 +1289,16 @@ class SegmentationDataset(Dataset):
             str(row.get("next_image_path") or current),
         )
         return np.stack(
-            [get_cached_image(path).astype(np.float32) / 255.0 for path in paths],
+            [DataStage.get_cached_image(path).astype(np.float32) / 255.0 for path in paths],
             axis=0,
         )
 
     def __getitem__(self, index):
         row=self.rows[index]
         image=self._image_stack(row)
-        mask=read_binary_mask(row["manual_mask_path"]).astype(np.float32)
-        heart_present=float(_as_int(row.get("heart_present"), int(mask.any())))
-        sample_weight=float(_as_float(row.get("sample_weight"), 1.0))
+        mask=DataStage.read_binary_mask(row["manual_mask_path"]).astype(np.float32)
+        heart_present=float(DataStage._as_int(row.get("heart_present"), int(mask.any())))
+        sample_weight=float(DataStage._as_float(row.get("sample_weight"), 1.0))
 
         if self.augment:
             rng=np.random.default_rng(self.seed + self.epoch * 1_000_003 + index)
@@ -1388,11 +1306,11 @@ class SegmentationDataset(Dataset):
                 image=np.flip(image, axis=2).copy()
                 mask=np.fliplr(mask).copy()
 
-            size=SEGMENTATION_SIZE
+            size=256
             angle=float(
                 rng.uniform(
-                    -AUGMENT_ROTATION_DEGREES,
-                    AUGMENT_ROTATION_DEGREES,
+                    -7.0,
+                    7.0,
                 )
             )
             scale=float(
@@ -1458,8 +1376,6 @@ class SegmentationDataset(Dataset):
             torch.tensor(sample_weight, dtype=torch.float32),
             str(row["patient_id"]),
         )
-
-
 class SegmentationInferenceDataset(Dataset):
     """Load image stacks for deterministic segmentation inference."""
 
@@ -1473,1418 +1389,1291 @@ class SegmentationInferenceDataset(Dataset):
         image=SegmentationDataset._image_stack(self.rows[index])
         return torch.from_numpy(np.ascontiguousarray(image)).float(), int(index)
 
+class AttentionStage:
+    """Train five patient-level folds from scratch and predict every image OOF."""
 
-# Attention U-Net training, calibration, and prediction settings.
-# Number of patient-level folds used for leakage-safe Attention U-Net cross-fitting.
-FOLDS=5
-
-# Number of channels in the first Attention U-Net encoder block.
-BASE_CHANNELS=24
-
-# Number of input channels; three channels represent previous, current, and next frames.
-INPUT_CHANNELS=3
-
-# Use neighboring frames as 2.5D context for each segmentation prediction.
-
-# Maximum number of training epochs for each cross-fitting fold.
-
-
-# Initial AdamW learning rate.
-
-# AdamW weight-decay strength.
-
-
-# Contribution of focal loss to the segmentation loss.
-
-# Contribution of Tversky loss to the segmentation loss.
-
-
-# False-positive penalty used by Tversky loss.
-
-# False-negative penalty used by Tversky loss.
-
-# Contribution of the heart-presence classification head to total loss.
-
-# Training weight for a manually drawn or corrected heart mask.
-MANUAL_DRAWN_WEIGHT=1.00
-
-# Training weight for an automatic mask confirmed by a human reviewer.
-AUTO_CONFIRMED_WEIGHT=0.72
-
-# Training weight for an explicit no-heart-visible target.
-NO_HEART_WEIGHT=0.90
-
-
-# Minimum accepted HEART_PRESENT masks required before training starts.
-
-# Smallest non-empty manual-mask area accepted as a heart target.
-MANUAL_MIN_AREA_RATIO=0.0005
-
-
-# Maximum absolute random rotation used during augmentation.
-AUGMENT_ROTATION_DEGREES=7.0
-
-
-# Candidate mask thresholds evaluated only on fold-level validation patients.
-CALIBRATION_THRESHOLDS=(
-    0.20,
-    0.25,
-    0.30,
-    0.35,
-    0.40,
-    0.45,
-    0.50,
-    0.55,
-    0.60,
-    0.65,
-    0.70,
-    0.75,
-)
-
-# Candidate heart-presence thresholds evaluated on validation patients.
-PRESENCE_CALIBRATION_THRESHOLDS=(
-    0.20,
-    0.25,
-    0.30,
-    0.35,
-    0.40,
-    0.45,
-    0.50,
-    0.55,
-    0.60,
-    0.65,
-    0.70,
-    0.75,
-    0.80,
-)
-
-# Fallback mask threshold when calibration cannot select one.
-DEFAULT_THRESHOLD=0.50
-
-# Fallback heart-presence threshold when calibration cannot select one.
-DEFAULT_PRESENCE_THRESHOLD=0.50
-
-# Peak segmentation probability that can override a negative presence prediction.
-PRESENCE_SEGMENTATION_OVERRIDE_PEAK=0.80
-
-# Smallest automatic mask area considered anatomically usable.
-PREDICTION_MIN_AREA_RATIO=0.003
-
-# Largest automatic mask area considered anatomically usable.
-
-
-# Threshold changes tested when the initial automatic mask is invalid.
-REPAIR_THRESHOLD_OFFSETS=(-0.20, -0.15, -0.10, -0.05, 0.05, 0.10, 0.15, 0.20)
-
-
-# Kernel size used to close small gaps in thresholded masks.
-
-# Largest robust geometry deviation allowed from the training-mask prior.
-PRIOR_MAX_ROBUST_Z=5.5
-
-# Contrast factor used for photometric test-time augmentation.
-
-
-# Kernel used to expand a mask before ROI and complement feature extraction.
-
-
-
-# Keep one checkpoint file per patient-level segmentation fold.
-def attention_checkpoint_path(workspace, fold):
-    return workspace.checkpoints / f"attention_unet_fold_{int(fold)}.pt"
-
-# Load torch file.
-def load_torch_file(path):
-    try:
-        return torch.load(str(path), map_location="cpu", weights_only=False)
-    except TypeError:
-        return torch.load(str(path), map_location="cpu")
-
-
-# Combine focal, Tversky, and heart-presence losses using per-target review weights.
-def segmentation_loss(
-    logits,
-    targets,
-    presence_logits,
-    presence_targets,
-    sample_weights,
-):
-    probability=torch.sigmoid(logits)
-    bce=F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
-    pt=probability * targets + (1.0 - probability) * (1.0 - targets)
-    focal=((1.0 - pt).pow(2.0) * bce).mean(
-        dim=(1, 2, 3)
-    )
-
-    tp=(probability * targets).sum(dim=(1, 2, 3))
-    fp=(probability * (1.0 - targets)).sum(dim=(1, 2, 3))
-    fn=((1.0 - probability) * targets).sum(dim=(1, 2, 3))
-    tversky=(tp + 1e-6) / (
-        tp
-        + 0.65 * fp  # penalize false-positive mask area
-        + 0.35 * fn  # penalize false-negative mask area
-        + 1e-6
-    )
-    segmentation_per_sample=(
-        0.40 * focal  # focal-loss contribution
-        + 0.60 * (1.0 - tversky)  # Tversky-loss contribution
-    )
-
-    sample_weights=sample_weights.float().clamp_min(1e-3)
-    segmentation_loss=(
-        segmentation_per_sample * sample_weights
-    ).sum() / sample_weights.sum().clamp_min(1e-6)
-    presence_loss=F.binary_cross_entropy_with_logits(
-        presence_logits.float(), presence_targets.float(), reduction="none"
-    )
-    presence_loss=(presence_loss * sample_weights).sum() / sample_weights.sum().clamp_min(1e-6)
-    return segmentation_loss + 0.30 * presence_loss  # auxiliary heart-presence loss
-
-# Hash the exact training targets/settings so unchanged folds can reuse checkpoints.
-
-# Select validation patients.
-def select_validation_patients(patient_ids, target_fold):
-    ordered=sorted(
-        set(map(str, patient_ids)),
-        key=lambda patient_id: hashlib.sha256(
-            f"{RANDOM_SEED}|validation|{target_fold}|{patient_id}".encode(
-                "utf-8"
-            )
-        ).hexdigest(),
-    )
-    count=max(
-        1,
-        int(
-            round(
-                len(ordered)
-                * 0.20
-            )
-        ),
-    )
-    count=min(count, max(1, len(ordered) - 1))
-    return set(ordered[:count])
-
-# Keep positive and negative presence examples represented in fold validation.
-def ensure_presence_coverage(
-    rows,
-    validation_patients,
-    target_fold,
-):
-    patients=sorted({str(row["patient_id"]) for row in rows})
-    has_label={0: set(), 1: set()}
-    for row in rows:
-        has_label[_as_int(row.get("heart_present"), 1)].add(
-            str(row["patient_id"])
+    # Keep one checkpoint file per patient-level segmentation fold.
+    @staticmethod
+    def attention_checkpoint_path(workspace, fold):
+        return workspace.checkpoints / f"attention_unet_fold_{int(fold)}.pt"
+    # Load torch file.
+    @staticmethod
+    def load_torch_file(path):
+        try:
+            return torch.load(str(path), map_location="cpu", weights_only=False)
+        except TypeError:
+            return torch.load(str(path), map_location="cpu")
+    # Combine focal, Tversky, and heart-presence losses using per-target review weights.
+    @staticmethod
+    def segmentation_loss(
+        logits,
+        targets,
+        presence_logits,
+        presence_targets,
+        sample_weights,
+    ):
+        probability=torch.sigmoid(logits)
+        bce=F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+        pt=probability * targets + (1.0 - probability) * (1.0 - targets)
+        focal=((1.0 - pt).pow(2.0) * bce).mean(
+            dim=(1, 2, 3)
         )
-    validation=set(validation_patients)
 
-    def ordered(values, salt):
-        return sorted(
-            values,
-            key=lambda patient: hashlib.sha256(
-                f"{RANDOM_SEED}|{target_fold}|{salt}|{patient}".encode(
+        tp=(probability * targets).sum(dim=(1, 2, 3))
+        fp=(probability * (1.0 - targets)).sum(dim=(1, 2, 3))
+        fn=((1.0 - probability) * targets).sum(dim=(1, 2, 3))
+        tversky=(tp + 1e-6) / (
+            tp
+            + 0.65 * fp  # penalize false-positive mask area
+            + 0.35 * fn  # penalize false-negative mask area
+            + 1e-6
+        )
+        segmentation_per_sample=(
+            0.40 * focal  # focal-loss contribution
+            + 0.60 * (1.0 - tversky)  # Tversky-loss contribution
+        )
+
+        sample_weights=sample_weights.float().clamp_min(1e-3)
+        segmentation_loss=(
+            segmentation_per_sample * sample_weights
+        ).sum() / sample_weights.sum().clamp_min(1e-6)
+        presence_loss=F.binary_cross_entropy_with_logits(
+            presence_logits.float(), presence_targets.float(), reduction="none"
+        )
+        presence_loss=(presence_loss * sample_weights).sum() / sample_weights.sum().clamp_min(1e-6)
+        return segmentation_loss + 0.30 * presence_loss  # auxiliary heart-presence loss
+    # Select validation patients.
+    @staticmethod
+    def select_validation_patients(patient_ids, target_fold):
+        ordered=sorted(
+            set(map(str, patient_ids)),
+            key=lambda patient_id: hashlib.sha256(
+                f"{42}|validation|{target_fold}|{patient_id}".encode(
                     "utf-8"
                 )
             ).hexdigest(),
         )
-
-    for label in (0, 1):
-        labelled=has_label[label]
-        if len(labelled) < 2:
-            continue
-        if not (validation & labelled):
-            incoming=ordered(labelled - validation, f"incoming-{label}")[0]
-            removable=[
-                patient
-                for patient in validation
-                if patient not in labelled
-                and all(
-                    len((validation - {patient}) & has_label[other]) > 0
-                    for other in (0, 1)
-                    if len(has_label[other]) >= 2
-                    and (validation & has_label[other])
+        count=max(
+            1,
+            int(
+                round(
+                    len(ordered)
+                    * 0.20
                 )
-            ]
-            if removable:
-                validation.remove(ordered(set(removable), f"remove-{label}")[0])
-            validation.add(incoming)
-        if not (labelled - validation):
+            ),
+        )
+        count=min(count, max(1, len(ordered) - 1))
+        return set(ordered[:count])
+    # Keep positive and negative presence examples represented in fold validation.
+    @staticmethod
+    def ensure_presence_coverage(
+        rows,
+        validation_patients,
+        target_fold,
+    ):
+        patients=sorted({str(row["patient_id"]) for row in rows})
+        has_label={0: set(), 1: set()}
+        for row in rows:
+            has_label[DataStage._as_int(row.get("heart_present"), 1)].add(
+                str(row["patient_id"])
+            )
+        validation=set(validation_patients)
 
-            outgoing=ordered(validation & labelled, f"outgoing-{label}")[-1]
-            validation.remove(outgoing)
-            replacement_candidates=set(patients) - validation - {outgoing}
-            if replacement_candidates:
-                validation.add(
-                    ordered(replacement_candidates, f"replacement-{label}")[0]
-                )
-    if not validation or len(validation) >= len(patients):
-        return set(validation_patients)
-    return validation
+        def ordered(values, salt):
+            return sorted(
+                values,
+                key=lambda patient: hashlib.sha256(
+                    f"{42}|{target_fold}|{salt}|{patient}".encode(
+                        "utf-8"
+                    )
+                ).hexdigest(),
+            )
 
-# Balance patients, series, duplicate clusters, and explicit no-heart targets in training.
-def training_sampler(
-    rows,
-    seed,
-):
-    rows=list(rows)
-    series_by_patient=defaultdict(set)
-    clusters_by_series=defaultdict(set)
-    cluster_counts=defaultdict(int)
-    for row in rows:
-        patient=str(row["patient_id"])
-        series=str(row.get("sequence_group_id") or row["series_id"])
-        cluster=str(row.get("perceptual_hash") or row["image_token"])
-        series_by_patient[patient].add(series)
-        clusters_by_series[(patient, series)].add(cluster)
-        cluster_counts[(patient, series, cluster)] +=1
+        for label in (0, 1):
+            labelled=has_label[label]
+            if len(labelled) < 2:
+                continue
+            if not (validation & labelled):
+                incoming=ordered(labelled - validation, f"incoming-{label}")[0]
+                removable=[
+                    patient
+                    for patient in validation
+                    if patient not in labelled
+                    and all(
+                        len((validation - {patient}) & has_label[other]) > 0
+                        for other in (0, 1)
+                        if len(has_label[other]) >= 2
+                        and (validation & has_label[other])
+                    )
+                ]
+                if removable:
+                    validation.remove(ordered(set(removable), f"remove-{label}")[0])
+                validation.add(incoming)
+            if not (labelled - validation):
 
-    base_weights=[]
-    labels=[]
-    for row in rows:
-        patient=str(row["patient_id"])
-        series=str(row.get("sequence_group_id") or row["series_id"])
-        cluster=str(row.get("perceptual_hash") or row["image_token"])
-        weight=1.0
-        weight /=max(1, len(series_by_patient[patient]))
-        weight /=max(1, len(clusters_by_series[(patient, series)]))
-        weight /=max(1, cluster_counts[(patient, series, cluster)])
-        base_weights.append(weight)
-        labels.append(_as_int(row.get("heart_present"), 1))
+                outgoing=ordered(validation & labelled, f"outgoing-{label}")[-1]
+                validation.remove(outgoing)
+                replacement_candidates=set(patients) - validation - {outgoing}
+                if replacement_candidates:
+                    validation.add(
+                        ordered(replacement_candidates, f"replacement-{label}")[0]
+                    )
+        if not validation or len(validation) >= len(patients):
+            return set(validation_patients)
+        return validation
+    # Balance patients, series, duplicate clusters, and explicit no-heart targets in training.
+    @staticmethod
+    def training_sampler(
+        rows,
+        seed,
+    ):
+        rows=list(rows)
+        series_by_patient=defaultdict(set)
+        clusters_by_series=defaultdict(set)
+        cluster_counts=defaultdict(int)
+        for row in rows:
+            patient=str(row["patient_id"])
+            series=str(row.get("sequence_group_id") or row["series_id"])
+            cluster=str(row.get("perceptual_hash") or row["image_token"])
+            series_by_patient[patient].add(series)
+            clusters_by_series[(patient, series)].add(cluster)
+            cluster_counts[(patient, series, cluster)] +=1
 
-    base=np.asarray(base_weights, dtype=np.float64)
-    labels_array=np.asarray(labels, dtype=np.int64)
-    positive=labels_array == 1
-    negative=labels_array == 0
-    if positive.any() and negative.any():
-        target_negative=float(0.30)
-        target_positive=1.0 - target_negative
-        base[positive] *=target_positive / max(base[positive].sum(), 1e-12)
-        base[negative] *=target_negative / max(base[negative].sum(), 1e-12)
-    else:
-        base /=max(base.sum(), 1e-12)
+        base_weights=[]
+        labels=[]
+        for row in rows:
+            patient=str(row["patient_id"])
+            series=str(row.get("sequence_group_id") or row["series_id"])
+            cluster=str(row.get("perceptual_hash") or row["image_token"])
+            weight=1.0
+            weight /=max(1, len(series_by_patient[patient]))
+            weight /=max(1, len(clusters_by_series[(patient, series)]))
+            weight /=max(1, cluster_counts[(patient, series, cluster)])
+            base_weights.append(weight)
+            labels.append(DataStage._as_int(row.get("heart_present"), 1))
 
-    generator=torch.Generator().manual_seed(int(seed))
-    return WeightedRandomSampler(
-        weights=torch.as_tensor(base, dtype=torch.double),
-        num_samples=len(rows),
-        replacement=True,
-        generator=generator,
-    )
+        base=np.asarray(base_weights, dtype=np.float64)
+        labels_array=np.asarray(labels, dtype=np.int64)
+        positive=labels_array == 1
+        negative=labels_array == 0
+        if positive.any() and negative.any():
+            target_negative=float(0.30)
+            target_positive=1.0 - target_negative
+            base[positive] *=target_positive / max(base[positive].sum(), 1e-12)
+            base[negative] *=target_negative / max(base[negative].sum(), 1e-12)
+        else:
+            base /=max(base.sum(), 1e-12)
 
-# Summarize mask area, boundary contact, centroid, and aspect ratio for QC.
-def mask_features(mask):
-    mask=(np.asarray(mask) > 0).astype(np.uint8)
-    area, boundary=mask_geometry(mask)
-    if not mask.any():
+        generator=torch.Generator().manual_seed(int(seed))
+        return WeightedRandomSampler(
+            weights=torch.as_tensor(base, dtype=torch.double),
+            num_samples=len(rows),
+            replacement=True,
+            generator=generator,
+        )
+    # Summarize mask area, boundary contact, centroid, and aspect ratio for QC.
+    @staticmethod
+    def mask_features(mask):
+        mask=(np.asarray(mask) > 0).astype(np.uint8)
+        area, boundary=AttentionStage.mask_geometry(mask)
+        if not mask.any():
+            return {
+                "area": area,
+                "boundary": boundary,
+                "centroid_x": np.nan,
+                "centroid_y": np.nan,
+                "aspect_ratio": np.nan,
+            }
+        ys, xs=np.nonzero(mask)
+        width=float(xs.max() - xs.min() + 1)
+        height=float(ys.max() - ys.min() + 1)
+        size=float(mask.shape[0])
         return {
             "area": area,
             "boundary": boundary,
-            "centroid_x": np.nan,
-            "centroid_y": np.nan,
-            "aspect_ratio": np.nan,
+            "centroid_x": float(xs.mean() / max(1.0, mask.shape[1] - 1)),
+            "centroid_y": float(ys.mean() / max(1.0, mask.shape[0] - 1)),
+            "aspect_ratio": float(width / max(height, 1.0)),
         }
-    ys, xs=np.nonzero(mask)
-    width=float(xs.max() - xs.min() + 1)
-    height=float(ys.max() - ys.min() + 1)
-    size=float(mask.shape[0])
-    return {
-        "area": area,
-        "boundary": boundary,
-        "centroid_x": float(xs.mean() / max(1.0, mask.shape[1] - 1)),
-        "centroid_y": float(ys.mean() / max(1.0, mask.shape[0] - 1)),
-        "aspect_ratio": float(width / max(height, 1.0)),
-    }
-
-# Build geometry prior.
-def build_geometry_prior(rows):
-    features=[]
-    for row in rows:
-        if _as_int(row.get("heart_present"), 1) != 1:
-            continue
-        try:
-            features.append(
-                mask_features(
-                    read_binary_mask(row["manual_mask_path"])
+    # Build geometry prior.
+    @staticmethod
+    def build_geometry_prior(rows):
+        features=[]
+        for row in rows:
+            if DataStage._as_int(row.get("heart_present"), 1) != 1:
+                continue
+            try:
+                features.append(
+                    AttentionStage.mask_features(
+                        DataStage.read_binary_mask(row["manual_mask_path"])
+                    )
                 )
-            )
-        except Exception:
-            continue
-    keys=("area", "centroid_x", "centroid_y", "aspect_ratio")
-    if not features:
-        return {"count": 0, "median": {}, "scale": {}}
-    median={}
-    scale={}
-    for key in keys:
-        values=np.asarray([item[key] for item in features], dtype=np.float64)
-        values=values[np.isfinite(values)]
-        if not len(values):
-            continue
-        center=float(np.median(values))
-        mad=float(np.median(np.abs(values - center)))
-        median[key]=center
-        scale[key]=max(1e-3, 1.4826 * mad)
-    return {"count": len(features), "median": median, "scale": scale}
+            except Exception:
+                continue
+        keys=("area", "centroid_x", "centroid_y", "aspect_ratio")
+        if not features:
+            return {"count": 0, "median": {}, "scale": {}}
+        median={}
+        scale={}
+        for key in keys:
+            values=np.asarray([item[key] for item in features], dtype=np.float64)
+            values=values[np.isfinite(values)]
+            if not len(values):
+                continue
+            center=float(np.median(values))
+            mad=float(np.median(np.abs(values - center)))
+            median[key]=center
+            scale[key]=max(1e-3, 1.4826 * mad)
+        return {"count": len(features), "median": median, "scale": scale}
+    # Calculate prior deviation.
+    @staticmethod
+    def calculate_prior_deviation(mask, prior):
+        if not prior or DataStage._as_int(prior.get("count"), 0) < 5 or not np.asarray(mask).any():
+            return 0.0
+        features=AttentionStage.mask_features(mask)
+        deviations=[]
+        for key, center in dict(prior.get("median", {})).items():
+            value=features.get(key, np.nan)
+            scale=DataStage._as_float(dict(prior.get("scale", {})).get(key), 0.0)
+            if np.isfinite(value) and scale > 0:
+                deviations.append(abs(float(value) - float(center)) / scale)
+        return float(max(deviations)) if deviations else 0.0
+    # Average recall across available heart-present / no-heart classes.
+    @staticmethod
+    def balanced_accuracy(labels, predictions):
+        labels=np.asarray(labels, dtype=np.int64)
+        predictions=np.asarray(predictions, dtype=np.int64)
+        values=[]
+        for label in (0, 1):
+            selector=labels == label
+            if selector.any():
+                values.append(float(np.mean(predictions[selector] == label)))
+        return float(np.mean(values)) if values else 0.0
+    # Choose mask and presence thresholds only on non-test validation patients.
+    @staticmethod
+    def calibrate_threshold(
+        model,
+        loader,
+        device,
+        geometry_prior,
+    ):
+        probabilities=[]
+        targets=[]
+        presence_probabilities=[]
+        presence_targets=[]
+        patients=[]
+        model.eval()
+        with torch.inference_mode():
+            for images, masks, target_presence, _weights, patient_ids in loader:
+                images=DataStage.move_tensor(images, device)
+                with DataStage.autocast(device):
+                    logits, presence_logits=model(images)
+                    probability=torch.sigmoid(logits)
+                    presence_probability=torch.sigmoid(presence_logits)
+                probabilities.extend(probability.float().cpu().numpy()[:, 0])
+                targets.extend(masks.numpy()[:, 0])
+                presence_probabilities.extend(
+                    presence_probability.float().cpu().numpy().tolist()
+                )
+                presence_targets.extend(target_presence.numpy().astype(int).tolist())
+                patients.extend(map(str, patient_ids))
 
-# Calculate prior deviation.
-def calculate_prior_deviation(mask, prior):
-    if not prior or _as_int(prior.get("count"), 0) < 5 or not np.asarray(mask).any():
-        return 0.0
-    features=mask_features(mask)
-    deviations=[]
-    for key, center in dict(prior.get("median", {})).items():
-        value=features.get(key, np.nan)
-        scale=_as_float(dict(prior.get("scale", {})).get(key), 0.0)
-        if np.isfinite(value) and scale > 0:
-            deviations.append(abs(float(value) - float(center)) / scale)
-    return float(max(deviations)) if deviations else 0.0
+        labels_array=np.asarray(presence_targets, dtype=np.int64)
+        presence_array=np.asarray(presence_probabilities, dtype=np.float64)
+        best_presence={
+            "threshold": 0.50,
+            "balanced_accuracy": 0.0,
+        }
+        if len(np.unique(labels_array)) >= 2:
+            for threshold in (0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80):
+                prediction=(presence_array >= threshold).astype(np.int64)
+                balanced=AttentionStage.balanced_accuracy(
+                    labels_array, prediction
+                )
+                candidate={
+                    "threshold": float(threshold),
+                    "balanced_accuracy": balanced,
+                }
+                if (
+                    candidate["balanced_accuracy"],
+                    -abs(candidate["threshold"] - 0.5),
+                ) > (
+                    best_presence["balanced_accuracy"],
+                    -abs(best_presence["threshold"] - 0.5),):
+                    best_presence=candidate
+        elif len(labels_array):
+            best_presence["balanced_accuracy"]=1.0
 
-# Average recall across available heart-present / no-heart classes.
-def balanced_accuracy(labels, predictions):
-    labels=np.asarray(labels, dtype=np.int64)
-    predictions=np.asarray(predictions, dtype=np.int64)
-    values=[]
-    for label in (0, 1):
-        selector=labels == label
-        if selector.any():
-            values.append(float(np.mean(predictions[selector] == label)))
-    return float(np.mean(values)) if values else 0.0
+        best=None
+        for threshold in (0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75):
+            by_patient=defaultdict(list)
+            invalid=0
+            for probability, target, target_presence, patient_id in zip(
+                probabilities, targets, presence_targets, patients):
+                prediction=AttentionStage.candidate_mask(
+                    probability, threshold
+                )
+                if int(target_presence) == 1:
+                    intersection=float(
+                        np.logical_and(prediction, target > 0.5).sum()
+                    )
+                    denominator=float(
+                        prediction.sum() + (target > 0.5).sum()
+                    )
+                    quality=(2.0 * intersection + 1e-6) / (
+                        denominator + 1e-6
+                    )
+                    valid, _=AttentionStage.validate_mask(
+                        prediction, probability, geometry_prior
+                    )
+                    invalid +=int(not valid)
+                else:
 
-# Choose mask and presence thresholds only on non-test validation patients.
-def calibrate_threshold(
-    model,
-    loader,
-    device,
-    geometry_prior,
-):
-    probabilities=[]
-    targets=[]
-    presence_probabilities=[]
-    presence_targets=[]
-    patients=[]
-    model.eval()
-    with torch.inference_mode():
-        for images, masks, target_presence, _weights, patient_ids in loader:
-            images=move_tensor(images, device)
-            with autocast(device):
-                logits, presence_logits=model(images)
-                probability=torch.sigmoid(logits)
-                presence_probability=torch.sigmoid(presence_logits)
-            probabilities.extend(probability.float().cpu().numpy()[:, 0])
-            targets.extend(masks.numpy()[:, 0])
-            presence_probabilities.extend(
-                presence_probability.float().cpu().numpy().tolist()
-            )
-            presence_targets.extend(target_presence.numpy().astype(int).tolist())
-            patients.extend(map(str, patient_ids))
-
-    labels_array=np.asarray(presence_targets, dtype=np.int64)
-    presence_array=np.asarray(presence_probabilities, dtype=np.float64)
-    best_presence={
-        "threshold": DEFAULT_PRESENCE_THRESHOLD,
-        "balanced_accuracy": 0.0,
-    }
-    if len(np.unique(labels_array)) >= 2:
-        for threshold in PRESENCE_CALIBRATION_THRESHOLDS:
-            prediction=(presence_array >= threshold).astype(np.int64)
-            balanced=balanced_accuracy(
-                labels_array, prediction
-            )
+                    quality=1.0 - min(1.0, float(prediction.mean()) / 0.10)
+                by_patient[patient_id].append(float(quality))
+            patient_scores=[
+                float(np.mean(values)) for values in by_patient.values()
+            ]
+            mean_score=float(np.mean(patient_scores)) if patient_scores else 0.0
+            invalid_rate=float(invalid / max(1, sum(presence_targets)))
+            score=mean_score - 0.20 * invalid_rate
             candidate={
                 "threshold": float(threshold),
-                "balanced_accuracy": balanced,
+                "patient_balanced_segmentation_score": mean_score,
+                "invalid_rate_positive": invalid_rate,
+                "score": score,
             }
-            if (
-                candidate["balanced_accuracy"],
-                -abs(candidate["threshold"] - 0.5),
-            ) > (
-                best_presence["balanced_accuracy"],
-                -abs(best_presence["threshold"] - 0.5),):
-                best_presence=candidate
-    elif len(labels_array):
-        best_presence["balanced_accuracy"]=1.0
+            if best is None or (
+                candidate["score"], -abs(threshold - 0.5)
+            ) > (best["score"], -abs(best["threshold"] - 0.5)):
+                best=candidate
 
-    best=None
-    for threshold in CALIBRATION_THRESHOLDS:
-        by_patient=defaultdict(list)
-        invalid=0
-        for probability, target, target_presence, patient_id in zip(
-            probabilities, targets, presence_targets, patients):
-            prediction=candidate_mask(
-                probability, threshold
-            )
-            if int(target_presence) == 1:
-                intersection=float(
-                    np.logical_and(prediction, target > 0.5).sum()
-                )
-                denominator=float(
-                    prediction.sum() + (target > 0.5).sum()
-                )
-                quality=(2.0 * intersection + 1e-6) / (
-                    denominator + 1e-6
-                )
-                valid, _=validate_mask(
-                    prediction, probability, geometry_prior
-                )
-                invalid +=int(not valid)
-            else:
-
-                quality=1.0 - min(1.0, float(prediction.mean()) / 0.10)
-            by_patient[patient_id].append(float(quality))
-        patient_scores=[
-            float(np.mean(values)) for values in by_patient.values()
-        ]
-        mean_score=float(np.mean(patient_scores)) if patient_scores else 0.0
-        invalid_rate=float(invalid / max(1, sum(presence_targets)))
-        score=mean_score - 0.20 * invalid_rate
-        candidate={
-            "threshold": float(threshold),
-            "patient_balanced_segmentation_score": mean_score,
-            "invalid_rate_positive": invalid_rate,
-            "score": score,
+        result=best or {
+            "threshold": 0.50,
+            "patient_balanced_segmentation_score": 0.0,
+            "invalid_rate_positive": 1.0,
+            "score": -1.0,
         }
-        if best is None or (
-            candidate["score"], -abs(threshold - 0.5)
-        ) > (best["score"], -abs(best["threshold"] - 0.5)):
-            best=candidate
+        result["presence_threshold"]=float(best_presence["threshold"])
+        result["presence_balanced_accuracy"]=float(
+            best_presence["balanced_accuracy"]
+        )
+        return result
+    # For target fold k, every patient assigned to k is excluded from both model
+    # fitting and threshold calibration. The saved checkpoint therefore produces
+    # genuinely out-of-fold masks for those patients.
+    @staticmethod
+    def train_attention_crossfit(accepted_rows, workspace, device):
+        DataStage.seed_everything(include_cuda=device.type == "cuda")
+        checkpoint_map={}
+        all_patients=sorted({str(row["patient_id"]) for row in accepted_rows})
 
-    result=best or {
-        "threshold": DEFAULT_THRESHOLD,
-        "patient_balanced_segmentation_score": 0.0,
-        "invalid_rate_positive": 1.0,
-        "score": -1.0,
-    }
-    result["presence_threshold"]=float(best_presence["threshold"])
-    result["presence_balanced_accuracy"]=float(
-        best_presence["balanced_accuracy"]
-    )
-    return result
+        for fold in range(5):  # five patient-level folds
+            fold_started=time.perf_counter()
+            checkpoint_path=AttentionStage.attention_checkpoint_path(workspace, fold)
+            non_test_rows=[
+                row
+                for row in accepted_rows
+                if int(row["segmentation_fold"]) != fold
+            ]
+            validation_patients=AttentionStage.select_validation_patients(
+                (row["patient_id"] for row in non_test_rows), fold
+            )
+            validation_patients=AttentionStage.ensure_presence_coverage(
+                non_test_rows, validation_patients, fold
+            )
+            train_rows=[
+                row
+                for row in non_test_rows
+                if row["patient_id"] not in validation_patients
+            ]
+            validation_rows=[
+                row
+                for row in non_test_rows
+                if row["patient_id"] in validation_patients
+            ]
+            if not train_rows or not validation_rows:
+                raise RuntimeError(f"Fold {fold}: train or validation split is empty.")
 
-# For target fold k, every patient assigned to k is excluded from both model
-# fitting and threshold calibration. The saved checkpoint therefore produces
-# genuinely out-of-fold masks for those patients.
-def train_attention_crossfit(accepted_rows, workspace, device):
-    seed_everything(include_cuda=device.type == "cuda")
-    checkpoint_map={}
-    all_patients=sorted({str(row["patient_id"]) for row in accepted_rows})
+            train_positive=sum(
+                DataStage._as_int(row.get("heart_present"), 1) == 1 for row in train_rows
+            )
+            train_negative=len(train_rows) - train_positive
+            validation_positive=sum(
+                DataStage._as_int(row.get("heart_present"), 1) == 1
+                for row in validation_rows
+            )
+            validation_negative=len(validation_rows) - validation_positive
+            print(
+                f"[ATTENTION] Fold {fold}: train={len(train_rows)} "
+                f"(+{train_positive}/-{train_negative}), validation={len(validation_rows)} "
+                f"(+{validation_positive}/-{validation_negative}), device={device.type}"
+            )
 
-    for fold in range(FOLDS):
-        fold_started=time.perf_counter()
-        checkpoint_path=attention_checkpoint_path(workspace, fold)
-        non_test_rows=[
-            row
-            for row in accepted_rows
-            if int(row["segmentation_fold"]) != fold
-        ]
-        validation_patients=select_validation_patients(
-            (row["patient_id"] for row in non_test_rows), fold
-        )
-        validation_patients=ensure_presence_coverage(
-            non_test_rows, validation_patients, fold
-        )
-        train_rows=[
-            row
-            for row in non_test_rows
-            if row["patient_id"] not in validation_patients
-        ]
-        validation_rows=[
-            row
-            for row in non_test_rows
-            if row["patient_id"] in validation_patients
-        ]
-        if not train_rows or not validation_rows:
-            raise RuntimeError(f"Fold {fold}: train or validation split is empty.")
+            train_dataset=SegmentationDataset(
+                train_rows,
+                augment=True,
+                seed=42 + fold * 1000,
+            )
+            validation_dataset=SegmentationDataset(
+                validation_rows,
+                augment=False,
+                seed=42,
+            )
+            train_sampler=AttentionStage.training_sampler(
+                train_rows, 42 + fold
+            )
+            train_loader=DataLoader(
+                train_dataset,
+                batch_size=10 if device.type == "cuda" else 3,
+                sampler=train_sampler,
+                shuffle=False,
+                num_workers=0,
+                pin_memory=device.type == "cuda",
+            )
+            validation_loader=DataLoader(
+                validation_dataset,
+                batch_size=10 if device.type == "cuda" else 3,
+                shuffle=False,
+                num_workers=0,
+                pin_memory=device.type == "cuda",
+            )
 
-        train_positive=sum(
-            _as_int(row.get("heart_present"), 1) == 1 for row in train_rows
-        )
-        train_negative=len(train_rows) - train_positive
-        validation_positive=sum(
-            _as_int(row.get("heart_present"), 1) == 1
-            for row in validation_rows
-        )
-        validation_negative=len(validation_rows) - validation_positive
-        print(
-            f"[ATTENTION] Fold {fold}: train={len(train_rows)} "
-            f"(+{train_positive}/-{train_negative}), validation={len(validation_rows)} "
-            f"(+{validation_positive}/-{validation_negative}), device={device.type}"
-        )
+            model=DataStage.prepare_model(AttentionUNet(), device)
+            optimizer=torch.optim.AdamW(
+                model.parameters(),
+                lr=8e-4,  # AdamW learning rate used in the research run  # initial AdamW learning rate
+                weight_decay=1e-4,  # small L2 regularization  # small L2 regularization
+            )
+            scheduler=torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode="max",
+                factor=0.5,
+                patience=3,
+                min_lr=1e-6,
+            )
+            scaler=DataStage.grad_scaler(device)
+            best_state=None
+            best_metric=-1.0
+            best_epoch=0
+            patience=0
+            history=[]
 
-        train_dataset=SegmentationDataset(
-            train_rows,
-            augment=True,
-            seed=RANDOM_SEED + fold * 1000,
-        )
-        validation_dataset=SegmentationDataset(
-            validation_rows,
-            augment=False,
-            seed=RANDOM_SEED,
-        )
-        train_sampler=training_sampler(
-            train_rows, RANDOM_SEED + fold
-        )
-        train_loader=DataLoader(
-            train_dataset,
-            batch_size=10 if device.type == "cuda" else 3,
-            sampler=train_sampler,
-            shuffle=False,
-            num_workers=0,
-            pin_memory=device.type == "cuda",
-        )
-        validation_loader=DataLoader(
-            validation_dataset,
-            batch_size=10 if device.type == "cuda" else 3,
-            shuffle=False,
-            num_workers=0,
-            pin_memory=device.type == "cuda",
-        )
-
-        model=prepare_model(AttentionUNet(), device)
-        optimizer=torch.optim.AdamW(
-            model.parameters(),
-            lr=8e-4,  # initial AdamW learning rate
-            weight_decay=1e-4,  # small L2 regularization
-        )
-        scheduler=torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            mode="max",
-            factor=0.5,
-            patience=3,
-            min_lr=1e-6,
-        )
-        scaler=grad_scaler(device)
-        best_state=None
-        best_metric=-1.0
-        best_epoch=0
-        patience=0
-        history=[]
-
-        for epoch in range(1, 36 + 1):  # train at most 36 epochs per fold
-            train_dataset.set_epoch(epoch)
-            model.train()
-            train_losses=[]
-            for (
-                images,
-                masks,
-                presence_targets,
-                sample_weights,
-                _patient_ids,
-            ) in train_loader:
-                images=move_tensor(images, device)
-                masks=move_tensor(masks, device)
-                presence_targets=move_tensor(
-                    presence_targets, device
-                )
-                sample_weights=move_tensor(
-                    sample_weights, device
-                )
-                optimizer.zero_grad(set_to_none=True)
-                with autocast(device):
-                    logits, presence_logits=model(images)
-                    loss=segmentation_loss(
-                        logits,
-                        masks,
-                        presence_logits,
-                        presence_targets,
-                        sample_weights,
-                    )
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-                train_losses.append(float(loss.detach().cpu()))
-
-            model.eval()
-            validation_losses=[]
-            by_patient_scores=defaultdict(list)
-            presence_labels=[]
-            presence_predictions=[]
-            with torch.inference_mode():
+            for epoch in range(1, 36 + 1):  # maximum 36 training epochs per fold  # train at most 36 epochs per fold
+                train_dataset.set_epoch(epoch)
+                model.train()
+                train_losses=[]
                 for (
                     images,
                     masks,
                     presence_targets,
                     sample_weights,
-                    patient_ids,
-                ) in validation_loader:
-                    images=move_tensor(images, device)
-                    masks=move_tensor(masks, device)
-                    presence_targets_device=move_tensor(
+                    _patient_ids,
+                ) in train_loader:
+                    images=DataStage.move_tensor(images, device)
+                    masks=DataStage.move_tensor(masks, device)
+                    presence_targets=DataStage.move_tensor(
                         presence_targets, device
                     )
-                    sample_weights=move_tensor(
+                    sample_weights=DataStage.move_tensor(
                         sample_weights, device
                     )
-                    with autocast(device):
+                    optimizer.zero_grad(set_to_none=True)
+                    with DataStage.autocast(device):
                         logits, presence_logits=model(images)
-                        loss=segmentation_loss(
+                        loss=AttentionStage.segmentation_loss(
                             logits,
                             masks,
                             presence_logits,
-                            presence_targets_device,
+                            presence_targets,
                             sample_weights,
                         )
-                    validation_losses.append(float(loss.cpu()))
-                    binary=(torch.sigmoid(logits) >= 0.5).float()
-                    intersection=(binary * masks).sum(dim=(1, 2, 3))
-                    denominator=binary.sum(dim=(1, 2, 3)) + masks.sum(
-                        dim=(1, 2, 3)
-                    )
-                    dice=(2 * intersection + 1e-6) / (
-                        denominator + 1e-6
-                    )
-                    negative_quality=1.0 - binary.mean(dim=(1, 2, 3))
-                    target_presence_cpu=presence_targets.numpy().astype(int)
-                    sample_scores=torch.where(
-                        presence_targets_device > 0.5,
-                        dice,
-                        negative_quality,
-                    ).float().cpu().numpy()
-                    for patient_id, score in zip(patient_ids, sample_scores):
-                        by_patient_scores[str(patient_id)].append(float(score))
-                    presence_labels.extend(target_presence_cpu.tolist())
-                    presence_predictions.extend(
-                        (
-                            torch.sigmoid(presence_logits) >= 0.5
-                        ).long().cpu().numpy().tolist()
-                    )
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                    train_losses.append(float(loss.detach().cpu()))
 
-            mean_train=float(np.mean(train_losses))
-            mean_val=float(np.mean(validation_losses))
-            patient_balanced=float(
-                np.mean(
-                    [np.mean(values) for values in by_patient_scores.values()]
+                model.eval()
+                validation_losses=[]
+                by_patient_scores=defaultdict(list)
+                presence_labels=[]
+                presence_predictions=[]
+                with torch.inference_mode():
+                    for (
+                        images,
+                        masks,
+                        presence_targets,
+                        sample_weights,
+                        patient_ids,
+                    ) in validation_loader:
+                        images=DataStage.move_tensor(images, device)
+                        masks=DataStage.move_tensor(masks, device)
+                        presence_targets_device=DataStage.move_tensor(
+                            presence_targets, device
+                        )
+                        sample_weights=DataStage.move_tensor(
+                            sample_weights, device
+                        )
+                        with DataStage.autocast(device):
+                            logits, presence_logits=model(images)
+                            loss=AttentionStage.segmentation_loss(
+                                logits,
+                                masks,
+                                presence_logits,
+                                presence_targets_device,
+                                sample_weights,
+                            )
+                        validation_losses.append(float(loss.cpu()))
+                        binary=(torch.sigmoid(logits) >= 0.5).float()
+                        intersection=(binary * masks).sum(dim=(1, 2, 3))
+                        denominator=binary.sum(dim=(1, 2, 3)) + masks.sum(
+                            dim=(1, 2, 3)
+                        )
+                        dice=(2 * intersection + 1e-6) / (
+                            denominator + 1e-6
+                        )
+                        negative_quality=1.0 - binary.mean(dim=(1, 2, 3))
+                        target_presence_cpu=presence_targets.numpy().astype(int)
+                        sample_scores=torch.where(
+                            presence_targets_device > 0.5,
+                            dice,
+                            negative_quality,
+                        ).float().cpu().numpy()
+                        for patient_id, score in zip(patient_ids, sample_scores):
+                            by_patient_scores[str(patient_id)].append(float(score))
+                        presence_labels.extend(target_presence_cpu.tolist())
+                        presence_predictions.extend(
+                            (
+                                torch.sigmoid(presence_logits) >= 0.5
+                            ).long().cpu().numpy().tolist()
+                        )
+
+                mean_train=float(np.mean(train_losses))
+                mean_val=float(np.mean(validation_losses))
+                patient_balanced=float(
+                    np.mean(
+                        [np.mean(values) for values in by_patient_scores.values()]
+                    )
+                )
+                presence_balanced=AttentionStage.balanced_accuracy(
+                    np.asarray(presence_labels),
+                    np.asarray(presence_predictions),
+                )
+                selection_metric=0.80 * patient_balanced + 0.20 * presence_balanced
+                scheduler.step(selection_metric)
+                current_lr=float(optimizer.param_groups[0]["lr"])
+                history.append(
+                    {
+                        "epoch": epoch,
+                        "train_loss": mean_train,
+                        "validation_loss": mean_val,
+                        "patient_balanced_segmentation_score_0_5": patient_balanced,
+                        "presence_balanced_accuracy_0_5": presence_balanced,
+                        "selection_metric": selection_metric,
+                        "learning_rate": current_lr,
+                    }
+                )
+                print(
+                    f"  epoch={epoch:02d} train_loss={mean_train:.4f} "
+                    f"val_loss={mean_val:.4f} seg={patient_balanced:.4f} "
+                    f"presence={presence_balanced:.4f} metric={selection_metric:.4f} "
+                    f"lr={current_lr:.2e}"
+                )
+                if selection_metric > best_metric + 1e-5:
+                    best_metric=selection_metric
+                    best_epoch=epoch
+                    best_state={
+                        key: value.detach().cpu().clone()
+                        for key, value in model.state_dict().items()
+                    }
+                    patience=0
+                else:
+                    patience +=1
+                    if patience >= 8:
+                        print(f"  early stopping after epoch {epoch}.")
+                        break
+
+            if best_state is None:
+                raise RuntimeError(f"Fold {fold}: no model checkpoint was selected.")
+            model.load_state_dict(best_state)
+            geometry_prior=AttentionStage.build_geometry_prior(train_rows)
+            calibration=AttentionStage.calibrate_threshold(
+                model, validation_loader, device, geometry_prior
+            )
+            checkpoint={
+                "schema": "simple-attention-2p5d-presence-v3",
+                "state_dict": best_state,
+                    "fold": fold,
+                "base_channels": 24,
+                "input_channels": 3,
+                "best_epoch": best_epoch,
+                "best_selection_metric": best_metric,
+                "calibration": calibration,
+                "geometry_prior": geometry_prior,
+                "train_positive_targets": train_positive,
+                "train_negative_targets": train_negative,
+                "train_patients": sorted(
+                    {str(row["patient_id"]) for row in train_rows}
+                ),
+                "validation_patients": sorted(validation_patients),
+                "excluded_test_patients": sorted(
+                    patient
+                    for patient in all_patients
+                    if any(
+                        str(row["patient_id"]) == patient
+                        and int(row["segmentation_fold"]) == fold
+                        for row in accepted_rows
+                    )
+                ),
+                "history": history,
+            }
+            torch.save(checkpoint, checkpoint_path)
+            checkpoint_map[fold]=checkpoint_path
+            del model, optimizer, scheduler, scaler, train_loader, validation_loader
+            del train_dataset, validation_dataset, checkpoint, best_state, train_sampler
+            DataStage.release_device(device)
+
+        DataStage.clear_image_cache()
+        return checkpoint_map
+    # Keep the dominant connected mask component and discard small detached islands.
+    @staticmethod
+    def largest_component(mask):
+        binary=(np.asarray(mask) > 0).astype(np.uint8)
+        if not binary.any():
+            return binary
+        count, labels, stats, _=cv2.connectedComponentsWithStats(
+            binary, connectivity=8
+        )
+        if count <= 1:
+            return binary
+        label=1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        return (labels == label).astype(np.uint8)
+    # Measure mask area and the fraction touching the image boundary.
+    @staticmethod
+    def mask_geometry(mask):
+        mask=(np.asarray(mask) > 0).astype(np.uint8)
+        area=float(mask.mean())
+        if not mask.any():
+            return area, 0.0
+        border=np.zeros_like(mask, dtype=bool)
+        border[:2, :]=True
+        border[-2:, :]=True
+        border[:, :2]=True
+        border[:, -2:]=True
+        boundary_touch=float(
+            np.logical_and(mask > 0, border).sum() / max(1, mask.sum())
+        )
+        return area, boundary_touch
+    # Threshold, close small gaps, and keep the largest connected Attention region.
+    @staticmethod
+    def candidate_mask(probability, threshold):
+        mask=(probability >= float(threshold)).astype(np.uint8)
+        kernel_size=5  # close small holes/gaps in thresholded masks
+        if kernel_size > 1:
+            kernel=np.ones((kernel_size, kernel_size), dtype=np.uint8)
+            mask=cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        return AttentionStage.largest_component(mask)
+    # Validate mask.
+    @staticmethod
+    def validate_mask(
+        mask,
+        probability,
+        geometry_prior=None,
+    ):
+        area, boundary=AttentionStage.mask_geometry(mask)
+        peak=float(np.max(probability))
+        reasons=[]
+        if area < 0.003:
+            reasons.append("area_too_small")
+        if area > 0.65:  # reject implausibly large heart masks
+            reasons.append("area_too_large")
+        if peak < 0.50:
+            reasons.append("low_peak_probability")
+        if boundary > 0.35:
+            reasons.append("touches_boundary")
+        prior_deviation=AttentionStage.calculate_prior_deviation(mask, geometry_prior)
+        if prior_deviation > 5.5:
+            reasons.append("geometry_outlier")
+        return not reasons, ";".join(reasons)
+    # Try nearby thresholds and geometry priors when the first automatic mask is implausible.
+    @staticmethod
+    def repair_probability(
+        probability,
+        threshold,
+        geometry_prior=None,
+    ):
+        candidates=[]
+        thresholds=[threshold] + [
+            float(np.clip(threshold + offset, 0.05, 0.95))
+            for offset in (-0.20, -0.15, -0.10, -0.05, 0.05, 0.10, 0.15, 0.20)
+        ]
+        for candidate_threshold in sorted(set(thresholds)):
+            mask=AttentionStage.candidate_mask(
+                probability, candidate_threshold
+            )
+            valid, reason=AttentionStage.validate_mask(
+                mask, probability, geometry_prior
+            )
+            _area, boundary=AttentionStage.mask_geometry(mask)
+            prior_deviation=AttentionStage.calculate_prior_deviation(
+                mask, geometry_prior
+            )
+            mean_inside=(
+                float(probability[mask > 0].mean()) if mask.any() else 0.0
+            )
+            score=(
+                mean_inside
+                - 0.50 * boundary
+                - 0.06 * min(prior_deviation, 10.0)
+            )
+            candidates.append(
+                (
+                    valid,
+                    score,
+                    mask,
+                    candidate_threshold,
+                    reason,
+                    prior_deviation,
                 )
             )
-            presence_balanced=balanced_accuracy(
-                np.asarray(presence_labels),
-                np.asarray(presence_predictions),
+        valid_candidates=[candidate for candidate in candidates if candidate[0]]
+        if valid_candidates:
+            _, _, mask, used_threshold, _, prior_deviation=max(
+                valid_candidates, key=lambda item: item[1]
             )
-            selection_metric=0.80 * patient_balanced + 0.20 * presence_balanced
-            scheduler.step(selection_metric)
-            current_lr=float(optimizer.param_groups[0]["lr"])
-            history.append(
-                {
-                    "epoch": epoch,
-                    "train_loss": mean_train,
-                    "validation_loss": mean_val,
-                    "patient_balanced_segmentation_score_0_5": patient_balanced,
-                    "presence_balanced_accuracy_0_5": presence_balanced,
-                    "selection_metric": selection_metric,
-                    "learning_rate": current_lr,
-                }
-            )
-            print(
-                f"  epoch={epoch:02d} train_loss={mean_train:.4f} "
-                f"val_loss={mean_val:.4f} seg={patient_balanced:.4f} "
-                f"presence={presence_balanced:.4f} metric={selection_metric:.4f} "
-                f"lr={current_lr:.2e}"
-            )
-            if selection_metric > best_metric + 1e-5:
-                best_metric=selection_metric
-                best_epoch=epoch
-                best_state={
-                    key: value.detach().cpu().clone()
-                    for key, value in model.state_dict().items()
-                }
-                patience=0
-            else:
-                patience +=1
-                if patience >= 8:
-                    print(f"  early stopping after epoch {epoch}.")
-                    break
-
-        if best_state is None:
-            raise RuntimeError(f"Fold {fold}: no model checkpoint was selected.")
-        model.load_state_dict(best_state)
-        geometry_prior=build_geometry_prior(train_rows)
-        calibration=calibrate_threshold(
-            model, validation_loader, device, geometry_prior
-        )
-        checkpoint={
-            "schema": "simple-attention-2p5d-presence-v3",
-            "state_dict": best_state,
-                "fold": fold,
-            "base_channels": BASE_CHANNELS,
-            "input_channels": INPUT_CHANNELS,
-            "best_epoch": best_epoch,
-            "best_selection_metric": best_metric,
-            "calibration": calibration,
-            "geometry_prior": geometry_prior,
-            "train_positive_targets": train_positive,
-            "train_negative_targets": train_negative,
-            "train_patients": sorted(
-                {str(row["patient_id"]) for row in train_rows}
-            ),
-            "validation_patients": sorted(validation_patients),
-            "excluded_test_patients": sorted(
-                patient
-                for patient in all_patients
-                if any(
-                    str(row["patient_id"]) == patient
-                    and int(row["segmentation_fold"]) == fold
-                    for row in accepted_rows
-                )
-            ),
-            "history": history,
-        }
-        torch.save(checkpoint, checkpoint_path)
-        checkpoint_map[fold]=checkpoint_path
-        del model, optimizer, scheduler, scaler, train_loader, validation_loader
-        del train_dataset, validation_dataset, checkpoint, best_state, train_sampler
-        release_device(device)
-
-    clear_image_cache()
-    return checkpoint_map
-
-
-# Reuse all five fold checkpoints only when their manual-target fingerprints still match.
-
-# Keep the dominant connected mask component and discard small detached islands.
-def largest_component(mask):
-    binary=(np.asarray(mask) > 0).astype(np.uint8)
-    if not binary.any():
-        return binary
-    count, labels, stats, _=cv2.connectedComponentsWithStats(
-        binary, connectivity=8
-    )
-    if count <= 1:
-        return binary
-    label=1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-    return (labels == label).astype(np.uint8)
-
-# Measure mask area and the fraction touching the image boundary.
-def mask_geometry(mask):
-    mask=(np.asarray(mask) > 0).astype(np.uint8)
-    area=float(mask.mean())
-    if not mask.any():
-        return area, 0.0
-    border=np.zeros_like(mask, dtype=bool)
-    border[:2, :]=True
-    border[-2:, :]=True
-    border[:, :2]=True
-    border[:, -2:]=True
-    boundary_touch=float(
-        np.logical_and(mask > 0, border).sum() / max(1, mask.sum())
-    )
-    return area, boundary_touch
-
-# Threshold, close small gaps, and keep the largest connected Attention region.
-def candidate_mask(probability, threshold):
-    mask=(probability >= float(threshold)).astype(np.uint8)
-    kernel_size=5  # close small holes/gaps in thresholded masks
-    if kernel_size > 1:
-        kernel=np.ones((kernel_size, kernel_size), dtype=np.uint8)
-        mask=cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    return largest_component(mask)
-
-# Validate mask.
-def validate_mask(
-    mask,
-    probability,
-    geometry_prior=None,
-):
-    area, boundary=mask_geometry(mask)
-    peak=float(np.max(probability))
-    reasons=[]
-    if area < PREDICTION_MIN_AREA_RATIO:
-        reasons.append("area_too_small")
-    if area > 0.65:  # reject implausibly large heart masks
-        reasons.append("area_too_large")
-    if peak < 0.50:
-        reasons.append("low_peak_probability")
-    if boundary > 0.35:
-        reasons.append("touches_boundary")
-    prior_deviation=calculate_prior_deviation(mask, geometry_prior)
-    if prior_deviation > PRIOR_MAX_ROBUST_Z:
-        reasons.append("geometry_outlier")
-    return not reasons, ";".join(reasons)
-
-# Try nearby thresholds and geometry priors when the first automatic mask is implausible.
-def repair_probability(
-    probability,
-    threshold,
-    geometry_prior=None,
-):
-    candidates=[]
-    thresholds=[threshold] + [
-        float(np.clip(threshold + offset, 0.05, 0.95))
-        for offset in REPAIR_THRESHOLD_OFFSETS
-    ]
-    for candidate_threshold in sorted(set(thresholds)):
-        mask=candidate_mask(
-            probability, candidate_threshold
-        )
-        valid, reason=validate_mask(
-            mask, probability, geometry_prior
-        )
-        _area, boundary=mask_geometry(mask)
-        prior_deviation=calculate_prior_deviation(
-            mask, geometry_prior
-        )
-        mean_inside=(
-            float(probability[mask > 0].mean()) if mask.any() else 0.0
-        )
-        score=(
-            mean_inside
-            - 0.50 * boundary
-            - 0.06 * min(prior_deviation, 10.0)
-        )
-        candidates.append(
-            (
-                valid,
-                score,
+            return (
                 mask,
-                candidate_threshold,
-                reason,
-                prior_deviation,
+                True,
+                "adaptive_threshold_with_fold_prior",
+                float(used_threshold),
+                "",
+                float(prior_deviation),
             )
-        )
-    valid_candidates=[candidate for candidate in candidates if candidate[0]]
-    if valid_candidates:
-        _, _, mask, used_threshold, _, prior_deviation=max(
-            valid_candidates, key=lambda item: item[1]
+        _, _, mask, used_threshold, reason, prior_deviation=max(
+            candidates, key=lambda item: item[1]
         )
         return (
             mask,
-            True,
-            "adaptive_threshold_with_fold_prior",
+            False,
+            "unresolved",
             float(used_threshold),
-            "",
+            reason,
             float(prior_deviation),
         )
-    _, _, mask, used_threshold, reason, prior_deviation=max(
-        candidates, key=lambda item: item[1]
-    )
-    return (
-        mask,
-        False,
-        "unresolved",
-        float(used_threshold),
-        reason,
-        float(prior_deviation),
-    )
-
-# Build prediction fingerprint.
-
-# Load cached predictions.
-
-# Store resumable prediction metadata separately for each segmentation fold.
-
-# Hash one fold checkpoint plus its exact input slices/context for safe reuse.
-
-# Combine entropy, TTA disagreement, presence ambiguity, and geometry deviation.
-def uncertainty_metrics(
-    probability,
-    alternate_probability,
-    presence_probability,
-    presence_threshold,
-    prior_deviation,
-    final_valid,
-):
-    probability=np.clip(probability.astype(np.float64), 1e-6, 1.0 - 1e-6)
-    entropy=-(
-        probability * np.log(probability)
-        + (1.0 - probability) * np.log(1.0 - probability)
-    ) / math.log(2.0)
-    entropy_flat=entropy.reshape(-1)
-    top_count=max(1, int(round(0.10 * entropy_flat.size)))
-    mean_entropy=float(
-        np.partition(entropy_flat, entropy_flat.size - top_count)[-top_count:].mean()
-    )
-    disagreement=float(
-        np.mean(np.abs(probability - alternate_probability))
-    )
-    disagreement_normalized=min(
-        1.0,
-        disagreement
-        / max(0.08, 1e-6),
-    )
-    presence_ambiguity=max(
-        0.0,
-        1.0
-        - abs(float(presence_probability) - float(presence_threshold)) / 0.50,
-    )
-    prior_normalized=min(
-        1.0,
-        float(prior_deviation)
-        / max(PRIOR_MAX_ROBUST_Z, 1e-6),
-    )
-    uncertainty=(
-        0.35 * mean_entropy
-        + 0.35 * disagreement_normalized
-        + 0.20 * presence_ambiguity
-        + 0.10 * prior_normalized
-        + (0.15 if not final_valid else 0.0)
-    )
-    return disagreement, mean_entropy, float(min(1.0, uncertainty))
-
-# Apply sequence consistency.
-def apply_sequence_consistency(
-    prediction_rows,
-    dataset_rows,
-):
-    base_by_token={
-        str(row["image_token"]): row for row in dataset_rows
-    }
-    groups=defaultdict(list)
-    for prediction in prediction_rows:
-        token=str(prediction.get("image_token", ""))
-        base=base_by_token.get(token, {})
-        group=str(
-            base.get("sequence_group_id")
-            or f"{prediction.get('series_id', '')}::{Path(str(prediction.get('image_path', ''))).parent}"
+    # Combine entropy, TTA disagreement, presence ambiguity, and geometry deviation.
+    @staticmethod
+    def uncertainty_metrics(
+        probability,
+        alternate_probability,
+        presence_probability,
+        presence_threshold,
+        prior_deviation,
+        final_valid,
+    ):
+        probability=np.clip(probability.astype(np.float64), 1e-6, 1.0 - 1e-6)
+        entropy=-(
+            probability * np.log(probability)
+            + (1.0 - probability) * np.log(1.0 - probability)
+        ) / math.log(2.0)
+        entropy_flat=entropy.reshape(-1)
+        top_count=max(1, int(round(0.10 * entropy_flat.size)))
+        mean_entropy=float(
+            np.partition(entropy_flat, entropy_flat.size - top_count)[-top_count:].mean()
         )
-        prediction["_sequence_index"]=_as_int(
-            base.get("sequence_index"), 0
+        disagreement=float(
+            np.mean(np.abs(probability - alternate_probability))
         )
-        groups[group].append(prediction)
-
-    def pair_inconsistency(first, second):
-        first_present=_as_int(first.get("attention_heart_present"), 1)
-        second_present=_as_int(second.get("attention_heart_present"), 1)
-        if first_present != second_present:
-            return 1.0
-        if first_present == 0:
-            return 0.0
-        first_area=_as_float(first.get("attention_area_ratio"), 0.0)
-        second_area=_as_float(second.get("attention_area_ratio"), 0.0)
-        area_change=min(
+        disagreement_normalized=min(
             1.0,
-            abs(first_area - second_area)
-            / max(0.01, 0.5 * (first_area + second_area)),
+            disagreement
+            / max(0.08, 1e-6),
         )
-        first_x=_as_float(first.get("attention_centroid_x"), np.nan)
-        first_y=_as_float(first.get("attention_centroid_y"), np.nan)
-        second_x=_as_float(second.get("attention_centroid_x"), np.nan)
-        second_y=_as_float(second.get("attention_centroid_y"), np.nan)
-        if all(np.isfinite(value) for value in (first_x, first_y, second_x, second_y)):
-            centroid_change=min(
+        presence_ambiguity=max(
+            0.0,
+            1.0
+            - abs(float(presence_probability) - float(presence_threshold)) / 0.50,
+        )
+        prior_normalized=min(
+            1.0,
+            float(prior_deviation)
+            / max(5.5, 1e-6),
+        )
+        uncertainty=(
+            0.35 * mean_entropy
+            + 0.35 * disagreement_normalized
+            + 0.20 * presence_ambiguity
+            + 0.10 * prior_normalized
+            + (0.15 if not final_valid else 0.0)
+        )
+        return disagreement, mean_entropy, float(min(1.0, uncertainty))
+    # Apply sequence consistency.
+    @staticmethod
+    def apply_sequence_consistency(
+        prediction_rows,
+        dataset_rows,
+    ):
+        base_by_token={
+            str(row["image_token"]): row for row in dataset_rows
+        }
+        groups=defaultdict(list)
+        for prediction in prediction_rows:
+            token=str(prediction.get("image_token", ""))
+            base=base_by_token.get(token, {})
+            group=str(
+                base.get("sequence_group_id")
+                or f"{prediction.get('series_id', '')}::{Path(str(prediction.get('image_path', ''))).parent}"
+            )
+            prediction["_sequence_index"]=DataStage._as_int(
+                base.get("sequence_index"), 0
+            )
+            groups[group].append(prediction)
+
+        def pair_inconsistency(first, second):
+            first_present=DataStage._as_int(first.get("attention_heart_present"), 1)
+            second_present=DataStage._as_int(second.get("attention_heart_present"), 1)
+            if first_present != second_present:
+                return 1.0
+            if first_present == 0:
+                return 0.0
+            first_area=DataStage._as_float(first.get("attention_area_ratio"), 0.0)
+            second_area=DataStage._as_float(second.get("attention_area_ratio"), 0.0)
+            area_change=min(
                 1.0,
-                math.hypot(first_x - second_x, first_y - second_y) / 0.25,
+                abs(first_area - second_area)
+                / max(0.01, 0.5 * (first_area + second_area)),
             )
-        else:
-            centroid_change=1.0
-        return float(0.55 * area_change + 0.45 * centroid_change)
-
-    for group_rows in groups.values():
-        group_rows.sort(key=lambda row: _as_int(row.get("_sequence_index"), 0))
-        for index, row in enumerate(group_rows):
-            comparisons=[]
-            if index > 0:
-                comparisons.append(pair_inconsistency(row, group_rows[index - 1]))
-            if index + 1 < len(group_rows):
-                comparisons.append(pair_inconsistency(row, group_rows[index + 1]))
-            inconsistency=float(np.mean(comparisons)) if comparisons else 0.0
-            previous_inconsistency=_as_float(
-                row.get("attention_sequence_inconsistency"), 0.0
-            )
-            base_uncertainty=max(
-                0.0,
-                _as_float(row.get("attention_uncertainty_score"), 0.0)
-                - 0.20 * previous_inconsistency,
-            )
-            row["attention_sequence_inconsistency"]=inconsistency
-            row["attention_uncertainty_score"]=min(
-                1.0, base_uncertainty + 0.20 * inconsistency
-            )
-            row.pop("_sequence_index", None)
-
-# Compare OOF masks with accepted manual targets at patient-balanced level.
-def evaluate_oof_segmentation(
-    workspace,
-    prediction_rows,
-):
-    predictions={
-        str(row.get("image_token", "")): row for row in prediction_rows
-    }
-    audit_rows=[
-        row
-        for row in read_csv(workspace.manual_audit)
-        if row.get("status") == "ACCEPTED"
-    ]
-    metrics=[]
-    for target_row in audit_rows:
-        token=str(target_row.get("image_token", ""))
-        prediction_row=predictions.get(token)
-        if prediction_row is None:
-            continue
-        predicted_path=Path(
-            prediction_row.get("predicted_attention_mask_path", "")
-        )
-        target_path=Path(target_row.get("manual_mask_path", ""))
-        if not predicted_path.is_file() or not target_path.is_file():
-            continue
-        predicted=read_binary_mask(predicted_path)
-        target=read_binary_mask(target_path)
-        predicted_bool=predicted > 0
-        target_bool=target > 0
-        tp=float(np.logical_and(predicted_bool, target_bool).sum())
-        fp=float(np.logical_and(predicted_bool, ~target_bool).sum())
-        fn=float(np.logical_and(~predicted_bool, target_bool).sum())
-        union=tp + fp + fn
-        denominator=2.0 * tp + fp + fn
-        dice=1.0 if denominator == 0 else 2.0 * tp / denominator
-        iou=1.0 if union == 0 else tp / union
-        precision=1.0 if tp + fp == 0 and not target_bool.any() else tp / max(1.0, tp + fp)
-        recall=1.0 if tp + fn == 0 else tp / max(1.0, tp + fn)
-        target_features=mask_features(target)
-        predicted_features=mask_features(predicted)
-        if target_bool.any() and predicted_bool.any():
-            centroid_distance=float(
-                math.hypot(
-                    predicted_features["centroid_x"] - target_features["centroid_x"],
-                    predicted_features["centroid_y"] - target_features["centroid_y"],
+            first_x=DataStage._as_float(first.get("attention_centroid_x"), np.nan)
+            first_y=DataStage._as_float(first.get("attention_centroid_y"), np.nan)
+            second_x=DataStage._as_float(second.get("attention_centroid_x"), np.nan)
+            second_y=DataStage._as_float(second.get("attention_centroid_y"), np.nan)
+            if all(np.isfinite(value) for value in (first_x, first_y, second_x, second_y)):
+                centroid_change=min(
+                    1.0,
+                    math.hypot(first_x - second_x, first_y - second_y) / 0.25,
                 )
-            )
-        else:
-            centroid_distance=np.nan
-        metrics.append(
-            {
-                "image_token": token,
-                "patient_id": target_row.get("patient_id", ""),
-                "series_id": target_row.get("series_id", ""),
-                "target_type": target_row.get("target_type", ""),
-                "heart_present": _as_int(target_row.get("heart_present"), 1),
-                "dice": dice,
-                "iou": iou,
-                "precision": precision,
-                "recall": recall,
-                "target_area_ratio": float(target_bool.mean()),
-                "predicted_area_ratio": float(predicted_bool.mean()),
-                "absolute_area_error": abs(
-                    float(predicted_bool.mean()) - float(target_bool.mean())
-                ),
-                "false_positive_area_ratio": float(fp / predicted_bool.size),
-                "centroid_distance_normalized": centroid_distance,
-                "presence_probability": _as_float(
-                    prediction_row.get("attention_presence_probability"), np.nan
-                ),
-                "predicted_heart_present": _as_int(
-                    prediction_row.get("attention_heart_present"), 1
-                ),
-                "uncertainty_score": _as_float(
-                    prediction_row.get("attention_uncertainty_score"), np.nan
-                ),
-                "sequence_inconsistency": _as_float(
-                    prediction_row.get("attention_sequence_inconsistency"), np.nan
-                ),
-            }
-        )
+            else:
+                centroid_change=1.0
+            return float(0.55 * area_change + 0.45 * centroid_change)
 
-    positive=[row for row in metrics if _as_int(row["heart_present"], 1) == 1]
-    negative=[row for row in metrics if _as_int(row["heart_present"], 1) == 0]
-
-    def patient_balanced(rows, key):
-        by_patient=defaultdict(list)
-        for row in rows:
-            value=_as_float(row.get(key), np.nan)
-            if np.isfinite(value):
-                by_patient[str(row.get("patient_id", ""))].append(value)
-        values=[np.mean(items) for items in by_patient.values() if items]
-        return float(np.mean(values)) if values else np.nan
-
-    summary={
-        "evaluated_targets": len(metrics),
-        "positive_targets": len(positive),
-        "negative_targets": len(negative),
-        "patient_balanced_dice_all": patient_balanced(metrics, "dice"),
-        "patient_balanced_dice_positive": patient_balanced(positive, "dice"),
-        "patient_balanced_iou_positive": patient_balanced(positive, "iou"),
-        "patient_balanced_precision_positive": patient_balanced(
-            positive, "precision"
-        ),
-        "patient_balanced_recall_positive": patient_balanced(
-            positive, "recall"
-        ),
-        "no_heart_empty_prediction_rate": (
-            float(
-                np.mean(
-                    [
-                        row["predicted_area_ratio"]
-                        < PREDICTION_MIN_AREA_RATIO
-                        for row in negative
-                    ]
+        for group_rows in groups.values():
+            group_rows.sort(key=lambda row: DataStage._as_int(row.get("_sequence_index"), 0))
+            for index, row in enumerate(group_rows):
+                comparisons=[]
+                if index > 0:
+                    comparisons.append(pair_inconsistency(row, group_rows[index - 1]))
+                if index + 1 < len(group_rows):
+                    comparisons.append(pair_inconsistency(row, group_rows[index + 1]))
+                inconsistency=float(np.mean(comparisons)) if comparisons else 0.0
+                previous_inconsistency=DataStage._as_float(
+                    row.get("attention_sequence_inconsistency"), 0.0
                 )
-            )
-            if negative
-            else np.nan
-        ),
-        "no_heart_mean_false_positive_area_ratio": (
-            float(np.mean([row["false_positive_area_ratio"] for row in negative]))
-            if negative
-            else np.nan
-        ),
-    }
-    if metrics:
-        print(
-            "[ATTENTION OOF] "
-            f"targets={len(metrics)}, positive_dice_patient="
-            f"{summary['patient_balanced_dice_positive']:.4f}, "
-            f"negative_empty_rate={summary['no_heart_empty_prediction_rate']}"
-        )
-    return summary
-
-# Inference is resumable per fold. A fold result is reused only when its
-# checkpoint and all image/context fingerprints match; otherwise that fold alone
-# is recomputed. This makes post-review retraining incremental rather than global.
-def predict_attention_masks(rows, workspace, device, checkpoint_map):
-    # Automatic masks are never reused. Every run predicts the complete dataset
-    # from the five freshly trained out-of-fold models.
-    results=[None] * len(rows)
-    started=time.perf_counter()
-
-    for fold in range(FOLDS):
-        fold_indices=[
-            index
-            for index, row in enumerate(rows)
-            if int(row["segmentation_fold"]) == fold
+                base_uncertainty=max(
+                    0.0,
+                    DataStage._as_float(row.get("attention_uncertainty_score"), 0.0)
+                    - 0.20 * previous_inconsistency,
+                )
+                row["attention_sequence_inconsistency"]=inconsistency
+                row["attention_uncertainty_score"]=min(
+                    1.0, base_uncertainty + 0.20 * inconsistency
+                )
+                row.pop("_sequence_index", None)
+    # Compare OOF masks with accepted manual targets at patient-balanced level.
+    @staticmethod
+    def evaluate_oof_segmentation(
+        workspace,
+        prediction_rows,
+    ):
+        predictions={
+            str(row.get("image_token", "")): row for row in prediction_rows
+        }
+        audit_rows=[
+            row
+            for row in DataStage.read_csv(workspace.manual_audit)
+            if row.get("status") == "ACCEPTED"
         ]
-        fold_rows=[rows[index] for index in fold_indices]
-        if not fold_rows:
-            continue
+        metrics=[]
+        for target_row in audit_rows:
+            token=str(target_row.get("image_token", ""))
+            prediction_row=predictions.get(token)
+            if prediction_row is None:
+                continue
+            predicted_path=Path(
+                prediction_row.get("predicted_attention_mask_path", "")
+            )
+            target_path=Path(target_row.get("manual_mask_path", ""))
+            if not predicted_path.is_file() or not target_path.is_file():
+                continue
+            predicted=DataStage.read_binary_mask(predicted_path)
+            target=DataStage.read_binary_mask(target_path)
+            predicted_bool=predicted > 0
+            target_bool=target > 0
+            tp=float(np.logical_and(predicted_bool, target_bool).sum())
+            fp=float(np.logical_and(predicted_bool, ~target_bool).sum())
+            fn=float(np.logical_and(~predicted_bool, target_bool).sum())
+            union=tp + fp + fn
+            denominator=2.0 * tp + fp + fn
+            dice=1.0 if denominator == 0 else 2.0 * tp / denominator
+            iou=1.0 if union == 0 else tp / union
+            precision=1.0 if tp + fp == 0 and not target_bool.any() else tp / max(1.0, tp + fp)
+            recall=1.0 if tp + fn == 0 else tp / max(1.0, tp + fn)
+            target_features=AttentionStage.mask_features(target)
+            predicted_features=AttentionStage.mask_features(predicted)
+            if target_bool.any() and predicted_bool.any():
+                centroid_distance=float(
+                    math.hypot(
+                        predicted_features["centroid_x"] - target_features["centroid_x"],
+                        predicted_features["centroid_y"] - target_features["centroid_y"],
+                    )
+                )
+            else:
+                centroid_distance=np.nan
+            metrics.append(
+                {
+                    "image_token": token,
+                    "patient_id": target_row.get("patient_id", ""),
+                    "series_id": target_row.get("series_id", ""),
+                    "target_type": target_row.get("target_type", ""),
+                    "heart_present": DataStage._as_int(target_row.get("heart_present"), 1),
+                    "dice": dice,
+                    "iou": iou,
+                    "precision": precision,
+                    "recall": recall,
+                    "target_area_ratio": float(target_bool.mean()),
+                    "predicted_area_ratio": float(predicted_bool.mean()),
+                    "absolute_area_error": abs(
+                        float(predicted_bool.mean()) - float(target_bool.mean())
+                    ),
+                    "false_positive_area_ratio": float(fp / predicted_bool.size),
+                    "centroid_distance_normalized": centroid_distance,
+                    "presence_probability": DataStage._as_float(
+                        prediction_row.get("attention_presence_probability"), np.nan
+                    ),
+                    "predicted_heart_present": DataStage._as_int(
+                        prediction_row.get("attention_heart_present"), 1
+                    ),
+                    "uncertainty_score": DataStage._as_float(
+                        prediction_row.get("attention_uncertainty_score"), np.nan
+                    ),
+                    "sequence_inconsistency": DataStage._as_float(
+                        prediction_row.get("attention_sequence_inconsistency"), np.nan
+                    ),
+                }
+            )
 
-        checkpoint=load_torch_file(checkpoint_map[fold])
-        model=AttentionUNet(
-            base_channels=int(
-                checkpoint.get(
-                    "base_channels", BASE_CHANNELS
-                )
+        positive=[row for row in metrics if DataStage._as_int(row["heart_present"], 1) == 1]
+        negative=[row for row in metrics if DataStage._as_int(row["heart_present"], 1) == 0]
+
+        def patient_balanced(rows, key):
+            by_patient=defaultdict(list)
+            for row in rows:
+                value=DataStage._as_float(row.get(key), np.nan)
+                if np.isfinite(value):
+                    by_patient[str(row.get("patient_id", ""))].append(value)
+            values=[np.mean(items) for items in by_patient.values() if items]
+            return float(np.mean(values)) if values else np.nan
+
+        summary={
+            "evaluated_targets": len(metrics),
+            "positive_targets": len(positive),
+            "negative_targets": len(negative),
+            "patient_balanced_dice_all": patient_balanced(metrics, "dice"),
+            "patient_balanced_dice_positive": patient_balanced(positive, "dice"),
+            "patient_balanced_iou_positive": patient_balanced(positive, "iou"),
+            "patient_balanced_precision_positive": patient_balanced(
+                positive, "precision"
             ),
-            input_channels=int(
-                checkpoint.get(
-                    "input_channels", INPUT_CHANNELS
-                )
+            "patient_balanced_recall_positive": patient_balanced(
+                positive, "recall"
             ),
-        )
-        model.load_state_dict(checkpoint["state_dict"])
-        model=prepare_model(model, device).eval()
-        calibration=checkpoint.get("calibration", {}) or {}
-        threshold=float(
-            calibration.get(
-                "threshold", DEFAULT_THRESHOLD
+            "no_heart_empty_prediction_rate": (
+                float(
+                    np.mean(
+                        [
+                            row["predicted_area_ratio"]
+                            < 0.003
+                            for row in negative
+                        ]
+                    )
+                )
+                if negative
+                else np.nan
+            ),
+            "no_heart_mean_false_positive_area_ratio": (
+                float(np.mean([row["false_positive_area_ratio"] for row in negative]))
+                if negative
+                else np.nan
+            ),
+        }
+        if metrics:
+            print(
+                "[ATTENTION OOF] "
+                f"targets={len(metrics)}, positive_dice_patient="
+                f"{summary['patient_balanced_dice_positive']:.4f}, "
+                f"negative_empty_rate={summary['no_heart_empty_prediction_rate']}"
             )
-        )
-        presence_threshold=float(
-            calibration.get(
-                "presence_threshold",
-                DEFAULT_PRESENCE_THRESHOLD,
+        return summary
+    # Inference is resumable per fold. A fold result is reused only when its
+    # checkpoint and all image/context fingerprints match; otherwise that fold alone
+    # is recomputed. This makes post-review retraining incremental rather than global.
+    @staticmethod
+    def predict_attention_masks(rows, workspace, device, checkpoint_map):
+        # Automatic masks are never reused. Every run predicts the complete dataset
+        # from the five freshly trained out-of-fold models.
+        results=[None] * len(rows)
+        started=time.perf_counter()
+
+        for fold in range(5):  # five patient-level folds
+            fold_indices=[
+                index
+                for index, row in enumerate(rows)
+                if int(row["segmentation_fold"]) == fold
+            ]
+            fold_rows=[rows[index] for index in fold_indices]
+            if not fold_rows:
+                continue
+
+            checkpoint=AttentionStage.load_torch_file(checkpoint_map[fold])
+            model=AttentionUNet(
+                base_channels=int(
+                    checkpoint.get(
+                        "base_channels", 24
+                    )
+                ),
+                input_channels=int(
+                    checkpoint.get(
+                        "input_channels", 3
+                    )
+                ),
             )
+            model.load_state_dict(checkpoint["state_dict"])
+            model=DataStage.prepare_model(model, device).eval()
+            calibration=checkpoint.get("calibration", {}) or {}
+            threshold=float(
+                calibration.get(
+                    "threshold", 0.50
+                )
+            )
+            presence_threshold=float(
+                calibration.get(
+                    "presence_threshold",
+                    0.50,
+                )
+            )
+            geometry_prior=checkpoint.get("geometry_prior", {}) or {}
+            checkpoint_fingerprint=f"fold_{fold}"
+            loader=DataLoader(
+                SegmentationInferenceDataset(fold_rows),
+                batch_size=10 if device.type == "cuda" else 3,
+                shuffle=False,
+                num_workers=0,
+                pin_memory=device.type == "cuda",
+            )
+            print(
+                f"[ATTENTION] 2.5D prediction for fold {fold}: {len(fold_rows)} "
+                f"images, device={device.type}"
+            )
+            fold_results=[]
+
+            with torch.inference_mode():
+                for images, local_indices in tqdm(
+                    loader, desc=f"Attention 2.5D fold {fold}"):
+                    images=DataStage.move_tensor(images, device)
+                    with DataStage.autocast(device):
+                        logits, presence_logits=model(images)
+                    original_probability=torch.sigmoid(logits)[:, 0]
+                    original_presence=torch.sigmoid(presence_logits)
+
+                    factor=1.10  # second photometric view for uncertainty estimation
+                    tta_images=torch.clamp(
+                        (images - 0.5) * factor + 0.5, 0.0, 1.0
+                    )
+                    with DataStage.autocast(device):
+                        tta_logits, tta_presence_logits=model(tta_images)
+                    tta_probability=torch.sigmoid(tta_logits)[:, 0]
+                    tta_presence=torch.sigmoid(tta_presence_logits)
+
+                    averaged_probability=(
+                        original_probability + tta_probability
+                    ) / 2.0
+                    averaged_presence=(
+                        original_presence + tta_presence
+                    ) / 2.0
+                    probabilities=averaged_probability.float().cpu().numpy()
+                    alternate_probabilities=tta_probability.float().cpu().numpy()
+                    presence_probabilities=(
+                        averaged_presence.float().cpu().numpy()
+                    )
+
+                    for batch_position, local_index_tensor in enumerate(
+                        local_indices):
+                        local_index=int(local_index_tensor)
+                        global_index=fold_indices[local_index]
+                        row=rows[global_index]
+                        probability=probabilities[batch_position]
+                        alternate_probability=alternate_probabilities[
+                            batch_position
+                        ]
+                        presence_probability=float(
+                            presence_probabilities[batch_position]
+                        )
+                        heart_present=bool(
+                            presence_probability >= presence_threshold
+                            or float(probability.max())
+                            >= 0.80
+                        )
+                        initial_mask=AttentionStage.candidate_mask(
+                            probability, threshold
+                        )
+                        initial_valid, initial_reason=(
+                            AttentionStage.validate_mask(
+                                initial_mask, probability, geometry_prior
+                            )
+                        )
+
+                        if not heart_present:
+                            final_mask=np.zeros_like(initial_mask, dtype=np.uint8)
+                            final_valid=True
+                            repair_method="presence_head_empty"
+                            used_threshold=threshold
+                            final_reason=""
+                            prior_deviation=0.0
+                        elif initial_valid:
+                            final_mask=initial_mask
+                            final_valid=True
+                            repair_method="none"
+                            used_threshold=threshold
+                            final_reason=""
+                            prior_deviation=AttentionStage.calculate_prior_deviation(
+                                final_mask, geometry_prior
+                            )
+                        else:
+                            (
+                                final_mask,
+                                final_valid,
+                                repair_method,
+                                used_threshold,
+                                final_reason,
+                                prior_deviation,
+                            )=AttentionStage.repair_probability(
+                                probability, threshold, geometry_prior
+                            )
+                            repair_method="photometric_tta+" + repair_method
+
+                        geometry=AttentionStage.mask_features(final_mask)
+                        area=float(geometry["area"])
+                        boundary=float(geometry["boundary"])
+                        centroid_x=geometry["centroid_x"]
+                        centroid_y=geometry["centroid_y"]
+                        disagreement, entropy, uncertainty=(
+                            AttentionStage.uncertainty_metrics(
+                                probability,
+                                alternate_probability,
+                                presence_probability,
+                                presence_threshold,
+                                prior_deviation,
+                                final_valid,
+                            )
+                        )
+                        mask_path=Path(row["predicted_attention_mask_path"])
+                        # Every experiment later reads this out-of-fold mask from disk.
+                        DataStage.write_png(mask_path, final_mask.astype(np.uint8) * 255)
+
+                        result_row={
+                            **row,
+                            "attention_valid_initial": int(initial_valid),
+                            "attention_valid_final": int(final_valid),
+                            "attention_invalid_reason_initial": initial_reason,
+                            "attention_invalid_reason_final": final_reason,
+                            "attention_repair_method": repair_method,
+                            "attention_threshold_used": float(used_threshold),
+                            "attention_area_ratio": area,
+                            "attention_peak_probability": float(
+                                probability.max()
+                            ),
+                            "attention_boundary_touch_fraction": boundary,
+                            "attention_heart_present": int(heart_present),
+                            "attention_presence_probability": presence_probability,
+                            "attention_presence_threshold": presence_threshold,
+                            "attention_tta_disagreement": disagreement,
+                            "attention_mean_entropy": entropy,
+                            "attention_uncertainty_score": uncertainty,
+                            "attention_sequence_inconsistency": 0.0,
+                            "attention_centroid_x": centroid_x,
+                            "attention_centroid_y": centroid_y,
+                            "attention_prior_deviation": float(prior_deviation),
+                            "checkpoint_fingerprint": checkpoint_fingerprint,
+                        }
+                        results[global_index]=result_row
+                        fold_results.append(result_row)
+
+            AttentionStage.apply_sequence_consistency(
+                fold_results, fold_rows
+            )
+            del model, loader, checkpoint, fold_results
+            DataStage.release_device(device)
+
+        final_results=[result for result in results if result is not None]
+        if len(final_results) != len(rows):
+            raise RuntimeError(
+                "Prediction did not produce exactly one row per image."
+            )
+        AttentionStage.apply_sequence_consistency(final_results, rows)
+        DataStage.write_csv(
+            workspace.prediction_audit,
+            final_results,
+            final_results[0].keys(),
         )
-        geometry_prior=checkpoint.get("geometry_prior", {}) or {}
-        checkpoint_fingerprint=f"fold_{fold}"
-        loader=DataLoader(
-            SegmentationInferenceDataset(fold_rows),
-            batch_size=10 if device.type == "cuda" else 3,
-            shuffle=False,
-            num_workers=0,
-            pin_memory=device.type == "cuda",
+        invalid_rows=[
+            row
+            for row in final_results
+            if DataStage._as_int(row.get("attention_valid_final"), 0) != 1
+        ]
+        segmentation_summary=AttentionStage.evaluate_oof_segmentation(
+            workspace, final_results
         )
+        summary={
+            "device": device.type,
+            "images": len(final_results),
+            "valid_initial": sum(
+                DataStage._as_int(row.get("attention_valid_initial"), 0)
+                for row in final_results
+            ),
+            "valid_final": sum(
+                DataStage._as_int(row.get("attention_valid_final"), 0)
+                for row in final_results
+            ),
+            "predicted_heart_present": sum(
+                DataStage._as_int(row.get("attention_heart_present"), 0)
+                for row in final_results
+            ),
+            "predicted_no_heart": sum(
+                DataStage._as_int(row.get("attention_heart_present"), 0) == 0
+                for row in final_results
+            ),
+            "uncertain_above_review_threshold": sum(
+                DataStage._as_float(row.get("attention_uncertainty_score"), 0.0)
+                >= 0.18
+                for row in final_results
+            ),
+            "invalid_final": len(invalid_rows),
+            "prediction_audit": str(workspace.prediction_audit),
+            "segmentation_oof": segmentation_summary,
+            "elapsed": DataStage.format_seconds(
+                time.perf_counter() - started
+            ),
+        }
         print(
-            f"[ATTENTION] 2.5D prediction for fold {fold}: {len(fold_rows)} "
-            f"images, device={device.type}"
+            "[ATTENTION] "
+            f"valid_final={summary['valid_final']}/{summary['images']}, "
+            f"heart_present={summary['predicted_heart_present']}, "
+            f"invalid={summary['invalid_final']} | {workspace.prediction_audit}"
         )
-        fold_results=[]
+        DataStage.clear_image_cache()
+        return final_results
 
-        with torch.inference_mode():
-            for images, local_indices in tqdm(
-                loader, desc=f"Attention 2.5D fold {fold}"):
-                images=move_tensor(images, device)
-                with autocast(device):
-                    logits, presence_logits=model(images)
-                original_probability=torch.sigmoid(logits)[:, 0]
-                original_presence=torch.sigmoid(presence_logits)
-
-                factor=1.10  # second photometric view for uncertainty estimation
-                tta_images=torch.clamp(
-                    (images - 0.5) * factor + 0.5, 0.0, 1.0
-                )
-                with autocast(device):
-                    tta_logits, tta_presence_logits=model(tta_images)
-                tta_probability=torch.sigmoid(tta_logits)[:, 0]
-                tta_presence=torch.sigmoid(tta_presence_logits)
-
-                averaged_probability=(
-                    original_probability + tta_probability
-                ) / 2.0
-                averaged_presence=(
-                    original_presence + tta_presence
-                ) / 2.0
-                probabilities=averaged_probability.float().cpu().numpy()
-                alternate_probabilities=tta_probability.float().cpu().numpy()
-                presence_probabilities=(
-                    averaged_presence.float().cpu().numpy()
-                )
-
-                for batch_position, local_index_tensor in enumerate(
-                    local_indices):
-                    local_index=int(local_index_tensor)
-                    global_index=fold_indices[local_index]
-                    row=rows[global_index]
-                    probability=probabilities[batch_position]
-                    alternate_probability=alternate_probabilities[
-                        batch_position
-                    ]
-                    presence_probability=float(
-                        presence_probabilities[batch_position]
-                    )
-                    heart_present=bool(
-                        presence_probability >= presence_threshold
-                        or float(probability.max())
-                        >= PRESENCE_SEGMENTATION_OVERRIDE_PEAK
-                    )
-                    initial_mask=candidate_mask(
-                        probability, threshold
-                    )
-                    initial_valid, initial_reason=(
-                        validate_mask(
-                            initial_mask, probability, geometry_prior
-                        )
-                    )
-
-                    if not heart_present:
-                        final_mask=np.zeros_like(initial_mask, dtype=np.uint8)
-                        final_valid=True
-                        repair_method="presence_head_empty"
-                        used_threshold=threshold
-                        final_reason=""
-                        prior_deviation=0.0
-                    elif initial_valid:
-                        final_mask=initial_mask
-                        final_valid=True
-                        repair_method="none"
-                        used_threshold=threshold
-                        final_reason=""
-                        prior_deviation=calculate_prior_deviation(
-                            final_mask, geometry_prior
-                        )
-                    else:
-                        (
-                            final_mask,
-                            final_valid,
-                            repair_method,
-                            used_threshold,
-                            final_reason,
-                            prior_deviation,
-                        )=repair_probability(
-                            probability, threshold, geometry_prior
-                        )
-                        repair_method="photometric_tta+" + repair_method
-
-                    geometry=mask_features(final_mask)
-                    area=float(geometry["area"])
-                    boundary=float(geometry["boundary"])
-                    centroid_x=geometry["centroid_x"]
-                    centroid_y=geometry["centroid_y"]
-                    disagreement, entropy, uncertainty=(
-                        uncertainty_metrics(
-                            probability,
-                            alternate_probability,
-                            presence_probability,
-                            presence_threshold,
-                            prior_deviation,
-                            final_valid,
-                        )
-                    )
-                    mask_path=Path(row["predicted_attention_mask_path"])
-                    # Every experiment later reads this out-of-fold mask from disk.
-                    write_png(mask_path, final_mask.astype(np.uint8) * 255)
-
-                    result_row={
-                        **row,
-                        "attention_valid_initial": int(initial_valid),
-                        "attention_valid_final": int(final_valid),
-                        "attention_invalid_reason_initial": initial_reason,
-                        "attention_invalid_reason_final": final_reason,
-                        "attention_repair_method": repair_method,
-                        "attention_threshold_used": float(used_threshold),
-                        "attention_area_ratio": area,
-                        "attention_peak_probability": float(
-                            probability.max()
-                        ),
-                        "attention_boundary_touch_fraction": boundary,
-                        "attention_heart_present": int(heart_present),
-                        "attention_presence_probability": presence_probability,
-                        "attention_presence_threshold": presence_threshold,
-                        "attention_tta_disagreement": disagreement,
-                        "attention_mean_entropy": entropy,
-                        "attention_uncertainty_score": uncertainty,
-                        "attention_sequence_inconsistency": 0.0,
-                        "attention_centroid_x": centroid_x,
-                        "attention_centroid_y": centroid_y,
-                        "attention_prior_deviation": float(prior_deviation),
-                        "checkpoint_fingerprint": checkpoint_fingerprint,
-                    }
-                    results[global_index]=result_row
-                    fold_results.append(result_row)
-
-        apply_sequence_consistency(
-            fold_results, fold_rows
-        )
-        del model, loader, checkpoint, fold_results
-        release_device(device)
-
-    final_results=[result for result in results if result is not None]
-    if len(final_results) != len(rows):
-        raise RuntimeError(
-            "Prediction did not produce exactly one row per image."
-        )
-    apply_sequence_consistency(final_results, rows)
-    write_csv(
-        workspace.prediction_audit,
-        final_results,
-        final_results[0].keys(),
-    )
-    invalid_rows=[
-        row
-        for row in final_results
-        if _as_int(row.get("attention_valid_final"), 0) != 1
-    ]
-    segmentation_summary=evaluate_oof_segmentation(
-        workspace, final_results
-    )
-    summary={
-        "device": device.type,
-        "images": len(final_results),
-        "valid_initial": sum(
-            _as_int(row.get("attention_valid_initial"), 0)
-            for row in final_results
-        ),
-        "valid_final": sum(
-            _as_int(row.get("attention_valid_final"), 0)
-            for row in final_results
-        ),
-        "predicted_heart_present": sum(
-            _as_int(row.get("attention_heart_present"), 0)
-            for row in final_results
-        ),
-        "predicted_no_heart": sum(
-            _as_int(row.get("attention_heart_present"), 0) == 0
-            for row in final_results
-        ),
-        "uncertain_above_review_threshold": sum(
-            _as_float(row.get("attention_uncertainty_score"), 0.0)
-            >= UNCERTAINTY_MIN_SCORE
-            for row in final_results
-        ),
-        "invalid_final": len(invalid_rows),
-        "prediction_audit": str(workspace.prediction_audit),
-        "segmentation_oof": segmentation_summary,
-        "elapsed": format_seconds(
-            time.perf_counter() - started
-        ),
-    }
-    print(
-        "[ATTENTION] "
-        f"valid_final={summary['valid_final']}/{summary['images']}, "
-        f"heart_present={summary['predicted_heart_present']}, "
-        f"invalid={summary['invalid_final']} | {workspace.prediction_audit}"
-    )
-    clear_image_cache()
-    return final_results
-
-
-# -----------------------------------------------------------------------------
-# STEP 4 — HTML REVIEW: inspect/correct unresolved masks without changing folds
-# -----------------------------------------------------------------------------
+# =============================================================================
+# STAGE 3 — OPTIONAL HTML REVIEW
+# =============================================================================
 class HammingBKTree:
     """Search perceptual hashes by Hamming distance without scanning every hash."""
 
@@ -2921,362 +2710,349 @@ class HammingBKTree:
             stack.extend(child for edge, child in children.items() if low <= edge <= high)
         return False
 
+class ReviewStage:
+    """Select unresolved images for manual review in the current session."""
 
-# Manual-review queue and editor settings.
-# Default maximum novel review candidates selected per patient.
-NEW_IMAGES_PER_PATIENT=10
-
-
-# Minimum automatic uncertainty score used by the uncertain review scope.
-UNCERTAINTY_MIN_SCORE=0.18
-
-
-
-# Merge review rows.
-def merge_review_rows(
-    dataset_rows,
-    workspace,
-):
-    quality={
-        row["image_token"]: row
-        for row in read_csv(workspace.quality_audit)
-    }
-    predictions={
-        row["image_token"]: row
-        for row in read_csv(workspace.prediction_audit)
-    }
-    annotations=load_annotations(workspace)
-    merged=[]
-    for original in dataset_rows:
-        row=dict(original)
-        row.update(quality.get(row["image_token"], {}))
-        row.update(predictions.get(row["image_token"], {}))
-        annotation=annotations.get(str(row["image_token"]), {})
-        annotation_type=normalize_target_type(
-            annotation.get("target_type", "")
-        )
-        row["manual_annotation_type"]=annotation_type
-        row["review_target_type"]=annotation_type or "UNLABELED"
-        row["manual_annotation_source"]=annotation.get("source", "")
-        mask_qc=manual_mask_qc(row["manual_mask_path"])
-        row.update(
-            {
-                "manual_mask_exists": mask_qc["exists"],
-                "manual_mask_usable": mask_qc["usable"],
-                "manual_mask_area_ratio": mask_qc["area_ratio"],
-                "manual_mask_reason": mask_qc["reason"],
-            }
-        )
-        merged.append(row)
-    return merged
-
-# Normalize target type.
-def normalize_target_type(value):
-    target=str(value or "").strip().upper()
-    if target in {"", "UNLABELED", "NONE", "NAN"}:
-        return ""
-    return target
-
-# Read the normalized explicit review label attached to one image.
-def row_target_type(row):
-    return normalize_target_type(
-        row.get("manual_annotation_type", row.get("target_type", ""))
-    )
-
-
-# Avoid presenting the same image twice inside one manual-review round.
-
-# Distribute review candidates across patients and series instead of oversampling one scan.
-def round_robin_review(
-    rows,
-    limit,
-    per_patient,
-    seed,
-):
-    def priority(row):
-        explicit_priority=row.get("review_priority", "")
-        if str(explicit_priority).strip() != "":
-            primary=_as_float(explicit_priority, 0.0)
-        else:
-            uncertainty=_as_float(
-                row.get("attention_uncertainty_score"), 0.0
+    # Merge review rows.
+    @staticmethod
+    def merge_review_rows(
+        dataset_rows,
+        workspace,
+    ):
+        quality={
+            row["image_token"]: row
+            for row in DataStage.read_csv(workspace.quality_audit)
+        }
+        predictions={
+            row["image_token"]: row
+            for row in DataStage.read_csv(workspace.prediction_audit)
+        }
+        annotations=DataStage.load_annotations(workspace)
+        merged=[]
+        for original in dataset_rows:
+            row=dict(original)
+            row.update(quality.get(row["image_token"], {}))
+            row.update(predictions.get(row["image_token"], {}))
+            annotation=annotations.get(str(row["image_token"]), {})
+            annotation_type=ReviewStage.normalize_target_type(
+                annotation.get("target_type", "")
             )
-            valid=_as_int(row.get("attention_valid_final"), 0)
-            primary=-uncertainty if uncertainty > 0 else float(valid)
-        peak=_as_float(row.get("attention_peak_probability"), 0.0)
-        tie=hashlib.sha256(
-            f"{seed}|{row['image_token']}".encode("utf-8")
-        ).hexdigest()
-        return (primary, peak, tie)
-
-    by_patient_series=defaultdict(
-        lambda: defaultdict(list)
-    )
-    for row in rows:
-        sequence_group=str(
-            row.get("sequence_group_id") or row["series_id"]
+            row["manual_annotation_type"]=annotation_type
+            row["review_target_type"]=annotation_type or "UNLABELED"
+            row["manual_annotation_source"]=annotation.get("source", "")
+            mask_qc=DataStage.manual_mask_qc(row["manual_mask_path"])
+            row.update(
+                {
+                    "manual_mask_exists": mask_qc["exists"],
+                    "manual_mask_usable": mask_qc["usable"],
+                    "manual_mask_area_ratio": mask_qc["area_ratio"],
+                    "manual_mask_reason": mask_qc["reason"],
+                }
+            )
+            merged.append(row)
+        return merged
+    # Normalize target type.
+    @staticmethod
+    def normalize_target_type(value):
+        target=str(value or "").strip().upper()
+        if target in {"", "UNLABELED", "NONE", "NAN"}:
+            return ""
+        return target
+    # Read the normalized explicit review label attached to one image.
+    @staticmethod
+    def row_target_type(row):
+        return ReviewStage.normalize_target_type(
+            row.get("manual_annotation_type", row.get("target_type", ""))
         )
-        by_patient_series[str(row["patient_id"])][sequence_group].append(row)
+    # Distribute review candidates across patients and series instead of oversampling one scan.
+    @staticmethod
+    def round_robin_review(
+        rows,
+        limit,
+        per_patient,
+        seed,
+    ):
+        def priority(row):
+            explicit_priority=row.get("review_priority", "")
+            if str(explicit_priority).strip() != "":
+                primary=DataStage._as_float(explicit_priority, 0.0)
+            else:
+                uncertainty=DataStage._as_float(
+                    row.get("attention_uncertainty_score"), 0.0
+                )
+                valid=DataStage._as_int(row.get("attention_valid_final"), 0)
+                primary=-uncertainty if uncertainty > 0 else float(valid)
+            peak=DataStage._as_float(row.get("attention_peak_probability"), 0.0)
+            tie=hashlib.sha256(
+                f"{seed}|{row['image_token']}".encode("utf-8")
+            ).hexdigest()
+            return (primary, peak, tie)
 
-    patient_queues={}
-    for patient_id, series_map in by_patient_series.items():
-        series_ids=sorted(series_map)
-        for series_id in series_ids:
-            series_map[series_id].sort(key=priority)
-        queue=[]
-        position=0
-        while len(queue) < per_patient:
-            added=False
+        by_patient_series=defaultdict(
+            lambda: defaultdict(list)
+        )
+        for row in rows:
+            sequence_group=str(
+                row.get("sequence_group_id") or row["series_id"]
+            )
+            by_patient_series[str(row["patient_id"])][sequence_group].append(row)
+
+        patient_queues={}
+        for patient_id, series_map in by_patient_series.items():
+            series_ids=sorted(series_map)
             for series_id in series_ids:
-                if position < len(series_map[series_id]):
-                    queue.append(series_map[series_id][position])
+                series_map[series_id].sort(key=priority)
+            queue=[]
+            position=0
+            while len(queue) < per_patient:
+                added=False
+                for series_id in series_ids:
+                    if position < len(series_map[series_id]):
+                        queue.append(series_map[series_id][position])
+                        added=True
+                        if len(queue) >= per_patient:
+                            break
+                if not added:
+                    break
+                position +=1
+            patient_queues[patient_id]=queue
+
+        selected=[]
+        position=0
+        while len(selected) < limit:
+            added=False
+            for patient_id in sorted(patient_queues):
+                queue=patient_queues[patient_id]
+                if position < len(queue):
+                    selected.append(queue[position])
                     added=True
-                    if len(queue) >= per_patient:
+                    if len(selected) >= limit:
                         break
             if not added:
                 break
             position +=1
-        patient_queues[patient_id]=queue
-
-    selected=[]
-    position=0
-    while len(selected) < limit:
-        added=False
-        for patient_id in sorted(patient_queues):
-            queue=patient_queues[patient_id]
-            if position < len(queue):
-                selected.append(queue[position])
-                added=True
-                if len(selected) >= limit:
-                    break
-        if not added:
-            break
-        position +=1
-    return selected
-
-# The UNLABELED filter is always applied before the review scope. This prevents
-# a prior HEART_PRESENT, NO_HEART_VISIBLE, or UNUSABLE decision from silently
-# reappearing in a later annotation round.
-def select_review_rows(
-    dataset_rows,
-    workspace,
-    scope="invalid",
-    limit=None,
-    seed=42,
-    review_round=1,
-):
-    scope=str(scope).lower()
-    allowed={"invalid", "uncertain", "empty", "novel", "manual", "all"}
-    if scope not in allowed:
-        raise ValueError(
-            "scope must be invalid/uncertain/empty/novel/manual/all."
-        )
-    limit=int(300 if limit is None else limit)
-    all_rows=merge_review_rows(dataset_rows, workspace)
-    target_counts=defaultdict(int)
-    for row in all_rows:
-        target=row_target_type(row) or "UNLABELED"
-        target_counts[target] +=1
-    rows=[row for row in all_rows if row_target_type(row) == ""]
-    labeled_excluded=len(all_rows) - len(rows)
-    print(
-        "[REVIEW][TARGET FILTER] "
-        f"UNLABELED={len(rows)}, already-labeled excluded={labeled_excluded}, "
-        f"distribution={dict(sorted(target_counts.items()))}"
-    )
-    reviewed=set()  # no review history is stored between sessions
-
-    if scope == "invalid":
-        candidates=[
-            row
-            for row in rows
-            if _as_int(row.get("attention_valid_final"), 1) == 0
-            and Path(row["predicted_attention_mask_path"]).is_file()
-            and row["image_token"] not in reviewed
-        ]
-        for row in candidates:
-            row["review_priority"]=_as_float(
-                row.get("attention_peak_probability"), 0.0
+        return selected
+    # The UNLABELED filter is always applied before the review scope. This prevents
+    # a prior HEART_PRESENT, NO_HEART_VISIBLE, or UNUSABLE decision from silently
+    # reappearing in a later annotation round.
+    @staticmethod
+    def select_review_rows(
+        dataset_rows,
+        workspace,
+        scope="invalid",
+        limit=None,
+        seed=42,
+        review_round=1,
+    ):
+        scope=str(scope).lower()
+        allowed={"invalid", "uncertain", "empty", "novel", "manual", "all"}
+        if scope not in allowed:
+            raise ValueError(
+                "scope must be invalid/uncertain/empty/novel/manual/all."
             )
-        candidates=round_robin_review(
-            candidates,
-            limit=max(1, limit),
-            per_patient=max(
-                NEW_IMAGES_PER_PATIENT,
-                int(math.ceil(limit / max(1, len({r['patient_id'] for r in candidates}))))
-                if candidates
-                else NEW_IMAGES_PER_PATIENT,
-            ),
-            seed=seed,
-        )
-    elif scope == "uncertain":
-        candidates=[]
-        for row in rows:
-            if row["image_token"] in reviewed:
-                continue
-            if _as_int(row.get("quality_valid"), 0) != 1:
-                continue
-            if not Path(row["predicted_attention_mask_path"]).is_file():
-                continue
-            uncertainty=_as_float(
-                row.get("attention_uncertainty_score"), 0.0
-            )
-            presence=_as_float(
-                row.get("attention_presence_probability"), np.nan
-            )
-            presence_threshold=_as_float(
-                row.get("attention_presence_threshold"),
-                DEFAULT_PRESENCE_THRESHOLD,
-            )
-            near_presence_boundary=bool(
-                np.isfinite(presence)
-                and abs(presence - presence_threshold)
-                <= 0.15
-            )
-            if (
-                uncertainty < UNCERTAINTY_MIN_SCORE
-                and not near_presence_boundary
-                and _as_int(row.get("attention_valid_final"), 1) == 1):
-                continue
-
-            row["review_priority"]=-uncertainty
-            candidates.append(row)
-        candidates=round_robin_review(
-            candidates,
-            limit=max(1, limit),
-            per_patient=max(
-                NEW_IMAGES_PER_PATIENT,
-                int(math.ceil(limit / max(1, len({r['patient_id'] for r in candidates}))))
-                if candidates
-                else NEW_IMAGES_PER_PATIENT,
-            ),
-            seed=seed,
-        )
-    elif scope == "empty":
-        candidates=[
-            row
-            for row in rows
-            if Path(row["manual_mask_path"]).is_file()
-            and not bool(row.get("manual_annotation_type"))
-            and str(row.get("manual_mask_reason", ""))
-            == "empty_or_nearly_empty"
-            and Path(row["predicted_attention_mask_path"]).is_file()
-            and row["image_token"] not in reviewed
-        ]
-        for row in candidates:
-            row["review_priority"]=-_as_float(
-                row.get("attention_uncertainty_score"), 0.0
-            )
-        candidates=round_robin_review(
-            candidates,
-            limit=max(1, limit),
-            per_patient=max(
-                NEW_IMAGES_PER_PATIENT,
-                int(math.ceil(limit / max(1, len({r['patient_id'] for r in candidates}))))
-                if candidates
-                else NEW_IMAGES_PER_PATIENT,
-            ),
-            seed=seed,
-        )
-    elif scope == "manual":
-
-
-        candidates=[
-            row
-            for row in rows
-            if Path(row["manual_mask_path"]).is_file()
-            and Path(row["predicted_attention_mask_path"]).is_file()
-            and row["image_token"] not in reviewed
-        ]
-        candidates.sort(
-            key=lambda row: (
-                row["patient_id"],
-                row["series_id"],
-                row["image_token"],
-            )
-        )
-    elif scope == "all":
-        candidates=[
-            row
-            for row in rows
-            if Path(row["predicted_attention_mask_path"]).is_file()
-            and row["image_token"] not in reviewed
-        ]
-        candidates.sort(
-            key=lambda row: (
-                row["patient_id"],
-                row["series_id"],
-                row["image_token"],
-            )
-        )
-    else:
-
-
-        manual_hashes=[]
+        limit=int(300 if limit is None else limit)
+        all_rows=ReviewStage.merge_review_rows(dataset_rows, workspace)
+        target_counts=defaultdict(int)
         for row in all_rows:
-            is_annotated=bool(row.get("manual_annotation_type")) or Path(
-                row["manual_mask_path"]
-            ).is_file()
-            if is_annotated and row.get("perceptual_hash"):
-                manual_hashes.append(int(str(row["perceptual_hash"]), 16))
-        if not manual_hashes:
+            target=ReviewStage.row_target_type(row) or "UNLABELED"
+            target_counts[target] +=1
+        rows=[row for row in all_rows if ReviewStage.row_target_type(row) == ""]
+        labeled_excluded=len(all_rows) - len(rows)
+        print(
+            "[REVIEW][TARGET FILTER] "
+            f"UNLABELED={len(rows)}, already-labeled excluded={labeled_excluded}, "
+            f"distribution={dict(sorted(target_counts.items()))}"
+        )
+        reviewed=set()  # no review history is stored between sessions
+
+        if scope == "invalid":
+            candidates=[
+                row
+                for row in rows
+                if DataStage._as_int(row.get("attention_valid_final"), 1) == 0
+                and Path(row["predicted_attention_mask_path"]).is_file()
+                and row["image_token"] not in reviewed
+            ]
+            for row in candidates:
+                row["review_priority"]=DataStage._as_float(
+                    row.get("attention_peak_probability"), 0.0
+                )
+            candidates=ReviewStage.round_robin_review(
+                candidates,
+                limit=max(1, limit),
+                per_patient=max(
+                    10,
+                    int(math.ceil(limit / max(1, len({r['patient_id'] for r in candidates}))))
+                    if candidates
+                    else 10,
+                ),
+                seed=seed,
+            )
+        elif scope == "uncertain":
+            candidates=[]
+            for row in rows:
+                if row["image_token"] in reviewed:
+                    continue
+                if DataStage._as_int(row.get("quality_valid"), 0) != 1:
+                    continue
+                if not Path(row["predicted_attention_mask_path"]).is_file():
+                    continue
+                uncertainty=DataStage._as_float(
+                    row.get("attention_uncertainty_score"), 0.0
+                )
+                presence=DataStage._as_float(
+                    row.get("attention_presence_probability"), np.nan
+                )
+                presence_threshold=DataStage._as_float(
+                    row.get("attention_presence_threshold"),
+                    0.50,
+                )
+                near_presence_boundary=bool(
+                    np.isfinite(presence)
+                    and abs(presence - presence_threshold)
+                    <= 0.15
+                )
+                if (
+                    uncertainty < 0.18
+                    and not near_presence_boundary
+                    and DataStage._as_int(row.get("attention_valid_final"), 1) == 1):
+                    continue
+
+                row["review_priority"]=-uncertainty
+                candidates.append(row)
+            candidates=ReviewStage.round_robin_review(
+                candidates,
+                limit=max(1, limit),
+                per_patient=max(
+                    10,
+                    int(math.ceil(limit / max(1, len({r['patient_id'] for r in candidates}))))
+                    if candidates
+                    else 10,
+                ),
+                seed=seed,
+            )
+        elif scope == "empty":
+            candidates=[
+                row
+                for row in rows
+                if Path(row["manual_mask_path"]).is_file()
+                and not bool(row.get("manual_annotation_type"))
+                and str(row.get("manual_mask_reason", ""))
+                == "empty_or_nearly_empty"
+                and Path(row["predicted_attention_mask_path"]).is_file()
+                and row["image_token"] not in reviewed
+            ]
+            for row in candidates:
+                row["review_priority"]=-DataStage._as_float(
+                    row.get("attention_uncertainty_score"), 0.0
+                )
+            candidates=ReviewStage.round_robin_review(
+                candidates,
+                limit=max(1, limit),
+                per_patient=max(
+                    10,
+                    int(math.ceil(limit / max(1, len({r['patient_id'] for r in candidates}))))
+                    if candidates
+                    else 10,
+                ),
+                seed=seed,
+            )
+        elif scope == "manual":
+
+
+            candidates=[
+                row
+                for row in rows
+                if Path(row["manual_mask_path"]).is_file()
+                and Path(row["predicted_attention_mask_path"]).is_file()
+                and row["image_token"] not in reviewed
+            ]
+            candidates.sort(
+                key=lambda row: (
+                    row["patient_id"],
+                    row["series_id"],
+                    row["image_token"],
+                )
+            )
+        elif scope == "all":
+            candidates=[
+                row
+                for row in rows
+                if Path(row["predicted_attention_mask_path"]).is_file()
+                and row["image_token"] not in reviewed
+            ]
+            candidates.sort(
+                key=lambda row: (
+                    row["patient_id"],
+                    row["series_id"],
+                    row["image_token"],
+                )
+            )
+        else:
+
+
+            manual_hashes=[]
+            for row in all_rows:
+                is_annotated=bool(row.get("manual_annotation_type")) or Path(
+                    row["manual_mask_path"]
+                ).is_file()
+                if is_annotated and row.get("perceptual_hash"):
+                    manual_hashes.append(int(str(row["perceptual_hash"]), 16))
+            if not manual_hashes:
+                raise RuntimeError(
+                    "The novel scope requires at least one labeled image."
+                )
+            tree=HammingBKTree()
+            for value in sorted(set(manual_hashes)):
+                tree.add(value)
+
+            candidates=[]
+            excluded=defaultdict(int)
+            for row in rows:
+                if bool(row.get("manual_annotation_type")) or Path(
+                    row["manual_mask_path"]
+                ).is_file():
+                    excluded["already_annotated"] +=1
+                    continue
+                if row["image_token"] in reviewed:
+                    excluded["already_reviewed_this_round"] +=1
+                    continue
+                if DataStage._as_int(row.get("quality_valid"), 0) != 1:
+                    excluded["quality_invalid"] +=1
+                    continue
+                if not Path(row["predicted_attention_mask_path"]).is_file():
+                    excluded["missing_attention_mask"] +=1
+                    continue
+                phash=str(row.get("perceptual_hash", ""))
+                if not phash:
+                    excluded["missing_phash"] +=1
+                    continue
+                if tree.has_near(
+                    int(phash, 16), 6):
+                    excluded["similar_to_annotated"] +=1
+                    continue
+                row["review_priority"]=-DataStage._as_float(
+                    row.get("attention_uncertainty_score"), 0.0
+                )
+                candidates.append(row)
+            candidates=ReviewStage.round_robin_review(
+                candidates,
+                limit=max(1, limit),
+                per_patient=10,
+                seed=seed,
+            )
+            print(f"[REVIEW novel] excluded={dict(excluded)}")
+
+        if limit > 0 and scope in {"manual", "all"}:
+            candidates=candidates[:limit]
+        if not candidates:
             raise RuntimeError(
-                "The novel scope requires at least one labeled image."
+                "No target=UNLABELED images are eligible for "
+                f"scope={scope!r}. HEART_PRESENT, "
+                "NO_HEART_VISIBLE, and UNUSABLE images are excluded automatically."
             )
-        tree=HammingBKTree()
-        for value in sorted(set(manual_hashes)):
-            tree.add(value)
-
-        candidates=[]
-        excluded=defaultdict(int)
-        for row in rows:
-            if bool(row.get("manual_annotation_type")) or Path(
-                row["manual_mask_path"]
-            ).is_file():
-                excluded["already_annotated"] +=1
-                continue
-            if row["image_token"] in reviewed:
-                excluded["already_reviewed_this_round"] +=1
-                continue
-            if _as_int(row.get("quality_valid"), 0) != 1:
-                excluded["quality_invalid"] +=1
-                continue
-            if not Path(row["predicted_attention_mask_path"]).is_file():
-                excluded["missing_attention_mask"] +=1
-                continue
-            phash=str(row.get("perceptual_hash", ""))
-            if not phash:
-                excluded["missing_phash"] +=1
-                continue
-            if tree.has_near(
-                int(phash, 16), 6):
-                excluded["similar_to_annotated"] +=1
-                continue
-            row["review_priority"]=-_as_float(
-                row.get("attention_uncertainty_score"), 0.0
-            )
-            candidates.append(row)
-        candidates=round_robin_review(
-            candidates,
-            limit=max(1, limit),
-            per_patient=NEW_IMAGES_PER_PATIENT,
-            seed=seed,
-        )
-        print(f"[REVIEW novel] excluded={dict(excluded)}")
-
-    if limit > 0 and scope in {"manual", "all"}:
-        candidates=candidates[:limit]
-    if not candidates:
-        raise RuntimeError(
-            "No target=UNLABELED images are eligible for "
-            f"scope={scope!r}. HEART_PRESENT, "
-            "NO_HEART_VISIBLE, and UNUSABLE images are excluded automatically."
-        )
-    print(f"[REVIEW] scope={scope}, images={len(candidates)}")
-    return candidates
-
-# Append one editor action to the persistent manual-review history.
-
+        print(f"[REVIEW] scope={scope}, images={len(candidates)}")
+        return candidates
 
 class MaskEditor:
     """Kaggle-safe HTML5 editor for correcting segmentation targets.
@@ -3296,12 +3072,12 @@ class MaskEditor:
         review_scope="invalid",):
         import ipywidgets as widgets
 
-        annotations=load_annotations(workspace)
+        annotations=DataStage.load_annotations(workspace)
         unlabeled_rows=[]
         for source_row in rows:
             row=dict(source_row)
             annotation=annotations.get(str(row.get("image_token", "")), {})
-            target=normalize_target_type(
+            target=ReviewStage.normalize_target_type(
                 annotation.get("target_type", row.get("manual_annotation_type", ""))
             )
             if target:
@@ -3497,10 +3273,10 @@ class MaskEditor:
         auto_path=Path(row["predicted_attention_mask_path"])
         if not auto_path.is_file():
             raise FileNotFoundError(f"Missing Attention mask: {auto_path}")
-        image=standardized_uint8(row["image_path"])
-        auto_mask=read_binary_mask(auto_path)
+        image=DataStage.standardized_uint8(row["image_path"])
+        auto_mask=DataStage.read_binary_mask(auto_path)
         manual_path=Path(row["manual_mask_path"])
-        current=read_binary_mask(manual_path) if manual_path.is_file() else auto_mask.copy()
+        current=DataStage.read_binary_mask(manual_path) if manual_path.is_file() else auto_mask.copy()
         self.image=image.astype(np.float32) / 255.0
         self.auto_mask=auto_mask.astype(np.uint8)
         self.base_mask=self.auto_mask.copy()
@@ -3511,7 +3287,7 @@ class MaskEditor:
     def render(self):
         row=self.rows[self.index]
         target_type=(
-            normalize_target_type(
+            ReviewStage.normalize_target_type(
                 row.get("manual_annotation_type", row.get("target_type", ""))
             )
             or "UNLABELED"
@@ -3522,7 +3298,7 @@ class MaskEditor:
         canvas_id=f"cad_canvas_{self.widget_id}"
         keyboard_sink_id=f"cad_keyboard_sink_{self.widget_id}"
         placeholder=f"CAD_MASK_SYNC_{self.widget_id}"
-        size=SEGMENTATION_SIZE
+        size=256
         html=f"""
         <div style="font-family:Arial,sans-serif;max-width:900px">
           <div style="margin-bottom:6px;font-size:14px">
@@ -4013,7 +3789,7 @@ class MaskEditor:
                 binary=(decoded > 127).astype(np.uint8)
             self.mask=cv2.resize(
                 binary,
-                (SEGMENTATION_SIZE, SEGMENTATION_SIZE),
+                (256, 256),
                 interpolation=cv2.INTER_NEAREST,
             ).astype(np.uint8)
         except Exception as error:
@@ -4032,12 +3808,12 @@ class MaskEditor:
             )
             return
         row=self.rows[self.index]
-        manual=manual_mask_qc(row["manual_mask_path"])
-        annotation=load_annotations(self.workspace).get(
+        manual=DataStage.manual_mask_qc(row["manual_mask_path"])
+        annotation=DataStage.load_annotations(self.workspace).get(
             str(row["image_token"]), {}
         )
         target_type=(
-            normalize_target_type(annotation.get("target_type", ""))
+            ReviewStage.normalize_target_type(annotation.get("target_type", ""))
             or "UNLABELED"
         )
         self.status.value=(
@@ -4045,8 +3821,8 @@ class MaskEditor:
             f"<b>{prefix}</b> index={self.index + 1}/{len(self.rows)}; "
             f"target={target_type}; manual={'yes' if manual['exists'] else 'no'}; "
             f"usable={manual['usable']}; attention_valid={row.get('attention_valid_final', '')}; "
-            f"presence={_as_float(row.get('attention_presence_probability'), np.nan):.3f}; "
-            f"uncertainty={_as_float(row.get('attention_uncertainty_score'), np.nan):.3f}; "
+            f"presence={DataStage._as_float(row.get('attention_presence_probability'), np.nan):.3f}; "
+            f"uncertainty={DataStage._as_float(row.get('attention_uncertainty_score'), np.nan):.3f}; "
             f"reason={row.get('attention_invalid_reason_final', '')}</span>"
         )
 
@@ -4061,8 +3837,8 @@ class MaskEditor:
         row=self.rows[self.index]
         binary=(np.asarray(mask) > 0).astype(np.uint8)
         path=Path(row["manual_mask_path"])
-        write_png(path, binary * 255)
-        set_annotation(
+        DataStage.write_png(path, binary * 255)
+        DataStage.set_annotation(
             self.workspace,
             row,
             target_type=target_type,
@@ -4076,7 +3852,7 @@ class MaskEditor:
         self.mask=binary.copy()
 
     def save(self):
-        if float((self.mask > 0).mean()) < MANUAL_MIN_AREA_RATIO:
+        if float((self.mask > 0).mean()) < 0.0005:
             raise ValueError(
                 "The mask is empty. Use No heart [H] for a valid image "
                 "without a visible heart, or Unusable [U] for blur/noise/localizer frames."
@@ -4086,7 +3862,7 @@ class MaskEditor:
             HEART_PRESENT,
             source="human_drawn_or_corrected",
             action="save_manual_heart_present",
-            sample_weight=MANUAL_DRAWN_WEIGHT,
+            sample_weight=1.0,
         )
         self.update_status("Saved HEART_PRESENT; weight=1.00.")
         print("[EDITOR]", self.rows[self.index]["manual_mask_path"], "| HEART_PRESENT")
@@ -4096,7 +3872,7 @@ class MaskEditor:
         self._advance_after_target("Saved HEART_PRESENT.")
 
     def accept_auto(self):
-        if float((self.auto_mask > 0).mean()) < MANUAL_MIN_AREA_RATIO:
+        if float((self.auto_mask > 0).mean()) < 0.0005:
             raise ValueError(
                 "The automatic mask is empty; use No heart [H], not Auto OK."
             )
@@ -4105,10 +3881,10 @@ class MaskEditor:
             HEART_PRESENT,
             source="human_confirmed_auto",
             action="accept_auto_and_save",
-            sample_weight=AUTO_CONFIRMED_WEIGHT,
+            sample_weight=0.72,
         )
         self._advance_after_target(
-            f"Auto saved HEART_PRESENT; weight={AUTO_CONFIRMED_WEIGHT:.2f}."
+            f"Auto saved HEART_PRESENT; weight={0.72:.2f}."
         )
 
     def mark_no_heart(self):
@@ -4118,14 +3894,14 @@ class MaskEditor:
             NO_HEART_VISIBLE,
             source="human_no_heart_visible",
             action="mark_no_heart_visible",
-            sample_weight=NO_HEART_WEIGHT,
+            sample_weight=0.90,
         )
         self._advance_after_target("Saved NO_HEART_VISIBLE negative target.")
 
     def mark_unusable(self):
         row=self.rows[self.index]
         Path(row["manual_mask_path"]).unlink(missing_ok=True)
-        set_annotation(
+        DataStage.set_annotation(
             self.workspace,
             row,
             target_type=UNUSABLE,
@@ -4162,7 +3938,7 @@ class MaskEditor:
     def delete_manual(self):
         row=self.rows[self.index]
         Path(row["manual_mask_path"]).unlink(missing_ok=True)
-        remove_annotation(self.workspace, str(row["image_token"]))
+        DataStage.remove_annotation(self.workspace, str(row["image_token"]))
         row["manual_annotation_type"]=""
         row["manual_annotation_source"]=""
         self.mask=self.auto_mask.copy()
@@ -4192,973 +3968,803 @@ class MaskEditor:
         display(Javascript(self._shortcut_script()))
         return self
 
+# =============================================================================
+# STAGE 4 — SICK/NORMAL MATCHING
+# =============================================================================
+class MatchingStage:
+    """Rebuild strict-core and expanded balanced matching from current-run data."""
 
-# -----------------------------------------------------------------------------
-# PIPELINE STEP 5 — Cross-class Sick-to-Normal matching
-# -----------------------------------------------------------------------------
-
-
-# Minimum number of acquisition-family clusters.
-MIN_FAMILIES=8
-
-# Maximum number of acquisition-family clusters.
-MAX_FAMILIES=32
-
-# Approximate eligible images represented by one acquisition family.
-TARGET_IMAGES_PER_FAMILY=1800
-
-# Minimum images from each class required for a shared family.
-MIN_IMAGES_PER_CLASS_PER_FAMILY=12
-
-# Minimum patients from each class required for a shared family.
-MIN_PATIENTS_PER_CLASS_PER_FAMILY=2
-
-# Top-neighbor count used by the strict reciprocal matching core.
-MUTUAL_NEIGHBORS=5
-
-# Robust MAD multiplier used for the strict-core distance caliper.
-CALIPER_MAD_MULTIPLIER=2.5
-
-# Upper distance quantile used for the strict-core caliper.
-CALIPER_QUANTILE=0.90
-
-# Largest normalized sequence-position difference for strict pairs.
-MAX_SEQUENCE_POSITION_DIFFERENCE=0.25
-
-# Largest automatic-mask area difference for strict pairs.
-MAX_AREA_RATIO_DIFFERENCE=0.20
-
-# Strict-core cap for one patient inside one acquisition family.
-MAX_MATCHES_PER_PATIENT_PER_FAMILY=20
-
-# Strict-core cap for one sequence group inside one family.
-MAX_MATCHES_PER_SEQUENCE_GROUP=5
-
-# Target fraction of eligible images included in the balanced matched cohort.
-TARGET_MATCHED_IMAGE_FRACTION=0.50
-
-# Top-neighbor count used to construct the extended candidate graph.
-EXTENDED_NEIGHBORS=12
-
-# Robust MAD multiplier used for the extended distance caliper.
-EXTENDED_CALIPER_MAD_MULTIPLIER=3.5
-
-# Upper distance quantile used for the extended caliper.
-EXTENDED_CALIPER_QUANTILE=0.97
-
-# Largest extended caliper relative to the strict-core caliper.
-EXTENDED_MAX_CALIPER_MULTIPLIER=1.18
-
-# Largest sequence-position difference for extended pairs.
-EXTENDED_MAX_SEQUENCE_POSITION_DIFFERENCE=0.25
-
-# Largest automatic-mask area difference for extended pairs.
-EXTENDED_MAX_AREA_RATIO_DIFFERENCE=0.20
-
-# Extended-stage cap for one patient inside one family.
-EXTENDED_MAX_MATCHES_PER_PATIENT_PER_FAMILY=60
-
-# Extended-stage cap for one sequence group inside one family.
-EXTENDED_MAX_MATCHES_PER_SEQUENCE_GROUP=15
-
-# Extended-stage cap for one Sick/Normal sequence-pair combination.
-EXTENDED_MAX_MATCHES_PER_SEQUENCE_PAIR=12
-
-# Extended-stage cap for one Sick/Normal patient pair.
-EXTENDED_MAX_MATCHES_PER_PATIENT_PAIR=60
-
-# Multiplier controlling the total matched-image cap per patient.
-PATIENT_TOTAL_CAP_MULTIPLIER=1.70
-
-
-# Prefer sequence pairs already represented in the strict core.
-PRIORITIZE_CORE_SEQUENCE_PAIRS=True
-
-# Descriptor weight assigned to perceptual-hash similarity.
-PHASH_BLOCK_WEIGHT=0.45
-
-# Descriptor weight assigned to automatic-mask geometry.
-GEOMETRY_BLOCK_WEIGHT=0.25
-
-# Descriptor weight assigned to normalized sequence position.
-SEQUENCE_BLOCK_WEIGHT=0.15
-
-# Descriptor weight assigned to image-quality measurements.
-QUALITY_BLOCK_WEIGHT=0.15
-
-
-# Record the matching rules inside the cache fingerprint for reproducibility.
-def matching_settings_payload():
-    return {
-        "schema": "cross-class-matching-v2-core-plus-extended",
-        "min_families": MIN_FAMILIES,
-        "max_families": MAX_FAMILIES,
-        "target_images_per_family": TARGET_IMAGES_PER_FAMILY,
-        "minimum_images_per_class_per_family": MIN_IMAGES_PER_CLASS_PER_FAMILY,
-        "minimum_patients_per_class_per_family": MIN_PATIENTS_PER_CLASS_PER_FAMILY,
-        "core_mutual_neighbors": MUTUAL_NEIGHBORS,
-        "core_caliper_mad_multiplier": CALIPER_MAD_MULTIPLIER,
-        "core_caliper_quantile": CALIPER_QUANTILE,
-        "maximum_sequence_position_difference": MAX_SEQUENCE_POSITION_DIFFERENCE,
-        "maximum_area_ratio_difference": MAX_AREA_RATIO_DIFFERENCE,
-        "core_maximum_matches_per_patient_per_family": MAX_MATCHES_PER_PATIENT_PER_FAMILY,
-        "core_maximum_matches_per_sequence_group": MAX_MATCHES_PER_SEQUENCE_GROUP,
-        "target_matched_image_fraction": TARGET_MATCHED_IMAGE_FRACTION,
-        "extended_neighbors": EXTENDED_NEIGHBORS,
-        "extended_caliper_mad_multiplier": EXTENDED_CALIPER_MAD_MULTIPLIER,
-        "extended_caliper_quantile": EXTENDED_CALIPER_QUANTILE,
-        "extended_max_caliper_multiplier": EXTENDED_MAX_CALIPER_MULTIPLIER,
-        "extended_maximum_sequence_position_difference": EXTENDED_MAX_SEQUENCE_POSITION_DIFFERENCE,
-        "extended_maximum_area_ratio_difference": EXTENDED_MAX_AREA_RATIO_DIFFERENCE,
-        "extended_maximum_matches_per_patient_per_family": EXTENDED_MAX_MATCHES_PER_PATIENT_PER_FAMILY,
-        "extended_maximum_matches_per_sequence_group": EXTENDED_MAX_MATCHES_PER_SEQUENCE_GROUP,
-        "extended_maximum_matches_per_sequence_pair": EXTENDED_MAX_MATCHES_PER_SEQUENCE_PAIR,
-        "extended_maximum_matches_per_patient_pair": EXTENDED_MAX_MATCHES_PER_PATIENT_PAIR,
-        "patient_total_cap_multiplier": PATIENT_TOTAL_CAP_MULTIPLIER,
-        "prioritize_core_sequence_pairs": PRIORITIZE_CORE_SEQUENCE_PAIRS,
-        "block_weights": {
-            "phash": PHASH_BLOCK_WEIGHT,
-            "geometry": GEOMETRY_BLOCK_WEIGHT,
-            "sequence": SEQUENCE_BLOCK_WEIGHT,
-            "quality": QUALITY_BLOCK_WEIGHT,
-        },
-        "random_seed": RANDOM_SEED,
-    }
-
-# Invalidate matched cohorts only when their inputs or matching rules changed.
-
-# Convert slice position to a normalized within-series coordinate for matching.
-def sequence_position(row):
-    length=max(1, _as_int(row.get("sequence_length"), 1))
-    index=int(np.clip(_as_int(row.get("sequence_index"), 0), 0, length - 1))
-    if length <= 1:
-        return 0.5
-    return float(index / (length - 1))
-
-# Convert the perceptual hash string to bits used by the matching descriptor.
-def phash_bits(value):
-    number=int(str(value), 16)
-    return np.asarray(
-        [(number >> shift) & 1 for shift in range(63, -1, -1)],
-        dtype=np.float32,
-    )
-
-# Median/MAD standardize matching variables so one descriptor block cannot dominate.
-def robust_standardize(values):
-    values=np.asarray(values, dtype=np.float32).copy()
-    if values.ndim == 1:
-        values=values[:, None]
-    for column in range(values.shape[1]):
-        current=values[:, column]
-        finite=np.isfinite(current)
-        center=float(np.median(current[finite])) if finite.any() else 0.0
-        current[~finite]=center
-        mad=float(np.median(np.abs(current - center)))
-        scale=max(1e-3, 1.4826 * mad)
-        values[:, column]=np.clip((current - center) / scale, -5.0, 5.0)
-    return values
-
-# Build acquisition/anatomy/quality descriptors without using the CAD label as a feature.
-def matching_descriptor(rows):
-    phash=np.stack(
-        [phash_bits(row["perceptual_hash"]) for row in rows]
-    )
-    phash=phash * 2.0 - 1.0
-    geometry=robust_standardize(
-        np.asarray(
-            [
-                [
-                    _as_float(row.get("attention_area_ratio"), np.nan),
-                    _as_float(row.get("attention_centroid_x"), np.nan),
-                    _as_float(row.get("attention_centroid_y"), np.nan),
-                    _as_float(row.get("attention_boundary_touch_fraction"), np.nan),
-                ]
-                for row in rows
-            ],
-            dtype=np.float32,
-        )
-    )
-    sequence=robust_standardize(
-        np.asarray(
-            [[sequence_position(row)] for row in rows],
-            dtype=np.float32,
-        )
-    )
-    quality=robust_standardize(
-        np.asarray(
-            [
-                [
-                    math.log1p(max(0.0, _as_float(row.get("sharpness"), 0.0))),
-                    _as_float(row.get("noise_ratio"), np.nan),
-                    _as_float(row.get("dynamic_range"), np.nan),
-                ]
-                for row in rows
-            ],
-            dtype=np.float32,
-        )
-    )
-
-    def block_scale(weight, dimensions):
-        return math.sqrt(max(float(weight), 0.0) / max(1, int(dimensions)))
-
-    descriptor=np.concatenate(
-        [
-            phash * block_scale(PHASH_BLOCK_WEIGHT, phash.shape[1]),
-            geometry
-            * block_scale(GEOMETRY_BLOCK_WEIGHT, geometry.shape[1]),
-            sequence
-            * block_scale(SEQUENCE_BLOCK_WEIGHT, sequence.shape[1]),
-            quality
-            * block_scale(QUALITY_BLOCK_WEIGHT, quality.shape[1]),
-        ],
-        axis=1,
-    )
-    return np.ascontiguousarray(descriptor, dtype=np.float32)
-
-# Merge matching rows.
-def merge_matching_rows(
-    dataset_rows, workspace
-):
-    quality={
-        str(row.get("image_token", "")): row
-        for row in read_csv(workspace.quality_audit)
-    }
-    predictions={
-        str(row.get("image_token", "")): row
-        for row in read_csv(workspace.prediction_audit)
-    }
-    merged=[]
-    for original in dataset_rows:
-        row=dict(original)
-        token=str(row["image_token"])
-        row.update(predictions.get(token, {}))
-        row.update(quality.get(token, {}))
-        centroid_x=_as_float(row.get("attention_centroid_x"), np.nan)
-        centroid_y=_as_float(row.get("attention_centroid_y"), np.nan)
-        if not (np.isfinite(centroid_x) and np.isfinite(centroid_y)):
-            mask_path=Path(str(row.get("predicted_attention_mask_path", "")))
-            if mask_path.is_file():
-                try:
-                    features=mask_features(
-                        read_binary_mask(mask_path)
-                    )
-                    row["attention_area_ratio"]=features["area"]
-                    row["attention_boundary_touch_fraction"]=features["boundary"]
-                    row["attention_centroid_x"]=features["centroid_x"]
-                    row["attention_centroid_y"]=features["centroid_y"]
-                except Exception:
-                    pass
-        merged.append(row)
-    return merged
-
-# Explain why a slice can or cannot participate in Sick/Normal matching.
-def matching_eligibility_reason(row):
-    reasons=[]
-    if _as_int(row.get("quality_valid"), 0) != 1:
-        reasons.append("quality_invalid")
-    if _as_int(row.get("attention_valid_final"), 0) != 1:
-        reasons.append("attention_invalid")
-    if _as_int(row.get("attention_heart_present"), 1) != 1:
-        reasons.append("heart_not_visible")
-    if (
-        _as_float(row.get("attention_area_ratio"), 0.0)
-        < PREDICTION_MIN_AREA_RATIO):
-        reasons.append("attention_area_too_small")
-    if not str(row.get("perceptual_hash", "")).strip():
-        reasons.append("missing_phash")
-    if not Path(str(row.get("predicted_attention_mask_path", ""))).is_file():
-        reasons.append("missing_attention_mask")
-    return ";".join(reasons)
-
-# Choose acquisition-family granularity from cohort size while respecting class coverage.
-def choose_family_count(number_of_images):
-    estimate=int(
-        math.ceil(
-            number_of_images
-            / max(1, TARGET_IMAGES_PER_FAMILY)
-        )
-    )
-    count=int(
-        np.clip(
-            estimate,
-            MIN_FAMILIES,
-            MAX_FAMILIES,
-        )
-    )
-    return max(2, min(count, number_of_images))
-
-# Require each acquisition family to contain enough Sick and Normal patients/slices.
-def family_is_shared(rows):
-    for label in (0, 1):
-        class_rows=[row for row in rows if _as_int(row.get("label"), -1) == label]
-        if len(class_rows) < MIN_IMAGES_PER_CLASS_PER_FAMILY:
-            return False
-        if (
-            len({str(row.get("patient_id", "")) for row in class_rows})
-            < MIN_PATIENTS_PER_CLASS_PER_FAMILY):
-            return False
-    return True
-
-# Derive a distance cutoff from robust neighbour-distance statistics.
-def robust_caliper(
-    distances,
-    mad_multiplier,
-    quantile,
-):
-    values=np.asarray(list(distances), dtype=np.float64)
-    values=values[np.isfinite(values)]
-    if not len(values):
-        return np.nan
-    median=float(np.median(values))
-    mad=float(np.median(np.abs(values - median)))
-    robust_scale=max(1e-9, 1.4826 * mad)
-    mad_caliper=median + float(mad_multiplier) * robust_scale
-    quantile_caliper=float(np.quantile(values, float(quantile)))
-    return float(max(median, min(mad_caliper, quantile_caliper)))
-
-# Reject candidate pairs that differ too much in sequence position or mask area.
-def passes_anatomical_gates(
-    sick_row,
-    normal_row,
-    extended,
-):
-    sequence_limit=(
-        EXTENDED_MAX_SEQUENCE_POSITION_DIFFERENCE
-        if extended
-        else MAX_SEQUENCE_POSITION_DIFFERENCE
-    )
-    area_limit=(
-        EXTENDED_MAX_AREA_RATIO_DIFFERENCE
-        if extended
-        else MAX_AREA_RATIO_DIFFERENCE
-    )
-    if (
-        abs(
-            sequence_position(sick_row)
-            - sequence_position(normal_row)
-        )
-        > sequence_limit):
-        return False
-    sick_area=_as_float(sick_row.get("attention_area_ratio"), np.nan)
-    normal_area=_as_float(normal_row.get("attention_area_ratio"), np.nan)
-    if (
-        np.isfinite(sick_area)
-        and np.isfinite(normal_area)
-        and abs(sick_area - normal_area) > area_limit):
-        return False
-    return True
-
-# Return stable patient/series identifiers used by matching capacity limits.
-def pair_keys(
-    sick_row, normal_row, family
-):
-    sick_patient=str(sick_row["patient_id"])
-    normal_patient=str(normal_row["patient_id"])
-    sick_sequence=str(
-        sick_row.get("sequence_group_id") or sick_row.get("series_id", "")
-    )
-    normal_sequence=str(
-        normal_row.get("sequence_group_id") or normal_row.get("series_id", "")
-    )
-    return (
-        (sick_patient, family),
-        (normal_patient, family),
-        (sick_sequence, family),
-        (normal_sequence, family),
-        (sick_patient, normal_patient),
-        (sick_sequence, normal_sequence),
-    )
-
-# Build the strict core and expanded balanced Sick/Normal matched cohort.
-def build_cross_class_matching(dataset_rows, workspace):
-    # Matching is intentionally rebuilt every run. It uses only the current OOF
-    # masks, quality measurements, labels, and dataset geometry.
-    merged=merge_matching_rows(dataset_rows, workspace)
-    manifest_by_token={}
-    eligible_rows=[]
-    for row in merged:
-        token=str(row["image_token"])
-        reason=matching_eligibility_reason(row)
-        record={
-            "image_token": token,
-            "image_path": str(row.get("image_path", "")),
-            "patient_id": str(row.get("patient_id", "")),
-            "series_id": str(row.get("series_id", "")),
-            "sequence_group_id": str(
-                row.get("sequence_group_id") or row.get("series_id", "")
-            ),
-            "label": _as_int(row.get("label"), -1),
-            "class_name": "Sick" if _as_int(row.get("label"), -1) == 1 else "Normal",
-            "eligible_for_matching": int(not reason),
-            "acquisition_family": "",
-            "shared_family": 0,
-            "selected_for_core_matched_cohort": 0,
-            "selected_for_matched_cohort": 0,
-            "match_stage": "",
-            "pair_id": "",
-            "matched_partner_token": "",
-            "matched_partner_patient": "",
-            "matched_partner_series": "",
-            "match_distance": "",
-            "mutual_rank_from_sick": "",
-            "mutual_rank_from_normal": "",
-            "reciprocal_extended_neighbor": "",
-            "sequence_pair_seeded_by_core": "",
-            "family_core_caliper": "",
-            "family_extended_caliper": "",
-            "family_caliper": "",
-            "sequence_position": sequence_position(row),
-            "attention_area_ratio": _as_float(
-                row.get("attention_area_ratio"), np.nan
-            ),
-            "exclusion_reason": reason,
+    # Record the matching rules inside the cache fingerprint for reproducibility.
+    @staticmethod
+    def matching_settings_payload():
+        return {
+            "schema": "cross-class-matching-v2-core-plus-extended",
+            "min_families": 8,
+            "max_families": 32,
+            "target_images_per_family": 1800,
+            "minimum_images_per_class_per_family": 12,
+            "minimum_patients_per_class_per_family": 2,
+            "core_mutual_neighbors": 5,
+            "core_caliper_mad_multiplier": 2.5,
+            "core_caliper_quantile": 0.90,
+            "maximum_sequence_position_difference": 0.25,
+            "maximum_area_ratio_difference": 0.20,
+            "core_maximum_matches_per_patient_per_family": 20,
+            "core_maximum_matches_per_sequence_group": 5,
+            "target_matched_image_fraction": 0.50,
+            "extended_neighbors": 12,
+            "extended_caliper_mad_multiplier": 3.5,
+            "extended_caliper_quantile": 0.97,
+            "extended_max_caliper_multiplier": 1.18,
+            "extended_maximum_sequence_position_difference": 0.25,
+            "extended_maximum_area_ratio_difference": 0.20,
+            "extended_maximum_matches_per_patient_per_family": 60,
+            "extended_maximum_matches_per_sequence_group": 15,
+            "extended_maximum_matches_per_sequence_pair": 12,
+            "extended_maximum_matches_per_patient_pair": 60,
+            "patient_total_cap_multiplier": 1.70,
+            "prioritize_core_sequence_pairs": True,
+            "block_weights": {
+                "phash": 0.45,
+                "geometry": 0.25,
+                "sequence": 0.15,
+                "quality": 0.15,
+            },
+            "random_seed": 42,
         }
-        manifest_by_token[token]=record
-        if not reason:
-            eligible_rows.append(row)
-
-    labels=np.asarray(
-        [_as_int(row.get("label"), -1) for row in eligible_rows], dtype=np.int64
-    )
-    if len(eligible_rows) < 4 or set(labels.tolist()) != {0, 1}:
-        raise RuntimeError(
-            "Matching requires eligible images from both classes; "
-            f"remaining Normal={int(np.sum(labels == 0))}, Sick={int(np.sum(labels == 1))}."
+    # Convert slice position to a normalized within-series coordinate for matching.
+    @staticmethod
+    def sequence_position(row):
+        length=max(1, DataStage._as_int(row.get("sequence_length"), 1))
+        index=int(np.clip(DataStage._as_int(row.get("sequence_index"), 0), 0, length - 1))
+        if length <= 1:
+            return 0.5
+        return float(index / (length - 1))
+    # Convert the perceptual hash string to bits used by the matching descriptor.
+    @staticmethod
+    def phash_bits(value):
+        number=int(str(value), 16)
+        return np.asarray(
+            [(number >> shift) & 1 for shift in range(63, -1, -1)],
+            dtype=np.float32,
         )
-
-    descriptor=matching_descriptor(eligible_rows)
-    family_count=choose_family_count(len(eligible_rows))
-    batch_size=min(4096, max(256, len(eligible_rows) // 10))
-    clusterer=MiniBatchKMeans(
-        n_clusters=family_count,
-        random_state=RANDOM_SEED,
-        batch_size=batch_size,
-        n_init=5,
-        max_iter=200,
-        reassignment_ratio=0.01,
-    )
-    family_labels=clusterer.fit_predict(descriptor).astype(np.int64)
-
-    family_indices=defaultdict(list)
-    for index, family in enumerate(family_labels.tolist()):
-        family_indices[int(family)].append(index)
-        token=str(eligible_rows[index]["image_token"])
-        manifest_by_token[token]["acquisition_family"]=int(family)
-
-    shared_families=set()
-    for family, indices in family_indices.items():
-        family_rows=[eligible_rows[index] for index in indices]
-        if family_is_shared(family_rows):
-            shared_families.add(int(family))
-            for index in indices:
-                manifest_by_token[str(eligible_rows[index]["image_token"])][
-                    "shared_family"
-                ]=1
-        else:
-            for index in indices:
-                manifest_by_token[str(eligible_rows[index]["image_token"])][
-                    "exclusion_reason"
-                ]="family_not_shared_between_classes"
-
-    if not shared_families:
-        raise RuntimeError(
-            "No acquisition family contains enough images and patients from both classes."
+    # Median/MAD standardize matching variables so one descriptor block cannot dominate.
+    @staticmethod
+    def robust_standardize(values):
+        values=np.asarray(values, dtype=np.float32).copy()
+        if values.ndim == 1:
+            values=values[:, None]
+        for column in range(values.shape[1]):
+            current=values[:, column]
+            finite=np.isfinite(current)
+            center=float(np.median(current[finite])) if finite.any() else 0.0
+            current[~finite]=center
+            mad=float(np.median(np.abs(current - center)))
+            scale=max(1e-3, 1.4826 * mad)
+            values[:, column]=np.clip((current - center) / scale, -5.0, 5.0)
+        return values
+    # Build acquisition/anatomy/quality descriptors without using the CAD label as a feature.
+    @staticmethod
+    def matching_descriptor(rows):
+        phash=np.stack(
+            [MatchingStage.phash_bits(row["perceptual_hash"]) for row in rows]
         )
-
-    normal_count=int(np.sum(labels == 0))
-    sick_count=int(np.sum(labels == 1))
-    maximum_possible_pairs=min(normal_count, sick_count)
-    requested_target_pairs=int(
-        round(
-            len(eligible_rows)
-            * float(TARGET_MATCHED_IMAGE_FRACTION)
-            / 2.0
-        )
-    )
-    requested_target_pairs=max(1, min(requested_target_pairs, maximum_possible_pairs))
-
-    patients_by_label={
-        label: sorted(
-            {
-                str(row["patient_id"])
-                for row in eligible_rows
-                if _as_int(row.get("label"), -1) == label
-            }
-        )
-        for label in (0, 1)
-    }
-    patient_total_caps={
-        label: max(
-            EXTENDED_MAX_MATCHES_PER_PATIENT_PER_FAMILY,
-            int(
-                math.ceil(
-                    requested_target_pairs
-                    / max(1, len(patients_by_label[label]))
-                    * PATIENT_TOTAL_CAP_MULTIPLIER
-                )
-            ),
-        )
-        for label in (0, 1)
-    }
-
-    used_tokens=set()
-    patient_family_counts=defaultdict(int)
-    sequence_counts=defaultdict(int)
-    patient_total_counts=defaultdict(int)
-    patient_pair_counts=defaultdict(int)
-    sequence_pair_counts=defaultdict(int)
-    core_sequence_pairs=set()
-    selected_pair_distances=[]
-    core_pair_distances=[]
-    extended_pair_distances=[]
-    family_summaries=[]
-    pair_number=0
-    core_pair_count=0
-    extended_pair_count=0
-
-    family_data={}
-    token_candidate_stage={}
-
-    # Build candidate graphs first. The extended graph is the union of the
-    # top-K neighbours from both directions; the strict graph is its mutual
-    # top-5 subset.
-    for family in sorted(shared_families):
-        indices=family_indices[family]
-        normal_positions=[
-            index for index in indices if _as_int(eligible_rows[index].get("label"), -1) == 0
-        ]
-        sick_positions=[
-            index for index in indices if _as_int(eligible_rows[index].get("label"), -1) == 1
-        ]
-        normal_descriptor=descriptor[normal_positions]
-        sick_descriptor=descriptor[sick_positions]
-        extended_sick_to_normal=min(
-            int(EXTENDED_NEIGHBORS), len(normal_positions)
-        )
-        extended_normal_to_sick=min(
-            int(EXTENDED_NEIGHBORS), len(sick_positions)
-        )
-
-        normal_model=NearestNeighbors(
-            n_neighbors=extended_sick_to_normal,
-            metric="euclidean",
-            algorithm="auto",
-            n_jobs=-1,
-        ).fit(normal_descriptor)
-        sick_to_normal_distance, sick_to_normal_index=normal_model.kneighbors(
-            sick_descriptor, return_distance=True
-        )
-        sick_model=NearestNeighbors(
-            n_neighbors=extended_normal_to_sick,
-            metric="euclidean",
-            algorithm="auto",
-            n_jobs=-1,
-        ).fit(sick_descriptor)
-        normal_to_sick_distance, normal_to_sick_index=sick_model.kneighbors(
-            normal_descriptor, return_distance=True
-        )
-
-        sick_rank_maps=[
-            {int(normal_local): int(rank + 1) for rank, normal_local in enumerate(neighbours)}
-            for neighbours in sick_to_normal_index
-        ]
-        normal_rank_maps=[
-            {int(sick_local): int(rank + 1) for rank, sick_local in enumerate(neighbours)}
-            for neighbours in normal_to_sick_index
-        ]
-        edge_keys=set()
-        for sick_local, neighbours in enumerate(sick_to_normal_index):
-            edge_keys.update((int(sick_local), int(value)) for value in neighbours)
-        for normal_local, neighbours in enumerate(normal_to_sick_index):
-            edge_keys.update((int(value), int(normal_local)) for value in neighbours)
-
-        all_edges=[]
-        core_edges=[]
-        for sick_local, normal_local in edge_keys:
-            sick_global=sick_positions[sick_local]
-            normal_global=normal_positions[normal_local]
-            sick_row=eligible_rows[sick_global]
-            normal_row=eligible_rows[normal_global]
-            if not passes_anatomical_gates(
-                sick_row, normal_row, extended=True):
-                continue
-            rank_from_sick=sick_rank_maps[sick_local].get(normal_local)
-            rank_from_normal=normal_rank_maps[normal_local].get(sick_local)
-            distance=float(
-                np.linalg.norm(
-                    descriptor[sick_global] - descriptor[normal_global]
-                )
+        phash=phash * 2.0 - 1.0
+        geometry=MatchingStage.robust_standardize(
+            np.asarray(
+                [
+                    [
+                        DataStage._as_float(row.get("attention_area_ratio"), np.nan),
+                        DataStage._as_float(row.get("attention_centroid_x"), np.nan),
+                        DataStage._as_float(row.get("attention_centroid_y"), np.nan),
+                        DataStage._as_float(row.get("attention_boundary_touch_fraction"), np.nan),
+                    ]
+                    for row in rows
+                ],
+                dtype=np.float32,
             )
-            reciprocal=rank_from_sick is not None and rank_from_normal is not None
-            is_core=bool(
-                reciprocal
-                and rank_from_sick <= MUTUAL_NEIGHBORS
-                and rank_from_normal <= MUTUAL_NEIGHBORS
-                and passes_anatomical_gates(
-                    sick_row, normal_row, extended=False
-                )
-            )
-            sick_token=str(sick_row["image_token"])
-            normal_token=str(normal_row["image_token"])
-            token_candidate_stage.setdefault(sick_token, "extended_candidate")
-            token_candidate_stage.setdefault(normal_token, "extended_candidate")
-            if is_core:
-                token_candidate_stage[sick_token]="core_candidate"
-                token_candidate_stage[normal_token]="core_candidate"
-            edge={
-                "family": int(family),
-                "distance": distance,
-                "sick_global": int(sick_global),
-                "normal_global": int(normal_global),
-                "rank_from_sick": rank_from_sick,
-                "rank_from_normal": rank_from_normal,
-                "reciprocal": int(reciprocal),
-                "is_core": int(is_core),
-                "tie": hashlib.sha256(
-                    f"{family}|{sick_token}|{normal_token}".encode("utf-8")
-                ).hexdigest(),
-            }
-            all_edges.append(edge)
-            if is_core:
-                core_edges.append(edge)
-
-        core_caliper=robust_caliper(
-            [edge["distance"] for edge in core_edges],
-            CALIPER_MAD_MULTIPLIER,
-            CALIPER_QUANTILE,
         )
-        extended_caliper=robust_caliper(
-            [edge["distance"] for edge in all_edges],
-            EXTENDED_CALIPER_MAD_MULTIPLIER,
-            EXTENDED_CALIPER_QUANTILE,
-        )
-        if np.isfinite(core_caliper):
-            maximum_extended=(
-                float(core_caliper)
-                * float(EXTENDED_MAX_CALIPER_MULTIPLIER)
+        sequence=MatchingStage.robust_standardize(
+            np.asarray(
+                [[MatchingStage.sequence_position(row)] for row in rows],
+                dtype=np.float32,
             )
-            if np.isfinite(extended_caliper):
-                extended_caliper=max(
-                    float(core_caliper),
-                    min(float(extended_caliper), maximum_extended),
-                )
-            else:
-                extended_caliper=maximum_extended
+        )
+        quality=MatchingStage.robust_standardize(
+            np.asarray(
+                [
+                    [
+                        math.log1p(max(0.0, DataStage._as_float(row.get("sharpness"), 0.0))),
+                        DataStage._as_float(row.get("noise_ratio"), np.nan),
+                        DataStage._as_float(row.get("dynamic_range"), np.nan),
+                    ]
+                    for row in rows
+                ],
+                dtype=np.float32,
+            )
+        )
 
-        family_data[family]={
-            "normal_positions": normal_positions,
-            "sick_positions": sick_positions,
-            "core_edges": core_edges,
-            "all_edges": all_edges,
-            "core_caliper": core_caliper,
-            "extended_caliper": extended_caliper,
-            "core_selected": 0,
-            "extended_selected": 0,
-        }
-        for index in indices:
-            record=manifest_by_token[str(eligible_rows[index]["image_token"])]
-            if np.isfinite(core_caliper):
-                record["family_core_caliper"]=float(core_caliper)
-            if np.isfinite(extended_caliper):
-                record["family_extended_caliper"]=float(extended_caliper)
+        def block_scale(weight, dimensions):
+            return math.sqrt(max(float(weight), 0.0) / max(1, int(dimensions)))
 
-    def can_select(
-        edge,
-        stage,
-        patient_quota=None,
+        descriptor=np.concatenate(
+            [
+                phash * block_scale(0.45, phash.shape[1]),
+                geometry
+                * block_scale(0.25, geometry.shape[1]),
+                sequence
+                * block_scale(0.15, sequence.shape[1]),
+                quality
+                * block_scale(0.15, quality.shape[1]),
+            ],
+            axis=1,
+        )
+        return np.ascontiguousarray(descriptor, dtype=np.float32)
+    # Merge matching rows.
+    @staticmethod
+    def merge_matching_rows(
+        dataset_rows, workspace
     ):
-        family=int(edge["family"])
-        sick_row=eligible_rows[int(edge["sick_global"])]
-        normal_row=eligible_rows[int(edge["normal_global"])]
-        sick_token=str(sick_row["image_token"])
-        normal_token=str(normal_row["image_token"])
-        if sick_token in used_tokens or normal_token in used_tokens:
-            return False
-        (
-            sick_patient_key,
-            normal_patient_key,
-            sick_sequence_key,
-            normal_sequence_key,
-            patient_pair_key,
-            sequence_pair_key,
-        )=pair_keys(sick_row, normal_row, family)
-        if stage == "core_mutual":
-            patient_family_limit=MAX_MATCHES_PER_PATIENT_PER_FAMILY
-            sequence_limit=MAX_MATCHES_PER_SEQUENCE_GROUP
-        else:
-            patient_family_limit=EXTENDED_MAX_MATCHES_PER_PATIENT_PER_FAMILY
-            sequence_limit=EXTENDED_MAX_MATCHES_PER_SEQUENCE_GROUP
+        quality={
+            str(row.get("image_token", "")): row
+            for row in DataStage.read_csv(workspace.quality_audit)
+        }
+        predictions={
+            str(row.get("image_token", "")): row
+            for row in DataStage.read_csv(workspace.prediction_audit)
+        }
+        merged=[]
+        for original in dataset_rows:
+            row=dict(original)
+            token=str(row["image_token"])
+            row.update(predictions.get(token, {}))
+            row.update(quality.get(token, {}))
+            centroid_x=DataStage._as_float(row.get("attention_centroid_x"), np.nan)
+            centroid_y=DataStage._as_float(row.get("attention_centroid_y"), np.nan)
+            if not (np.isfinite(centroid_x) and np.isfinite(centroid_y)):
+                mask_path=Path(str(row.get("predicted_attention_mask_path", "")))
+                if mask_path.is_file():
+                    try:
+                        features=AttentionStage.mask_features(
+                            DataStage.read_binary_mask(mask_path)
+                        )
+                        row["attention_area_ratio"]=features["area"]
+                        row["attention_boundary_touch_fraction"]=features["boundary"]
+                        row["attention_centroid_x"]=features["centroid_x"]
+                        row["attention_centroid_y"]=features["centroid_y"]
+                    except Exception:
+                        pass
+            merged.append(row)
+        return merged
+    # Explain why a slice can or cannot participate in Sick/Normal matching.
+    @staticmethod
+    def matching_eligibility_reason(row):
+        reasons=[]
+        if DataStage._as_int(row.get("quality_valid"), 0) != 1:
+            reasons.append("quality_invalid")
+        if DataStage._as_int(row.get("attention_valid_final"), 0) != 1:
+            reasons.append("attention_invalid")
+        if DataStage._as_int(row.get("attention_heart_present"), 1) != 1:
+            reasons.append("heart_not_visible")
         if (
-            patient_family_counts[sick_patient_key] >= patient_family_limit
-            or patient_family_counts[normal_patient_key] >= patient_family_limit
-            or sequence_counts[sick_sequence_key] >= sequence_limit
-            or sequence_counts[normal_sequence_key] >= sequence_limit):
-            return False
-        if stage != "core_mutual":
-            if (
-                patient_pair_counts[patient_pair_key]
-                >= EXTENDED_MAX_MATCHES_PER_PATIENT_PAIR
-                or sequence_pair_counts[sequence_pair_key]
-                >= EXTENDED_MAX_MATCHES_PER_SEQUENCE_PAIR):
-                return False
-            for row in (sick_row, normal_row):
-                label=_as_int(row.get("label"), -1)
-                patient=str(row["patient_id"])
-                cap=int(patient_total_caps[label])
-                if patient_total_counts[patient] >= cap:
-                    return False
-                if patient_quota is not None and patient_total_counts[patient] >= int(
-                    patient_quota[label]):
-                    return False
-        return True
-
-    def select_edge(edge, stage):
-        nonlocal pair_number, core_pair_count, extended_pair_count
-        family=int(edge["family"])
-        sick_row=eligible_rows[int(edge["sick_global"])]
-        normal_row=eligible_rows[int(edge["normal_global"])]
-        sick_token=str(sick_row["image_token"])
-        normal_token=str(normal_row["image_token"])
-        (
-            sick_patient_key,
-            normal_patient_key,
-            sick_sequence_key,
-            normal_sequence_key,
-            patient_pair_key,
-            sequence_pair_key,
-        )=pair_keys(sick_row, normal_row, family)
-        seeded=int(sequence_pair_key in core_sequence_pairs)
-        pair_number +=1
-        prefix="CORE" if stage == "core_mutual" else "EXT"
-        pair_id=f"CCM_{prefix}_F{family:02d}_P{pair_number:06d}"
-        applied_caliper=(
-            family_data[family]["core_caliper"]
-            if stage == "core_mutual"
-            else family_data[family]["extended_caliper"]
+            DataStage._as_float(row.get("attention_area_ratio"), 0.0)
+            < 0.003):
+            reasons.append("attention_area_too_small")
+        if not str(row.get("perceptual_hash", "")).strip():
+            reasons.append("missing_phash")
+        if not Path(str(row.get("predicted_attention_mask_path", ""))).is_file():
+            reasons.append("missing_attention_mask")
+        return ";".join(reasons)
+    # Choose acquisition-family granularity from cohort size while respecting class coverage.
+    @staticmethod
+    def choose_family_count(number_of_images):
+        estimate=int(
+            math.ceil(
+                number_of_images
+                / max(1, 1800)
+            )
         )
-        for source_row, partner_row in (
-            (sick_row, normal_row),
-            (normal_row, sick_row),):
-            source_token=str(source_row["image_token"])
-            record=manifest_by_token[source_token]
-            record.update(
+        count=int(
+            np.clip(
+                estimate,
+                8,
+                32,
+            )
+        )
+        return max(2, min(count, number_of_images))
+    # Require each acquisition family to contain enough Sick and Normal patients/slices.
+    @staticmethod
+    def family_is_shared(rows):
+        for label in (0, 1):
+            class_rows=[row for row in rows if DataStage._as_int(row.get("label"), -1) == label]
+            if len(class_rows) < 12:
+                return False
+            if (
+                len({str(row.get("patient_id", "")) for row in class_rows})
+                < 2):
+                return False
+        return True
+    # Derive a distance cutoff from robust neighbour-distance statistics.
+    @staticmethod
+    def robust_caliper(
+        distances,
+        mad_multiplier,
+        quantile,
+    ):
+        values=np.asarray(list(distances), dtype=np.float64)
+        values=values[np.isfinite(values)]
+        if not len(values):
+            return np.nan
+        median=float(np.median(values))
+        mad=float(np.median(np.abs(values - median)))
+        robust_scale=max(1e-9, 1.4826 * mad)
+        mad_caliper=median + float(mad_multiplier) * robust_scale
+        quantile_caliper=float(np.quantile(values, float(quantile)))
+        return float(max(median, min(mad_caliper, quantile_caliper)))
+    # Reject candidate pairs that differ too much in sequence position or mask area.
+    @staticmethod
+    def passes_anatomical_gates(
+        sick_row,
+        normal_row,
+        extended,
+    ):
+        sequence_limit=(
+            0.25
+            if extended
+            else 0.25
+        )
+        area_limit=(
+            0.20
+            if extended
+            else 0.20
+        )
+        if (
+            abs(
+                MatchingStage.sequence_position(sick_row)
+                - MatchingStage.sequence_position(normal_row)
+            )
+            > sequence_limit):
+            return False
+        sick_area=DataStage._as_float(sick_row.get("attention_area_ratio"), np.nan)
+        normal_area=DataStage._as_float(normal_row.get("attention_area_ratio"), np.nan)
+        if (
+            np.isfinite(sick_area)
+            and np.isfinite(normal_area)
+            and abs(sick_area - normal_area) > area_limit):
+            return False
+        return True
+    # Return stable patient/series identifiers used by matching capacity limits.
+    @staticmethod
+    def pair_keys(
+        sick_row, normal_row, family
+    ):
+        sick_patient=str(sick_row["patient_id"])
+        normal_patient=str(normal_row["patient_id"])
+        sick_sequence=str(
+            sick_row.get("sequence_group_id") or sick_row.get("series_id", "")
+        )
+        normal_sequence=str(
+            normal_row.get("sequence_group_id") or normal_row.get("series_id", "")
+        )
+        return (
+            (sick_patient, family),
+            (normal_patient, family),
+            (sick_sequence, family),
+            (normal_sequence, family),
+            (sick_patient, normal_patient),
+            (sick_sequence, normal_sequence),
+        )
+    # Build the strict core and expanded balanced Sick/Normal matched cohort.
+    @staticmethod
+    def build_cross_class_matching(dataset_rows, workspace):
+        # Matching is intentionally rebuilt every run. It uses only the current OOF
+        # masks, quality measurements, labels, and dataset geometry.
+        merged=MatchingStage.merge_matching_rows(dataset_rows, workspace)
+        manifest_by_token={}
+        eligible_rows=[]
+        for row in merged:
+            token=str(row["image_token"])
+            reason=MatchingStage.matching_eligibility_reason(row)
+            record={
+                "image_token": token,
+                "image_path": str(row.get("image_path", "")),
+                "patient_id": str(row.get("patient_id", "")),
+                "series_id": str(row.get("series_id", "")),
+                "sequence_group_id": str(
+                    row.get("sequence_group_id") or row.get("series_id", "")
+                ),
+                "label": DataStage._as_int(row.get("label"), -1),
+                "class_name": "Sick" if DataStage._as_int(row.get("label"), -1) == 1 else "Normal",
+                "eligible_for_matching": int(not reason),
+                "acquisition_family": "",
+                "shared_family": 0,
+                "selected_for_core_matched_cohort": 0,
+                "selected_for_matched_cohort": 0,
+                "match_stage": "",
+                "pair_id": "",
+                "matched_partner_token": "",
+                "matched_partner_patient": "",
+                "matched_partner_series": "",
+                "match_distance": "",
+                "mutual_rank_from_sick": "",
+                "mutual_rank_from_normal": "",
+                "reciprocal_extended_neighbor": "",
+                "sequence_pair_seeded_by_core": "",
+                "family_core_caliper": "",
+                "family_extended_caliper": "",
+                "family_caliper": "",
+                "sequence_position": MatchingStage.sequence_position(row),
+                "attention_area_ratio": DataStage._as_float(
+                    row.get("attention_area_ratio"), np.nan
+                ),
+                "exclusion_reason": reason,
+            }
+            manifest_by_token[token]=record
+            if not reason:
+                eligible_rows.append(row)
+
+        labels=np.asarray(
+            [DataStage._as_int(row.get("label"), -1) for row in eligible_rows], dtype=np.int64
+        )
+        if len(eligible_rows) < 4 or set(labels.tolist()) != {0, 1}:
+            raise RuntimeError(
+                "Matching requires eligible images from both classes; "
+                f"remaining Normal={int(np.sum(labels == 0))}, Sick={int(np.sum(labels == 1))}."
+            )
+
+        descriptor=MatchingStage.matching_descriptor(eligible_rows)
+        family_count=MatchingStage.choose_family_count(len(eligible_rows))
+        batch_size=min(4096, max(256, len(eligible_rows) // 10))
+        clusterer=MiniBatchKMeans(
+            n_clusters=family_count,
+            random_state=42,
+            batch_size=batch_size,
+            n_init=5,
+            max_iter=200,
+            reassignment_ratio=0.01,
+        )
+        family_labels=clusterer.fit_predict(descriptor).astype(np.int64)
+
+        family_indices=defaultdict(list)
+        for index, family in enumerate(family_labels.tolist()):
+            family_indices[int(family)].append(index)
+            token=str(eligible_rows[index]["image_token"])
+            manifest_by_token[token]["acquisition_family"]=int(family)
+
+        shared_families=set()
+        for family, indices in family_indices.items():
+            family_rows=[eligible_rows[index] for index in indices]
+            if MatchingStage.family_is_shared(family_rows):
+                shared_families.add(int(family))
+                for index in indices:
+                    manifest_by_token[str(eligible_rows[index]["image_token"])][
+                        "shared_family"
+                    ]=1
+            else:
+                for index in indices:
+                    manifest_by_token[str(eligible_rows[index]["image_token"])][
+                        "exclusion_reason"
+                    ]="family_not_shared_between_classes"
+
+        if not shared_families:
+            raise RuntimeError(
+                "No acquisition family contains enough images and patients from both classes."
+            )
+
+        normal_count=int(np.sum(labels == 0))
+        sick_count=int(np.sum(labels == 1))
+        maximum_possible_pairs=min(normal_count, sick_count)
+        requested_target_pairs=int(
+            round(
+                len(eligible_rows)
+                * float(0.50)
+                / 2.0
+            )
+        )
+        requested_target_pairs=max(1, min(requested_target_pairs, maximum_possible_pairs))
+
+        patients_by_label={
+            label: sorted(
                 {
-                    "selected_for_core_matched_cohort": int(stage == "core_mutual"),
-                    "selected_for_matched_cohort": 1,
-                    "match_stage": stage,
-                    "pair_id": pair_id,
-                    "matched_partner_token": str(partner_row["image_token"]),
-                    "matched_partner_patient": str(partner_row["patient_id"]),
-                    "matched_partner_series": str(partner_row["series_id"]),
-                    "match_distance": float(edge["distance"]),
-                    "mutual_rank_from_sick": (
-                        "" if edge.get("rank_from_sick") is None else int(edge["rank_from_sick"])
-                    ),
-                    "mutual_rank_from_normal": (
-                        "" if edge.get("rank_from_normal") is None else int(edge["rank_from_normal"])
-                    ),
-                    "reciprocal_extended_neighbor": int(edge.get("reciprocal", 0)),
-                    "sequence_pair_seeded_by_core": seeded,
-                    "family_caliper": float(applied_caliper),
-                    "exclusion_reason": "",
+                    str(row["patient_id"])
+                    for row in eligible_rows
+                    if DataStage._as_int(row.get("label"), -1) == label
                 }
             )
-        used_tokens.update((sick_token, normal_token))
-        patient_family_counts[sick_patient_key] +=1
-        patient_family_counts[normal_patient_key] +=1
-        sequence_counts[sick_sequence_key] +=1
-        sequence_counts[normal_sequence_key] +=1
-        patient_total_counts[str(sick_row["patient_id"])] +=1
-        patient_total_counts[str(normal_row["patient_id"])] +=1
-        patient_pair_counts[patient_pair_key] +=1
-        sequence_pair_counts[sequence_pair_key] +=1
-        selected_pair_distances.append(float(edge["distance"]))
-        if stage == "core_mutual":
-            core_sequence_pairs.add(sequence_pair_key)
-            core_pair_distances.append(float(edge["distance"]))
-            core_pair_count +=1
-            family_data[family]["core_selected"] +=1
-        else:
-            extended_pair_distances.append(float(edge["distance"]))
-            extended_pair_count +=1
-            family_data[family]["extended_selected"] +=1
-
-    # Stage 1: preserve the previous strict cohort.
-    for family in sorted(shared_families):
-        caliper=family_data[family]["core_caliper"]
-        if not np.isfinite(caliper):
-            continue
-        for edge in sorted(
-            family_data[family]["core_edges"],
-            key=lambda item: (item["distance"], item["tie"]),):
-            if float(edge["distance"]) > float(caliper):
-                continue
-            if can_select(edge, "core_mutual"):
-                select_edge(edge, "core_mutual")
-
-    # Allocate the remaining target proportionally to the unused common
-    # support of each family. This prevents a few large families from taking
-    # the whole extension.
-    remaining_target=max(0, requested_target_pairs - core_pair_count)
-    remaining_capacity={
-        family: max(
-            0,
-            min(
-                len(family_data[family]["normal_positions"]),
-                len(family_data[family]["sick_positions"]),
-            )
-            - int(family_data[family]["core_selected"]),
-        )
-        for family in sorted(shared_families)
-    }
-    total_remaining_capacity=sum(remaining_capacity.values())
-    extension_targets={family: 0 for family in shared_families}
-    if remaining_target > 0 and total_remaining_capacity > 0:
-        raw_targets={
-            family: remaining_target
-            * remaining_capacity[family]
-            / total_remaining_capacity
-            for family in shared_families
+            for label in (0, 1)
         }
-        extension_targets={
-            family: min(
-                remaining_capacity[family], int(math.floor(raw_targets[family]))
+        patient_total_caps={
+            label: max(
+                60,
+                int(
+                    math.ceil(
+                        requested_target_pairs
+                        / max(1, len(patients_by_label[label]))
+                        * 1.70
+                    )
+                ),
             )
-            for family in shared_families
+            for label in (0, 1)
         }
-        unassigned=remaining_target - sum(extension_targets.values())
-        for family in sorted(
-            shared_families,
-            key=lambda value: (
-                raw_targets[value] - math.floor(raw_targets[value]),
-                remaining_capacity[value],
-            ),
-            reverse=True,):
-            if unassigned <= 0:
-                break
-            if extension_targets[family] < remaining_capacity[family]:
-                extension_targets[family] +=1
-                unassigned -=1
 
-    # Stage 2: add close one-sided or reciprocal top-K neighbours. Core-seeded
-    # sequence pairs are considered first, then reciprocal candidates, then
-    # distance/rank. Quota passes stop a single patient from monopolising a family.
-    for family in sorted(shared_families):
-        family_target=int(extension_targets.get(family, 0))
-        if family_target <= 0:
-            continue
-        extended_caliper=family_data[family]["extended_caliper"]
-        if not np.isfinite(extended_caliper):
-            continue
-        candidates=[]
-        for edge in family_data[family]["all_edges"]:
-            if float(edge["distance"]) > float(extended_caliper):
-                continue
+        used_tokens=set()
+        patient_family_counts=defaultdict(int)
+        sequence_counts=defaultdict(int)
+        patient_total_counts=defaultdict(int)
+        patient_pair_counts=defaultdict(int)
+        sequence_pair_counts=defaultdict(int)
+        core_sequence_pairs=set()
+        selected_pair_distances=[]
+        core_pair_distances=[]
+        extended_pair_distances=[]
+        family_summaries=[]
+        pair_number=0
+        core_pair_count=0
+        extended_pair_count=0
+
+        family_data={}
+        token_candidate_stage={}
+
+        # Build candidate graphs first. The extended graph is the union of the
+        # top-K neighbours from both directions; the strict graph is its mutual
+        # top-5 subset.
+        for family in sorted(shared_families):
+            indices=family_indices[family]
+            normal_positions=[
+                index for index in indices if DataStage._as_int(eligible_rows[index].get("label"), -1) == 0
+            ]
+            sick_positions=[
+                index for index in indices if DataStage._as_int(eligible_rows[index].get("label"), -1) == 1
+            ]
+            normal_descriptor=descriptor[normal_positions]
+            sick_descriptor=descriptor[sick_positions]
+            extended_sick_to_normal=min(
+                int(12), len(normal_positions)
+            )
+            extended_normal_to_sick=min(
+                int(12), len(sick_positions)
+            )
+
+            normal_model=NearestNeighbors(
+                n_neighbors=extended_sick_to_normal,
+                metric="euclidean",
+                algorithm="auto",
+                n_jobs=-1,
+            ).fit(normal_descriptor)
+            sick_to_normal_distance, sick_to_normal_index=normal_model.kneighbors(
+                sick_descriptor, return_distance=True
+            )
+            sick_model=NearestNeighbors(
+                n_neighbors=extended_normal_to_sick,
+                metric="euclidean",
+                algorithm="auto",
+                n_jobs=-1,
+            ).fit(sick_descriptor)
+            normal_to_sick_distance, normal_to_sick_index=sick_model.kneighbors(
+                normal_descriptor, return_distance=True
+            )
+
+            sick_rank_maps=[
+                {int(normal_local): int(rank + 1) for rank, normal_local in enumerate(neighbours)}
+                for neighbours in sick_to_normal_index
+            ]
+            normal_rank_maps=[
+                {int(sick_local): int(rank + 1) for rank, sick_local in enumerate(neighbours)}
+                for neighbours in normal_to_sick_index
+            ]
+            edge_keys=set()
+            for sick_local, neighbours in enumerate(sick_to_normal_index):
+                edge_keys.update((int(sick_local), int(value)) for value in neighbours)
+            for normal_local, neighbours in enumerate(normal_to_sick_index):
+                edge_keys.update((int(value), int(normal_local)) for value in neighbours)
+
+            all_edges=[]
+            core_edges=[]
+            for sick_local, normal_local in edge_keys:
+                sick_global=sick_positions[sick_local]
+                normal_global=normal_positions[normal_local]
+                sick_row=eligible_rows[sick_global]
+                normal_row=eligible_rows[normal_global]
+                if not MatchingStage.passes_anatomical_gates(
+                    sick_row, normal_row, extended=True):
+                    continue
+                rank_from_sick=sick_rank_maps[sick_local].get(normal_local)
+                rank_from_normal=normal_rank_maps[normal_local].get(sick_local)
+                distance=float(
+                    np.linalg.norm(
+                        descriptor[sick_global] - descriptor[normal_global]
+                    )
+                )
+                reciprocal=rank_from_sick is not None and rank_from_normal is not None
+                is_core=bool(
+                    reciprocal
+                    and rank_from_sick <= 5
+                    and rank_from_normal <= 5
+                    and MatchingStage.passes_anatomical_gates(
+                        sick_row, normal_row, extended=False
+                    )
+                )
+                sick_token=str(sick_row["image_token"])
+                normal_token=str(normal_row["image_token"])
+                token_candidate_stage.setdefault(sick_token, "extended_candidate")
+                token_candidate_stage.setdefault(normal_token, "extended_candidate")
+                if is_core:
+                    token_candidate_stage[sick_token]="core_candidate"
+                    token_candidate_stage[normal_token]="core_candidate"
+                edge={
+                    "family": int(family),
+                    "distance": distance,
+                    "sick_global": int(sick_global),
+                    "normal_global": int(normal_global),
+                    "rank_from_sick": rank_from_sick,
+                    "rank_from_normal": rank_from_normal,
+                    "reciprocal": int(reciprocal),
+                    "is_core": int(is_core),
+                    "tie": hashlib.sha256(
+                        f"{family}|{sick_token}|{normal_token}".encode("utf-8")
+                    ).hexdigest(),
+                }
+                all_edges.append(edge)
+                if is_core:
+                    core_edges.append(edge)
+
+            core_caliper=MatchingStage.robust_caliper(
+                [edge["distance"] for edge in core_edges],
+                2.5,
+                0.90,
+            )
+            extended_caliper=MatchingStage.robust_caliper(
+                [edge["distance"] for edge in all_edges],
+                3.5,
+                0.97,
+            )
+            if np.isfinite(core_caliper):
+                maximum_extended=(
+                    float(core_caliper)
+                    * float(1.18)
+                )
+                if np.isfinite(extended_caliper):
+                    extended_caliper=max(
+                        float(core_caliper),
+                        min(float(extended_caliper), maximum_extended),
+                    )
+                else:
+                    extended_caliper=maximum_extended
+
+            family_data[family]={
+                "normal_positions": normal_positions,
+                "sick_positions": sick_positions,
+                "core_edges": core_edges,
+                "all_edges": all_edges,
+                "core_caliper": core_caliper,
+                "extended_caliper": extended_caliper,
+                "core_selected": 0,
+                "extended_selected": 0,
+            }
+            for index in indices:
+                record=manifest_by_token[str(eligible_rows[index]["image_token"])]
+                if np.isfinite(core_caliper):
+                    record["family_core_caliper"]=float(core_caliper)
+                if np.isfinite(extended_caliper):
+                    record["family_extended_caliper"]=float(extended_caliper)
+
+        def can_select(
+            edge,
+            stage,
+            patient_quota=None,
+        ):
+            family=int(edge["family"])
             sick_row=eligible_rows[int(edge["sick_global"])]
             normal_row=eligible_rows[int(edge["normal_global"])]
-            sequence_pair=pair_keys(
-                sick_row, normal_row, family
-            )[-1]
-            seeded=int(sequence_pair in core_sequence_pairs)
-            rank_sick=edge.get("rank_from_sick")
-            rank_normal=edge.get("rank_from_normal")
-            rank_sum=int(rank_sick or EXTENDED_NEIGHBORS + 1) + int(
-                rank_normal or EXTENDED_NEIGHBORS + 1
-            )
-            candidates.append(
-                {
-                    **edge,
-                    "seeded": seeded,
-                    "rank_sum": rank_sum,
-                    "normalized_distance": float(edge["distance"])
-                    / max(float(extended_caliper), 1e-9),
-                }
-            )
-        candidates.sort(
-            key=lambda item: (
-                0
+            sick_token=str(sick_row["image_token"])
+            normal_token=str(normal_row["image_token"])
+            if sick_token in used_tokens or normal_token in used_tokens:
+                return False
+            (
+                sick_patient_key,
+                normal_patient_key,
+                sick_sequence_key,
+                normal_sequence_key,
+                patient_pair_key,
+                sequence_pair_key,
+            )=MatchingStage.pair_keys(sick_row, normal_row, family)
+            if stage == "core_mutual":
+                patient_family_limit=20
+                sequence_limit=5
+            else:
+                patient_family_limit=60
+                sequence_limit=15
+            if (
+                patient_family_counts[sick_patient_key] >= patient_family_limit
+                or patient_family_counts[normal_patient_key] >= patient_family_limit
+                or sequence_counts[sick_sequence_key] >= sequence_limit
+                or sequence_counts[normal_sequence_key] >= sequence_limit):
+                return False
+            if stage != "core_mutual":
                 if (
-                    PRIORITIZE_CORE_SEQUENCE_PAIRS
-                    and item["seeded"]
-                )
-                else 1,
-                0 if item.get("reciprocal", 0) else 1,
-                item["normalized_distance"],
-                item["rank_sum"],
-                item["tie"],
+                    patient_pair_counts[patient_pair_key]
+                    >= 60
+                    or sequence_pair_counts[sequence_pair_key]
+                    >= 12):
+                    return False
+                for row in (sick_row, normal_row):
+                    label=DataStage._as_int(row.get("label"), -1)
+                    patient=str(row["patient_id"])
+                    cap=int(patient_total_caps[label])
+                    if patient_total_counts[patient] >= cap:
+                        return False
+                    if patient_quota is not None and patient_total_counts[patient] >= int(
+                        patient_quota[label]):
+                        return False
+            return True
+
+        def select_edge(edge, stage):
+            nonlocal pair_number, core_pair_count, extended_pair_count
+            family=int(edge["family"])
+            sick_row=eligible_rows[int(edge["sick_global"])]
+            normal_row=eligible_rows[int(edge["normal_global"])]
+            sick_token=str(sick_row["image_token"])
+            normal_token=str(normal_row["image_token"])
+            (
+                sick_patient_key,
+                normal_patient_key,
+                sick_sequence_key,
+                normal_sequence_key,
+                patient_pair_key,
+                sequence_pair_key,
+            )=MatchingStage.pair_keys(sick_row, normal_row, family)
+            seeded=int(sequence_pair_key in core_sequence_pairs)
+            pair_number +=1
+            prefix="CORE" if stage == "core_mutual" else "EXT"
+            pair_id=f"CCM_{prefix}_F{family:02d}_P{pair_number:06d}"
+            applied_caliper=(
+                family_data[family]["core_caliper"]
+                if stage == "core_mutual"
+                else family_data[family]["extended_caliper"]
             )
-        )
-
-        selected_here=0
-        max_cap=max(patient_total_caps.values())
-        starting_quota=max(
-            1,
-            min(
-                [patient_total_counts.get(patient, 0) for patient in patient_total_counts]
-                or [1]
-            ),
-        )
-        quota_values=np.unique(
-            np.ceil(
-                np.linspace(
-                    starting_quota,
-                    max_cap,
-                    max(2, int(12)),
+            for source_row, partner_row in (
+                (sick_row, normal_row),
+                (normal_row, sick_row),):
+                source_token=str(source_row["image_token"])
+                record=manifest_by_token[source_token]
+                record.update(
+                    {
+                        "selected_for_core_matched_cohort": int(stage == "core_mutual"),
+                        "selected_for_matched_cohort": 1,
+                        "match_stage": stage,
+                        "pair_id": pair_id,
+                        "matched_partner_token": str(partner_row["image_token"]),
+                        "matched_partner_patient": str(partner_row["patient_id"]),
+                        "matched_partner_series": str(partner_row["series_id"]),
+                        "match_distance": float(edge["distance"]),
+                        "mutual_rank_from_sick": (
+                            "" if edge.get("rank_from_sick") is None else int(edge["rank_from_sick"])
+                        ),
+                        "mutual_rank_from_normal": (
+                            "" if edge.get("rank_from_normal") is None else int(edge["rank_from_normal"])
+                        ),
+                        "reciprocal_extended_neighbor": int(edge.get("reciprocal", 0)),
+                        "sequence_pair_seeded_by_core": seeded,
+                        "family_caliper": float(applied_caliper),
+                        "exclusion_reason": "",
+                    }
                 )
-            ).astype(int)
-        )
-        for quota in quota_values:
-            if selected_here >= family_target or pair_number >= requested_target_pairs:
-                break
-            patient_quota={0: int(quota), 1: int(quota)}
-            for edge in candidates:
-                if selected_here >= family_target or pair_number >= requested_target_pairs:
-                    break
-                if can_select(edge, "extended_neighbor", patient_quota=patient_quota):
-                    select_edge(edge, "extended_neighbor")
-                    selected_here +=1
+            used_tokens.update((sick_token, normal_token))
+            patient_family_counts[sick_patient_key] +=1
+            patient_family_counts[normal_patient_key] +=1
+            sequence_counts[sick_sequence_key] +=1
+            sequence_counts[normal_sequence_key] +=1
+            patient_total_counts[str(sick_row["patient_id"])] +=1
+            patient_total_counts[str(normal_row["patient_id"])] +=1
+            patient_pair_counts[patient_pair_key] +=1
+            sequence_pair_counts[sequence_pair_key] +=1
+            selected_pair_distances.append(float(edge["distance"]))
+            if stage == "core_mutual":
+                core_sequence_pairs.add(sequence_pair_key)
+                core_pair_distances.append(float(edge["distance"]))
+                core_pair_count +=1
+                family_data[family]["core_selected"] +=1
+            else:
+                extended_pair_distances.append(float(edge["distance"]))
+                extended_pair_count +=1
+                family_data[family]["extended_selected"] +=1
 
-    # Spillover pass: if a family could not fill its proportional allocation,
-    # other families with unused high-quality edges may contribute the remainder.
-    # All one-to-one and capacity constraints remain active.
-    if pair_number < requested_target_pairs:
-        spillover_added=0
+        # Stage 1: preserve the previous strict cohort.
         for family in sorted(shared_families):
-            if pair_number >= requested_target_pairs:
-                break
+            caliper=family_data[family]["core_caliper"]
+            if not np.isfinite(caliper):
+                continue
+            for edge in sorted(
+                family_data[family]["core_edges"],
+                key=lambda item: (item["distance"], item["tie"]),):
+                if float(edge["distance"]) > float(caliper):
+                    continue
+                if can_select(edge, "core_mutual"):
+                    select_edge(edge, "core_mutual")
+
+        # Allocate the remaining target proportionally to the unused common
+        # support of each family. This prevents a few large families from taking
+        # the whole extension.
+        remaining_target=max(0, requested_target_pairs - core_pair_count)
+        remaining_capacity={
+            family: max(
+                0,
+                min(
+                    len(family_data[family]["normal_positions"]),
+                    len(family_data[family]["sick_positions"]),
+                )
+                - int(family_data[family]["core_selected"]),
+            )
+            for family in sorted(shared_families)
+        }
+        total_remaining_capacity=sum(remaining_capacity.values())
+        extension_targets={family: 0 for family in shared_families}
+        if remaining_target > 0 and total_remaining_capacity > 0:
+            raw_targets={
+                family: remaining_target
+                * remaining_capacity[family]
+                / total_remaining_capacity
+                for family in shared_families
+            }
+            extension_targets={
+                family: min(
+                    remaining_capacity[family], int(math.floor(raw_targets[family]))
+                )
+                for family in shared_families
+            }
+            unassigned=remaining_target - sum(extension_targets.values())
+            for family in sorted(
+                shared_families,
+                key=lambda value: (
+                    raw_targets[value] - math.floor(raw_targets[value]),
+                    remaining_capacity[value],
+                ),
+                reverse=True,):
+                if unassigned <= 0:
+                    break
+                if extension_targets[family] < remaining_capacity[family]:
+                    extension_targets[family] +=1
+                    unassigned -=1
+
+        # Stage 2: add close one-sided or reciprocal top-K neighbours. Core-seeded
+        # sequence pairs are considered first, then reciprocal candidates, then
+        # distance/rank. Quota passes stop a single patient from monopolising a family.
+        for family in sorted(shared_families):
+            family_target=int(extension_targets.get(family, 0))
+            if family_target <= 0:
+                continue
             extended_caliper=family_data[family]["extended_caliper"]
             if not np.isfinite(extended_caliper):
                 continue
-            spillover_candidates=[]
+            candidates=[]
             for edge in family_data[family]["all_edges"]:
                 if float(edge["distance"]) > float(extended_caliper):
                     continue
                 sick_row=eligible_rows[int(edge["sick_global"])]
                 normal_row=eligible_rows[int(edge["normal_global"])]
-                sequence_pair=pair_keys(
+                sequence_pair=MatchingStage.pair_keys(
                     sick_row, normal_row, family
                 )[-1]
+                seeded=int(sequence_pair in core_sequence_pairs)
                 rank_sick=edge.get("rank_from_sick")
                 rank_normal=edge.get("rank_from_normal")
-                spillover_candidates.append(
+                rank_sum=int(rank_sick or 12 + 1) + int(
+                    rank_normal or 12 + 1
+                )
+                candidates.append(
                     {
                         **edge,
-                        "seeded": int(sequence_pair in core_sequence_pairs),
-                        "rank_sum": int(
-                            rank_sick or EXTENDED_NEIGHBORS + 1
-                        )
-                        + int(
-                            rank_normal or EXTENDED_NEIGHBORS + 1
-                        ),
+                        "seeded": seeded,
+                        "rank_sum": rank_sum,
                         "normalized_distance": float(edge["distance"])
                         / max(float(extended_caliper), 1e-9),
                     }
                 )
-            spillover_candidates.sort(
+            candidates.sort(
                 key=lambda item: (
                     0
                     if (
-                        PRIORITIZE_CORE_SEQUENCE_PAIRS
+                        True
                         and item["seeded"]
                     )
                     else 1,
@@ -5168,216 +4774,296 @@ def build_cross_class_matching(dataset_rows, workspace):
                     item["tie"],
                 )
             )
-            for edge in spillover_candidates:
+
+            selected_here=0
+            max_cap=max(patient_total_caps.values())
+            starting_quota=max(
+                1,
+                min(
+                    [patient_total_counts.get(patient, 0) for patient in patient_total_counts]
+                    or [1]
+                ),
+            )
+            quota_values=np.unique(
+                np.ceil(
+                    np.linspace(
+                        starting_quota,
+                        max_cap,
+                        max(2, int(12)),
+                    )
+                ).astype(int)
+            )
+            for quota in quota_values:
+                if selected_here >= family_target or pair_number >= requested_target_pairs:
+                    break
+                patient_quota={0: int(quota), 1: int(quota)}
+                for edge in candidates:
+                    if selected_here >= family_target or pair_number >= requested_target_pairs:
+                        break
+                    if can_select(edge, "extended_neighbor", patient_quota=patient_quota):
+                        select_edge(edge, "extended_neighbor")
+                        selected_here +=1
+
+        # Spillover pass: if a family could not fill its proportional allocation,
+        # other families with unused high-quality edges may contribute the remainder.
+        # All one-to-one and capacity constraints remain active.
+        if pair_number < requested_target_pairs:
+            spillover_added=0
+            for family in sorted(shared_families):
                 if pair_number >= requested_target_pairs:
                     break
-                if can_select(edge, "extended_neighbor", patient_quota=None):
-                    select_edge(edge, "extended_neighbor")
-                    spillover_added +=1
-        if spillover_added:
-            print(
-                "[MATCHING] Spillover redistributed "
-                f"{spillover_added} extended pairs across families."
+                extended_caliper=family_data[family]["extended_caliper"]
+                if not np.isfinite(extended_caliper):
+                    continue
+                spillover_candidates=[]
+                for edge in family_data[family]["all_edges"]:
+                    if float(edge["distance"]) > float(extended_caliper):
+                        continue
+                    sick_row=eligible_rows[int(edge["sick_global"])]
+                    normal_row=eligible_rows[int(edge["normal_global"])]
+                    sequence_pair=MatchingStage.pair_keys(
+                        sick_row, normal_row, family
+                    )[-1]
+                    rank_sick=edge.get("rank_from_sick")
+                    rank_normal=edge.get("rank_from_normal")
+                    spillover_candidates.append(
+                        {
+                            **edge,
+                            "seeded": int(sequence_pair in core_sequence_pairs),
+                            "rank_sum": int(
+                                rank_sick or 12 + 1
+                            )
+                            + int(
+                                rank_normal or 12 + 1
+                            ),
+                            "normalized_distance": float(edge["distance"])
+                            / max(float(extended_caliper), 1e-9),
+                        }
+                    )
+                spillover_candidates.sort(
+                    key=lambda item: (
+                        0
+                        if (
+                            True
+                            and item["seeded"]
+                        )
+                        else 1,
+                        0 if item.get("reciprocal", 0) else 1,
+                        item["normalized_distance"],
+                        item["rank_sum"],
+                        item["tie"],
+                    )
+                )
+                for edge in spillover_candidates:
+                    if pair_number >= requested_target_pairs:
+                        break
+                    if can_select(edge, "extended_neighbor", patient_quota=None):
+                        select_edge(edge, "extended_neighbor")
+                        spillover_added +=1
+            if spillover_added:
+                print(
+                    "[MATCHING] Spillover redistributed "
+                    f"{spillover_added} extended pairs across families."
+                )
+
+        # Explain every non-selected image in the manifest.
+        for family in sorted(shared_families):
+            data=family_data[family]
+            candidate_tokens=set()
+            below_extended_tokens=set()
+            for edge in data["all_edges"]:
+                sick_token=str(eligible_rows[int(edge["sick_global"])]["image_token"])
+                normal_token=str(eligible_rows[int(edge["normal_global"])]["image_token"])
+                candidate_tokens.update((sick_token, normal_token))
+                if np.isfinite(data["extended_caliper"]) and float(edge["distance"]) <= float(
+                    data["extended_caliper"]):
+                    below_extended_tokens.update((sick_token, normal_token))
+            for index in family_indices[family]:
+                token=str(eligible_rows[index]["image_token"])
+                record=manifest_by_token[token]
+                if DataStage._as_int(record.get("selected_for_matched_cohort"), 0) == 1:
+                    continue
+                if token not in candidate_tokens:
+                    record["exclusion_reason"]="no_cross_class_neighbor_in_extended_top_k"
+                elif token not in below_extended_tokens:
+                    record["exclusion_reason"]="above_extended_family_caliper"
+                elif pair_number >= requested_target_pairs:
+                    record["exclusion_reason"]="expanded_target_reached"
+                else:
+                    record["exclusion_reason"]="one_to_one_or_capacity_limit"
+
+            family_summaries.append(
+                {
+                    "family": family,
+                    "normal_images": len(data["normal_positions"]),
+                    "sick_images": len(data["sick_positions"]),
+                    "normal_patients": len(
+                        {
+                            str(eligible_rows[index]["patient_id"])
+                            for index in data["normal_positions"]
+                        }
+                    ),
+                    "sick_patients": len(
+                        {
+                            str(eligible_rows[index]["patient_id"])
+                            for index in data["sick_positions"]
+                        }
+                    ),
+                    "core_candidate_edges": len(data["core_edges"]),
+                    "extended_candidate_edges": len(data["all_edges"]),
+                    "core_caliper": (
+                        float(data["core_caliper"])
+                        if np.isfinite(data["core_caliper"])
+                        else None
+                    ),
+                    "extended_caliper": (
+                        float(data["extended_caliper"])
+                        if np.isfinite(data["extended_caliper"])
+                        else None
+                    ),
+                    "core_selected_pairs": int(data["core_selected"]),
+                    "extended_added_pairs": int(data["extended_selected"]),
+                    "selected_pairs": int(data["core_selected"] + data["extended_selected"]),
+                    "extended_target_pairs": int(extension_targets.get(family, 0)),
+                }
             )
 
-    # Explain every non-selected image in the manifest.
-    for family in sorted(shared_families):
-        data=family_data[family]
-        candidate_tokens=set()
-        below_extended_tokens=set()
-        for edge in data["all_edges"]:
-            sick_token=str(eligible_rows[int(edge["sick_global"])]["image_token"])
-            normal_token=str(eligible_rows[int(edge["normal_global"])]["image_token"])
-            candidate_tokens.update((sick_token, normal_token))
-            if np.isfinite(data["extended_caliper"]) and float(edge["distance"]) <= float(
-                data["extended_caliper"]):
-                below_extended_tokens.update((sick_token, normal_token))
-        for index in family_indices[family]:
-            token=str(eligible_rows[index]["image_token"])
-            record=manifest_by_token[token]
-            if _as_int(record.get("selected_for_matched_cohort"), 0) == 1:
-                continue
-            if token not in candidate_tokens:
-                record["exclusion_reason"]="no_cross_class_neighbor_in_extended_top_k"
-            elif token not in below_extended_tokens:
-                record["exclusion_reason"]="above_extended_family_caliper"
-            elif pair_number >= requested_target_pairs:
-                record["exclusion_reason"]="expanded_target_reached"
-            else:
-                record["exclusion_reason"]="one_to_one_or_capacity_limit"
+        manifest=[
+            manifest_by_token[str(row["image_token"])] for row in dataset_rows
+        ]
+        selected=[
+            row
+            for row in manifest
+            if DataStage._as_int(row.get("selected_for_matched_cohort"), 0) == 1
+        ]
+        core_selected=[
+            row
+            for row in manifest
+            if DataStage._as_int(row.get("selected_for_core_matched_cohort"), 0) == 1
+        ]
+        selected_normal=[row for row in selected if DataStage._as_int(row.get("label"), -1) == 0]
+        selected_sick=[row for row in selected if DataStage._as_int(row.get("label"), -1) == 1]
+        normal_patients=sorted({str(row["patient_id"]) for row in selected_normal})
+        sick_patients=sorted({str(row["patient_id"]) for row in selected_sick})
+        if len(selected_normal) != len(selected_sick):
+            raise RuntimeError("Internal matching produced unequal class sizes.")
+        if len(normal_patients) < 2 or len(sick_patients) < 2:
+            raise RuntimeError(
+                "The matched cohort has too few patients for evaluation: "
+                f"Normal={len(normal_patients)}, Sick={len(sick_patients)}."
+            )
 
-        family_summaries.append(
-            {
-                "family": family,
-                "normal_images": len(data["normal_positions"]),
-                "sick_images": len(data["sick_positions"]),
-                "normal_patients": len(
-                    {
-                        str(eligible_rows[index]["patient_id"])
-                        for index in data["normal_positions"]
-                    }
-                ),
-                "sick_patients": len(
-                    {
-                        str(eligible_rows[index]["patient_id"])
-                        for index in data["sick_positions"]
-                    }
-                ),
-                "core_candidate_edges": len(data["core_edges"]),
-                "extended_candidate_edges": len(data["all_edges"]),
-                "core_caliper": (
-                    float(data["core_caliper"])
-                    if np.isfinite(data["core_caliper"])
-                    else None
-                ),
-                "extended_caliper": (
-                    float(data["extended_caliper"])
-                    if np.isfinite(data["extended_caliper"])
-                    else None
-                ),
-                "core_selected_pairs": int(data["core_selected"]),
-                "extended_added_pairs": int(data["extended_selected"]),
-                "selected_pairs": int(data["core_selected"] + data["extended_selected"]),
-                "extended_target_pairs": int(extension_targets.get(family, 0)),
-            }
+        per_patient=defaultdict(int)
+        for row in selected:
+            per_patient[str(row["patient_id"])] +=1
+        selected_fraction_eligible=len(selected) / max(1, len(eligible_rows))
+        selected_fraction_dataset=len(selected) / max(1, len(dataset_rows))
+        summary={
+            "fingerprint": fingerprint,
+            **MatchingStage.matching_settings_payload(),
+            "dataset_images": len(dataset_rows),
+            "eligible_images": len(eligible_rows),
+            "acquisition_families": family_count,
+            "shared_families": len(shared_families),
+            "requested_target_pairs": requested_target_pairs,
+            "requested_target_images": requested_target_pairs * 2,
+            "core_matched_pairs": len(core_selected) // 2,
+            "core_selected_images": len(core_selected),
+            "extended_added_pairs": extended_pair_count,
+            "extended_added_images": extended_pair_count * 2,
+            "matched_pairs": len(selected_normal),
+            "selected_images": len(selected),
+            "selected_fraction_of_eligible": float(selected_fraction_eligible),
+            "selected_fraction_of_dataset": float(selected_fraction_dataset),
+            "target_achieved": bool(len(selected_normal) >= requested_target_pairs),
+            "selected_normal_images": len(selected_normal),
+            "selected_sick_images": len(selected_sick),
+            "selected_normal_patients": len(normal_patients),
+            "selected_sick_patients": len(sick_patients),
+            "normal_patients": normal_patients,
+            "sick_patients": sick_patients,
+            "patient_total_caps_by_class": {
+                "Normal": int(patient_total_caps[0]),
+                "Sick": int(patient_total_caps[1]),
+            },
+            "selected_images_per_patient": dict(sorted(per_patient.items())),
+            "distance_median": (
+                float(np.median(selected_pair_distances))
+                if selected_pair_distances
+                else None
+            ),
+            "distance_p90": (
+                float(np.quantile(selected_pair_distances, 0.90))
+                if selected_pair_distances
+                else None
+            ),
+            "core_distance_median": (
+                float(np.median(core_pair_distances)) if core_pair_distances else None
+            ),
+            "core_distance_p90": (
+                float(np.quantile(core_pair_distances, 0.90))
+                if core_pair_distances
+                else None
+            ),
+            "extended_distance_median": (
+                float(np.median(extended_pair_distances))
+                if extended_pair_distances
+                else None
+            ),
+            "extended_distance_p90": (
+                float(np.quantile(extended_pair_distances, 0.90))
+                if extended_pair_distances
+                else None
+            ),
+            "families": family_summaries,
+            "manifest": str(workspace.cross_class_matching_manifest),
+            "interpretation": (
+                "B1/AU2/C2 use the expanded balanced cohort. The previous strict "
+                "mutual-neighbour cohort is retained in selected_for_core_matched_cohort "
+                "for audit and sensitivity checks."
+            ),
+        }
+        DataStage.write_csv(
+            workspace.cross_class_matching_manifest,
+            manifest,
+            manifest[0].keys(),
         )
-
-    manifest=[
-        manifest_by_token[str(row["image_token"])] for row in dataset_rows
-    ]
-    selected=[
-        row
-        for row in manifest
-        if _as_int(row.get("selected_for_matched_cohort"), 0) == 1
-    ]
-    core_selected=[
-        row
-        for row in manifest
-        if _as_int(row.get("selected_for_core_matched_cohort"), 0) == 1
-    ]
-    selected_normal=[row for row in selected if _as_int(row.get("label"), -1) == 0]
-    selected_sick=[row for row in selected if _as_int(row.get("label"), -1) == 1]
-    normal_patients=sorted({str(row["patient_id"]) for row in selected_normal})
-    sick_patients=sorted({str(row["patient_id"]) for row in selected_sick})
-    if len(selected_normal) != len(selected_sick):
-        raise RuntimeError("Internal matching produced unequal class sizes.")
-    if len(normal_patients) < 2 or len(sick_patients) < 2:
-        raise RuntimeError(
-            "The matched cohort has too few patients for evaluation: "
-            f"Normal={len(normal_patients)}, Sick={len(sick_patients)}."
-        )
-
-    per_patient=defaultdict(int)
-    for row in selected:
-        per_patient[str(row["patient_id"])] +=1
-    selected_fraction_eligible=len(selected) / max(1, len(eligible_rows))
-    selected_fraction_dataset=len(selected) / max(1, len(dataset_rows))
-    summary={
-        "fingerprint": fingerprint,
-        **matching_settings_payload(),
-        "dataset_images": len(dataset_rows),
-        "eligible_images": len(eligible_rows),
-        "acquisition_families": family_count,
-        "shared_families": len(shared_families),
-        "requested_target_pairs": requested_target_pairs,
-        "requested_target_images": requested_target_pairs * 2,
-        "core_matched_pairs": len(core_selected) // 2,
-        "core_selected_images": len(core_selected),
-        "extended_added_pairs": extended_pair_count,
-        "extended_added_images": extended_pair_count * 2,
-        "matched_pairs": len(selected_normal),
-        "selected_images": len(selected),
-        "selected_fraction_of_eligible": float(selected_fraction_eligible),
-        "selected_fraction_of_dataset": float(selected_fraction_dataset),
-        "target_achieved": bool(len(selected_normal) >= requested_target_pairs),
-        "selected_normal_images": len(selected_normal),
-        "selected_sick_images": len(selected_sick),
-        "selected_normal_patients": len(normal_patients),
-        "selected_sick_patients": len(sick_patients),
-        "normal_patients": normal_patients,
-        "sick_patients": sick_patients,
-        "patient_total_caps_by_class": {
-            "Normal": int(patient_total_caps[0]),
-            "Sick": int(patient_total_caps[1]),
-        },
-        "selected_images_per_patient": dict(sorted(per_patient.items())),
-        "distance_median": (
-            float(np.median(selected_pair_distances))
-            if selected_pair_distances
-            else None
-        ),
-        "distance_p90": (
-            float(np.quantile(selected_pair_distances, 0.90))
-            if selected_pair_distances
-            else None
-        ),
-        "core_distance_median": (
-            float(np.median(core_pair_distances)) if core_pair_distances else None
-        ),
-        "core_distance_p90": (
-            float(np.quantile(core_pair_distances, 0.90))
-            if core_pair_distances
-            else None
-        ),
-        "extended_distance_median": (
-            float(np.median(extended_pair_distances))
-            if extended_pair_distances
-            else None
-        ),
-        "extended_distance_p90": (
-            float(np.quantile(extended_pair_distances, 0.90))
-            if extended_pair_distances
-            else None
-        ),
-        "families": family_summaries,
-        "manifest": str(workspace.cross_class_matching_manifest),
-        "interpretation": (
-            "B1/AU2/C2 use the expanded balanced cohort. The previous strict "
-            "mutual-neighbour cohort is retained in selected_for_core_matched_cohort "
-            "for audit and sensitivity checks."
-        ),
-    }
-    write_csv(
-        workspace.cross_class_matching_manifest,
-        manifest,
-        manifest[0].keys(),
-    )
-    write_json(workspace.cross_class_matching_summary, summary)
-    if not summary["target_achieved"]:
+        DataStage.write_json(workspace.cross_class_matching_summary, summary)
+        if not summary["target_achieved"]:
+            print(
+                "[MATCHING][WARNING] The requested expanded target could not be fully "
+                "reached without violating one-to-one, anatomical, patient, or sequence caps."
+            )
         print(
-            "[MATCHING][WARNING] The requested expanded target could not be fully "
-            "reached without violating one-to-one, anatomical, patient, or sequence caps."
+            "[MATCHING] Sick↔Normal core+extended: "
+            f"eligible={len(eligible_rows)}, core_pairs={len(core_selected) // 2}, "
+            f"total_pairs={len(selected_normal)}, images={len(selected)} "
+            f"({100.0 * selected_fraction_dataset:.1f}% dataset), "
+            f"patients Normal={len(normal_patients)}, Sick={len(sick_patients)} | "
+            f"{workspace.cross_class_matching_manifest}"
         )
-    print(
-        "[MATCHING] Sick↔Normal core+extended: "
-        f"eligible={len(eligible_rows)}, core_pairs={len(core_selected) // 2}, "
-        f"total_pairs={len(selected_normal)}, images={len(selected)} "
-        f"({100.0 * selected_fraction_dataset:.1f}% dataset), "
-        f"patients Normal={len(normal_patients)}, Sick={len(sick_patients)} | "
-        f"{workspace.cross_class_matching_manifest}"
-    )
-    return manifest
+        return manifest
+    # Read the final unique image tokens selected for the balanced matched cohort.
+    @staticmethod
+    def selected_matched_tokens(
+        manifest,
+        core_only=False,
+    ):
+        field=(
+            "selected_for_core_matched_cohort"
+            if core_only
+            else "selected_for_matched_cohort"
+        )
+        return {
+            str(row.get("image_token", ""))
+            for row in manifest
+            if DataStage._as_int(row.get(field), 0) == 1
+        }
 
-# Read the final unique image tokens selected for the balanced matched cohort.
-def selected_matched_tokens(
-    manifest,
-    core_only=False,
-):
-    field=(
-        "selected_for_core_matched_cohort"
-        if core_only
-        else "selected_for_matched_cohort"
-    )
-    return {
-        str(row.get("image_token", ""))
-        for row in manifest
-        if _as_int(row.get(field), 0) == 1
-    }
-
-
-# -----------------------------------------------------------------------------
-# PIPELINE STEP 6 — Frozen feature extraction and patient aggregation
-# -----------------------------------------------------------------------------
+# =============================================================================
+# STAGE 5 — FROZEN EFFICIENTNET FEATURES
+# =============================================================================
+# PyTorch Dataset/model/pool classes hold actual runtime state, so classes are natural here.
 class FeatureDataset(Dataset):
     """Load full-image, automatic-mask, and manual-mask tensors for feature extraction."""
 
@@ -5389,21 +5075,21 @@ class FeatureDataset(Dataset):
 
     def __getitem__(self, index):
         row=self.rows[index]
-        robust, raw, content=classifier_views(row["image_path"])
+        robust, raw, content=DataStage.classifier_views(row["image_path"])
         attention_path=Path(row["predicted_attention_mask_path"])
         if attention_path.is_file():
-            attention=read_binary_mask(
-                attention_path, size=CLASSIFICATION_SIZE
+            attention=DataStage.read_binary_mask(
+                attention_path, size=224
             ).astype(np.float32)
         else:
             attention=np.zeros(
-                (CLASSIFICATION_SIZE, CLASSIFICATION_SIZE),
+                (224, 224),
                 dtype=np.float32,
             )
         manual_path=Path(row["manual_mask_path"])
         if manual_path.is_file():
-            manual=read_binary_mask(
-                manual_path, size=CLASSIFICATION_SIZE
+            manual=DataStage.read_binary_mask(
+                manual_path, size=224
             ).astype(np.float32)
         else:
             manual=np.zeros_like(attention)
@@ -5418,8 +5104,6 @@ class FeatureDataset(Dataset):
             torch.from_numpy(manual).unsqueeze(0).float(),
             int(index),
         )
-
-
 class FrozenEfficientNet(nn.Module):
     """Expose pretrained EfficientNet-B0 as a frozen embedding extractor."""
 
@@ -5448,8 +5132,6 @@ class FrozenEfficientNet(nn.Module):
     def forward(self, images):
         images=(images.float() - self.mean) / self.std
         return self.model(images)
-
-
 class StreamingPatientPool:
     """Aggregate slice embeddings first by series and then by patient."""
 
@@ -5504,28 +5186,25 @@ class StreamingPatientPool:
             "series_proxies": int(len(self.series_data[mode])),
         }
 
+class FeatureStage:
+    """Build all eleven full-image/ROI/complement patient feature sets from scratch."""
 
-# All 11 experiments are rebuilt every run. The first seven are the main CAD
-# experiments; the last four compare automatic masks with the manual reference.
-MODES=(
-    "B0_FULL_IMAGE",
-    "B2_ATTENTION_ELIGIBLE_FULL_IMAGE",
-    "AU1_ATTENTION_ROI",
-    "C1_ATTENTION_COMPLEMENT",
-    "B1_MATCHED_FULL_IMAGE",
-    "AU2_MATCHED_ATTENTION_ROI",
-    "C2_MATCHED_ATTENTION_COMPLEMENT",
-    "M1_MANUAL_ROI",
-    "C3_MANUAL_COMPLEMENT",
-    "AU3_ATTENTION_ROI_MANUAL_SUBSET",
-    "C4_ATTENTION_COMPLEMENT_MANUAL_SUBSET",
-)
-
-# These four modes use exactly the accepted positive manual-mask images.
-MANUAL_SUBSET_MODES=set(MODES[7:])
-
-# Human-readable explanation of every experiment.
-MODE_DESCRIPTIONS={
+    # These names define the research experiments; they are not tunable settings.
+    MODES = (
+        "B0_FULL_IMAGE",
+        "B2_ATTENTION_ELIGIBLE_FULL_IMAGE",
+        "AU1_ATTENTION_ROI",
+        "C1_ATTENTION_COMPLEMENT",
+        "B1_MATCHED_FULL_IMAGE",
+        "AU2_MATCHED_ATTENTION_ROI",
+        "C2_MATCHED_ATTENTION_COMPLEMENT",
+        "M1_MANUAL_ROI",
+        "C3_MANUAL_COMPLEMENT",
+        "AU3_ATTENTION_ROI_MANUAL_SUBSET",
+        "C4_ATTENTION_COMPLEMENT_MANUAL_SUBSET",
+    )
+    MANUAL_SUBSET_MODES = set(MODES[7:])
+    MODE_DESCRIPTIONS = {
     "B0_FULL_IMAGE": "Full-image contextual baseline on every dataset slice",
     "B2_ATTENTION_ELIGIBLE_FULL_IMAGE": "Full image on exactly the AU1/C1 attention-eligible slices",
     "AU1_ATTENTION_ROI": "Automatic Attention U-Net heart ROI on the same attention-eligible slices",
@@ -5538,9 +5217,7 @@ MODE_DESCRIPTIONS={
     "AU3_ATTENTION_ROI_MANUAL_SUBSET": "Automatic ROI on the same manually annotated images",
     "C4_ATTENTION_COMPLEMENT_MANUAL_SUBSET": "Automatic complement on the same manually annotated images",
 }
-
-# Named source cohort used by every experiment.
-MODE_COHORTS={
+    MODE_COHORTS = {
     "B0_FULL_IMAGE": "all_dataset_slices",
     "B2_ATTENTION_ELIGIBLE_FULL_IMAGE": "attention_eligible_same_slices",
     "AU1_ATTENTION_ROI": "attention_eligible_same_slices",
@@ -5554,964 +5231,946 @@ MODE_COHORTS={
     "C4_ATTENTION_COMPLEMENT_MANUAL_SUBSET": "manual_positive_same_slices",
 }
 
-
-# Normalize normalize.
-def region_normalize(images, masks):
-    if masks.ndim == 3:
-        masks=masks.unsqueeze(1)
-    visible=masks > 0.5
-    batch_size=images.shape[0]
-    bins=int(256)
-    mask_flat=visible[:, 0].reshape(batch_size, -1)
-    counts=mask_flat.sum(dim=1).long()
-    values=images[:, 0].float().clamp(0.0, 1.0)
-    indices=torch.round(values * float(bins - 1)).long().clamp_(0, bins - 1)
-    indices=indices.reshape(batch_size, -1)
-    histogram=torch.zeros(batch_size, bins, device=images.device, dtype=torch.float32)
-    histogram.scatter_add_(1, indices, mask_flat.float())
-    cumulative=torch.cumsum(histogram, dim=1)
-    safe_counts=counts.clamp_min(1)
-    lower_rank=(
-        torch.floor(
-            1.0 / 100.0
-            * (safe_counts - 1).float()
-        ).long()
-        + 1
-    )
-    upper_rank=(
-        torch.floor(
-            99.0 / 100.0
-            * (safe_counts - 1).float()
-        ).long()
-        + 1
-    )
-    lower_bin=(cumulative >= lower_rank[:, None].float()).long().argmax(dim=1)
-    upper_bin=(cumulative >= upper_rank[:, None].float()).long().argmax(dim=1)
-    lower=lower_bin.float().view(-1, 1, 1, 1) / float(bins - 1)
-    upper=upper_bin.float().view(-1, 1, 1, 1) / float(bins - 1)
-    valid=(
-        (counts >= 64)
-        & (upper[:, 0, 0, 0] > lower[:, 0, 0, 0])
-    )
-    scaled=(images.float() - lower) / (upper - lower).clamp_min(
-        8.0 / 255.0
-    )
-    scaled=scaled.clamp(0.0, 1.0) * visible.float()
-    return scaled * valid.view(-1, 1, 1, 1).float()
-
-# Dilate the heart mask slightly before ROI/complement feature extraction.
-def support_mask(mask, content):
-    kernel=15  # dilate the ROI slightly before feature extraction
-    support=F.max_pool2d(
-        (mask > 0.5).float(), kernel_size=kernel, stride=1, padding=kernel // 2
-    )
-    return (support > 0.5).float() * (content > 0.5).float()
-
-# Return only accepted positive manual targets used by manual-reference experiments.
-def accepted_manual_tokens(
-    workspace,
-    verbose=False,
-):
-    audit_rows=read_csv(workspace.manual_audit)
-    accepted=set()
-    explicit_positive=0
-    legacy_inferred=0
-    skipped_nonpositive=0
-    skipped_unusable=0
-
-    for row in audit_rows:
-        if str(row.get("status", "")).strip().upper() != "ACCEPTED":
-            continue
-        token=str(row.get("image_token", "")).strip()
-        if not token:
-            continue
-        target_type=str(row.get("target_type", "")).strip().upper()
-        heart_present_raw=str(row.get("heart_present", "")).strip()
-
-        if target_type in {NO_HEART_VISIBLE, UNUSABLE, "UNLABELED_EMPTY"}:
-            skipped_nonpositive +=1
-            continue
-
-        path_value=str(row.get("manual_mask_path", "")).strip()
-        path=Path(path_value) if path_value else workspace.manual_masks / f"{token}.png"
-
-        if target_type == HEART_PRESENT or heart_present_raw == "1":
-            qc=manual_mask_qc(path)
-            if qc.get("usable"):
-                accepted.add(token)
-                explicit_positive +=1
-            else:
-                skipped_unusable +=1
-            continue
-
-
-        if not target_type and not heart_present_raw:
-            qc=manual_mask_qc(path)
-            if qc.get("usable"):
-                accepted.add(token)
-                legacy_inferred +=1
-            else:
-                skipped_unusable +=1
-        else:
-            skipped_nonpositive +=1
-
-    if verbose:
-        print(
-            "[FEATURE BANK][MANUAL] "
-            f"audit_rows={len(audit_rows)}, accepted_heart={len(accepted)}, "
-            f"explicit={explicit_positive}, legacy_inferred={legacy_inferred}, "
-            f"skipped_nonpositive={skipped_nonpositive}, "
-            f"skipped_unusable={skipped_unusable}"
+    @staticmethod
+    def region_normalize(images, masks):
+        if masks.ndim == 3:
+            masks=masks.unsqueeze(1)
+        visible=masks > 0.5
+        batch_size=images.shape[0]
+        bins=int(256)
+        mask_flat=visible[:, 0].reshape(batch_size, -1)
+        counts=mask_flat.sum(dim=1).long()
+        values=images[:, 0].float().clamp(0.0, 1.0)
+        indices=torch.round(values * float(bins - 1)).long().clamp_(0, bins - 1)
+        indices=indices.reshape(batch_size, -1)
+        histogram=torch.zeros(batch_size, bins, device=images.device, dtype=torch.float32)
+        histogram.scatter_add_(1, indices, mask_flat.float())
+        cumulative=torch.cumsum(histogram, dim=1)
+        safe_counts=counts.clamp_min(1)
+        lower_rank=(
+            torch.floor(
+                1.0 / 100.0
+                * (safe_counts - 1).float()
+            ).long()
+            + 1
         )
-    return accepted
-
-# Check same cohort.
-def assert_same_cohort(
-    bank,
-    modes,
-    cohort_name,
-):
-
-    modes=tuple(modes)
-    reference_mode=modes[0]
-    reference=bank[reference_mode]
-    reference_patients=np.asarray(reference["patient_ids"]).astype(str)
-    reference_labels=np.asarray(reference["y"], dtype=np.int64)
-    reference_slices=int(reference["source_slices"])
-    reference_series=int(reference["series_proxies"])
-
-    for mode in modes[1:]:
-        current=bank[mode]
-        checks={
-            "patient_ids": np.array_equal(
-                reference_patients,
-                np.asarray(current["patient_ids"]).astype(str),
-            ),
-            "labels": np.array_equal(
-                reference_labels,
-                np.asarray(current["y"], dtype=np.int64),
-            ),
-            "source_slices": reference_slices == int(current["source_slices"]),
-            "series_proxies": reference_series == int(current["series_proxies"]),
-        }
-        failed=[name for name, passed in checks.items() if not passed]
-        if failed:
-            raise RuntimeError(
-                f"Same-slice cohort {cohort_name!r} is inconsistent between "
-                f"{reference_mode} and {mode}: {failed}. Rebuild the affected "
-                "feature-bank modes before interpreting their AUC difference."
-            )
-
-    print(
-        f"[FEATURE BANK][COHORT] {cohort_name}: modes={list(modes)}, "
-        f"patients={len(reference_patients)}, slices={reference_slices}, "
-        f"series={reference_series}"
-    )
-
-# Validate cohort alignment.
-def validate_cohort_alignment(bank):
-    assert_same_cohort(
-        bank,
-        (
-            "B2_ATTENTION_ELIGIBLE_FULL_IMAGE",
-            "AU1_ATTENTION_ROI",
-            "C1_ATTENTION_COMPLEMENT",
-        ),
-        "attention_eligible_same_slices",
-    )
-    assert_same_cohort(
-        bank,
-        (
-            "B1_MATCHED_FULL_IMAGE",
-            "AU2_MATCHED_ATTENTION_ROI",
-            "C2_MATCHED_ATTENTION_COMPLEMENT",
-        ),
-        "cross_class_matched_same_slices",
-    )
-    assert_same_cohort(
-        bank,
-        (
-            "M1_MANUAL_ROI",
-            "C3_MANUAL_COMPLEMENT",
-            "AU3_ATTENTION_ROI_MANUAL_SUBSET",
-            "C4_ATTENTION_COMPLEMENT_MANUAL_SUBSET",
-        ),
-        "manual_positive_same_slices",
-    )
-
-# Hash preprocessing, masks, matching, and experiment definitions for feature-cache reuse.
-
-# Load feature modes.
-
-
-# Reuse safe unaffected feature modes when only B2 or matching-dependent modes changed.
-
-# Load compatible feature cache.
-
-# Build every experiment from a frozen EfficientNet pass. B2, AU1, and C1
-# are forced to share the exact same Attention-eligible rows. During a full
-# rebuild, B0 embeddings are reused for the B2 and B1 subsets, so the added
-# methodological control does not create duplicate full-image forward passes.
-def build_feature_bank(dataset_rows, workspace, device):
-    # Features are always rebuilt. EfficientNet-B0 stays frozen; only the image
-    # representation changes between full-image, ROI, and complement experiments.
-    reusable_bank={}
-    modes_to_compute=MODES
-    compute_set=set(MODES)
-
-    quality={
-        row["image_token"]: row
-        for row in read_csv(workspace.quality_audit)
-    }
-    predictions={
-        row["image_token"]: row
-        for row in read_csv(workspace.prediction_audit)
-    }
-    accepted_manual=accepted_manual_tokens(
-        workspace, verbose=True
-    )
-    if not accepted_manual:
-        raise RuntimeError(
-            "No usable manual HEART_PRESENT mask is available for "
-            "M1/C3/AU3/C4. The audit was checked or migrated, but no "
-            "accepted non-empty PNG remained. Inspect simple_manual_mask_audit.csv "
-            "and manual_masks/. Baseline and automatic-Attention modes are not the cause of this error."
+        upper_rank=(
+            torch.floor(
+                99.0 / 100.0
+                * (safe_counts - 1).float()
+            ).long()
+            + 1
         )
-    matching_manifest=read_csv(
-        workspace.cross_class_matching_manifest
-    )
-    matched_tokens=selected_matched_tokens(
-        matching_manifest
-    )
-    if not matched_tokens:
-        raise RuntimeError(
-            "The cross-class matching manifest is missing or contains no pairs. "
-            "Run pipeline.build_cross_class_matching()."
+        lower_bin=(cumulative >= lower_rank[:, None].float()).long().argmax(dim=1)
+        upper_bin=(cumulative >= upper_rank[:, None].float()).long().argmax(dim=1)
+        lower=lower_bin.float().view(-1, 1, 1, 1) / float(bins - 1)
+        upper=upper_bin.float().view(-1, 1, 1, 1) / float(bins - 1)
+        valid=(
+            (counts >= 64)
+            & (upper[:, 0, 0, 0] > lower[:, 0, 0, 0])
         )
-    if len(predictions) != len(dataset_rows):
-        raise RuntimeError("The prediction audit does not cover the full dataset.")
-
-    rows=[]
-    for original in dataset_rows:
-        row=dict(original)
-        row.update(predictions.get(row["image_token"], {}))
-        row.update(quality.get(row["image_token"], {}))
-        row["keep_attention"]=int(
-            _as_int(row.get("attention_valid_final"), 0) == 1
-            and _as_int(row.get("attention_heart_present"), 1) == 1
-            and _as_int(row.get("quality_valid"), 0) == 1
-            and _as_float(row.get("attention_area_ratio"), 0.0)
-            >= PREDICTION_MIN_AREA_RATIO
+        scaled=(images.float() - lower) / (upper - lower).clamp_min(
+            8.0 / 255.0
         )
-        row["keep_manual_matched"]=int(
-            row["image_token"] in accepted_manual
+        scaled=scaled.clamp(0.0, 1.0) * visible.float()
+        return scaled * valid.view(-1, 1, 1, 1).float()
+    # Dilate the heart mask slightly before ROI/complement feature extraction.
+    @staticmethod
+    def support_mask(mask, content):
+        kernel=15  # expand ROI slightly before extracting ROI/complement features
+        support=F.max_pool2d(
+            (mask > 0.5).float(), kernel_size=kernel, stride=1, padding=kernel // 2
         )
-        row["keep_cross_class_matched"]=int(
-            row["image_token"] in matched_tokens and row["keep_attention"] == 1
-        )
-        rows.append(row)
-
-    if not rows:
-        raise RuntimeError("No images are eligible for feature extraction.")
-    print(f"[FEATURES] rebuilding all 11 experiments from {len(rows)} source images")
-
-    extractor=prepare_model(FrozenEfficientNet(), device).eval()
-    loader=DataLoader(
-        FeatureDataset(rows),
-        batch_size=12 if device.type == "cuda" else 4,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=device.type == "cuda",
-    )
-    pool=StreamingPatientPool(modes_to_compute)
-    started=time.perf_counter()
-
-    # Aliases receive the very same embeddings from a strict subset of the
-    # source rows. This avoids duplicate forward passes and guarantees that the
-    # same-slice controls differ only by their image representation.
-    alias_rules={
-        "B0_FULL_IMAGE": (
-            ("B2_ATTENTION_ELIGIBLE_FULL_IMAGE", "keep_attention"),
-            ("B1_MATCHED_FULL_IMAGE", "keep_cross_class_matched"),
-        ),
-        "B2_ATTENTION_ELIGIBLE_FULL_IMAGE": (
-            ("B1_MATCHED_FULL_IMAGE", "keep_cross_class_matched"),
-        ),
-        "AU1_ATTENTION_ROI": (
-            ("AU2_MATCHED_ATTENTION_ROI", "keep_cross_class_matched"),
-        ),
-        "C1_ATTENTION_COMPLEMENT": (
-            ("C2_MATCHED_ATTENTION_COMPLEMENT", "keep_cross_class_matched"),
-        ),
-    }
-
-    def encode_groups(
-        groups,
+        return (support > 0.5).float() * (content > 0.5).float()
+    # Return only accepted positive manual targets used by manual-reference experiments.
+    @staticmethod
+    def accepted_manual_tokens(
+        workspace,
+        verbose=False,
     ):
-        valid_groups=[
-            (mode, images, selected_rows)
-            for mode, images, selected_rows in groups
-            if mode in compute_set
-            and len(selected_rows) > 0
-            and images.shape[0] > 0
-        ]
-        if not valid_groups:
-            return
+        audit_rows=DataStage.read_csv(workspace.manual_audit)
+        accepted=set()
+        explicit_positive=0
+        legacy_inferred=0
+        skipped_nonpositive=0
+        skipped_unusable=0
 
-        combined=torch.cat(
-            [images.contiguous() for _, images, _ in valid_groups], dim=0
+        for row in audit_rows:
+            if str(row.get("status", "")).strip().upper() != "ACCEPTED":
+                continue
+            token=str(row.get("image_token", "")).strip()
+            if not token:
+                continue
+            target_type=str(row.get("target_type", "")).strip().upper()
+            heart_present_raw=str(row.get("heart_present", "")).strip()
+
+            if target_type in {NO_HEART_VISIBLE, UNUSABLE, "UNLABELED_EMPTY"}:
+                skipped_nonpositive +=1
+                continue
+
+            path_value=str(row.get("manual_mask_path", "")).strip()
+            path=Path(path_value) if path_value else workspace.manual_masks / f"{token}.png"
+
+            if target_type == HEART_PRESENT or heart_present_raw == "1":
+                qc=DataStage.manual_mask_qc(path)
+                if qc.get("usable"):
+                    accepted.add(token)
+                    explicit_positive +=1
+                else:
+                    skipped_unusable +=1
+                continue
+
+
+            if not target_type and not heart_present_raw:
+                qc=DataStage.manual_mask_qc(path)
+                if qc.get("usable"):
+                    accepted.add(token)
+                    legacy_inferred +=1
+                else:
+                    skipped_unusable +=1
+            else:
+                skipped_nonpositive +=1
+
+        if verbose:
+            print(
+                "[FEATURE BANK][MANUAL] "
+                f"audit_rows={len(audit_rows)}, accepted_heart={len(accepted)}, "
+                f"explicit={explicit_positive}, legacy_inferred={legacy_inferred}, "
+                f"skipped_nonpositive={skipped_nonpositive}, "
+                f"skipped_unusable={skipped_unusable}"
+            )
+        return accepted
+    @staticmethod
+    def assert_same_cohort(
+        bank,
+        modes,
+        cohort_name,
+    ):
+
+        modes=tuple(modes)
+        reference_mode=modes[0]
+        reference=bank[reference_mode]
+        reference_patients=np.asarray(reference["patient_ids"]).astype(str)
+        reference_labels=np.asarray(reference["y"], dtype=np.int64)
+        reference_slices=int(reference["source_slices"])
+        reference_series=int(reference["series_proxies"])
+
+        for mode in modes[1:]:
+            current=bank[mode]
+            checks={
+                "patient_ids": np.array_equal(
+                    reference_patients,
+                    np.asarray(current["patient_ids"]).astype(str),
+                ),
+                "labels": np.array_equal(
+                    reference_labels,
+                    np.asarray(current["y"], dtype=np.int64),
+                ),
+                "source_slices": reference_slices == int(current["source_slices"]),
+                "series_proxies": reference_series == int(current["series_proxies"]),
+            }
+            failed=[name for name, passed in checks.items() if not passed]
+            if failed:
+                raise RuntimeError(
+                    f"Same-slice cohort {cohort_name!r} is inconsistent between "
+                    f"{reference_mode} and {mode}: {failed}. Rebuild the affected "
+                    "feature-bank modes before interpreting their AUC difference."
+                )
+
+        print(
+            f"[FEATURE BANK][COHORT] {cohort_name}: modes={list(modes)}, "
+            f"patients={len(reference_patients)}, slices={reference_slices}, "
+            f"series={reference_series}"
         )
-        forward_batch=32 if device.type == "cuda" else 4
-        embedding_chunks=[]
-        for begin in range(0, combined.shape[0], forward_batch):
-            images_device=move_tensor(
-                combined[begin : begin + forward_batch], device
+    @staticmethod
+    def validate_cohort_alignment(bank):
+        FeatureStage.assert_same_cohort(
+            bank,
+            (
+                "B2_ATTENTION_ELIGIBLE_FULL_IMAGE",
+                "AU1_ATTENTION_ROI",
+                "C1_ATTENTION_COMPLEMENT",
+            ),
+            "attention_eligible_same_slices",
+        )
+        FeatureStage.assert_same_cohort(
+            bank,
+            (
+                "B1_MATCHED_FULL_IMAGE",
+                "AU2_MATCHED_ATTENTION_ROI",
+                "C2_MATCHED_ATTENTION_COMPLEMENT",
+            ),
+            "cross_class_matched_same_slices",
+        )
+        FeatureStage.assert_same_cohort(
+            bank,
+            (
+                "M1_MANUAL_ROI",
+                "C3_MANUAL_COMPLEMENT",
+                "AU3_ATTENTION_ROI_MANUAL_SUBSET",
+                "C4_ATTENTION_COMPLEMENT_MANUAL_SUBSET",
+            ),
+            "manual_positive_same_slices",
+        )
+    # Build every experiment from a frozen EfficientNet pass. B2, AU1, and C1
+    # are forced to share the exact same Attention-eligible rows. During a full
+    # rebuild, B0 embeddings are reused for the B2 and B1 subsets, so the added
+    # methodological control does not create duplicate full-image forward passes.
+    @staticmethod
+    def build_feature_bank(dataset_rows, workspace, device):
+        # Features are always rebuilt. EfficientNet-B0 stays frozen; only the image
+        # representation changes between full-image, ROI, and complement experiments.
+        reusable_bank={}
+        modes_to_compute=FeatureStage.MODES
+        compute_set=set(FeatureStage.MODES)
+
+        quality={
+            row["image_token"]: row
+            for row in DataStage.read_csv(workspace.quality_audit)
+        }
+        predictions={
+            row["image_token"]: row
+            for row in DataStage.read_csv(workspace.prediction_audit)
+        }
+        accepted_manual=FeatureStage.accepted_manual_tokens(
+            workspace, verbose=True
+        )
+        if not accepted_manual:
+            raise RuntimeError(
+                "No usable manual HEART_PRESENT mask is available for "
+                "M1/C3/AU3/C4. The audit was checked or migrated, but no "
+                "accepted non-empty PNG remained. Inspect simple_manual_mask_audit.csv "
+                "and manual_masks/. Baseline and automatic-Attention modes are not the cause of this error."
             )
-            with autocast(device):
-                output=extractor(images_device)
-            embedding_chunks.append(output.float().cpu())
-            del images_device, output
+        matching_manifest=DataStage.read_csv(
+            workspace.cross_class_matching_manifest
+        )
+        matched_tokens=MatchingStage.selected_matched_tokens(
+            matching_manifest
+        )
+        if not matched_tokens:
+            raise RuntimeError(
+                "The cross-class matching manifest is missing or contains no pairs. "
+                "Run pipeline.build_cross_class_matching()."
+            )
+        if len(predictions) != len(dataset_rows):
+            raise RuntimeError("The prediction audit does not cover the full dataset.")
 
-        embeddings=torch.cat(embedding_chunks, dim=0).numpy().astype(np.float32)
-        cursor=0
-        for mode, images, selected_rows in valid_groups:
-            count=int(images.shape[0])
-            current_embeddings=embeddings[cursor : cursor + count]
-            pool.add(mode, current_embeddings, selected_rows)
+        rows=[]
+        for original in dataset_rows:
+            row=dict(original)
+            row.update(predictions.get(row["image_token"], {}))
+            row.update(quality.get(row["image_token"], {}))
+            row["keep_attention"]=int(
+                DataStage._as_int(row.get("attention_valid_final"), 0) == 1
+                and DataStage._as_int(row.get("attention_heart_present"), 1) == 1
+                and DataStage._as_int(row.get("quality_valid"), 0) == 1
+                and DataStage._as_float(row.get("attention_area_ratio"), 0.0)
+                >= 0.003
+            )
+            row["keep_manual_matched"]=int(
+                row["image_token"] in accepted_manual
+            )
+            row["keep_cross_class_matched"]=int(
+                row["image_token"] in matched_tokens and row["keep_attention"] == 1
+            )
+            rows.append(row)
 
-            for alias_mode, selector_field in alias_rules.get(mode, ()):
-                if alias_mode not in compute_set:
-                    continue
-                alias_positions=[
+        if not rows:
+            raise RuntimeError("No images are eligible for feature extraction.")
+        print(f"[FEATURES] rebuilding all 11 experiments from {len(rows)} source images")
+
+        extractor=DataStage.prepare_model(FrozenEfficientNet(), device).eval()
+        loader=DataLoader(
+            FeatureDataset(rows),
+            batch_size=12 if device.type == "cuda" else 4,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=device.type == "cuda",
+        )
+        pool=StreamingPatientPool(modes_to_compute)
+        started=time.perf_counter()
+
+        # Aliases receive the very same embeddings from a strict subset of the
+        # source rows. This avoids duplicate forward passes and guarantees that the
+        # same-slice controls differ only by their image representation.
+        alias_rules={
+            "B0_FULL_IMAGE": (
+                ("B2_ATTENTION_ELIGIBLE_FULL_IMAGE", "keep_attention"),
+                ("B1_MATCHED_FULL_IMAGE", "keep_cross_class_matched"),
+            ),
+            "B2_ATTENTION_ELIGIBLE_FULL_IMAGE": (
+                ("B1_MATCHED_FULL_IMAGE", "keep_cross_class_matched"),
+            ),
+            "AU1_ATTENTION_ROI": (
+                ("AU2_MATCHED_ATTENTION_ROI", "keep_cross_class_matched"),
+            ),
+            "C1_ATTENTION_COMPLEMENT": (
+                ("C2_MATCHED_ATTENTION_COMPLEMENT", "keep_cross_class_matched"),
+            ),
+        }
+
+        def encode_groups(
+            groups,
+        ):
+            valid_groups=[
+                (mode, images, selected_rows)
+                for mode, images, selected_rows in groups
+                if mode in compute_set
+                and len(selected_rows) > 0
+                and images.shape[0] > 0
+            ]
+            if not valid_groups:
+                return
+
+            combined=torch.cat(
+                [images.contiguous() for _, images, _ in valid_groups], dim=0
+            )
+            forward_batch=32 if device.type == "cuda" else 4
+            embedding_chunks=[]
+            for begin in range(0, combined.shape[0], forward_batch):
+                images_device=DataStage.move_tensor(
+                    combined[begin : begin + forward_batch], device
+                )
+                with DataStage.autocast(device):
+                    output=extractor(images_device)
+                embedding_chunks.append(output.float().cpu())
+                del images_device, output
+
+            embeddings=torch.cat(embedding_chunks, dim=0).numpy().astype(np.float32)
+            cursor=0
+            for mode, images, selected_rows in valid_groups:
+                count=int(images.shape[0])
+                current_embeddings=embeddings[cursor : cursor + count]
+                pool.add(mode, current_embeddings, selected_rows)
+
+                for alias_mode, selector_field in alias_rules.get(mode, ()):
+                    if alias_mode not in compute_set:
+                        continue
+                    alias_positions=[
+                        position
+                        for position, row in enumerate(selected_rows)
+                        if DataStage._as_int(row.get(selector_field), 0) == 1
+                    ]
+                    if alias_positions:
+                        index_array=np.asarray(alias_positions, dtype=np.int64)
+                        pool.add(
+                            alias_mode,
+                            current_embeddings[index_array],
+                            [selected_rows[position] for position in alias_positions],
+                        )
+                cursor +=count
+            del combined, embeddings, embedding_chunks
+
+        with torch.inference_mode():
+            for robust, raw, content, attention, manual, indices in tqdm(
+                loader, desc=f"EfficientNet feature bank ({device.type})"):
+                batch_rows=[rows[int(index)] for index in indices]
+                attention_positions=[
                     position
-                    for position, row in enumerate(selected_rows)
-                    if _as_int(row.get(selector_field), 0) == 1
+                    for position, row in enumerate(batch_rows)
+                    if row["keep_attention"] == 1
                 ]
-                if alias_positions:
-                    index_array=np.asarray(alias_positions, dtype=np.int64)
-                    pool.add(
-                        alias_mode,
-                        current_embeddings[index_array],
-                        [selected_rows[position] for position in alias_positions],
+                matched_positions=[
+                    position
+                    for position, row in enumerate(batch_rows)
+                    if row["keep_cross_class_matched"] == 1
+                ]
+                manual_positions=[
+                    position
+                    for position, row in enumerate(batch_rows)
+                    if row["keep_manual_matched"] == 1
+                ]
+
+                groups=[]
+
+                # One full-image pass supplies B0 and, through exact row subsets,
+                # B2 and B1. During an incremental migration, B2 alone is computed
+                # on the Attention-eligible rows while all previous modes are reused.
+                if "B0_FULL_IMAGE" in compute_set:
+                    groups.append(("B0_FULL_IMAGE", robust, batch_rows))
+                elif (
+                    "B2_ATTENTION_ELIGIBLE_FULL_IMAGE" in compute_set
+                    and attention_positions):
+                    positions=torch.as_tensor(attention_positions, dtype=torch.long)
+                    groups.append(
+                        (
+                            "B2_ATTENTION_ELIGIBLE_FULL_IMAGE",
+                            robust.index_select(0, positions),
+                            [batch_rows[position] for position in attention_positions],
+                        )
                     )
-            cursor +=count
-        del combined, embeddings, embedding_chunks
-
-    with torch.inference_mode():
-        for robust, raw, content, attention, manual, indices in tqdm(
-            loader, desc=f"EfficientNet feature bank ({device.type})"):
-            batch_rows=[rows[int(index)] for index in indices]
-            attention_positions=[
-                position
-                for position, row in enumerate(batch_rows)
-                if row["keep_attention"] == 1
-            ]
-            matched_positions=[
-                position
-                for position, row in enumerate(batch_rows)
-                if row["keep_cross_class_matched"] == 1
-            ]
-            manual_positions=[
-                position
-                for position, row in enumerate(batch_rows)
-                if row["keep_manual_matched"] == 1
-            ]
-
-            groups=[]
-
-            # One full-image pass supplies B0 and, through exact row subsets,
-            # B2 and B1. During an incremental migration, B2 alone is computed
-            # on the Attention-eligible rows while all previous modes are reused.
-            if "B0_FULL_IMAGE" in compute_set:
-                groups.append(("B0_FULL_IMAGE", robust, batch_rows))
-            elif (
-                "B2_ATTENTION_ELIGIBLE_FULL_IMAGE" in compute_set
-                and attention_positions):
-                positions=torch.as_tensor(attention_positions, dtype=torch.long)
-                groups.append(
-                    (
-                        "B2_ATTENTION_ELIGIBLE_FULL_IMAGE",
-                        robust.index_select(0, positions),
-                        [batch_rows[position] for position in attention_positions],
+                elif "B1_MATCHED_FULL_IMAGE" in compute_set and matched_positions:
+                    positions=torch.as_tensor(matched_positions, dtype=torch.long)
+                    groups.append(
+                        (
+                            "B1_MATCHED_FULL_IMAGE",
+                            robust.index_select(0, positions),
+                            [batch_rows[position] for position in matched_positions],
+                        )
                     )
-                )
-            elif "B1_MATCHED_FULL_IMAGE" in compute_set and matched_positions:
-                positions=torch.as_tensor(matched_positions, dtype=torch.long)
-                groups.append(
-                    (
-                        "B1_MATCHED_FULL_IMAGE",
-                        robust.index_select(0, positions),
-                        [batch_rows[position] for position in matched_positions],
-                    )
-                )
 
-            needs_automatic_regions=bool(
-                compute_set
-                & {
-                    "AU1_ATTENTION_ROI",
-                    "C1_ATTENTION_COMPLEMENT",
-                    "AU2_MATCHED_ATTENTION_ROI",
-                    "C2_MATCHED_ATTENTION_COMPLEMENT",
-                }
-            )
-            if needs_automatic_regions:
-                use_attention_superset=bool(
+                needs_automatic_regions=bool(
                     compute_set
-                    & {"AU1_ATTENTION_ROI", "C1_ATTENTION_COMPLEMENT"}
+                    & {
+                        "AU1_ATTENTION_ROI",
+                        "C1_ATTENTION_COMPLEMENT",
+                        "AU2_MATCHED_ATTENTION_ROI",
+                        "C2_MATCHED_ATTENTION_COMPLEMENT",
+                    }
                 )
-                automatic_positions=(
-                    attention_positions if use_attention_superset else matched_positions
-                )
-                if automatic_positions:
-                    positions=torch.as_tensor(
-                        automatic_positions, dtype=torch.long
+                if needs_automatic_regions:
+                    use_attention_superset=bool(
+                        compute_set
+                        & {"AU1_ATTENTION_ROI", "C1_ATTENTION_COMPLEMENT"}
                     )
+                    automatic_positions=(
+                        attention_positions if use_attention_superset else matched_positions
+                    )
+                    if automatic_positions:
+                        positions=torch.as_tensor(
+                            automatic_positions, dtype=torch.long
+                        )
+                        selected_raw=raw.index_select(0, positions)
+                        selected_content=content.index_select(0, positions)
+                        selected_mask=attention.index_select(0, positions)
+                        support=FeatureStage.support_mask(
+                            selected_mask, selected_content
+                        )
+                        selected_rows=[
+                            batch_rows[position] for position in automatic_positions
+                        ]
+
+                        if "AU1_ATTENTION_ROI" in compute_set:
+                            roi_mode="AU1_ATTENTION_ROI"
+                        elif "AU2_MATCHED_ATTENTION_ROI" in compute_set:
+                            roi_mode="AU2_MATCHED_ATTENTION_ROI"
+                        else:
+                            roi_mode=""
+                        if roi_mode:
+                            groups.append(
+                                (
+                                    roi_mode,
+                                    FeatureStage.region_normalize(
+                                        selected_raw, support
+                                    ),
+                                    selected_rows,
+                                )
+                            )
+
+                        if "C1_ATTENTION_COMPLEMENT" in compute_set:
+                            complement_mode="C1_ATTENTION_COMPLEMENT"
+                        elif "C2_MATCHED_ATTENTION_COMPLEMENT" in compute_set:
+                            complement_mode="C2_MATCHED_ATTENTION_COMPLEMENT"
+                        else:
+                            complement_mode=""
+                        if complement_mode:
+                            groups.append(
+                                (
+                                    complement_mode,
+                                    FeatureStage.region_normalize(
+                                        selected_raw,
+                                        (selected_content > 0.5).float()
+                                        * (1.0 - support),
+                                    ),
+                                    selected_rows,
+                                )
+                            )
+
+                if (
+                    compute_set & FeatureStage.MANUAL_SUBSET_MODES
+                    and manual_positions):
+                    positions=torch.as_tensor(manual_positions, dtype=torch.long)
                     selected_raw=raw.index_select(0, positions)
                     selected_content=content.index_select(0, positions)
-                    selected_mask=attention.index_select(0, positions)
-                    support=support_mask(
-                        selected_mask, selected_content
+                    manual_mask=manual.index_select(0, positions)
+                    attention_mask=attention.index_select(0, positions)
+                    manual_support=FeatureStage.support_mask(
+                        manual_mask, selected_content
+                    )
+                    attention_support=FeatureStage.support_mask(
+                        attention_mask, selected_content
                     )
                     selected_rows=[
-                        batch_rows[position] for position in automatic_positions
+                        batch_rows[position] for position in manual_positions
                     ]
-
-                    if "AU1_ATTENTION_ROI" in compute_set:
-                        roi_mode="AU1_ATTENTION_ROI"
-                    elif "AU2_MATCHED_ATTENTION_ROI" in compute_set:
-                        roi_mode="AU2_MATCHED_ATTENTION_ROI"
-                    else:
-                        roi_mode=""
-                    if roi_mode:
-                        groups.append(
-                            (
-                                roi_mode,
-                                region_normalize(
-                                    selected_raw, support
-                                ),
-                                selected_rows,
-                            )
-                        )
-
-                    if "C1_ATTENTION_COMPLEMENT" in compute_set:
-                        complement_mode="C1_ATTENTION_COMPLEMENT"
-                    elif "C2_MATCHED_ATTENTION_COMPLEMENT" in compute_set:
-                        complement_mode="C2_MATCHED_ATTENTION_COMPLEMENT"
-                    else:
-                        complement_mode=""
-                    if complement_mode:
-                        groups.append(
-                            (
-                                complement_mode,
-                                region_normalize(
-                                    selected_raw,
-                                    (selected_content > 0.5).float()
-                                    * (1.0 - support),
-                                ),
-                                selected_rows,
-                            )
-                        )
-
-            if (
-                compute_set & MANUAL_SUBSET_MODES
-                and manual_positions):
-                positions=torch.as_tensor(manual_positions, dtype=torch.long)
-                selected_raw=raw.index_select(0, positions)
-                selected_content=content.index_select(0, positions)
-                manual_mask=manual.index_select(0, positions)
-                attention_mask=attention.index_select(0, positions)
-                manual_support=support_mask(
-                    manual_mask, selected_content
-                )
-                attention_support=support_mask(
-                    attention_mask, selected_content
-                )
-                selected_rows=[
-                    batch_rows[position] for position in manual_positions
-                ]
-                visible_content=(selected_content > 0.5).float()
-                manual_groups=(
-                    (
-                        "M1_MANUAL_ROI",
-                        region_normalize(
-                            selected_raw, manual_support
+                    visible_content=(selected_content > 0.5).float()
+                    manual_groups=(
+                        (
+                            "M1_MANUAL_ROI",
+                            FeatureStage.region_normalize(
+                                selected_raw, manual_support
+                            ),
                         ),
-                    ),
-                    (
-                        "C3_MANUAL_COMPLEMENT",
-                        region_normalize(
-                            selected_raw,
-                            visible_content * (1.0 - manual_support),
+                        (
+                            "C3_MANUAL_COMPLEMENT",
+                            FeatureStage.region_normalize(
+                                selected_raw,
+                                visible_content * (1.0 - manual_support),
+                            ),
                         ),
-                    ),
-                    (
-                        "AU3_ATTENTION_ROI_MANUAL_SUBSET",
-                        region_normalize(
-                            selected_raw, attention_support
+                        (
+                            "AU3_ATTENTION_ROI_MANUAL_SUBSET",
+                            FeatureStage.region_normalize(
+                                selected_raw, attention_support
+                            ),
                         ),
-                    ),
-                    (
-                        "C4_ATTENTION_COMPLEMENT_MANUAL_SUBSET",
-                        region_normalize(
-                            selected_raw,
-                            visible_content * (1.0 - attention_support),
+                        (
+                            "C4_ATTENTION_COMPLEMENT_MANUAL_SUBSET",
+                            FeatureStage.region_normalize(
+                                selected_raw,
+                                visible_content * (1.0 - attention_support),
+                            ),
                         ),
-                    ),
-                )
-                groups.extend(
-                    (mode, images, selected_rows)
-                    for mode, images in manual_groups
-                    if mode in compute_set
-                )
+                    )
+                    groups.extend(
+                        (mode, images, selected_rows)
+                        for mode, images in manual_groups
+                        if mode in compute_set
+                    )
 
-            encode_groups(groups)
-            del groups
+                encode_groups(groups)
+                del groups
 
-    computed_bank={
-        mode: pool.finalize(mode)
-        for mode in modes_to_compute
-    }
-    bank=dict(reusable_bank)
-    bank.update(computed_bank)
-    missing_modes=[
-        mode for mode in MODES if mode not in bank
-    ]
-    if missing_modes:
-        raise RuntimeError(
-            f"Feature-bank rebuild is missing modes: {missing_modes}"
-        )
-
-    validate_cohort_alignment(bank)
-    print("[FEATURES] all experiment representations built in memory")
-    del extractor, loader
-    release_device(device)
-    return bank
-
-
-# -----------------------------------------------------------------------------
-# PIPELINE STEP 7 — patient-level evaluation and paired comparisons
-# -----------------------------------------------------------------------------
-
-
-# Number of patient-level bootstrap samples used for confidence intervals.
-BOOTSTRAP_REPEATS=2000
-
-
-# Build classifier pipeline.
-def build_classifier_pipeline(c_value):
-    return SklearnPipeline(
-        [
-            ("scale", StandardScaler()),
-            (
-                "pca",
-                PCA(
-                    n_components=0.95,
-                    svd_solver="full",
-                ),
-            ),
-            (
-                "classifier",
-                LogisticRegression(
-                    C=float(c_value),
-                    class_weight="balanced",
-                    solver="liblinear",
-                    max_iter=5000,
-                    random_state=RANDOM_SEED,
-                ),
-            ),
+        computed_bank={
+            mode: pool.finalize(mode)
+            for mode in modes_to_compute
+        }
+        bank=dict(reusable_bank)
+        bank.update(computed_bank)
+        missing_modes=[
+            mode for mode in FeatureStage.MODES if mode not in bank
         ]
-    )
+        if missing_modes:
+            raise RuntimeError(
+                f"Feature-bank rebuild is missing modes: {missing_modes}"
+            )
 
-# Choose the probability threshold maximizing sensitivity + specificity - 1.
-def youden_threshold(labels, scores):
-    fpr, tpr, thresholds=roc_curve(labels, scores)
-    finite=np.isfinite(thresholds)
-    if not np.any(finite):
-        return 0.5
-    index=np.argmax((tpr - fpr)[finite])
-    return float(thresholds[finite][index])
+        FeatureStage.validate_cohort_alignment(bank)
+        print("[FEATURES] all experiment representations built in memory")
+        del extractor, loader
+        DataStage.release_device(device)
+        return bank
 
-# Select c and threshold.
-def select_c_and_threshold(X, y, seed):
-    class_counts=np.bincount(y, minlength=2)
-    n_splits=min(3, int(class_counts.min()))
-    if n_splits < 2:
-        return 1.0, 0.5
-    splitter=StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
-    best_c, best_auc, best_scores=1.0, -np.inf, None
-    for c_value in (0.01, 0.1, 1.0, 10.0):
-        scores=np.full(len(y), np.nan, dtype=np.float64)
-        for train_index, valid_index in splitter.split(X, y):
-            model=build_classifier_pipeline(c_value)
-            model.fit(X[train_index], y[train_index])
-            scores[valid_index]=model.predict_proba(X[valid_index])[:, 1]
-        auc=roc_auc_score(y, scores)
-        if (auc, -abs(math.log10(c_value))) > (best_auc, -abs(math.log10(best_c))):
-            best_c, best_auc, best_scores=float(c_value), float(auc), scores.copy()
-    threshold=youden_threshold(y, best_scores)
-    return best_c, threshold
+# =============================================================================
+# STAGE 6 — PATIENT-LEVEL EVALUATION
+# =============================================================================
+class EvaluationStage:
+    """Nested CV, confidence intervals, and paired AUC comparisons."""
 
-# Create deterministic stratified outer/inner folds over patients, never slices.
-def patient_fold_map(reference):
-    patients=np.asarray(reference["patient_ids"]).astype(str)
-    labels=np.asarray(reference["y"], dtype=np.int64)
-    class_counts=np.bincount(labels, minlength=2)
-    n_splits=min(5, int(class_counts.min()))
-    if n_splits < 2:
-        raise RuntimeError("At least two patients are required in each class.")
-    splitter=StratifiedKFold(
-        n_splits=n_splits,
-        shuffle=True,
-        random_state=RANDOM_SEED,
-    )
-    mapping={}
-    for fold, (_, valid_index) in enumerate(splitter.split(np.zeros(len(labels)), labels), start=1):
-        for index in valid_index:
-            mapping[patients[index]]=fold
-    return mapping
-
-# Bootstrap patient-level AUC to report a sampling confidence interval.
-def auc_confidence_interval(labels, scores, repeats, seed):
-    rng=np.random.default_rng(seed)
-    values=[]
-    for _ in range(int(repeats)):
-        indices=rng.integers(0, len(labels), size=len(labels))
-        if len(np.unique(labels[indices])) < 2:
-            continue
-        values.append(roc_auc_score(labels[indices], scores[indices]))
-    if not values:
-        return np.nan, np.nan
-    return float(np.quantile(values, 0.025)), float(np.quantile(values, 0.975))
-
-# Calculate classification metrics.
-def classification_metrics(labels, scores, predictions):
-    tn, fp, fn, tp=confusion_matrix(labels, predictions, labels=[0, 1]).ravel()
-    ci_low, ci_high=auc_confidence_interval(
-        labels,
-        scores,
-        BOOTSTRAP_REPEATS,
-        RANDOM_SEED + 9000,
-    )
-    return {
-        "auc": float(roc_auc_score(labels, scores)),
-        "auc_ci_low": ci_low,
-        "auc_ci_high": ci_high,
-        "average_precision": float(average_precision_score(labels, scores)),
-        "brier": float(brier_score_loss(labels, scores)),
-        "accuracy": float(np.mean(predictions == labels)),
-        "sensitivity": float(tp / max(1, tp + fn)),
-        "specificity": float(tn / max(1, tn + fp)),
-    }
-
-# Calculate paired auc difference.
-def paired_auc_difference(
-    first,
-    second,
-    repeats,
-    seed,
-):
-    merged=first.merge(second, on=["patient_id", "true_label"], suffixes=("_first", "_second"))
-    labels=merged["true_label"].to_numpy(dtype=np.int64)
-    first_scores=merged["score_first"].to_numpy(dtype=np.float64)
-    second_scores=merged["score_second"].to_numpy(dtype=np.float64)
-    if len(merged) < 4 or len(np.unique(labels)) < 2:
+    # Build classifier pipeline.
+    @staticmethod
+    def build_classifier_pipeline(c_value):
+        return SklearnPipeline(
+            [
+                ("scale", StandardScaler()),
+                (
+                    "pca",
+                    PCA(
+                        n_components=0.95,
+                        svd_solver="full",
+                    ),
+                ),
+                (
+                    "classifier",
+                    LogisticRegression(
+                        C=float(c_value),
+                        class_weight="balanced",
+                        solver="liblinear",
+                        max_iter=5000,
+                        random_state=42,
+                    ),
+                ),
+            ]
+        )
+    # Choose the probability threshold maximizing sensitivity + specificity - 1.
+    @staticmethod
+    def youden_threshold(labels, scores):
+        fpr, tpr, thresholds=roc_curve(labels, scores)
+        finite=np.isfinite(thresholds)
+        if not np.any(finite):
+            return 0.5
+        index=np.argmax((tpr - fpr)[finite])
+        return float(thresholds[finite][index])
+    # Select c and threshold.
+    @staticmethod
+    def select_c_and_threshold(X, y, seed):
+        class_counts=np.bincount(y, minlength=2)
+        n_splits=min(3, int(class_counts.min()))
+        if n_splits < 2:
+            return 1.0, 0.5
+        splitter=StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+        best_c, best_auc, best_scores=1.0, -np.inf, None
+        for c_value in (0.01, 0.1, 1.0, 10.0):
+            scores=np.full(len(y), np.nan, dtype=np.float64)
+            for train_index, valid_index in splitter.split(X, y):
+                model=EvaluationStage.build_classifier_pipeline(c_value)
+                model.fit(X[train_index], y[train_index])
+                scores[valid_index]=model.predict_proba(X[valid_index])[:, 1]
+            auc=roc_auc_score(y, scores)
+            if (auc, -abs(math.log10(c_value))) > (best_auc, -abs(math.log10(best_c))):
+                best_c, best_auc, best_scores=float(c_value), float(auc), scores.copy()
+        threshold=EvaluationStage.youden_threshold(y, best_scores)
+        return best_c, threshold
+    # Create deterministic stratified outer/inner folds over patients, never slices.
+    @staticmethod
+    def patient_fold_map(reference):
+        patients=np.asarray(reference["patient_ids"]).astype(str)
+        labels=np.asarray(reference["y"], dtype=np.int64)
+        class_counts=np.bincount(labels, minlength=2)
+        n_splits=min(5, int(class_counts.min()))
+        if n_splits < 2:
+            raise RuntimeError("At least two patients are required in each class.")
+        splitter=StratifiedKFold(
+            n_splits=n_splits,
+            shuffle=True,
+            random_state=42,
+        )
+        mapping={}
+        for fold, (_, valid_index) in enumerate(splitter.split(np.zeros(len(labels)), labels), start=1):
+            for index in valid_index:
+                mapping[patients[index]]=fold
+        return mapping
+    # Bootstrap patient-level AUC to report a sampling confidence interval.
+    @staticmethod
+    def auc_confidence_interval(labels, scores, repeats, seed):
+        rng=np.random.default_rng(seed)
+        values=[]
+        for _ in range(int(repeats)):
+            indices=rng.integers(0, len(labels), size=len(labels))
+            if len(np.unique(labels[indices])) < 2:
+                continue
+            values.append(roc_auc_score(labels[indices], scores[indices]))
+        if not values:
+            return np.nan, np.nan
+        return float(np.quantile(values, 0.025)), float(np.quantile(values, 0.975))
+    # Calculate classification metrics.
+    @staticmethod
+    def classification_metrics(labels, scores, predictions):
+        tn, fp, fn, tp=confusion_matrix(labels, predictions, labels=[0, 1]).ravel()
+        ci_low, ci_high=EvaluationStage.auc_confidence_interval(
+            labels,
+            scores,
+            2000,
+            42 + 9000,
+        )
+        return {
+            "auc": float(roc_auc_score(labels, scores)),
+            "auc_ci_low": ci_low,
+            "auc_ci_high": ci_high,
+            "average_precision": float(average_precision_score(labels, scores)),
+            "brier": float(brier_score_loss(labels, scores)),
+            "accuracy": float(np.mean(predictions == labels)),
+            "sensitivity": float(tp / max(1, tp + fn)),
+            "specificity": float(tn / max(1, tn + fp)),
+        }
+    # Calculate paired auc difference.
+    @staticmethod
+    def paired_auc_difference(
+        first,
+        second,
+        repeats,
+        seed,
+    ):
+        merged=first.merge(second, on=["patient_id", "true_label"], suffixes=("_first", "_second"))
+        labels=merged["true_label"].to_numpy(dtype=np.int64)
+        first_scores=merged["score_first"].to_numpy(dtype=np.float64)
+        second_scores=merged["score_second"].to_numpy(dtype=np.float64)
+        if len(merged) < 4 or len(np.unique(labels)) < 2:
+            return {
+                "n_patients": len(merged),
+                "auc_difference_first_minus_second": np.nan,
+                "ci_low": np.nan,
+                "ci_high": np.nan,
+            }
+        observed=float(roc_auc_score(labels, first_scores) - roc_auc_score(labels, second_scores))
+        rng=np.random.default_rng(seed)
+        differences=[]
+        for _ in range(int(repeats)):
+            indices=rng.integers(0, len(labels), size=len(labels))
+            if len(np.unique(labels[indices])) < 2:
+                continue
+            differences.append(
+                roc_auc_score(labels[indices], first_scores[indices])
+                - roc_auc_score(labels[indices], second_scores[indices])
+            )
         return {
             "n_patients": len(merged),
-            "auc_difference_first_minus_second": np.nan,
-            "ci_low": np.nan,
-            "ci_high": np.nan,
+            "auc_difference_first_minus_second": observed,
+            "ci_low": float(np.quantile(differences, 0.025)) if differences else np.nan,
+            "ci_high": float(np.quantile(differences, 0.975)) if differences else np.nan,
         }
-    observed=float(roc_auc_score(labels, first_scores) - roc_auc_score(labels, second_scores))
-    rng=np.random.default_rng(seed)
-    differences=[]
-    for _ in range(int(repeats)):
-        indices=rng.integers(0, len(labels), size=len(labels))
-        if len(np.unique(labels[indices])) < 2:
-            continue
-        differences.append(
-            roc_auc_score(labels[indices], first_scores[indices])
-            - roc_auc_score(labels[indices], second_scores[indices])
-        )
-    return {
-        "n_patients": len(merged),
-        "auc_difference_first_minus_second": observed,
-        "ci_low": float(np.quantile(differences, 0.025)) if differences else np.nan,
-        "ci_high": float(np.quantile(differences, 0.975)) if differences else np.nan,
-    }
+    # All hyperparameters and probability thresholds are selected inside the outer
+    # training fold. The held-out patients are used once, only for OOF scoring.
+    @staticmethod
+    def evaluate_experiments(bank, workspace):
+        fold_map=EvaluationStage.patient_fold_map(bank["B0_FULL_IMAGE"])
+        summary_rows=[]
+        prediction_tables={}
 
-# All hyperparameters and probability thresholds are selected inside the outer
-# training fold. The held-out patients are used once, only for OOF scoring.
-def evaluate_experiments(bank, workspace):
-    fold_map=patient_fold_map(bank["B0_FULL_IMAGE"])
-    summary_rows=[]
-    prediction_tables={}
+        for mode in FeatureStage.MODES:
+            values=bank[mode]
+            X=np.asarray(values["X"], dtype=np.float32)
+            y=np.asarray(values["y"], dtype=np.int64)
+            patients=np.asarray(values["patient_ids"]).astype(str)
+            if len(np.unique(y)) < 2:
+                raise RuntimeError(f"{mode}: one class is missing.")
+            unknown=sorted(set(patients) - set(fold_map))
+            if unknown:
+                raise RuntimeError(f"{mode}: patients missing from the fold map: {unknown}")
+            patient_folds=np.asarray([fold_map[patient] for patient in patients], dtype=np.int64)
+            scores=np.full(len(y), np.nan, dtype=np.float64)
+            predictions=np.full(len(y), -1, dtype=np.int64)
+            selected_cs=np.full(len(y), np.nan, dtype=np.float64)
+            thresholds=np.full(len(y), np.nan, dtype=np.float64)
 
-    for mode in MODES:
-        values=bank[mode]
-        X=np.asarray(values["X"], dtype=np.float32)
-        y=np.asarray(values["y"], dtype=np.int64)
-        patients=np.asarray(values["patient_ids"]).astype(str)
-        if len(np.unique(y)) < 2:
-            raise RuntimeError(f"{mode}: one class is missing.")
-        unknown=sorted(set(patients) - set(fold_map))
-        if unknown:
-            raise RuntimeError(f"{mode}: patients missing from the fold map: {unknown}")
-        patient_folds=np.asarray([fold_map[patient] for patient in patients], dtype=np.int64)
-        scores=np.full(len(y), np.nan, dtype=np.float64)
-        predictions=np.full(len(y), -1, dtype=np.int64)
-        selected_cs=np.full(len(y), np.nan, dtype=np.float64)
-        thresholds=np.full(len(y), np.nan, dtype=np.float64)
-
-        for fold in sorted(np.unique(patient_folds)):
-            train_index=np.flatnonzero(patient_folds != fold)
-            valid_index=np.flatnonzero(patient_folds == fold)
-            if len(np.unique(y[train_index])) < 2:
-                raise RuntimeError(
-                    f"{mode}: fold {fold} does not contain both classes in training. "
-                    "The matched cohort is too sparse; inspect the matching summary."
+            for fold in sorted(np.unique(patient_folds)):
+                train_index=np.flatnonzero(patient_folds != fold)
+                valid_index=np.flatnonzero(patient_folds == fold)
+                if len(np.unique(y[train_index])) < 2:
+                    raise RuntimeError(
+                        f"{mode}: fold {fold} does not contain both classes in training. "
+                        "The matched cohort is too sparse; inspect the matching summary."
+                    )
+                best_c, threshold=EvaluationStage.select_c_and_threshold(
+                    X[train_index], y[train_index], 42 + int(fold)
                 )
-            best_c, threshold=select_c_and_threshold(
-                X[train_index], y[train_index], RANDOM_SEED + int(fold)
+                model=EvaluationStage.build_classifier_pipeline(best_c)
+                model.fit(X[train_index], y[train_index])
+                fold_scores=model.predict_proba(X[valid_index])[:, 1]
+                scores[valid_index]=fold_scores
+                predictions[valid_index]=(fold_scores >= threshold).astype(np.int64)
+                selected_cs[valid_index]=best_c
+                thresholds[valid_index]=threshold
+
+            if not np.all(np.isfinite(scores)) or np.any(predictions < 0):
+                raise RuntimeError(f"{mode}: incomplete OOF predictions.")
+            metrics=EvaluationStage.classification_metrics(y, scores, predictions)
+            table=pd.DataFrame(
+                {
+                    "patient_id": patients,
+                    "true_label": y,
+                    "outer_fold": patient_folds,
+                    "score": scores,
+                    "predicted_label": predictions,
+                    "selected_c": selected_cs,
+                    "training_threshold": thresholds,
+                }
+            ).sort_values("patient_id")
+            prediction_tables[mode]=table
+            summary_rows.append(
+                {
+                    "mode": mode,
+                    "experiment_group": (
+                        "primary"
+                        if mode in FeatureStage.MODES[:7]
+                        else "mask_validation"
+                    ),
+                    "description": FeatureStage.MODE_DESCRIPTIONS[mode],
+                    "cohort": FeatureStage.MODE_COHORTS[mode],
+                    "patients": len(patients),
+                    "source_slices": values["source_slices"],
+                    "series_proxies": values["series_proxies"],
+                    **metrics,
+                }
             )
-            model=build_classifier_pipeline(best_c)
-            model.fit(X[train_index], y[train_index])
-            fold_scores=model.predict_proba(X[valid_index])[:, 1]
-            scores[valid_index]=fold_scores
-            predictions[valid_index]=(fold_scores >= threshold).astype(np.int64)
-            selected_cs[valid_index]=best_c
-            thresholds[valid_index]=threshold
+            print(
+                f"[EVALUATION] {mode}: AUC={metrics['auc']:.3f} "
+                f"AP={metrics['average_precision']:.3f} Brier={metrics['brier']:.3f}"
+            )
 
-        if not np.all(np.isfinite(scores)) or np.any(predictions < 0):
-            raise RuntimeError(f"{mode}: incomplete OOF predictions.")
-        metrics=classification_metrics(y, scores, predictions)
-        table=pd.DataFrame(
-            {
-                "patient_id": patients,
-                "true_label": y,
-                "outer_fold": patient_folds,
-                "score": scores,
-                "predicted_label": predictions,
-                "selected_c": selected_cs,
-                "training_threshold": thresholds,
-            }
-        ).sort_values("patient_id")
-        prediction_tables[mode]=table
-        summary_rows.append(
-            {
-                "mode": mode,
-                "experiment_group": (
-                    "primary"
-                    if mode in MODES[:7]
-                    else "mask_validation"
-                ),
-                "description": MODE_DESCRIPTIONS[mode],
-                "cohort": MODE_COHORTS[mode],
-                "patients": len(patients),
-                "source_slices": values["source_slices"],
-                "series_proxies": values["series_proxies"],
-                **metrics,
-            }
+        summary=pd.DataFrame(summary_rows).sort_values("auc", ascending=False)
+
+        comparisons=[]
+        for first_mode, second_mode, question in (
+            (
+                "AU1_ATTENTION_ROI",
+                "B2_ATTENTION_ELIGIBLE_FULL_IMAGE",
+                "same_attention_eligible_slices_roi_vs_full_image",
+            ),
+            (
+                "B2_ATTENTION_ELIGIBLE_FULL_IMAGE",
+                "C1_ATTENTION_COMPLEMENT",
+                "same_attention_eligible_slices_full_image_vs_complement",
+            ),
+            (
+                "AU1_ATTENTION_ROI",
+                "C1_ATTENTION_COMPLEMENT",
+                "same_attention_eligible_slices_roi_vs_complement",
+            ),
+            (
+                "B2_ATTENTION_ELIGIBLE_FULL_IMAGE",
+                "B0_FULL_IMAGE",
+                "attention_eligible_selection_effect_on_full_image",
+            ),
+            (
+                "AU2_MATCHED_ATTENTION_ROI",
+                "B1_MATCHED_FULL_IMAGE",
+                "cross_class_matched_roi_vs_full_image",
+            ),
+            (
+                "AU2_MATCHED_ATTENTION_ROI",
+                "C2_MATCHED_ATTENTION_COMPLEMENT",
+                "cross_class_matched_roi_vs_complement",
+            ),
+            (
+                "B1_MATCHED_FULL_IMAGE",
+                "C2_MATCHED_ATTENTION_COMPLEMENT",
+                "cross_class_matched_full_image_vs_complement",
+            ),
+            (
+                "B0_FULL_IMAGE",
+                "B1_MATCHED_FULL_IMAGE",
+                "all_slices_vs_cross_class_matched_full_image",
+            ),
+            (
+                "AU1_ATTENTION_ROI",
+                "AU2_MATCHED_ATTENTION_ROI",
+                "attention_eligible_vs_cross_class_matched_roi",
+            ),
+            (
+                "C1_ATTENTION_COMPLEMENT",
+                "C2_MATCHED_ATTENTION_COMPLEMENT",
+                "attention_eligible_vs_cross_class_matched_complement",
+            ),
+            (
+                "M1_MANUAL_ROI",
+                "AU3_ATTENTION_ROI_MANUAL_SUBSET",
+                "manual_vs_attention_roi_same_images",
+            ),
+            (
+                "C3_MANUAL_COMPLEMENT",
+                "C4_ATTENTION_COMPLEMENT_MANUAL_SUBSET",
+                "manual_vs_attention_complement_same_images",
+            ),):
+            comparison=EvaluationStage.paired_auc_difference(
+                prediction_tables[first_mode],
+                prediction_tables[second_mode],
+                2000,
+                42 + len(comparisons) * 100,
+            )
+            comparisons.append(
+                {
+                    "comparison": question,
+                    "first_mode": first_mode,
+                    "second_mode": second_mode,
+                    **comparison,
+                }
+            )
+        return summary, pd.DataFrame(comparisons)
+
+# =============================================================================
+# STAGE 7 — SIMPLE USER API
+# =============================================================================
+class Pipeline:
+    """Only two commands are needed: Pipeline.run() and Pipeline.review()."""
+
+    last_run = None  # current-session state only; never written as history
+
+    @staticmethod
+    def run(dataset_path=None, manual_root=None, minimum_masks=None):
+        """Retrain and reevaluate the complete research pipeline from scratch."""
+        line="=" * 88
+        print(f"\n{line}\nCARDIAC MRI CAD — FRESH FULL RUN\n{line}")
+
+        # STEP 1 — DATASET ---------------------------------------------------------
+        DataStage.seed_everything(include_cuda=False)
+        dataset_path=Path(dataset_path or DataStage._default_dataset_path())
+        workspace=DataStage.create_workspace(manual_root)
+        samples=DataStage.discover_dataset(dataset_path, workspace)
+        rows=DataStage.build_dataset_rows(samples, workspace)
+        print(f"[PERSISTENT] manual masks: {workspace.manual_masks}")
+        print(f"[PERSISTENT] manual labels: {workspace.manual_annotations}")
+        print(f"[TEMPORARY] this run only: {workspace.root}")
+
+        # STEP 2 — QUALITY + MANUAL TARGETS --------------------------------------
+        # Quality is measured again because no audit history is retained.
+        quality=DataStage.build_quality_audit(rows, workspace, refresh=True)
+        accepted, manual_summary=DataStage.audit_manual_masks(
+            rows, quality, workspace, minimum_masks=minimum_masks
         )
-        print(
-            f"[EVALUATION] {mode}: AUC={metrics['auc']:.3f} "
-            f"AP={metrics['average_precision']:.3f} Brier={metrics['brier']:.3f}"
+        print("\n[MANUAL TARGETS]")
+        display(pd.DataFrame([manual_summary]))
+
+        # STEP 3 — ATTENTION U-NET ------------------------------------------------
+        # Every fold is retrained. Patient k never appears in the model/calibration
+        # that predicts patient k, so all automatic masks remain genuinely OOF.
+        device=DataStage.start_device_stage("cuda", "Attention U-Net training")
+        try:
+            checkpoints=AttentionStage.train_attention_crossfit(accepted, workspace, device)
+        finally:
+            DataStage.finish_device_stage(device, "Attention U-Net training")
+
+        device=DataStage.start_device_stage("cuda", "Attention U-Net OOF prediction")
+        try:
+            predictions=AttentionStage.predict_attention_masks(rows, workspace, device, checkpoints)
+        finally:
+            DataStage.finish_device_stage(device, "Attention U-Net OOF prediction")
+
+        # STEP 4 — MATCHING -------------------------------------------------------
+        matching=MatchingStage.build_cross_class_matching(rows, workspace)
+        matching_summary=DataStage.read_json(workspace.cross_class_matching_summary, {}) or {}
+        print("\n[MATCHING]")
+        display(pd.DataFrame([matching_summary]))
+
+        # STEP 5 — FROZEN EFFICIENTNET FEATURES ---------------------------------
+        # ImageNet EfficientNet-B0 is frozen. The same extractor is used for every
+        # full-image / ROI / complement experiment.
+        device=DataStage.start_device_stage("cuda", "EfficientNet feature extraction")
+        try:
+            bank=FeatureStage.build_feature_bank(rows, workspace, device)
+        finally:
+            DataStage.finish_device_stage(device, "EfficientNet feature extraction")
+
+        # STEP 6 — PATIENT-LEVEL EVALUATION -------------------------------------
+        results, comparisons=EvaluationStage.evaluate_experiments(bank, workspace)
+        print("\n[EVALUATION SUMMARY]")
+        display(results)
+        print("\n[PAIRED AUC COMPARISONS]")
+        display(comparisons)
+
+        # Keep only in-memory references for an optional review in this same session.
+        # Starting a new run creates a new temporary workspace and recomputes everything.
+        Pipeline.last_run={
+            "rows": rows,
+            "workspace": workspace,
+            "predictions": predictions,
+            "matching": matching,
+            "feature_bank": bank,
+            "results": results,
+            "comparisons": comparisons,
+        }
+        return LAST_RUN
+    @staticmethod
+    def review(scope="invalid", limit=300, start_index=0, review_round=1, seed=42):
+        """Open the HTML editor for the most recent run and save only manual targets."""
+        if Pipeline.last_run is None:
+            raise RuntimeError("Run Pipeline.run() first so automatic OOF masks exist in this session.")
+
+        rows=Pipeline.last_run["rows"]
+        workspace=Pipeline.last_run["workspace"]
+        DataStage.register_existing_manual_masks(rows, workspace)
+        try:
+            queue=ReviewStage.select_review_rows(
+                rows, workspace, scope=scope, limit=limit, seed=seed, review_round=review_round
+            )
+        except RuntimeError as error:
+            print(error)
+            return None
+
+        # Editor actions persist only the manual PNG and its explicit label. Review
+        # queues/history/automatic masks live under the temporary workspace.
+        editor=MaskEditor(
+            queue,
+            workspace,
+            start_index=start_index,
+            brush_radius=8,  # editor brush radius in pixels
+            review_round=review_round,
+            review_scope=scope,
         )
+        return editor.show()
 
-    summary=pd.DataFrame(summary_rows).sort_values("auc", ascending=False)
-
-    comparisons=[]
-    for first_mode, second_mode, question in (
-        (
-            "AU1_ATTENTION_ROI",
-            "B2_ATTENTION_ELIGIBLE_FULL_IMAGE",
-            "same_attention_eligible_slices_roi_vs_full_image",
-        ),
-        (
-            "B2_ATTENTION_ELIGIBLE_FULL_IMAGE",
-            "C1_ATTENTION_COMPLEMENT",
-            "same_attention_eligible_slices_full_image_vs_complement",
-        ),
-        (
-            "AU1_ATTENTION_ROI",
-            "C1_ATTENTION_COMPLEMENT",
-            "same_attention_eligible_slices_roi_vs_complement",
-        ),
-        (
-            "B2_ATTENTION_ELIGIBLE_FULL_IMAGE",
-            "B0_FULL_IMAGE",
-            "attention_eligible_selection_effect_on_full_image",
-        ),
-        (
-            "AU2_MATCHED_ATTENTION_ROI",
-            "B1_MATCHED_FULL_IMAGE",
-            "cross_class_matched_roi_vs_full_image",
-        ),
-        (
-            "AU2_MATCHED_ATTENTION_ROI",
-            "C2_MATCHED_ATTENTION_COMPLEMENT",
-            "cross_class_matched_roi_vs_complement",
-        ),
-        (
-            "B1_MATCHED_FULL_IMAGE",
-            "C2_MATCHED_ATTENTION_COMPLEMENT",
-            "cross_class_matched_full_image_vs_complement",
-        ),
-        (
-            "B0_FULL_IMAGE",
-            "B1_MATCHED_FULL_IMAGE",
-            "all_slices_vs_cross_class_matched_full_image",
-        ),
-        (
-            "AU1_ATTENTION_ROI",
-            "AU2_MATCHED_ATTENTION_ROI",
-            "attention_eligible_vs_cross_class_matched_roi",
-        ),
-        (
-            "C1_ATTENTION_COMPLEMENT",
-            "C2_MATCHED_ATTENTION_COMPLEMENT",
-            "attention_eligible_vs_cross_class_matched_complement",
-        ),
-        (
-            "M1_MANUAL_ROI",
-            "AU3_ATTENTION_ROI_MANUAL_SUBSET",
-            "manual_vs_attention_roi_same_images",
-        ),
-        (
-            "C3_MANUAL_COMPLEMENT",
-            "C4_ATTENTION_COMPLEMENT_MANUAL_SUBSET",
-            "manual_vs_attention_complement_same_images",
-        ),):
-        comparison=paired_auc_difference(
-            prediction_tables[first_mode],
-            prediction_tables[second_mode],
-            BOOTSTRAP_REPEATS,
-            RANDOM_SEED + len(comparisons) * 100,
-        )
-        comparisons.append(
-            {
-                "comparison": question,
-                "first_mode": first_mode,
-                "second_mode": second_mode,
-                **comparison,
-            }
-        )
-    return summary, pd.DataFrame(comparisons)
-
-
-# -----------------------------------------------------------------------------
-# RUN THE RESEARCH PIPELINE
-# -----------------------------------------------------------------------------
-# Use a Kaggle GPU session and run this function once. Nothing except manual masks
-# and labels is reused from an earlier run.
-LAST_RUN=None
-
-
-def run_pipeline(dataset_path=None, manual_root=None, minimum_masks=None):
-    """Retrain and reevaluate the complete research pipeline from scratch."""
-    global LAST_RUN
-    line="=" * 88
-    print(f"\n{line}\nCARDIAC MRI CAD — FRESH FULL RUN\n{line}")
-
-    # STEP 1 — DATASET ---------------------------------------------------------
-    seed_everything(include_cuda=False)
-    dataset_path=Path(dataset_path or _default_dataset_path())
-    workspace=create_workspace(manual_root)
-    samples=discover_dataset(dataset_path, workspace)
-    rows=build_dataset_rows(samples, workspace)
-    print(f"[PERSISTENT] manual masks: {workspace.manual_masks}")
-    print(f"[PERSISTENT] manual labels: {workspace.manual_annotations}")
-    print(f"[TEMPORARY] this run only: {workspace.root}")
-
-    # STEP 2 — QUALITY + MANUAL TARGETS --------------------------------------
-    # Quality is measured again because no audit history is retained.
-    quality=build_quality_audit(rows, workspace, refresh=True)
-    accepted, manual_summary=audit_manual_masks(
-        rows, quality, workspace, minimum_masks=minimum_masks
-    )
-    print("\n[MANUAL TARGETS]")
-    display(pd.DataFrame([manual_summary]))
-
-    # STEP 3 — ATTENTION U-NET ------------------------------------------------
-    # Every fold is retrained. Patient k never appears in the model/calibration
-    # that predicts patient k, so all automatic masks remain genuinely OOF.
-    device=start_device_stage("cuda", "Attention U-Net training")
-    try:
-        checkpoints=train_attention_crossfit(accepted, workspace, device)
-    finally:
-        finish_device_stage(device, "Attention U-Net training")
-
-    device=start_device_stage("cuda", "Attention U-Net OOF prediction")
-    try:
-        predictions=predict_attention_masks(rows, workspace, device, checkpoints)
-    finally:
-        finish_device_stage(device, "Attention U-Net OOF prediction")
-
-    # STEP 4 — MATCHING -------------------------------------------------------
-    matching=build_cross_class_matching(rows, workspace)
-    matching_summary=read_json(workspace.cross_class_matching_summary, {}) or {}
-    print("\n[MATCHING]")
-    display(pd.DataFrame([matching_summary]))
-
-    # STEP 5 — FROZEN EFFICIENTNET FEATURES ---------------------------------
-    # ImageNet EfficientNet-B0 is frozen. The same extractor is used for every
-    # full-image / ROI / complement experiment.
-    device=start_device_stage("cuda", "EfficientNet feature extraction")
-    try:
-        bank=build_feature_bank(rows, workspace, device)
-    finally:
-        finish_device_stage(device, "EfficientNet feature extraction")
-
-    # STEP 6 — PATIENT-LEVEL EVALUATION -------------------------------------
-    results, comparisons=evaluate_experiments(bank, workspace)
-    print("\n[EVALUATION SUMMARY]")
-    display(results)
-    print("\n[PAIRED AUC COMPARISONS]")
-    display(comparisons)
-
-    # Keep only in-memory references for an optional review in this same session.
-    # Starting a new run creates a new temporary workspace and recomputes everything.
-    LAST_RUN={
-        "rows": rows,
-        "workspace": workspace,
-        "predictions": predictions,
-        "matching": matching,
-        "feature_bank": bank,
-        "results": results,
-        "comparisons": comparisons,
-    }
-    return LAST_RUN
-
-
-def open_html_review(scope="invalid", limit=300, start_index=0, review_round=1, seed=42):
-    """Open the HTML editor for the most recent run and save only manual targets."""
-    if LAST_RUN is None:
-        raise RuntimeError("Run run_pipeline() first so automatic OOF masks exist in this session.")
-
-    rows=LAST_RUN["rows"]
-    workspace=LAST_RUN["workspace"]
-    register_existing_manual_masks(rows, workspace)
-    try:
-        queue=select_review_rows(
-            rows, workspace, scope=scope, limit=limit, seed=seed, review_round=review_round
-        )
-    except RuntimeError as error:
-        print(error)
-        return None
-
-    # Editor actions persist only the manual PNG and its explicit label. Review
-    # queues/history/automatic masks live under the temporary workspace.
-    editor=MaskEditor(
-        queue,
-        workspace,
-        start_index=start_index,
-        brush_radius=8,  # editor brush radius in pixels
-        review_round=review_round,
-        review_scope=scope,
-    )
-    return editor.show()
-
-
-seed_everything(include_cuda=False)
-print(f"[PIPELINE] Version: {PIPELINE_VERSION}")
+# Importing the file does not train a model. It only prepares reproducible CPU state.
+DataStage.seed_everything(include_cuda=False)
 print("[PIPELINE] Persistent data: manual_masks/ + manual_annotation_labels.csv only")
-print("[PIPELINE] Run: run_pipeline() -> optional open_html_review() -> run_pipeline() again")
+print("[PIPELINE] Run: Pipeline.run() -> optional Pipeline.review() -> Pipeline.run() again")
