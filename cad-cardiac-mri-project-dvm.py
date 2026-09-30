@@ -1,20 +1,27 @@
-"""Simple stage-based cardiac MRI CAD research pipeline.
+"""Simple cardiac MRI CAD pipeline split into CPU and GPU Kaggle sessions.
 
-The file is intentionally organized like the research workflow, not like a software
-framework. Only manual masks and explicit labels persist between runs. Everything
-else is rebuilt from scratch and displayed in Kaggle.
+The code is organized by research stage, and each public Pipeline method is run in
+its own Kaggle accelerator mode:
 
-PIPELINE
-1. DataStage       -> dataset, preprocessing, quality, manual targets
-2. AttentionStage  -> five patient-level cross-fit Attention U-Nets + OOF masks
-3. ReviewStage     -> optional HTML review of unresolved masks
-4. MatchingStage   -> balanced Sick/Normal acquisition matching
-5. FeatureStage    -> frozen EfficientNet features for all 11 experiments
-6. EvaluationStage -> nested patient-level classification + paired AUC tests
-7. Pipeline        -> the two commands a user normally calls
+1. ``Pipeline.cpu_prepare()`` — Accelerator: None
+   Scan the dataset, build patient-safe sequence rows, measure image quality, audit
+   the manual targets, and save only the current hand-off tables.
+2. ``Pipeline.gpu_attention()`` — Accelerator: GPU
+   Load the prepared rows, train all five patient-level Attention U-Nets, generate
+   every out-of-fold mask, and delete the temporary checkpoints.
+3. ``Pipeline.review()`` — Accelerator: None, optional
+   Open the HTML editor using the saved OOF masks. Manual PNG masks and explicit
+   labels are the only permanent research data.
+4. ``Pipeline.cpu_final()`` — Accelerator: None
+   Rebuild matching, frozen EfficientNet features, nested patient-level evaluation,
+   and paired AUC comparisons. Results are displayed directly in Kaggle.
 
-Scientific safeguards remain unchanged: patient-level folds, out-of-fold masks,
-same-slice controls, matched cohorts, and patient-level evaluation.
+The folder ``current_run/`` is only a hand-off between the CPU, GPU, and final CPU
+sessions. ``cpu_prepare()`` replaces it, and ``cpu_final()`` removes it after a
+successful evaluation. Therefore no run history accumulates.
+
+Scientific safeguards remain unchanged: patient-level folds, genuinely out-of-fold
+masks, same-slice controls, balanced matched cohorts, and patient-level evaluation.
 """
 
 import base64
@@ -28,7 +35,7 @@ import os
 import random
 import re
 import time
-import tempfile
+import shutil
 import uuid
 from collections import OrderedDict, defaultdict, namedtuple
 from pathlib import Path
@@ -63,10 +70,9 @@ os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 Sample=namedtuple("Sample", "image_path label patient_id series_id image_token segmentation_fold")
 Workspace=namedtuple(
     "Workspace",
-    "root manual_masks predicted_masks mask_overlays checkpoints outputs dataset_manifest "
-    "quality_audit manual_audit manual_annotations prediction_audit prediction_parts_dir "
-    "review_history prediction_summary cross_class_matching_manifest cross_class_matching_summary "
-    "feature_bank feature_metadata",
+    "root current manual_masks manual_annotations dataset_manifest quality_audit "
+    "manual_audit accepted_targets predicted_masks prediction_audit checkpoints "
+    "cross_class_matching_manifest cross_class_matching_summary",
 )
 
 # Manual target labels are semantic values, not experiment settings.
@@ -83,10 +89,10 @@ ANNOTATION_FIELDS = (
 # STAGE 1 — DATASET, PREPROCESSING, QUALITY, AND MANUAL TARGETS
 # =============================================================================
 class DataStage:
-    """Everything needed before neural training.
+    """CPU preparation plus the small shared file helpers used by later stages.
 
-    No audit/history file is reused. The dataset and quality measurements are rebuilt
-    every run. Only manual PNG masks and manual labels are persistent.
+    ``current_run/`` contains only the active CPU→GPU→CPU hand-off. It is replaced
+    before a new preparation and removed after a successful final evaluation.
     """
 
     image_cache = OrderedDict()  # in-memory only; discarded when the run ends
@@ -249,42 +255,67 @@ class DataStage:
         return f"{seconds}s"
     # Only manual masks and their labels live in /kaggle/working.
     # Every other path belongs to a new temporary directory and disappears with the session.
+    # Build the shared Kaggle workspace. Only manual masks and labels live outside
+    # current_run/, so they survive after the current experiment is deleted.
     @staticmethod
-    def create_workspace(manual_root=None):
-        manual_root=Path(manual_root or DataStage._default_workspace_path())
-        manual_masks=manual_root / "manual_masks"
-        manual_labels=manual_root / "manual_annotation_labels.csv"
-        manual_masks.mkdir(parents=True, exist_ok=True)
-
-        # A fresh temporary workspace guarantees that training, predictions, matching,
-        # features, and evaluation are recomputed on every run instead of reused.
-        root=Path(tempfile.mkdtemp(prefix="cad_research_run_"))
-        outputs=root / "outputs"
+    def create_workspace(workspace_root=None):
+        root=Path(workspace_root or DataStage._default_workspace_path())
+        current=root / "current_run"
         workspace=Workspace(
             root=root,
-            manual_masks=manual_masks,
-            predicted_masks=root / "predicted_attention_masks",
-            mask_overlays=root / "mask_overlays",
-            checkpoints=root / "checkpoints",
-            outputs=outputs,
-            dataset_manifest=root / "dataset_manifest.csv",
-            quality_audit=root / "image_quality.csv",
-            manual_audit=root / "manual_audit.csv",
-            manual_annotations=manual_labels,
-            prediction_audit=root / "attention_predictions.csv",
-            prediction_parts_dir=outputs / "prediction_parts",
-            review_history=root / "review_history.csv",
-            prediction_summary=root / "prediction_summary.json",
-            cross_class_matching_manifest=root / "matching.csv",
-            cross_class_matching_summary=root / "matching_summary.json",
-            feature_bank=root / "feature_bank.npz",
-            feature_metadata=root / "feature_metadata.json",
+            current=current,
+            manual_masks=root / "manual_masks",
+            manual_annotations=root / "manual_annotation_labels.csv",
+            dataset_manifest=current / "dataset_rows.csv",
+            quality_audit=current / "image_quality.csv",
+            manual_audit=current / "manual_targets_audit.csv",
+            accepted_targets=current / "accepted_training_targets.csv",
+            predicted_masks=current / "predicted_attention_masks",
+            prediction_audit=current / "attention_oof_predictions.csv",
+            checkpoints=current / "temporary_checkpoints",
+            cross_class_matching_manifest=current / "matching.csv",
+            cross_class_matching_summary=current / "matching_summary.json",
         )
-        for folder in (root, outputs, workspace.predicted_masks, workspace.mask_overlays,
-                       workspace.checkpoints, workspace.prediction_parts_dir):
-            folder.mkdir(parents=True, exist_ok=True)
+        workspace.root.mkdir(parents=True, exist_ok=True)
+        workspace.manual_masks.mkdir(parents=True, exist_ok=True)
+        workspace.current.mkdir(parents=True, exist_ok=True)
+        workspace.predicted_masks.mkdir(parents=True, exist_ok=True)
+        workspace.checkpoints.mkdir(parents=True, exist_ok=True)
         return workspace
-    # JSON is used only inside the temporary run directory.
+
+    # Start a new experiment without touching manual masks or their labels.
+    @staticmethod
+    def reset_current_run(workspace):
+        shutil.rmtree(workspace.current, ignore_errors=True)
+        workspace.current.mkdir(parents=True, exist_ok=True)
+        workspace.predicted_masks.mkdir(parents=True, exist_ok=True)
+        workspace.checkpoints.mkdir(parents=True, exist_ok=True)
+
+    # Rerunning only the GPU stage must never mix old and new OOF predictions.
+    @staticmethod
+    def reset_attention_outputs(workspace):
+        shutil.rmtree(workspace.predicted_masks, ignore_errors=True)
+        shutil.rmtree(workspace.checkpoints, ignore_errors=True)
+        workspace.predicted_masks.mkdir(parents=True, exist_ok=True)
+        workspace.checkpoints.mkdir(parents=True, exist_ok=True)
+        workspace.prediction_audit.unlink(missing_ok=True)
+
+    # Delete every generated hand-off after successful final evaluation.
+    @staticmethod
+    def remove_current_run(workspace):
+        shutil.rmtree(workspace.current, ignore_errors=True)
+
+    # Detect a manual edit made after CPU preparation. This prevents a user from
+    # accidentally training or evaluating with stale target tables after review.
+    @staticmethod
+    def manual_data_changed_after(workspace, reference_path):
+        if not reference_path.is_file():
+            return True
+        latest=workspace.manual_annotations.stat().st_mtime_ns if workspace.manual_annotations.is_file() else 0
+        for mask_path in workspace.manual_masks.glob("*.png"):
+            latest=max(latest, mask_path.stat().st_mtime_ns)
+        return latest > reference_path.stat().st_mtime_ns
+    # JSON is used only for the current matching hand-off and is never historical.
     @staticmethod
     def write_json(path, payload):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -298,7 +329,7 @@ class DataStage:
             return json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             return default
-    # Write persistent audit/label tables that later stages must reuse.
+    # Write the current stage hand-off or the persistent manual-label table.
     @staticmethod
     def write_csv(path, rows, fields):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -306,14 +337,14 @@ class DataStage:
             writer = csv.DictWriter(handle, fieldnames=list(fields), extrasaction="ignore")
             writer.writeheader()
             writer.writerows({field: row.get(field, "") for field in fields} for row in rows)
-    # Read a persisted audit/label table as ordinary dictionaries.
+    # Read a current hand-off table as ordinary dictionaries.
     @staticmethod
     def read_csv(path):
         if not path.is_file():
             return []
         with path.open(newline="", encoding="utf-8") as handle:
             return list(csv.DictReader(handle))
-    # Save manual or OOF binary masks used by later pipeline stages.
+    # Save a manual mask or a current-run OOF mask used by the next stage.
     @staticmethod
     def write_png(path, image):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -949,10 +980,6 @@ class DataStage:
             )
 
         summary["reason_counts"]=dict(sorted(reason_counts.items()))
-        DataStage.write_json(
-            workspace.outputs / "review_manual_target_registration.json",
-            summary,
-        )
         print(
             "[REVIEW][EXISTING MASKS] "
             f"registered HEART_PRESENT={summary['registered_heart_present']}, "
@@ -6060,117 +6087,263 @@ class EvaluationStage:
         return summary, pd.DataFrame(comparisons)
 
 # =============================================================================
-# STAGE 7 — SIMPLE USER API
+# STAGE 7 — KAGGLE EXECUTION: CPU → GPU → OPTIONAL REVIEW → CPU
 # =============================================================================
 class Pipeline:
-    """Only two commands are needed: Pipeline.run() and Pipeline.review()."""
+    """Four explicit commands keep the GPU active only for Attention U-Net."""
 
-    last_run = None  # current-session state only; never written as history
-
+    # -------------------------------------------------------------------------
+    # 1. CPU PREPARATION — Kaggle Accelerator: None
+    # -------------------------------------------------------------------------
     @staticmethod
-    def run(dataset_path=None, manual_root=None, minimum_masks=None):
-        """Retrain and reevaluate the complete research pipeline from scratch."""
+    def cpu_prepare(dataset_path=None, workspace_root=None, minimum_masks=None):
+        """Rebuild the dataset, quality audit, and accepted manual targets on CPU."""
         line="=" * 88
-        print(f"\n{line}\nCARDIAC MRI CAD — FRESH FULL RUN\n{line}")
+        print(f"\n{line}\nCARDIAC MRI CAD — 1/3 CPU PREPARATION\n{line}")
 
-        # STEP 1 — DATASET ---------------------------------------------------------
         DataStage.seed_everything(include_cuda=False)
+        workspace=DataStage.create_workspace(workspace_root)
+
+        # A new preparation defines a new experiment. Delete every generated file
+        # from the previous run, but preserve manual_masks/ and the label CSV.
+        DataStage.reset_current_run(workspace)
         dataset_path=Path(dataset_path or DataStage._default_dataset_path())
-        workspace=DataStage.create_workspace(manual_root)
+
+        # Dataset rows include deterministic patient folds and previous/current/next
+        # image paths, so the GPU stage does not need to repeat dataset discovery.
         samples=DataStage.discover_dataset(dataset_path, workspace)
         rows=DataStage.build_dataset_rows(samples, workspace)
-        print(f"[PERSISTENT] manual masks: {workspace.manual_masks}")
-        print(f"[PERSISTENT] manual labels: {workspace.manual_annotations}")
-        print(f"[TEMPORARY] this run only: {workspace.root}")
 
-        # STEP 2 — QUALITY + MANUAL TARGETS --------------------------------------
-        # Quality is measured again because no audit history is retained.
+        # Convert every existing non-empty manual PNG into an explicit HEART_PRESENT
+        # label before the hand-off is timestamped. Opening the editor later therefore
+        # does not by itself make the prepared targets stale.
+        DataStage.register_existing_manual_masks(rows, workspace)
+
+        # Quality and manual-target validation are CPU-only and are completed before
+        # a GPU session is started.
         quality=DataStage.build_quality_audit(rows, workspace, refresh=True)
         accepted, manual_summary=DataStage.audit_manual_masks(
-            rows, quality, workspace, minimum_masks=minimum_masks
+            rows,
+            quality,
+            workspace,
+            minimum_masks=minimum_masks,
         )
+
+        # Save the complete accepted rows, including sequence context and weights,
+        # because these exact rows define Attention U-Net training in the next session.
+        DataStage.write_csv(
+            workspace.accepted_targets,
+            accepted,
+            accepted[0].keys(),
+        )
+
         print("\n[MANUAL TARGETS]")
         display(pd.DataFrame([manual_summary]))
+        print(f"[PERSISTENT] manual masks: {workspace.manual_masks}")
+        print(f"[PERSISTENT] manual labels: {workspace.manual_annotations}")
+        print(f"[HAND-OFF] current run: {workspace.current}")
+        print("[NEXT] Enable a Kaggle GPU, restart, run the definitions cell, then run Pipeline.gpu_attention().")
 
-        # STEP 3 — ATTENTION U-NET ------------------------------------------------
-        # Every fold is retrained. Patient k never appears in the model/calibration
-        # that predicts patient k, so all automatic masks remain genuinely OOF.
-        device=DataStage.start_device_stage("cuda", "Attention U-Net training")
+        return {
+            "patients": len({row["patient_id"] for row in rows}),
+            "images": len(rows),
+            "accepted_training_targets": len(accepted),
+            "manual_summary": manual_summary,
+        }
+
+    # -------------------------------------------------------------------------
+    # 2. GPU ATTENTION — Kaggle Accelerator: GPU
+    # -------------------------------------------------------------------------
+    @staticmethod
+    def gpu_attention(workspace_root=None):
+        """Train five cross-fitted Attention U-Nets and save all OOF masks."""
+        line="=" * 88
+        print(f"\n{line}\nCARDIAC MRI CAD — 2/3 GPU ATTENTION\n{line}")
+
+        workspace=DataStage.create_workspace(workspace_root)
+        rows=DataStage.read_csv(workspace.dataset_manifest)
+        accepted=DataStage.read_csv(workspace.accepted_targets)
+        if not rows or not accepted:
+            raise RuntimeError(
+                "CPU preparation files are missing. Disable the accelerator and run "
+                "Pipeline.cpu_prepare() first."
+            )
+        if DataStage.manual_data_changed_after(workspace, workspace.accepted_targets):
+            raise RuntimeError(
+                "Manual masks or labels changed after CPU preparation. Disable the GPU "
+                "and run Pipeline.cpu_prepare() again before training."
+            )
+
+        # Never combine predictions from different trainings. Only the current manual
+        # targets and the current CPU preparation are used.
+        DataStage.reset_attention_outputs(workspace)
+
+        device=DataStage.start_device_stage("cuda", "Attention U-Net training + OOF prediction")
         try:
-            checkpoints=AttentionStage.train_attention_crossfit(accepted, workspace, device)
+            checkpoints=AttentionStage.train_attention_crossfit(
+                accepted,
+                workspace,
+                device,
+            )
+            predictions=AttentionStage.predict_attention_masks(
+                rows,
+                workspace,
+                device,
+                checkpoints,
+            )
         finally:
-            DataStage.finish_device_stage(device, "Attention U-Net training")
+            DataStage.finish_device_stage(
+                device,
+                "Attention U-Net training + OOF prediction",
+            )
+            # Checkpoints are useful only while producing the current OOF masks.
+            # Remove them even when training/prediction stops with an error.
+            shutil.rmtree(workspace.checkpoints, ignore_errors=True)
 
-        device=DataStage.start_device_stage("cuda", "Attention U-Net OOF prediction")
+        summary={
+            "images": len(predictions),
+            "valid_masks": sum(
+                DataStage._as_int(row.get("attention_valid_final"), 0)
+                for row in predictions
+            ),
+            "invalid_masks": sum(
+                DataStage._as_int(row.get("attention_valid_final"), 0) != 1
+                for row in predictions
+            ),
+            "predicted_heart_present": sum(
+                DataStage._as_int(row.get("attention_heart_present"), 0)
+                for row in predictions
+            ),
+        }
+        print("\n[ATTENTION SUMMARY]")
+        display(pd.DataFrame([summary]))
+        print("[NEXT] Disable the GPU. Optionally run Pipeline.review(), then run Pipeline.cpu_final().")
+        return summary
+
+    # -------------------------------------------------------------------------
+    # OPTIONAL CPU REVIEW — Kaggle Accelerator: None
+    # -------------------------------------------------------------------------
+    @staticmethod
+    def review(
+        scope="invalid",
+        limit=300,
+        start_index=0,
+        workspace_root=None,
+        seed=42,
+    ):
+        """Open the HTML editor from the saved OOF masks without allocating CUDA."""
+        workspace=DataStage.create_workspace(workspace_root)
+        rows=DataStage.read_csv(workspace.dataset_manifest)
+        predictions=DataStage.read_csv(workspace.prediction_audit)
+        if not rows or not predictions:
+            raise RuntimeError(
+                "OOF masks are missing. Run Pipeline.cpu_prepare() and "
+                "Pipeline.gpu_attention() first."
+            )
+
+        DataStage.register_existing_manual_masks(rows, workspace)
         try:
-            predictions=AttentionStage.predict_attention_masks(rows, workspace, device, checkpoints)
-        finally:
-            DataStage.finish_device_stage(device, "Attention U-Net OOF prediction")
+            queue=ReviewStage.select_review_rows(
+                rows,
+                workspace,
+                scope=scope,
+                limit=limit,
+                seed=seed,
+                review_round=1,
+            )
+        except RuntimeError as error:
+            print(error)
+            return None
 
-        # STEP 4 — MATCHING -------------------------------------------------------
-        matching=MatchingStage.build_cross_class_matching(rows, workspace)
-        matching_summary=DataStage.read_json(workspace.cross_class_matching_summary, {}) or {}
+        # The editor writes only manual PNG masks and explicit labels. If anything is
+        # changed, rerun CPU preparation and GPU Attention before final evaluation.
+        editor=MaskEditor(
+            queue,
+            workspace,
+            start_index=start_index,
+            brush_radius=8,  # brush radius in 256×256 mask pixels
+            review_round=1,
+            review_scope=scope,
+        )
+        print(
+            "[AFTER REVIEW] Run Pipeline.cpu_prepare(), then Pipeline.gpu_attention(), "
+            "then Pipeline.cpu_final()."
+        )
+        return editor.show()
+
+    # -------------------------------------------------------------------------
+    # 3. FINAL CPU — Kaggle Accelerator: None
+    # -------------------------------------------------------------------------
+    @staticmethod
+    def cpu_final(workspace_root=None):
+        """Rebuild matching/features/evaluation on CPU and display the final tables."""
+        line="=" * 88
+        print(f"\n{line}\nCARDIAC MRI CAD — 3/3 FINAL CPU EVALUATION\n{line}")
+
+        DataStage.seed_everything(include_cuda=False)
+        workspace=DataStage.create_workspace(workspace_root)
+        rows=DataStage.read_csv(workspace.dataset_manifest)
+        predictions=DataStage.read_csv(workspace.prediction_audit)
+        if not rows or not predictions:
+            raise RuntimeError(
+                "Prepared rows or OOF predictions are missing. Run "
+                "Pipeline.cpu_prepare() and Pipeline.gpu_attention() first."
+            )
+        if DataStage.manual_data_changed_after(workspace, workspace.accepted_targets):
+            raise RuntimeError(
+                "Manual masks or labels changed after the current models were prepared. "
+                "Run Pipeline.cpu_prepare() and Pipeline.gpu_attention() again."
+            )
+        if len(predictions) != len(rows):
+            raise RuntimeError(
+                f"OOF prediction coverage is incomplete: {len(predictions)}/{len(rows)} images."
+            )
+        missing_masks=sum(
+            not Path(row.get("predicted_attention_mask_path", "")).is_file()
+            for row in predictions
+        )
+        if missing_masks:
+            raise RuntimeError(f"{missing_masks} OOF mask files are missing.")
+
+        # Matching is rebuilt from the current OOF masks and never reused as history.
+        MatchingStage.build_cross_class_matching(rows, workspace)
+        matching_summary=DataStage.read_json(
+            workspace.cross_class_matching_summary,
+            {},
+        ) or {}
         print("\n[MATCHING]")
         display(pd.DataFrame([matching_summary]))
 
-        # STEP 5 — FROZEN EFFICIENTNET FEATURES ---------------------------------
-        # ImageNet EfficientNet-B0 is frozen. The same extractor is used for every
-        # full-image / ROI / complement experiment.
-        device=DataStage.start_device_stage("cuda", "EfficientNet feature extraction")
+        # Frozen EfficientNet extraction runs on CPU. This is slower than CUDA, but it
+        # avoids consuming Kaggle GPU quota after Attention U-Net has finished.
+        device=DataStage.start_device_stage("cpu", "EfficientNet feature extraction")
         try:
             bank=FeatureStage.build_feature_bank(rows, workspace, device)
         finally:
             DataStage.finish_device_stage(device, "EfficientNet feature extraction")
 
-        # STEP 6 — PATIENT-LEVEL EVALUATION -------------------------------------
         results, comparisons=EvaluationStage.evaluate_experiments(bank, workspace)
         print("\n[EVALUATION SUMMARY]")
         display(results)
         print("\n[PAIRED AUC COMPARISONS]")
         display(comparisons)
 
-        # Keep only in-memory references for an optional review in this same session.
-        # Starting a new run creates a new temporary workspace and recomputes everything.
-        Pipeline.last_run={
-            "rows": rows,
-            "workspace": workspace,
-            "predictions": predictions,
-            "matching": matching,
-            "feature_bank": bank,
+        output={
+            "matching": matching_summary,
             "results": results,
             "comparisons": comparisons,
         }
-        return LAST_RUN
-    @staticmethod
-    def review(scope="invalid", limit=300, start_index=0, review_round=1, seed=42):
-        """Open the HTML editor for the most recent run and save only manual targets."""
-        if Pipeline.last_run is None:
-            raise RuntimeError("Run Pipeline.run() first so automatic OOF masks exist in this session.")
 
-        rows=Pipeline.last_run["rows"]
-        workspace=Pipeline.last_run["workspace"]
-        DataStage.register_existing_manual_masks(rows, workspace)
-        try:
-            queue=ReviewStage.select_review_rows(
-                rows, workspace, scope=scope, limit=limit, seed=seed, review_round=review_round
-            )
-        except RuntimeError as error:
-            print(error)
-            return None
+        # Final tables already live in the notebook output. Remove all generated data
+        # so the workspace again contains only manual masks and manual labels.
+        DataStage.remove_current_run(workspace)
+        print("[CLEANUP] current_run/ removed. Only manual masks and labels remain.")
+        return output
 
-        # Editor actions persist only the manual PNG and its explicit label. Review
-        # queues/history/automatic masks live under the temporary workspace.
-        editor=MaskEditor(
-            queue,
-            workspace,
-            start_index=start_index,
-            brush_radius=8,  # editor brush radius in pixels
-            review_round=review_round,
-            review_scope=scope,
-        )
-        return editor.show()
 
-# Importing the file does not train a model. It only prepares reproducible CPU state.
+# Importing definitions never allocates CUDA memory.
 DataStage.seed_everything(include_cuda=False)
-print("[PIPELINE] Persistent data: manual_masks/ + manual_annotation_labels.csv only")
-print("[PIPELINE] Run: Pipeline.run() -> optional Pipeline.review() -> Pipeline.run() again")
+print("[PIPELINE] 1. Accelerator None  -> Pipeline.cpu_prepare()")
+print("[PIPELINE] 2. Accelerator GPU   -> Pipeline.gpu_attention()")
+print("[PIPELINE] 3. Accelerator None  -> optional Pipeline.review()")
+print("[PIPELINE] 4. Accelerator None  -> Pipeline.cpu_final()")
