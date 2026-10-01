@@ -16,8 +16,9 @@ its own Kaggle accelerator mode:
 
 Generated files under ``current_run/`` are preserved by default. Nothing is deleted
 unless ``reset_files=True`` is passed explicitly. CPU/GPU hand-offs are validated with
-content fingerprints, not file modification times, so restarting a Kaggle session does
-not create a false "manual data changed" error:
+semantic fingerprints of normalized labels and binary mask pixels, not timestamps or
+raw PNG/CSV encoding, so restarting a Kaggle session does not create a false
+"manual data changed" error:
 
 - ``cpu_prepare(reset_files=True)`` clears the complete generated run first;
 - ``gpu_attention(reset_files=True)`` clears only old Attention masks, checkpoints,
@@ -336,10 +337,10 @@ class DataStage:
                 digest.update(chunk)
         return digest.hexdigest()
 
-    # Fingerprint exactly the persistent information a reviewer can change:
-    # manual_annotation_labels.csv plus every manual PNG name and byte content.
+    # Reproduce the first fingerprint format only for one-time migration of an
+    # already completed CPU/GPU hand-off. New runs do not depend on raw file bytes.
     @staticmethod
-    def manual_data_fingerprint(workspace):
+    def legacy_manual_data_fingerprint(workspace):
         digest=hashlib.sha256(b"cad-manual-data-v1")
         labels_exist=workspace.manual_annotations.is_file()
         digest.update(b"labels-present=" + str(int(labels_exist)).encode("ascii"))
@@ -359,23 +360,196 @@ class DataStage:
             "manual_labels_present": labels_exist,
         }
 
-    # Save the content snapshot only after CPU preparation has completed successfully.
+    # Normalize reviewer labels before hashing. Timestamps and CSV formatting are
+    # intentionally ignored because neither changes a training target.
+    @staticmethod
+    def normalized_manual_labels(workspace):
+        normalized=[]
+        for row in DataStage.read_csv(workspace.manual_annotations):
+            token=str(row.get("image_token", "")).strip()
+            if not token:
+                continue
+            normalized.append(
+                {
+                    "image_token": token,
+                    "target_type": str(row.get("target_type", "")).strip().upper(),
+                    "source": str(row.get("source", "")).strip(),
+                    "sample_weight": format(
+                        DataStage._as_float(row.get("sample_weight"), 0.0), ".12g"
+                    ),
+                }
+            )
+        return sorted(normalized, key=lambda row: row["image_token"])
+
+    # Hash the actual 256x256 binary masks, not PNG compression bytes. Re-encoding
+    # the same mask or restoring it in another Kaggle session therefore stays valid.
+    @staticmethod
+    def normalized_manual_masks(workspace):
+        masks=[]
+        for mask_path in sorted(
+            workspace.manual_masks.glob("*.png"), key=lambda path: path.name
+        ):
+            image=cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+            if image is None:
+                # An unreadable mask remains detectable and cannot silently match a
+                # previously valid binary mask.
+                pixel_fingerprint="UNREADABLE:" + DataStage.file_sha256(mask_path)
+                foreground_pixels=-1
+            else:
+                if image.shape != (256, 256):
+                    image=cv2.resize(image, (256, 256), interpolation=cv2.INTER_NEAREST)
+                binary=(image > 127).astype(np.uint8)
+                pixel_fingerprint=hashlib.sha256(binary.tobytes()).hexdigest()
+                foreground_pixels=int(binary.sum())
+            masks.append(
+                {
+                    "image_token": mask_path.stem,
+                    "pixel_fingerprint": pixel_fingerprint,
+                    "foreground_pixels": foreground_pixels,
+                }
+            )
+        return masks
+
+    # Fingerprint the semantic content that can affect training or manual-reference
+    # experiments: normalized labels plus normalized binary mask pixels.
+    @staticmethod
+    def manual_data_fingerprint(workspace):
+        labels=DataStage.normalized_manual_labels(workspace)
+        masks=DataStage.normalized_manual_masks(workspace)
+        labels_json=json.dumps(labels, sort_keys=True, separators=(",", ":"))
+        masks_json=json.dumps(masks, sort_keys=True, separators=(",", ":"))
+        labels_fingerprint=hashlib.sha256(labels_json.encode("utf-8")).hexdigest()
+        masks_fingerprint=hashlib.sha256(masks_json.encode("utf-8")).hexdigest()
+        combined=hashlib.sha256(b"cad-manual-data-v2")
+        combined.update(labels_fingerprint.encode("ascii"))
+        combined.update(masks_fingerprint.encode("ascii"))
+        return {
+            "schema": "cad-manual-data-v2",
+            "fingerprint": combined.hexdigest(),
+            "semantic_fingerprint": combined.hexdigest(),
+            "labels_fingerprint": labels_fingerprint,
+            "masks_fingerprint": masks_fingerprint,
+            "manual_mask_files": len(masks),
+            "manual_label_rows": len(labels),
+        }
+
+    # Save the semantic snapshot only after CPU preparation has completed. The
+    # preparation key is stable and is used by the GPU completion record.
     @staticmethod
     def save_manual_data_snapshot(workspace):
         snapshot=DataStage.manual_data_fingerprint(workspace)
+        snapshot["preparation_key"]=snapshot["fingerprint"]
         DataStage.write_json(workspace.manual_snapshot, snapshot)
         return snapshot
 
-    # Detect a real manual edit after CPU preparation. Touching/copying unchanged files
-    # no longer invalidates the GPU stage because only content is compared.
+    # Check whether the current manual files still describe the CPU-prepared audit.
+    # This is used only to migrate a legacy raw-byte snapshot without discarding an
+    # already completed GPU run.
+    @staticmethod
+    def manual_data_matches_preparation(workspace):
+        audit_rows=DataStage.read_csv(workspace.manual_audit)
+        accepted_rows=DataStage.read_csv(workspace.accepted_targets)
+        if not audit_rows or not accepted_rows:
+            return False
+
+        annotations={
+            str(row.get("image_token", "")).strip(): row
+            for row in DataStage.read_csv(workspace.manual_annotations)
+            if str(row.get("image_token", "")).strip()
+        }
+        mask_tokens={path.stem for path in workspace.manual_masks.glob("*.png")}
+        audit_tokens={
+            str(row.get("image_token", "")).strip()
+            for row in audit_rows
+            if str(row.get("image_token", "")).strip()
+        }
+        current_tokens=mask_tokens | set(annotations)
+        if current_tokens != audit_tokens:
+            return False
+
+        pixel_tolerance=2.0 / (256.0 * 256.0)  # at most two pixels of rounding noise
+        accepted_from_audit=set()
+
+        for row in audit_rows:
+            token=str(row.get("image_token", "")).strip()
+            target_type=str(row.get("target_type", "")).strip().upper()
+            status=str(row.get("status", "")).strip().upper()
+            annotation=annotations.get(token, {})
+            current_target=str(annotation.get("target_type", "")).strip().upper()
+            mask_path=workspace.manual_masks / f"{token}.png"
+            qc=DataStage.manual_mask_qc(mask_path)
+
+            if not current_target and qc.get("usable"):
+                current_target=HEART_PRESENT
+            if target_type in VALID_TARGET_TYPES and current_target != target_type:
+                return False
+
+            old_weight=DataStage._as_float(row.get("sample_weight"), np.nan)
+            new_weight=DataStage._as_float(annotation.get("sample_weight"), old_weight)
+            if np.isfinite(old_weight) and abs(old_weight - new_weight) > 1e-9:
+                return False
+
+            old_area=DataStage._as_float(row.get("area_ratio"), np.nan)
+            new_area=DataStage._as_float(qc.get("area_ratio"), np.nan)
+            if np.isfinite(old_area) != np.isfinite(new_area):
+                return False
+            if np.isfinite(old_area) and abs(old_area - new_area) > pixel_tolerance:
+                return False
+
+            if status == "ACCEPTED":
+                accepted_from_audit.add(token)
+                if target_type == HEART_PRESENT and not qc.get("usable"):
+                    return False
+                if target_type == NO_HEART_VISIBLE and (
+                    not np.isfinite(new_area) or new_area >= 0.0005
+                ):
+                    return False
+
+        accepted_tokens={
+            str(row.get("image_token", "")).strip()
+            for row in accepted_rows
+            if str(row.get("image_token", "")).strip()
+        }
+        return accepted_tokens == accepted_from_audit
+
+    # Detect a real semantic edit after CPU preparation. Legacy v1 snapshots are
+    # upgraded in place when the current masks/labels still match the prepared audit.
     @staticmethod
     def manual_data_changed_after(workspace, reference_path=None):
         saved=DataStage.read_json(workspace.manual_snapshot, {}) or {}
-        saved_fingerprint=str(saved.get("fingerprint", "")).strip()
+        saved_fingerprint=str(
+            saved.get("semantic_fingerprint") or saved.get("fingerprint") or ""
+        ).strip()
         if not saved_fingerprint:
             return True
+
         current=DataStage.manual_data_fingerprint(workspace)
-        return current["fingerprint"] != saved_fingerprint
+        if str(saved.get("schema", "")) == "cad-manual-data-v2":
+            return current["fingerprint"] != saved_fingerprint
+
+        # First try an exact v1 raw-byte match. If raw bytes changed, verify the
+        # semantic targets against the CPU-prepared audit before migrating.
+        legacy_current=DataStage.legacy_manual_data_fingerprint(workspace)
+        migration_is_safe=(
+            legacy_current["fingerprint"] == saved_fingerprint
+            or DataStage.manual_data_matches_preparation(workspace)
+        )
+        if not migration_is_safe:
+            return True
+
+        migrated=dict(current)
+        # Preserve the old preparation key so an already completed attention_run.json
+        # remains valid; future CPU preparation will create a native v2 key.
+        migrated["preparation_key"]=str(
+            saved.get("preparation_key") or saved.get("fingerprint") or ""
+        ).strip()
+        migrated["migrated_from"]="cad-manual-data-v1"
+        DataStage.write_json(workspace.manual_snapshot, migrated)
+        print(
+            "[HAND-OFF] Legacy manual snapshot upgraded to semantic v2; "
+            "the completed GPU run remains valid."
+        )
+        return False
 
     # Fingerprint the exact CPU hand-off consumed by Attention training.
     @staticmethod
@@ -383,7 +557,9 @@ class DataStage:
         if not workspace.dataset_manifest.is_file() or not workspace.accepted_targets.is_file():
             return ""
         snapshot=DataStage.read_json(workspace.manual_snapshot, {}) or {}
-        manual_fingerprint=str(snapshot.get("fingerprint", "")).strip()
+        manual_fingerprint=str(
+            snapshot.get("preparation_key") or snapshot.get("fingerprint") or ""
+        ).strip()
         if not manual_fingerprint:
             return ""
         payload={
@@ -6336,6 +6512,9 @@ class Pipeline:
                     "schema": "cad-attention-run-v1",
                     "run_id": gpu_run_id,
                     "preparation_fingerprint": preparation_fingerprint,
+                    "manual_semantic_fingerprint": DataStage.manual_data_fingerprint(
+                        workspace
+                    )["fingerprint"],
                     "images": len(predictions),
                 },
             )
@@ -6449,7 +6628,8 @@ class Pipeline:
             )
         if DataStage.manual_data_changed_after(workspace, workspace.accepted_targets):
             raise RuntimeError(
-                "Manual mask or label content changed after CPU preparation. Run "
+                "A manual target changed semantically after CPU preparation "
+                "(label, weight, mask membership, or binary mask pixels). Run "
                 "Pipeline.cpu_prepare() and Pipeline.gpu_attention() again."
             )
         if len(predictions) != len(rows):
@@ -6509,4 +6689,4 @@ print("[PIPELINE] 2. Accelerator GPU   -> Pipeline.gpu_attention(reset_files=Fal
 print("[PIPELINE] 3. Accelerator None  -> optional Pipeline.review()")
 print("[PIPELINE] 4. Accelerator None  -> Pipeline.cpu_final(reset_files=False)")
 print("[FILES] Nothing is deleted unless reset_files=True is passed explicitly.")
-print("[VALIDATION] CPU/GPU hand-offs use content fingerprints, not file timestamps.")
+print("[VALIDATION] Hand-offs use normalized labels and binary-mask fingerprints, not timestamps or PNG/CSV encoding.")
