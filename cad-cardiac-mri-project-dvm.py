@@ -1,8 +1,9 @@
-"""Simple stage-based cardiac MRI CAD research pipeline.
+"""One-step, in-memory cardiac MRI CAD research pipeline.
 
-The file is intentionally organized like the research workflow, not like a software
-framework. Only manual masks and explicit labels persist between runs. Everything
-else is rebuilt from scratch and displayed in Kaggle.
+Only manual PNG masks and explicit labels are written by this pipeline. All quality
+measurements, best model states, OOF masks, matching records, features, and results
+stay in RAM. A kernel restart discards them; each full run recomputes them.
+The HTML editor is displayed live and remains a separate, optional user action.
 
 PIPELINE
 1. DataStage       -> dataset, preprocessing, quality, manual targets
@@ -29,7 +30,6 @@ import os
 import random
 import re
 import time
-import tempfile
 import uuid
 from collections import OrderedDict, defaultdict, namedtuple
 from pathlib import Path
@@ -60,15 +60,8 @@ from tqdm.auto import tqdm
 
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
-# Stable records used to pass rows between stages.
-Sample=namedtuple("Sample", "image_path label patient_id series_id image_token segmentation_fold")
-Workspace=namedtuple(
-    "Workspace",
-    "root manual_masks predicted_masks mask_overlays checkpoints outputs dataset_manifest "
-    "quality_audit manual_audit manual_annotations prediction_audit prediction_parts_dir "
-    "review_history prediction_summary cross_class_matching_manifest cross_class_matching_summary "
-    "feature_bank feature_metadata",
-)
+# The workspace describes manual data only; intermediate stages use RAM.
+Workspace = namedtuple("Workspace", "root manual_masks manual_annotations")
 
 # Manual target labels are semantic values, not experiment settings.
 HEART_PRESENT = "HEART_PRESENT"
@@ -140,7 +133,7 @@ class DataStage:
                     directory_names[:]=[]
 
         return candidates[0] if candidates else Path.cwd() / "CAD Cardiac MRI Dataset"
-    # Choose the persistent workspace shared by CPU and GPU Kaggle sessions.
+    # Locate the existing manual-mask workspace without changing its folder layout.
     @staticmethod
     def _default_workspace_path():
         if Path("/kaggle/working").exists():
@@ -248,73 +241,14 @@ class DataStage:
         if minutes:
             return f"{minutes}m {seconds:02d}s"
         return f"{seconds}s"
-    # Only manual masks and their labels live in /kaggle/working.
-    # Every other path belongs to a new temporary directory and disappears with the session.
+    # Keep the existing manual-mask folder and label filename; create no run/output tree.
     @staticmethod
     def create_workspace(manual_root=None):
-        manual_root=Path(manual_root or DataStage._default_workspace_path())
-        manual_masks=manual_root / "manual_masks"
-        manual_labels=manual_root / "manual_annotation_labels.csv"
+        root = Path(manual_root or DataStage._default_workspace_path())
+        manual_masks = root / "manual_masks"
         manual_masks.mkdir(parents=True, exist_ok=True)
-
-        # A fresh temporary workspace guarantees that training, predictions, matching,
-        # features, and evaluation are recomputed on every run instead of reused.
-        root=Path(tempfile.mkdtemp(prefix="cad_research_run_"))
-        outputs=root / "outputs"
-        workspace=Workspace(
-            root=root,
-            manual_masks=manual_masks,
-            predicted_masks=root / "predicted_attention_masks",
-            mask_overlays=root / "mask_overlays",
-            checkpoints=root / "checkpoints",
-            outputs=outputs,
-            dataset_manifest=root / "dataset_manifest.csv",
-            quality_audit=root / "image_quality.csv",
-            manual_audit=root / "manual_audit.csv",
-            manual_annotations=manual_labels,
-            prediction_audit=root / "attention_predictions.csv",
-            prediction_parts_dir=outputs / "prediction_parts",
-            review_history=root / "review_history.csv",
-            prediction_summary=root / "prediction_summary.json",
-            cross_class_matching_manifest=root / "matching.csv",
-            cross_class_matching_summary=root / "matching_summary.json",
-            feature_bank=root / "feature_bank.npz",
-            feature_metadata=root / "feature_metadata.json",
-        )
-        for folder in (root, outputs, workspace.predicted_masks, workspace.mask_overlays,
-                       workspace.checkpoints, workspace.prediction_parts_dir):
-            folder.mkdir(parents=True, exist_ok=True)
-        return workspace
-    # JSON is used only inside the temporary run directory.
-    @staticmethod
-    def write_json(path, payload):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str), encoding="utf-8")
-    # Read cache metadata; return a simple fallback when the file is absent/corrupt.
-    @staticmethod
-    def read_json(path, default=None):
-        if not path.is_file():
-            return default
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return default
-    # Write persistent audit/label tables that later stages must reuse.
-    @staticmethod
-    def write_csv(path, rows, fields):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=list(fields), extrasaction="ignore")
-            writer.writeheader()
-            writer.writerows({field: row.get(field, "") for field in fields} for row in rows)
-    # Read a persisted audit/label table as ordinary dictionaries.
-    @staticmethod
-    def read_csv(path):
-        if not path.is_file():
-            return []
-        with path.open(newline="", encoding="utf-8") as handle:
-            return list(csv.DictReader(handle))
-    # Save manual or OOF binary masks used by later pipeline stages.
+        return Workspace(root, manual_masks, root / "manual_annotation_labels.csv")
+    # Save manual PNG targets only; automatic masks never use this function.
     @staticmethod
     def write_png(path, image):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -362,9 +296,9 @@ class DataStage:
             for index, patient_id in enumerate(ordered):
                 result[patient_id]=index % int(5)
         return result
-    # Scan Normal/Sick folders and create one record per MRI slice.
+    # Scan the dataset and add patient folds plus previous/current/next image context.
     @staticmethod
-    def discover_dataset(dataset_path, workspace=None):
+    def discover_dataset(dataset_path, workspace):
         dataset_path=Path(dataset_path)
         started=time.perf_counter()
         raw_rows=[]
@@ -384,11 +318,9 @@ class DataStage:
                     raise RuntimeError(f"{patient_id} appears in both classes.")
                 patient_to_label[patient_id]=label
 
-
                 for image_path in sorted(patient_path.iterdir()):
                     if image_path.is_file() and image_path.suffix.lower() in {".png", ".jpg", ".jpeg"}:
                         raw_rows.append((image_path, label, patient_id, f"{patient_id}/__ROOT__"))
-
 
                 for series_path in sorted(path for path in patient_path.iterdir() if path.is_dir()):
                     series_id=f"{patient_id}/{series_path.name}"
@@ -399,75 +331,27 @@ class DataStage:
         if not raw_rows:
             raise RuntimeError(f"No images were found in {dataset_path}")
 
-        folds=DataStage.patient_folds(patient_to_label)
-        samples=[
-            Sample(
-                image_path=str(path),
-                label=int(label),
-                patient_id=patient_id,
-                series_id=series_id,
-                image_token=DataStage.image_token(path, patient_id, series_id),
-                segmentation_fold=int(folds[patient_id]),
-            )
-            for path, label, patient_id, series_id in raw_rows
+        folds = DataStage.patient_folds(patient_to_label)
+        rows = [
+            {
+                "manifest_index": index,
+                "image_path": str(path),
+                "label": int(label),
+                "patient_id": patient_id,
+                "series_id": series_id,
+                "image_token": DataStage.image_token(path, patient_id, series_id),
+                "segmentation_fold": int(folds[patient_id]),
+            }
+            for index, (path, label, patient_id, series_id) in enumerate(raw_rows)
         ]
-
-        if len({sample.image_token for sample in samples}) != len(samples):
+        if len({row["image_token"] for row in rows}) != len(rows):
             raise RuntimeError("Duplicate image tokens were generated.")
+        for row in rows:
+            row["manual_mask_path"] = str(workspace.manual_masks / f"{row['image_token']}.png")
 
-        rows=[
-            {
-                "manifest_index": index,
-                "image_token": sample.image_token,
-                "image_path": sample.image_path,
-                "label": sample.label,
-                "patient_id": sample.patient_id,
-                "series_id": sample.series_id,
-                "segmentation_fold": sample.segmentation_fold,
-                "manual_mask_path": str((workspace.manual_masks if workspace else Path("manual_masks")) / f"{sample.image_token}.png"),
-                "predicted_attention_mask_path": str((workspace.predicted_masks if workspace else Path("predicted_attention_masks")) / f"{sample.image_token}.png"),
-            }
-            for index, sample in enumerate(samples)
-        ]
-        if workspace is not None:
-            DataStage.write_csv(workspace.dataset_manifest, rows, rows[0].keys())
-
-        print("[DATA] Patients:", len(patient_to_label))
-        print("[DATA] Normal:", sum(label == 0 for label in patient_to_label.values()))
-        print("[DATA] Sick:", sum(label == 1 for label in patient_to_label.values()))
-        print("[DATA] Images:", len(samples))
-        print("[DATA] Series proxies:", len({sample.series_id for sample in samples}))
-        print("[DATA] Scan time:", DataStage.format_seconds(time.perf_counter() - started))
-        return samples
-    # Sort slice filenames numerically (img2 before img10) when building sequence context.
-    @staticmethod
-    def natural_path_key(path):
-        return tuple(
-            int(part) if part.isdigit() else part.lower()
-            for part in re.split(r"(\d+)", str(path))
-        )
-    # Add sequence neighbours so 2.5D Attention uses previous/current/next frames.
-    @staticmethod
-    def build_dataset_rows(samples, workspace):
-        rows=[
-            {
-                "manifest_index": index,
-                "image_token": sample.image_token,
-                "image_path": sample.image_path,
-                "label": sample.label,
-                "patient_id": sample.patient_id,
-                "series_id": sample.series_id,
-                "segmentation_fold": sample.segmentation_fold,
-                "manual_mask_path": str(workspace.manual_masks / f"{sample.image_token}.png"),
-                "predicted_attention_mask_path": str(workspace.predicted_masks / f"{sample.image_token}.png"),
-            }
-            for index, sample in enumerate(samples)
-        ]
-
-
+        # Neighbours stay inside the same sequence directory and patient.
         by_sequence_group=defaultdict(list)
         for index, row in enumerate(rows):
-
 
             parent=str(Path(row["image_path"]).parent)
             sequence_group=f"{row['series_id']}::{parent}"
@@ -486,9 +370,20 @@ class DataStage:
                 rows[row_index]["previous_image_path"]=rows[previous_index]["image_path"]
                 rows[row_index]["next_image_path"]=rows[next_index]["image_path"]
 
-        if rows:
-            DataStage.write_csv(workspace.dataset_manifest, rows, rows[0].keys())
+        print("[DATA] Patients:", len(patient_to_label))
+        print("[DATA] Normal:", sum(label == 0 for label in patient_to_label.values()))
+        print("[DATA] Sick:", sum(label == 1 for label in patient_to_label.values()))
+        print("[DATA] Images:", len(rows))
+        print("[DATA] Series proxies:", len({row["series_id"] for row in rows}))
+        print("[DATA] Scan time:", DataStage.format_seconds(time.perf_counter() - started))
         return rows
+    # Sort slice filenames numerically (img2 before img10) when building sequence context.
+    @staticmethod
+    def natural_path_key(path):
+        return tuple(
+            int(part) if part.isdigit() else part.lower()
+            for part in re.split(r"(\d+)", str(path))
+        )
     # Read gray.
     @staticmethod
     def read_gray(path):
@@ -596,7 +491,7 @@ class DataStage:
         )
         canvas[top : top + resized_height, left : left + resized_width]=np.clip(resized, 0.0, 1.0)
         return canvas
-    # Remove only dark padding, robust-scale intensities, and center content on 256×256.
+    # Return only the robust/raw/content views actually consumed by the pipeline.
     @staticmethod
     def standardize_image(image):
         top, bottom, left, right=DataStage.detect_padding_bounds(image)
@@ -604,31 +499,25 @@ class DataStage:
         if cropped.size == 0:
             raise RuntimeError("Automatic cropping produced an empty image.")
         robust, _, _=DataStage.robust_scale(cropped)
-        # A second min-max view is kept because the original research pipeline used it
-        # when checking preprocessing consistency, while classifiers use robust/raw views.
         cropped_float=cropped.astype(np.float32)
-        low=float(cropped_float.min())
-        high=float(cropped_float.max())
-        minmax=(cropped_float - low) / (high - low) if high > low else np.zeros_like(cropped_float)
         raw=cropped_float / 255.0
         robust_canvas=DataStage.to_canvas(robust)
-        minmax_canvas=DataStage.to_canvas(minmax)
         raw_canvas=DataStage.to_canvas(raw)
         resized_height, resized_width, top_pad, left_pad, _=DataStage.canvas_geometry(*cropped.shape)
         content=np.zeros((256, 256), dtype=np.float32)
         content[top_pad:top_pad + resized_height, left_pad:left_pad + resized_width]=1.0
-        return robust_canvas, minmax_canvas, raw_canvas, content
+        return robust_canvas, raw_canvas, content
     # Return the canonical 256×256 robust-scaled image used by Attention U-Net.
     @staticmethod
     def standardized_uint8(path):
         image=DataStage.read_gray(path)
-        robust, _, _, _=DataStage.standardize_image(image)
+        robust, _, _=DataStage.standardize_image(image)
         return np.clip(np.round(robust * 255.0), 0, 255).astype(np.uint8)
     # Create the robust/raw/content views later combined with ROI or complement masks.
     @staticmethod
     def classifier_views(path):
         image=DataStage.read_gray(path)
-        robust, _, raw, content=DataStage.standardize_image(image)
+        robust, raw, content=DataStage.standardize_image(image)
         size=224
         robust_224=cv2.resize(robust, (size, size), interpolation=cv2.INTER_AREA)
         raw_224=cv2.resize(raw, (size, size), interpolation=cv2.INTER_AREA)
@@ -669,7 +558,7 @@ class DataStage:
     @staticmethod
     def image_quality_metrics(row):
         image=DataStage.read_gray(row["image_path"])
-        robust, _, raw, content=DataStage.standardize_image(image)
+        robust, raw, content=DataStage.standardize_image(image)
         coordinates=np.argwhere(content > 0.5)
         if not len(coordinates):
             return {
@@ -701,48 +590,16 @@ class DataStage:
             "noise_ratio": float(noise_sigma / max(dynamic_range, 1.0)),
             "dynamic_range": dynamic_range,
         }
-    # Measure blur/noise/dynamic range and reuse unchanged image measurements.
+    # Recompute image quality in RAM; thresholds and measurements are unchanged.
     @staticmethod
-    def build_quality_audit(rows, workspace, refresh=False):
-        existing={
-            row.get("image_token", ""): row
-            for row in DataStage.read_csv(workspace.quality_audit)
-        }
-        records=[]
-        started=time.perf_counter()
+    def build_quality_audit(rows):
+        records = []
+        started = time.perf_counter()
         for index, row in enumerate(rows, start=1):
-            path=Path(row["image_path"])
-            file_stat=path.stat() if path.is_file() else None
-            size_bytes=file_stat.st_size if file_stat is not None else -1
-            mtime_ns=file_stat.st_mtime_ns if file_stat is not None else -1
-            old=existing.get(row["image_token"], {})
-            reusable=(
-                not refresh
-                and old
-                and old.get("image_path") == str(path)
-                and DataStage._as_int(old.get("image_size_bytes"), -2) == int(size_bytes)
-                and DataStage._as_int(old.get("image_mtime_ns"), -2) == int(mtime_ns)
-                and old.get("perceptual_hash")
-            )
-            if reusable:
-                record=dict(old)
-            else:
-                metrics=DataStage.image_quality_metrics(row)
-                record={
-                    "image_token": row["image_token"],
-                    "image_path": str(path),
-                    "patient_id": row["patient_id"],
-                    "series_id": row["series_id"],
-                    "image_size_bytes": int(size_bytes),
-                    "image_mtime_ns": int(mtime_ns),
-                    **metrics,
-                }
-            records.append(record)
+            records.append({**row, **DataStage.image_quality_metrics(row)})
             if index == 1 or index % 5000 == 0 or index == len(rows):
-                print(
-                    f"[QUALITY] {index}/{len(rows)} | "
-                    f"{DataStage.format_seconds(time.perf_counter() - started)}"
-                )
+                print(f"[QUALITY] {index}/{len(rows)} | "
+                      f"{DataStage.format_seconds(time.perf_counter() - started)}")
 
         by_patient=defaultdict(list)
         for record in records:
@@ -781,10 +638,9 @@ class DataStage:
                 record["quality_valid"]=int(not reasons)
                 record["quality_reason"]=";".join(reasons)
 
-        DataStage.write_csv(workspace.quality_audit, records, records[0].keys())
-        valid=sum(int(row["quality_valid"]) for row in records)
-        print(f"[QUALITY] valid={valid}/{len(records)} | {workspace.quality_audit}")
-        return {str(row["image_token"]): row for row in records}
+        valid = sum(int(row["quality_valid"]) for row in records)
+        print(f"[QUALITY] valid={valid}/{len(records)}; measurements retained in RAM")
+        return records
     # Read binary mask.
     @staticmethod
     def read_binary_mask(path, size=None):
@@ -813,15 +669,31 @@ class DataStage:
         else:
             reason=""
         return {"exists": 1, "usable": int(not reason), "area_ratio": area, "reason": reason}
-    # Load annotations.
+    # Read only the persistent human decisions. Empty/unavailable labels mean no decisions.
     @staticmethod
     def load_annotations(workspace):
-        result={}
-        for row in DataStage.read_csv(workspace.manual_annotations):
-            token=str(row.get("image_token", "")).strip()
-            if token:
-                result[token]=dict(row)
-        return result
+        if not workspace.manual_annotations.is_file():
+            return {}
+        with workspace.manual_annotations.open(newline="", encoding="utf-8") as handle:
+            return {
+                str(row["image_token"]).strip(): dict(row)
+                for row in csv.DictReader(handle)
+                if str(row.get("image_token", "")).strip()
+            }
+
+    # Replace the label CSV only after the complete new table has been written.
+    @staticmethod
+    def save_annotations(workspace, annotations):
+        path = workspace.manual_annotations
+        pending = path.with_suffix(".csv.tmp")
+        try:
+            with pending.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=ANNOTATION_FIELDS, extrasaction="ignore")
+                writer.writeheader()
+                writer.writerows(annotations[token] for token in sorted(annotations))
+            pending.replace(path)
+        finally:
+            pending.unlink(missing_ok=True)
     # Use lower weight for confirmed-auto masks while preserving explicit negatives.
     @staticmethod
     def default_target_weight(target_type, source):
@@ -832,7 +704,7 @@ class DataStage:
         if "auto" in source:
             return float(0.72)
         return float(1.0)
-    # Persist one reviewer decision so later GPU runs can reuse it as a training target.
+    # Persist manual decisions only; no audit/history output file is needed.
     @staticmethod
     def set_annotation(
         workspace,
@@ -861,22 +733,14 @@ class DataStage:
             "sample_weight": float(weight),
             "note": str(note),
         }
-        DataStage.write_csv(
-            workspace.manual_annotations,
-            [records[token] for token in sorted(records)],
-            ANNOTATION_FIELDS,
-        )
-    # Remove annotation.
+        DataStage.save_annotations(workspace, records)
+    # Persist manual decisions only; no audit/history output file is needed.
     @staticmethod
     def remove_annotation(workspace, image_token):
         records=DataStage.load_annotations(workspace)
         records.pop(str(image_token), None)
-        DataStage.write_csv(
-            workspace.manual_annotations,
-            [records[token] for token in sorted(records)],
-            ANNOTATION_FIELDS,
-        )
-    # Register existing manual masks.
+        DataStage.save_annotations(workspace, records)
+    # Persist manual decisions only; no audit/history output file is needed.
     @staticmethod
     def register_existing_manual_masks(
         rows,
@@ -941,19 +805,10 @@ class DataStage:
             summary["registered_heart_present"] +=1
             reason_counts["registered_heart_present"] +=1
 
-
         if summary["registered_heart_present"] > 0 or not workspace.manual_annotations.is_file():
-            DataStage.write_csv(
-                workspace.manual_annotations,
-                [annotations[token] for token in sorted(annotations)],
-                ANNOTATION_FIELDS,
-            )
+            DataStage.save_annotations(workspace, annotations)
 
         summary["reason_counts"]=dict(sorted(reason_counts.items()))
-        DataStage.write_json(
-            workspace.outputs / "review_manual_target_registration.json",
-            summary,
-        )
         print(
             "[REVIEW][EXISTING MASKS] "
             f"registered HEART_PRESENT={summary['registered_heart_present']}, "
@@ -962,11 +817,10 @@ class DataStage:
             f"token missing={summary['skipped_token_absent_from_dataset']}"
         )
         return summary
-    # Validate explicit HEART_PRESENT/NO_HEART_VISIBLE/UNUSABLE targets for training.
+    # Validate current manual targets and return the audit in memory, never as a CSV.
     @staticmethod
     def audit_manual_masks(
         rows,
-        quality,
         workspace,
         minimum_masks=None,
     ):
@@ -1015,7 +869,7 @@ class DataStage:
                     target_type="UNLABELED_EMPTY"
                     source="legacy_unlabeled"
 
-            quality_row=quality.get(token, {})
+            quality_row=row
             quality_valid=DataStage._as_int(quality_row.get("quality_valid"), 0) == 1
             reasons=[]
             heart_present=""
@@ -1100,13 +954,6 @@ class DataStage:
                 negative_count +=1
                 fold_negative_counts[fold] +=1
 
-        # Use a fixed schema even when the audit is empty or begins with a stale token.
-        manual_audit_fields=(
-            "image_token", "patient_id", "series_id", "manual_mask_path", "status",
-            "target_type", "heart_present", "annotation_source", "sample_weight",
-            "area_ratio", "quality_valid", "quality_reason", "reason",
-        )
-        DataStage.write_csv(workspace.manual_audit, audit, manual_audit_fields)
         rejected=sum(row.get("status") == "REJECTED" for row in audit)
         excluded=sum(row.get("status") == "EXCLUDED" for row in audit)
         unlabeled_empty=sum(
@@ -1138,7 +985,6 @@ class DataStage:
                 str(fold): int(fold_negative_counts.get(fold, 0))
                 for fold in range(5)
             },
-            "audit": str(workspace.manual_audit),
             "annotations": str(workspace.manual_annotations),
         }
         print(
@@ -1148,10 +994,18 @@ class DataStage:
             f"patients={len(patient_counts)}"
         )
 
+        reason_counts = defaultdict(int)
+        for record in audit:
+            if record.get("status") != "ACCEPTED":
+                reason_counts[record.get("reason", "unknown")] += 1
+        summary["rejection_reasons"] = dict(sorted(reason_counts.items()))
+        if reason_counts:
+            print("[MANUAL MASKS] rejected/excluded reasons:", summary["rejection_reasons"])
+
         if positive_count < minimum_masks:
             raise RuntimeError(
                 f"Only {positive_count} valid HEART_PRESENT masks remain, below the minimum of "
-                f"{minimum_masks}. See {workspace.manual_audit}"
+                f"{minimum_masks}. Inspect the manual-target summary above and the HTML editor."
             )
         missing_folds=[
             fold
@@ -1164,7 +1018,7 @@ class DataStage:
             )
         if len(positive_patient_counts) < 5 + 1:
             raise RuntimeError("Too few patients have positive masks for cross-fitting.")
-        return accepted, summary
+        return accepted, audit, summary
 
 # =============================================================================
 # STAGE 2 — ATTENTION U-NET: MODEL + OOF SEGMENTATION
@@ -1309,10 +1163,6 @@ class SegmentationDataset(Dataset):
 
         if self.augment:
             rng=np.random.default_rng(self.seed + self.epoch * 1_000_003 + index)
-            if False and rng.random() < 0.5:
-                image=np.flip(image, axis=2).copy()
-                mask=np.fliplr(mask).copy()
-
             size=256
             angle=float(
                 rng.uniform(
@@ -1399,17 +1249,6 @@ class SegmentationInferenceDataset(Dataset):
 class AttentionStage:
     """Train five patient-level folds from scratch and predict every image OOF."""
 
-    # Keep one checkpoint file per patient-level segmentation fold.
-    @staticmethod
-    def attention_checkpoint_path(workspace, fold):
-        return workspace.checkpoints / f"attention_unet_fold_{int(fold)}.pt"
-    # Load torch file.
-    @staticmethod
-    def load_torch_file(path):
-        try:
-            return torch.load(str(path), map_location="cpu", weights_only=False)
-        except TypeError:
-            return torch.load(str(path), map_location="cpu")
     # Combine focal, Tversky, and heart-presence losses using per-target review weights.
     @staticmethod
     def segmentation_loss(
@@ -1594,7 +1433,6 @@ class AttentionStage:
         ys, xs=np.nonzero(mask)
         width=float(xs.max() - xs.min() + 1)
         height=float(ys.max() - ys.min() + 1)
-        size=float(mask.shape[0])
         return {
             "area": area,
             "boundary": boundary,
@@ -1766,18 +1604,15 @@ class AttentionStage:
             best_presence["balanced_accuracy"]
         )
         return result
-    # For target fold k, every patient assigned to k is excluded from both model
-    # fitting and threshold calibration. The saved checkpoint therefore produces
-    # genuinely out-of-fold masks for those patients.
+    # Exclude each test fold from fitting and calibration; retain best CPU weights in RAM.
     @staticmethod
-    def train_attention_crossfit(accepted_rows, workspace, device):
+    def train_attention_crossfit(accepted_rows, device):
         DataStage.seed_everything(include_cuda=device.type == "cuda")
-        checkpoint_map={}
+        fold_states={}
         all_patients=sorted({str(row["patient_id"]) for row in accepted_rows})
 
         for fold in range(5):  # five patient-level folds
             fold_started=time.perf_counter()
-            checkpoint_path=AttentionStage.attention_checkpoint_path(workspace, fold)
             non_test_rows=[
                 row
                 for row in accepted_rows
@@ -1849,8 +1684,8 @@ class AttentionStage:
             model=DataStage.prepare_model(AttentionUNet(), device)
             optimizer=torch.optim.AdamW(
                 model.parameters(),
-                lr=8e-4,  # AdamW learning rate used in the research run  # initial AdamW learning rate
-                weight_decay=1e-4,  # small L2 regularization  # small L2 regularization
+                lr=8e-4,  # initial AdamW learning rate used in the research run
+                weight_decay=1e-4,  # small L2 regularization
             )
             scheduler=torch.optim.lr_scheduler.ReduceLROnPlateau(
                 optimizer,
@@ -1866,7 +1701,7 @@ class AttentionStage:
             patience=0
             history=[]
 
-            for epoch in range(1, 36 + 1):  # maximum 36 training epochs per fold  # train at most 36 epochs per fold
+            for epoch in range(1, 36 + 1):  # train at most 36 epochs per fold
                 train_dataset.set_epoch(epoch)
                 model.train()
                 train_losses=[]
@@ -2001,13 +1836,13 @@ class AttentionStage:
                         break
 
             if best_state is None:
-                raise RuntimeError(f"Fold {fold}: no model checkpoint was selected.")
+                raise RuntimeError(f"Fold {fold}: no best model state was selected.")
             model.load_state_dict(best_state)
             geometry_prior=AttentionStage.build_geometry_prior(train_rows)
             calibration=AttentionStage.calibrate_threshold(
                 model, validation_loader, device, geometry_prior
             )
-            checkpoint={
+            fold_state={
                 "schema": "simple-attention-2p5d-presence-v3",
                 "state_dict": best_state,
                     "fold": fold,
@@ -2034,14 +1869,16 @@ class AttentionStage:
                 ),
                 "history": history,
             }
-            torch.save(checkpoint, checkpoint_path)
-            checkpoint_map[fold]=checkpoint_path
+            # CPU tensors are retained only until this fold has produced its OOF masks.
+            fold_states[fold]=fold_state
             del model, optimizer, scheduler, scaler, train_loader, validation_loader
-            del train_dataset, validation_dataset, checkpoint, best_state, train_sampler
+            del train_dataset, validation_dataset, fold_state, best_state, train_sampler
             DataStage.release_device(device)
+            print(f"[ATTENTION] fold {fold} trained in "
+                  f"{DataStage.format_seconds(time.perf_counter() - fold_started)}")
 
         DataStage.clear_image_cache()
-        return checkpoint_map
+        return fold_states
     # Keep the dominant connected mask component and discard small detached islands.
     @staticmethod
     def largest_component(mask):
@@ -2284,10 +2121,10 @@ class AttentionStage:
                     1.0, base_uncertainty + 0.20 * inconsistency
                 )
                 row.pop("_sequence_index", None)
-    # Compare OOF masks with accepted manual targets at patient-balanced level.
+    # Compare in-memory OOF predictions with accepted persistent manual targets.
     @staticmethod
     def evaluate_oof_segmentation(
-        workspace,
+        manual_audit,
         prediction_rows,
     ):
         predictions={
@@ -2295,7 +2132,7 @@ class AttentionStage:
         }
         audit_rows=[
             row
-            for row in DataStage.read_csv(workspace.manual_audit)
+            for row in manual_audit
             if row.get("status") == "ACCEPTED"
         ]
         metrics=[]
@@ -2304,13 +2141,10 @@ class AttentionStage:
             prediction_row=predictions.get(token)
             if prediction_row is None:
                 continue
-            predicted_path=Path(
-                prediction_row.get("predicted_attention_mask_path", "")
-            )
             target_path=Path(target_row.get("manual_mask_path", ""))
-            if not predicted_path.is_file() or not target_path.is_file():
+            if not target_path.is_file():
                 continue
-            predicted=DataStage.read_binary_mask(predicted_path)
+            predicted=AttentionStage.read_prediction_mask(prediction_row)
             target=DataStage.read_binary_mask(target_path)
             predicted_bool=predicted > 0
             target_bool=target > 0
@@ -2418,12 +2252,10 @@ class AttentionStage:
                 f"{summary['patient_balanced_dice_positive']:.4f}, "
                 f"negative_empty_rate={summary['no_heart_empty_prediction_rate']}"
             )
-        return summary
-    # Inference is resumable per fold. A fold result is reused only when its
-    # checkpoint and all image/context fingerprints match; otherwise that fold alone
-    # is recomputed. This makes post-review retraining incremental rather than global.
+        return summary, pd.DataFrame(metrics)
+    # Predict every image from freshly trained OOF states, without saving automatic masks.
     @staticmethod
-    def predict_attention_masks(rows, workspace, device, checkpoint_map):
+    def predict_attention_masks(rows, device, fold_states):
         # Automatic masks are never reused. Every run predicts the complete dataset
         # from the five freshly trained out-of-fold models.
         results=[None] * len(rows)
@@ -2439,22 +2271,26 @@ class AttentionStage:
             if not fold_rows:
                 continue
 
-            checkpoint=AttentionStage.load_torch_file(checkpoint_map[fold])
+            fold_state=fold_states.pop(fold)
+            held_out={str(row["patient_id"]) for row in fold_rows}
+            seen=set(fold_state["train_patients"]) | set(fold_state["validation_patients"])
+            if held_out & seen:
+                raise RuntimeError(f"Fold {fold}: OOF prediction would leak held-out patients.")
             model=AttentionUNet(
                 base_channels=int(
-                    checkpoint.get(
+                    fold_state.get(
                         "base_channels", 24
                     )
                 ),
                 input_channels=int(
-                    checkpoint.get(
+                    fold_state.get(
                         "input_channels", 3
                     )
                 ),
             )
-            model.load_state_dict(checkpoint["state_dict"])
+            model.load_state_dict(fold_state["state_dict"])
             model=DataStage.prepare_model(model, device).eval()
-            calibration=checkpoint.get("calibration", {}) or {}
+            calibration=fold_state.get("calibration", {}) or {}
             threshold=float(
                 calibration.get(
                     "threshold", 0.50
@@ -2466,8 +2302,7 @@ class AttentionStage:
                     0.50,
                 )
             )
-            geometry_prior=checkpoint.get("geometry_prior", {}) or {}
-            checkpoint_fingerprint=f"fold_{fold}"
+            geometry_prior=fold_state.get("geometry_prior", {}) or {}
             loader=DataLoader(
                 SegmentationInferenceDataset(fold_rows),
                 batch_size=10 if device.type == "cuda" else 3,
@@ -2581,9 +2416,8 @@ class AttentionStage:
                                 final_valid,
                             )
                         )
-                        mask_path=Path(row["predicted_attention_mask_path"])
-                        # Every experiment later reads this out-of-fold mask from disk.
-                        DataStage.write_png(mask_path, final_mask.astype(np.uint8) * 255)
+                        # One bit per pixel, lossless: 8192 bytes for a 256 x 256 mask.
+                        packed_mask=np.packbits(final_mask, axis=None)
 
                         result_row={
                             **row,
@@ -2608,7 +2442,7 @@ class AttentionStage:
                             "attention_centroid_x": centroid_x,
                             "attention_centroid_y": centroid_y,
                             "attention_prior_deviation": float(prior_deviation),
-                            "checkpoint_fingerprint": checkpoint_fingerprint,
+                            "attention_mask_bits": packed_mask,
                         }
                         results[global_index]=result_row
                         fold_results.append(result_row)
@@ -2616,7 +2450,7 @@ class AttentionStage:
             AttentionStage.apply_sequence_consistency(
                 fold_results, fold_rows
             )
-            del model, loader, checkpoint, fold_results
+            del model, loader, fold_state, fold_results
             DataStage.release_device(device)
 
         final_results=[result for result in results if result is not None]
@@ -2625,19 +2459,11 @@ class AttentionStage:
                 "Prediction did not produce exactly one row per image."
             )
         AttentionStage.apply_sequence_consistency(final_results, rows)
-        DataStage.write_csv(
-            workspace.prediction_audit,
-            final_results,
-            final_results[0].keys(),
-        )
         invalid_rows=[
             row
             for row in final_results
             if DataStage._as_int(row.get("attention_valid_final"), 0) != 1
         ]
-        segmentation_summary=AttentionStage.evaluate_oof_segmentation(
-            workspace, final_results
-        )
         summary={
             "device": device.type,
             "images": len(final_results),
@@ -2663,8 +2489,6 @@ class AttentionStage:
                 for row in final_results
             ),
             "invalid_final": len(invalid_rows),
-            "prediction_audit": str(workspace.prediction_audit),
-            "segmentation_oof": segmentation_summary,
             "elapsed": DataStage.format_seconds(
                 time.perf_counter() - started
             ),
@@ -2673,10 +2497,24 @@ class AttentionStage:
             "[ATTENTION] "
             f"valid_final={summary['valid_final']}/{summary['images']}, "
             f"heart_present={summary['predicted_heart_present']}, "
-            f"invalid={summary['invalid_final']} | {workspace.prediction_audit}"
+            f"invalid={summary['invalid_final']} | automatic masks retained in RAM"
         )
         DataStage.clear_image_cache()
-        return final_results
+        return final_results, summary
+
+    # Decode a losslessly packed automatic mask; resize exactly as for the former PNG.
+    @staticmethod
+    def read_prediction_mask(row, size=256):
+        packed = row.get("attention_mask_bits")
+        if packed is None:
+            raise RuntimeError(f"No current-session OOF mask for {row.get('image_token', '?')}.")
+        packed = np.asarray(packed, dtype=np.uint8)
+        if packed.size != 8192:
+            raise RuntimeError("An automatic mask must contain exactly 256 x 256 packed bits.")
+        mask = np.unpackbits(packed).reshape(256, 256)
+        if int(size) != 256:
+            mask = cv2.resize(mask, (int(size), int(size)), interpolation=cv2.INTER_NEAREST)
+        return mask
 
 # =============================================================================
 # STAGE 3 — OPTIONAL HTML REVIEW
@@ -2718,26 +2556,16 @@ class HammingBKTree:
 class ReviewStage:
     """Select unresolved images for manual review in the current session."""
 
-    # Merge review rows.
+    # Add the latest manual decisions to the current-session image records.
     @staticmethod
     def merge_review_rows(
         dataset_rows,
         workspace,
     ):
-        quality={
-            row["image_token"]: row
-            for row in DataStage.read_csv(workspace.quality_audit)
-        }
-        predictions={
-            row["image_token"]: row
-            for row in DataStage.read_csv(workspace.prediction_audit)
-        }
         annotations=DataStage.load_annotations(workspace)
         merged=[]
         for original in dataset_rows:
             row=dict(original)
-            row.update(quality.get(row["image_token"], {}))
-            row.update(predictions.get(row["image_token"], {}))
             annotation=annotations.get(str(row["image_token"]), {})
             annotation_type=ReviewStage.normalize_target_type(
                 annotation.get("target_type", "")
@@ -2837,9 +2665,7 @@ class ReviewStage:
                 break
             position +=1
         return selected
-    # The UNLABELED filter is always applied before the review scope. This prevents
-    # a prior HEART_PRESENT, NO_HEART_VISIBLE, or UNUSABLE decision from silently
-    # reappearing in a later annotation round.
+    # Exclude old decisions, but keep labeled images navigable inside the open editor.
     @staticmethod
     def select_review_rows(
         dataset_rows,
@@ -2847,7 +2673,6 @@ class ReviewStage:
         scope="invalid",
         limit=None,
         seed=42,
-        review_round=1,
     ):
         scope=str(scope).lower()
         allowed={"invalid", "uncertain", "empty", "novel", "manual", "all"}
@@ -2868,15 +2693,13 @@ class ReviewStage:
             f"UNLABELED={len(rows)}, already-labeled excluded={labeled_excluded}, "
             f"distribution={dict(sorted(target_counts.items()))}"
         )
-        reviewed=set()  # no review history is stored between sessions
 
         if scope == "invalid":
             candidates=[
                 row
                 for row in rows
                 if DataStage._as_int(row.get("attention_valid_final"), 1) == 0
-                and Path(row["predicted_attention_mask_path"]).is_file()
-                and row["image_token"] not in reviewed
+                and row.get("attention_mask_bits") is not None
             ]
             for row in candidates:
                 row["review_priority"]=DataStage._as_float(
@@ -2896,11 +2719,9 @@ class ReviewStage:
         elif scope == "uncertain":
             candidates=[]
             for row in rows:
-                if row["image_token"] in reviewed:
-                    continue
                 if DataStage._as_int(row.get("quality_valid"), 0) != 1:
                     continue
-                if not Path(row["predicted_attention_mask_path"]).is_file():
+                if row.get("attention_mask_bits") is None:
                     continue
                 uncertainty=DataStage._as_float(
                     row.get("attention_uncertainty_score"), 0.0
@@ -2944,8 +2765,6 @@ class ReviewStage:
                 and not bool(row.get("manual_annotation_type"))
                 and str(row.get("manual_mask_reason", ""))
                 == "empty_or_nearly_empty"
-                and Path(row["predicted_attention_mask_path"]).is_file()
-                and row["image_token"] not in reviewed
             ]
             for row in candidates:
                 row["review_priority"]=-DataStage._as_float(
@@ -2964,13 +2783,10 @@ class ReviewStage:
             )
         elif scope == "manual":
 
-
             candidates=[
                 row
                 for row in rows
                 if Path(row["manual_mask_path"]).is_file()
-                and Path(row["predicted_attention_mask_path"]).is_file()
-                and row["image_token"] not in reviewed
             ]
             candidates.sort(
                 key=lambda row: (
@@ -2980,12 +2796,7 @@ class ReviewStage:
                 )
             )
         elif scope == "all":
-            candidates=[
-                row
-                for row in rows
-                if Path(row["predicted_attention_mask_path"]).is_file()
-                and row["image_token"] not in reviewed
-            ]
+            candidates=list(rows)
             candidates.sort(
                 key=lambda row: (
                     row["patient_id"],
@@ -2994,7 +2805,6 @@ class ReviewStage:
                 )
             )
         else:
-
 
             manual_hashes=[]
             for row in all_rows:
@@ -3019,14 +2829,8 @@ class ReviewStage:
                 ).is_file():
                     excluded["already_annotated"] +=1
                     continue
-                if row["image_token"] in reviewed:
-                    excluded["already_reviewed_this_round"] +=1
-                    continue
                 if DataStage._as_int(row.get("quality_valid"), 0) != 1:
                     excluded["quality_invalid"] +=1
-                    continue
-                if not Path(row["predicted_attention_mask_path"]).is_file():
-                    excluded["missing_attention_mask"] +=1
                     continue
                 phash=str(row.get("perceptual_hash", ""))
                 if not phash:
@@ -3073,7 +2877,6 @@ class MaskEditor:
         workspace,
         start_index=0,
         brush_radius=8,
-        review_round=1,
         review_scope="invalid",):
         try:
             widgets=importlib.import_module("ipywidgets")
@@ -3106,7 +2909,6 @@ class MaskEditor:
         self.workspace=workspace
         self.index=int(np.clip(start_index, 0, len(self.rows) - 1))
         self.brush_radius=max(1, int(brush_radius))
-        self.review_round=int(review_round)
         self.review_scope=str(review_scope)
         self.image=None
         self.auto_mask=None
@@ -3141,7 +2943,6 @@ class MaskEditor:
                 layout=widgets.Layout(width=width, height="29px"),
                 style={"font_weight": "500"},
             )
-
 
         self.previous_button=compact_button("← Prev [P]", "68px", "Previous — P")
         self.next_button=compact_button("Next [N] →", "72px", "Next — N")
@@ -3185,7 +2986,7 @@ class MaskEditor:
         self.accept_button.on_click(lambda _: self._safe("Auto OK", self.accept_auto))
         self.no_heart_button.on_click(lambda _: self._safe("No heart", self.mark_no_heart))
         self.unusable_button.on_click(lambda _: self._safe("Unusable", self.mark_unusable))
-        self.skip_button.on_click(lambda _: self._safe("Skip", self.skip))
+        self.skip_button.on_click(lambda _: self._safe("Skip", self.next))
         self.reset_button.on_click(lambda _: self._safe("Reset", self.reset_to_auto))
         self.raw_button.on_click(lambda _: self._safe("Reset to image", self.reset_to_image))
         self.clear_button.on_click(lambda _: self._safe("Clear", self.clear_editable))
@@ -3247,7 +3048,6 @@ class MaskEditor:
             )
             return
 
-
         self.render()
         self.update_status(
             f"{message} End of queue; the image remains accessible, and "
@@ -3281,11 +3081,13 @@ class MaskEditor:
 
     def load_current(self):
         row=self.rows[self.index]
-        auto_path=Path(row["predicted_attention_mask_path"])
-        if not auto_path.is_file():
-            raise FileNotFoundError(f"Missing Attention mask: {auto_path}")
         image=DataStage.standardized_uint8(row["image_path"])
-        auto_mask=DataStage.read_binary_mask(auto_path)
+        # Manual drawing also works before OOF models have been trained in this session.
+        auto_mask=(
+            AttentionStage.read_prediction_mask(row)
+            if row.get("attention_mask_bits") is not None
+            else np.zeros((256, 256), dtype=np.uint8)
+        )
         manual_path=Path(row["manual_mask_path"])
         current=DataStage.read_binary_mask(manual_path) if manual_path.is_file() else auto_mask.copy()
         self.image=image.astype(np.float32) / 255.0
@@ -3734,7 +3536,6 @@ class MaskEditor:
         self._last_shortcut_payload=payload
         action=payload.split("|", 1)[0].strip().lower()
 
-
         now=time.monotonic()
         if self._shortcut_busy or now - self._last_shortcut_at < 0.12:
             return
@@ -3748,7 +3549,7 @@ class MaskEditor:
             "accept_auto": ("Auto OK", self.accept_auto),
             "no_heart": ("No heart", self.mark_no_heart),
             "unusable": ("Unusable", self.mark_unusable),
-            "skip": ("Skip", self.skip),
+            "skip": ("Skip", self.next),
             "clear": ("Clear", self.clear_editable),
             "delete": ("Delete manual", self.delete_manual),
             "brush_down": (
@@ -3842,7 +3643,6 @@ class MaskEditor:
         mask,
         target_type,
         source,
-        action,
         sample_weight=None,
     ):
         row=self.rows[self.index]
@@ -3872,7 +3672,6 @@ class MaskEditor:
             self.mask,
             HEART_PRESENT,
             source="human_drawn_or_corrected",
-            action="save_manual_heart_present",
             sample_weight=1.0,
         )
         self.update_status("Saved HEART_PRESENT; weight=1.00.")
@@ -3891,7 +3690,6 @@ class MaskEditor:
             self.auto_mask,
             HEART_PRESENT,
             source="human_confirmed_auto",
-            action="accept_auto_and_save",
             sample_weight=0.72,
         )
         self._advance_after_target(
@@ -3904,7 +3702,6 @@ class MaskEditor:
             empty,
             NO_HEART_VISIBLE,
             source="human_no_heart_visible",
-            action="mark_no_heart_visible",
             sample_weight=0.90,
         )
         self._advance_after_target("Saved NO_HEART_VISIBLE negative target.")
@@ -3921,9 +3718,6 @@ class MaskEditor:
         )
         row["manual_annotation_type"]=UNUSABLE
         self._advance_after_target("Marked UNUSABLE; excluded from training.")
-
-    def skip(self):
-        self.next()
 
     def reset_to_auto(self):
         self.base_mask=self.auto_mask.copy()
@@ -3985,44 +3779,6 @@ class MaskEditor:
 class MatchingStage:
     """Rebuild strict-core and expanded balanced matching from current-run data."""
 
-    # Record the matching rules inside the cache fingerprint for reproducibility.
-    @staticmethod
-    def matching_settings_payload():
-        return {
-            "schema": "cross-class-matching-v2-core-plus-extended",
-            "min_families": 8,
-            "max_families": 32,
-            "target_images_per_family": 1800,
-            "minimum_images_per_class_per_family": 12,
-            "minimum_patients_per_class_per_family": 2,
-            "core_mutual_neighbors": 5,
-            "core_caliper_mad_multiplier": 2.5,
-            "core_caliper_quantile": 0.90,
-            "maximum_sequence_position_difference": 0.25,
-            "maximum_area_ratio_difference": 0.20,
-            "core_maximum_matches_per_patient_per_family": 20,
-            "core_maximum_matches_per_sequence_group": 5,
-            "target_matched_image_fraction": 0.50,
-            "extended_neighbors": 12,
-            "extended_caliper_mad_multiplier": 3.5,
-            "extended_caliper_quantile": 0.97,
-            "extended_max_caliper_multiplier": 1.18,
-            "extended_maximum_sequence_position_difference": 0.25,
-            "extended_maximum_area_ratio_difference": 0.20,
-            "extended_maximum_matches_per_patient_per_family": 60,
-            "extended_maximum_matches_per_sequence_group": 15,
-            "extended_maximum_matches_per_sequence_pair": 12,
-            "extended_maximum_matches_per_patient_pair": 60,
-            "patient_total_cap_multiplier": 1.70,
-            "prioritize_core_sequence_pairs": True,
-            "block_weights": {
-                "phash": 0.45,
-                "geometry": 0.25,
-                "sequence": 0.15,
-                "quality": 0.15,
-            },
-            "random_seed": 42,
-        }
     # Convert slice position to a normalized within-series coordinate for matching.
     @staticmethod
     def sequence_position(row):
@@ -4111,43 +3867,7 @@ class MatchingStage:
             axis=1,
         )
         return np.ascontiguousarray(descriptor, dtype=np.float32)
-    # Merge matching rows.
-    @staticmethod
-    def merge_matching_rows(
-        dataset_rows, workspace
-    ):
-        quality={
-            str(row.get("image_token", "")): row
-            for row in DataStage.read_csv(workspace.quality_audit)
-        }
-        predictions={
-            str(row.get("image_token", "")): row
-            for row in DataStage.read_csv(workspace.prediction_audit)
-        }
-        merged=[]
-        for original in dataset_rows:
-            row=dict(original)
-            token=str(row["image_token"])
-            row.update(predictions.get(token, {}))
-            row.update(quality.get(token, {}))
-            centroid_x=DataStage._as_float(row.get("attention_centroid_x"), np.nan)
-            centroid_y=DataStage._as_float(row.get("attention_centroid_y"), np.nan)
-            if not (np.isfinite(centroid_x) and np.isfinite(centroid_y)):
-                mask_path=Path(str(row.get("predicted_attention_mask_path", "")))
-                if mask_path.is_file():
-                    try:
-                        features=AttentionStage.mask_features(
-                            DataStage.read_binary_mask(mask_path)
-                        )
-                        row["attention_area_ratio"]=features["area"]
-                        row["attention_boundary_touch_fraction"]=features["boundary"]
-                        row["attention_centroid_x"]=features["centroid_x"]
-                        row["attention_centroid_y"]=features["centroid_y"]
-                    except Exception:
-                        pass
-            merged.append(row)
-        return merged
-    # Explain why a slice can or cannot participate in Sick/Normal matching.
+    # Require the same quality/geometry gates and a current in-memory automatic mask.
     @staticmethod
     def matching_eligibility_reason(row):
         reasons=[]
@@ -4163,7 +3883,7 @@ class MatchingStage:
             reasons.append("attention_area_too_small")
         if not str(row.get("perceptual_hash", "")).strip():
             reasons.append("missing_phash")
-        if not Path(str(row.get("predicted_attention_mask_path", ""))).is_file():
+        if row.get("attention_mask_bits") is None:
             reasons.append("missing_attention_mask")
         return ";".join(reasons)
     # Choose acquisition-family granularity from cohort size while respecting class coverage.
@@ -4212,23 +3932,14 @@ class MatchingStage:
         mad_caliper=median + float(mad_multiplier) * robust_scale
         quantile_caliper=float(np.quantile(values, float(quantile)))
         return float(max(median, min(mad_caliper, quantile_caliper)))
-    # Reject candidate pairs that differ too much in sequence position or mask area.
+    # Both core and extended matching use the same anatomical limits.
     @staticmethod
     def passes_anatomical_gates(
         sick_row,
         normal_row,
-        extended,
     ):
-        sequence_limit=(
-            0.25
-            if extended
-            else 0.25
-        )
-        area_limit=(
-            0.20
-            if extended
-            else 0.20
-        )
+        sequence_limit=0.25
+        area_limit=0.20
         if (
             abs(
                 MatchingStage.sequence_position(sick_row)
@@ -4265,15 +3976,14 @@ class MatchingStage:
             (sick_patient, normal_patient),
             (sick_sequence, normal_sequence),
         )
-    # Build the strict core and expanded balanced Sick/Normal matched cohort.
+    # Rebuild the strict core and expanded balanced cohort from current RAM records.
     @staticmethod
-    def build_cross_class_matching(dataset_rows, workspace):
+    def build_cross_class_matching(dataset_rows):
         # Matching is intentionally rebuilt every run. It uses only the current OOF
         # masks, quality measurements, labels, and dataset geometry.
-        merged=MatchingStage.merge_matching_rows(dataset_rows, workspace)
         manifest_by_token={}
         eligible_rows=[]
-        for row in merged:
+        for row in dataset_rows:
             token=str(row["image_token"])
             reason=MatchingStage.matching_eligibility_reason(row)
             record={
@@ -4442,8 +4152,8 @@ class MatchingStage:
                 algorithm="auto",
                 n_jobs=-1,
             ).fit(normal_descriptor)
-            sick_to_normal_distance, sick_to_normal_index=normal_model.kneighbors(
-                sick_descriptor, return_distance=True
+            sick_to_normal_index=normal_model.kneighbors(
+                sick_descriptor, return_distance=False
             )
             sick_model=NearestNeighbors(
                 n_neighbors=extended_normal_to_sick,
@@ -4451,8 +4161,8 @@ class MatchingStage:
                 algorithm="auto",
                 n_jobs=-1,
             ).fit(sick_descriptor)
-            normal_to_sick_distance, normal_to_sick_index=sick_model.kneighbors(
-                normal_descriptor, return_distance=True
+            normal_to_sick_index=sick_model.kneighbors(
+                normal_descriptor, return_distance=False
             )
 
             sick_rank_maps=[
@@ -4477,7 +4187,7 @@ class MatchingStage:
                 sick_row=eligible_rows[sick_global]
                 normal_row=eligible_rows[normal_global]
                 if not MatchingStage.passes_anatomical_gates(
-                    sick_row, normal_row, extended=True):
+                    sick_row, normal_row):
                     continue
                 rank_from_sick=sick_rank_maps[sick_local].get(normal_local)
                 rank_from_normal=normal_rank_maps[normal_local].get(sick_local)
@@ -4491,9 +4201,6 @@ class MatchingStage:
                     reciprocal
                     and rank_from_sick <= 5
                     and rank_from_normal <= 5
-                    and MatchingStage.passes_anatomical_gates(
-                        sick_row, normal_row, extended=False
-                    )
                 )
                 sick_token=str(sick_row["image_token"])
                 normal_token=str(normal_row["image_token"])
@@ -4969,28 +4676,7 @@ class MatchingStage:
             per_patient[str(row["patient_id"])] +=1
         selected_fraction_eligible=len(selected) / max(1, len(eligible_rows))
         selected_fraction_dataset=len(selected) / max(1, len(dataset_rows))
-        matching_settings=MatchingStage.matching_settings_payload()
-        fingerprint_payload={
-            "settings": matching_settings,
-            "selected_pairs": sorted(
-                (
-                    str(row.get("pair_id", "")),
-                    str(row.get("image_token", "")),
-                    str(row.get("matched_partner_token", "")),
-                )
-                for row in selected_sick
-            ),
-        }
-        fingerprint=hashlib.sha256(
-            json.dumps(
-                fingerprint_payload,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ).hexdigest()
         summary={
-            "fingerprint": fingerprint,
-            **matching_settings,
             "dataset_images": len(dataset_rows),
             "eligible_images": len(eligible_rows),
             "acquisition_families": family_count,
@@ -5046,19 +4732,12 @@ class MatchingStage:
                 else None
             ),
             "families": family_summaries,
-            "manifest": str(workspace.cross_class_matching_manifest),
             "interpretation": (
                 "B1/AU2/C2 use the expanded balanced cohort. The previous strict "
                 "mutual-neighbour cohort is retained in selected_for_core_matched_cohort "
                 "for audit and sensitivity checks."
             ),
         }
-        DataStage.write_csv(
-            workspace.cross_class_matching_manifest,
-            manifest,
-            manifest[0].keys(),
-        )
-        DataStage.write_json(workspace.cross_class_matching_summary, summary)
         if not summary["target_achieved"]:
             print(
                 "[MATCHING][WARNING] The requested expanded target could not be fully "
@@ -5069,26 +4748,9 @@ class MatchingStage:
             f"eligible={len(eligible_rows)}, core_pairs={len(core_selected) // 2}, "
             f"total_pairs={len(selected_normal)}, images={len(selected)} "
             f"({100.0 * selected_fraction_dataset:.1f}% dataset), "
-            f"patients Normal={len(normal_patients)}, Sick={len(sick_patients)} | "
-            f"{workspace.cross_class_matching_manifest}"
+            f"patients Normal={len(normal_patients)}, Sick={len(sick_patients)}"
         )
-        return manifest
-    # Read the final unique image tokens selected for the balanced matched cohort.
-    @staticmethod
-    def selected_matched_tokens(
-        manifest,
-        core_only=False,
-    ):
-        field=(
-            "selected_for_core_matched_cohort"
-            if core_only
-            else "selected_for_matched_cohort"
-        )
-        return {
-            str(row.get("image_token", ""))
-            for row in manifest
-            if DataStage._as_int(row.get(field), 0) == 1
-        }
+        return manifest, summary
 
 # =============================================================================
 # STAGE 5 — FROZEN EFFICIENTNET FEATURES
@@ -5106,16 +4768,7 @@ class FeatureDataset(Dataset):
     def __getitem__(self, index):
         row=self.rows[index]
         robust, raw, content=DataStage.classifier_views(row["image_path"])
-        attention_path=Path(row["predicted_attention_mask_path"])
-        if attention_path.is_file():
-            attention=DataStage.read_binary_mask(
-                attention_path, size=224
-            ).astype(np.float32)
-        else:
-            attention=np.zeros(
-                (224, 224),
-                dtype=np.float32,
-            )
+        attention=AttentionStage.read_prediction_mask(row, size=224).astype(np.float32)
         manual_path=Path(row["manual_mask_path"])
         if manual_path.is_file():
             manual=DataStage.read_binary_mask(
@@ -5166,9 +4819,8 @@ class StreamingPatientPool:
     """Aggregate slice embeddings first by series and then by patient."""
 
     def __init__(self, modes):
-        self.modes=tuple(modes)
         self.series_data={
-            mode: {} for mode in self.modes
+            mode: {} for mode in modes
         }
         self.source_slices=defaultdict(int)
 
@@ -5201,8 +4853,7 @@ class StreamingPatientPool:
         if not patients:
             raise RuntimeError(
                 f"Mode {mode} contains no patients. For M1/C3/AU3/C4, "
-                "inspect [FEATURE BANK][MANUAL] and the manual-audit schema; "
-                "legacy audits are rebuilt automatically."
+                "inspect [FEATURES][MANUAL] and the current manual-target audit."
             )
         X=np.stack(
             [np.mean(np.stack(patient_series[patient]), axis=0) for patient in patients]
@@ -5233,7 +4884,6 @@ class FeatureStage:
         "AU3_ATTENTION_ROI_MANUAL_SUBSET",
         "C4_ATTENTION_COMPLEMENT_MANUAL_SUBSET",
     )
-    MANUAL_SUBSET_MODES = set(MODES[7:])
     MODE_DESCRIPTIONS = {
     "B0_FULL_IMAGE": "Full-image contextual baseline on every dataset slice",
     "B2_ATTENTION_ELIGIBLE_FULL_IMAGE": "Full image on exactly the AU1/C1 attention-eligible slices",
@@ -5312,64 +4962,6 @@ class FeatureStage:
             (mask > 0.5).float(), kernel_size=kernel, stride=1, padding=kernel // 2
         )
         return (support > 0.5).float() * (content > 0.5).float()
-    # Return only accepted positive manual targets used by manual-reference experiments.
-    @staticmethod
-    def accepted_manual_tokens(
-        workspace,
-        verbose=False,
-    ):
-        audit_rows=DataStage.read_csv(workspace.manual_audit)
-        accepted=set()
-        explicit_positive=0
-        legacy_inferred=0
-        skipped_nonpositive=0
-        skipped_unusable=0
-
-        for row in audit_rows:
-            if str(row.get("status", "")).strip().upper() != "ACCEPTED":
-                continue
-            token=str(row.get("image_token", "")).strip()
-            if not token:
-                continue
-            target_type=str(row.get("target_type", "")).strip().upper()
-            heart_present_raw=str(row.get("heart_present", "")).strip()
-
-            if target_type in {NO_HEART_VISIBLE, UNUSABLE, "UNLABELED_EMPTY"}:
-                skipped_nonpositive +=1
-                continue
-
-            path_value=str(row.get("manual_mask_path", "")).strip()
-            path=Path(path_value) if path_value else workspace.manual_masks / f"{token}.png"
-
-            if target_type == HEART_PRESENT or heart_present_raw == "1":
-                qc=DataStage.manual_mask_qc(path)
-                if qc.get("usable"):
-                    accepted.add(token)
-                    explicit_positive +=1
-                else:
-                    skipped_unusable +=1
-                continue
-
-
-            if not target_type and not heart_present_raw:
-                qc=DataStage.manual_mask_qc(path)
-                if qc.get("usable"):
-                    accepted.add(token)
-                    legacy_inferred +=1
-                else:
-                    skipped_unusable +=1
-            else:
-                skipped_nonpositive +=1
-
-        if verbose:
-            print(
-                "[FEATURE BANK][MANUAL] "
-                f"audit_rows={len(audit_rows)}, accepted_heart={len(accepted)}, "
-                f"explicit={explicit_positive}, legacy_inferred={legacy_inferred}, "
-                f"skipped_nonpositive={skipped_nonpositive}, "
-                f"skipped_unusable={skipped_unusable}"
-            )
-        return accepted
     @staticmethod
     def assert_same_cohort(
         bank,
@@ -5442,102 +5034,63 @@ class FeatureStage:
             ),
             "manual_positive_same_slices",
         )
-    # Build every experiment from a frozen EfficientNet pass. B2, AU1, and C1
-    # are forced to share the exact same Attention-eligible rows. During a full
-    # rebuild, B0 embeddings are reused for the B2 and B1 subsets, so the added
-    # methodological control does not create duplicate full-image forward passes.
+    # Compute all eleven modes every run; share identical embeddings across exact subsets.
     @staticmethod
-    def build_feature_bank(dataset_rows, workspace, device):
-        # Features are always rebuilt. EfficientNet-B0 stays frozen; only the image
-        # representation changes between full-image, ROI, and complement experiments.
-        reusable_bank={}
-        modes_to_compute=FeatureStage.MODES
-        compute_set=set(FeatureStage.MODES)
-
-        quality={
-            row["image_token"]: row
-            for row in DataStage.read_csv(workspace.quality_audit)
+    def build_feature_bank(dataset_rows, accepted_rows, matching_manifest, device):
+        accepted_manual = {
+            str(row["image_token"])
+            for row in accepted_rows
+            if row.get("segmentation_target_type") == HEART_PRESENT
+            and DataStage.manual_mask_qc(row["manual_mask_path"])["usable"]
         }
-        predictions={
-            row["image_token"]: row
-            for row in DataStage.read_csv(workspace.prediction_audit)
-        }
-        accepted_manual=FeatureStage.accepted_manual_tokens(
-            workspace, verbose=True
-        )
+        print(f"[FEATURES][MANUAL] accepted positive masks={len(accepted_manual)}")
         if not accepted_manual:
-            raise RuntimeError(
-                "No usable manual HEART_PRESENT mask is available for "
-                "M1/C3/AU3/C4. The audit was checked or migrated, but no "
-                "accepted non-empty PNG remained. Inspect simple_manual_mask_audit.csv "
-                "and manual_masks/. Baseline and automatic-Attention modes are not the cause of this error."
-            )
-        matching_manifest=DataStage.read_csv(
-            workspace.cross_class_matching_manifest
-        )
-        matched_tokens=MatchingStage.selected_matched_tokens(
-            matching_manifest
-        )
+            raise RuntimeError("No usable accepted HEART_PRESENT masks remain for M1/C3/AU3/C4.")
+        matched_tokens = {
+            str(row["image_token"])
+            for row in matching_manifest
+            if DataStage._as_int(row.get("selected_for_matched_cohort"), 0) == 1
+        }
         if not matched_tokens:
-            raise RuntimeError(
-                "The cross-class matching manifest is missing or contains no pairs. "
-                "Run pipeline.build_cross_class_matching()."
-            )
-        if len(predictions) != len(dataset_rows):
-            raise RuntimeError("The prediction audit does not cover the full dataset.")
-
-        rows=[]
+            raise RuntimeError("The current matching stage produced no usable matched pairs.")
+        rows = []
         for original in dataset_rows:
-            row=dict(original)
-            row.update(predictions.get(row["image_token"], {}))
-            row.update(quality.get(row["image_token"], {}))
-            row["keep_attention"]=int(
+            row = dict(original)
+            if row.get("attention_mask_bits") is None:
+                raise RuntimeError(f"Missing current-session OOF prediction for {row['image_token']}.")
+            row["keep_attention"] = int(
                 DataStage._as_int(row.get("attention_valid_final"), 0) == 1
                 and DataStage._as_int(row.get("attention_heart_present"), 1) == 1
                 and DataStage._as_int(row.get("quality_valid"), 0) == 1
-                and DataStage._as_float(row.get("attention_area_ratio"), 0.0)
-                >= 0.003
+                and DataStage._as_float(row.get("attention_area_ratio"), 0.0) >= 0.003
             )
-            row["keep_manual_matched"]=int(
-                row["image_token"] in accepted_manual
-            )
-            row["keep_cross_class_matched"]=int(
+            row["keep_manual_matched"] = int(row["image_token"] in accepted_manual)
+            row["keep_cross_class_matched"] = int(
                 row["image_token"] in matched_tokens and row["keep_attention"] == 1
             )
             rows.append(row)
-
         if not rows:
             raise RuntimeError("No images are eligible for feature extraction.")
         print(f"[FEATURES] rebuilding all 11 experiments from {len(rows)} source images")
-
-        extractor=DataStage.prepare_model(FrozenEfficientNet(), device).eval()
-        loader=DataLoader(
+        extractor = DataStage.prepare_model(FrozenEfficientNet(), device).eval()
+        loader = DataLoader(
             FeatureDataset(rows),
             batch_size=12 if device.type == "cuda" else 4,
             shuffle=False,
             num_workers=0,
             pin_memory=device.type == "cuda",
         )
-        pool=StreamingPatientPool(modes_to_compute)
-        started=time.perf_counter()
+        pool = StreamingPatientPool(FeatureStage.MODES)
+        started = time.perf_counter()
 
-        # Aliases receive the very same embeddings from a strict subset of the
-        # source rows. This avoids duplicate forward passes and guarantees that the
-        # same-slice controls differ only by their image representation.
-        alias_rules={
+        # Reuse embeddings only inside this run, never from a previous run or file.
+        alias_rules = {
             "B0_FULL_IMAGE": (
                 ("B2_ATTENTION_ELIGIBLE_FULL_IMAGE", "keep_attention"),
                 ("B1_MATCHED_FULL_IMAGE", "keep_cross_class_matched"),
             ),
-            "B2_ATTENTION_ELIGIBLE_FULL_IMAGE": (
-                ("B1_MATCHED_FULL_IMAGE", "keep_cross_class_matched"),
-            ),
-            "AU1_ATTENTION_ROI": (
-                ("AU2_MATCHED_ATTENTION_ROI", "keep_cross_class_matched"),
-            ),
-            "C1_ATTENTION_COMPLEMENT": (
-                ("C2_MATCHED_ATTENTION_COMPLEMENT", "keep_cross_class_matched"),
-            ),
+            "AU1_ATTENTION_ROI": (("AU2_MATCHED_ATTENTION_ROI", "keep_cross_class_matched"),),
+            "C1_ATTENTION_COMPLEMENT": (("C2_MATCHED_ATTENTION_COMPLEMENT", "keep_cross_class_matched"),),
         }
 
         def encode_groups(
@@ -5546,8 +5099,7 @@ class FeatureStage:
             valid_groups=[
                 (mode, images, selected_rows)
                 for mode, images, selected_rows in groups
-                if mode in compute_set
-                and len(selected_rows) > 0
+                if len(selected_rows) > 0
                 and images.shape[0] > 0
             ]
             if not valid_groups:
@@ -5575,8 +5127,6 @@ class FeatureStage:
                 pool.add(mode, current_embeddings, selected_rows)
 
                 for alias_mode, selector_field in alias_rules.get(mode, ()):
-                    if alias_mode not in compute_set:
-                        continue
                     alias_positions=[
                         position
                         for position, row in enumerate(selected_rows)
@@ -5594,191 +5144,55 @@ class FeatureStage:
 
         with torch.inference_mode():
             for robust, raw, content, attention, manual, indices in tqdm(
-                loader, desc=f"EfficientNet feature bank ({device.type})"):
-                batch_rows=[rows[int(index)] for index in indices]
-                attention_positions=[
-                    position
-                    for position, row in enumerate(batch_rows)
-                    if row["keep_attention"] == 1
-                ]
-                matched_positions=[
-                    position
-                    for position, row in enumerate(batch_rows)
-                    if row["keep_cross_class_matched"] == 1
-                ]
-                manual_positions=[
-                    position
-                    for position, row in enumerate(batch_rows)
-                    if row["keep_manual_matched"] == 1
-                ]
+                loader, desc=f"EfficientNet feature bank ({device.type})"
+            ):
+                batch_rows = [rows[int(index)] for index in indices]
+                attention_positions = [i for i, row in enumerate(batch_rows) if row["keep_attention"]]
+                manual_positions = [i for i, row in enumerate(batch_rows) if row["keep_manual_matched"]]
+                groups = [("B0_FULL_IMAGE", robust, batch_rows)]
 
-                groups=[]
+                # Automatic ROI/complement plus aliases for the matched cohort.
+                if attention_positions:
+                    positions = torch.as_tensor(attention_positions, dtype=torch.long)
+                    selected_raw = raw.index_select(0, positions)
+                    selected_content = content.index_select(0, positions)
+                    selected_mask = attention.index_select(0, positions)
+                    support = FeatureStage.support_mask(selected_mask, selected_content)
+                    selected_rows = [batch_rows[i] for i in attention_positions]
+                    groups.extend([
+                        ("AU1_ATTENTION_ROI", FeatureStage.region_normalize(selected_raw, support), selected_rows),
+                        ("C1_ATTENTION_COMPLEMENT", FeatureStage.region_normalize(
+                            selected_raw, (selected_content > 0.5).float() * (1.0 - support)
+                        ), selected_rows),
+                    ])
 
-                # One full-image pass supplies B0 and, through exact row subsets,
-                # B2 and B1. During an incremental migration, B2 alone is computed
-                # on the Attention-eligible rows while all previous modes are reused.
-                if "B0_FULL_IMAGE" in compute_set:
-                    groups.append(("B0_FULL_IMAGE", robust, batch_rows))
-                elif (
-                    "B2_ATTENTION_ELIGIBLE_FULL_IMAGE" in compute_set
-                    and attention_positions):
-                    positions=torch.as_tensor(attention_positions, dtype=torch.long)
-                    groups.append(
-                        (
-                            "B2_ATTENTION_ELIGIBLE_FULL_IMAGE",
-                            robust.index_select(0, positions),
-                            [batch_rows[position] for position in attention_positions],
-                        )
-                    )
-                elif "B1_MATCHED_FULL_IMAGE" in compute_set and matched_positions:
-                    positions=torch.as_tensor(matched_positions, dtype=torch.long)
-                    groups.append(
-                        (
-                            "B1_MATCHED_FULL_IMAGE",
-                            robust.index_select(0, positions),
-                            [batch_rows[position] for position in matched_positions],
-                        )
-                    )
-
-                needs_automatic_regions=bool(
-                    compute_set
-                    & {
-                        "AU1_ATTENTION_ROI",
-                        "C1_ATTENTION_COMPLEMENT",
-                        "AU2_MATCHED_ATTENTION_ROI",
-                        "C2_MATCHED_ATTENTION_COMPLEMENT",
-                    }
-                )
-                if needs_automatic_regions:
-                    use_attention_superset=bool(
-                        compute_set
-                        & {"AU1_ATTENTION_ROI", "C1_ATTENTION_COMPLEMENT"}
-                    )
-                    automatic_positions=(
-                        attention_positions if use_attention_superset else matched_positions
-                    )
-                    if automatic_positions:
-                        positions=torch.as_tensor(
-                            automatic_positions, dtype=torch.long
-                        )
-                        selected_raw=raw.index_select(0, positions)
-                        selected_content=content.index_select(0, positions)
-                        selected_mask=attention.index_select(0, positions)
-                        support=FeatureStage.support_mask(
-                            selected_mask, selected_content
-                        )
-                        selected_rows=[
-                            batch_rows[position] for position in automatic_positions
-                        ]
-
-                        if "AU1_ATTENTION_ROI" in compute_set:
-                            roi_mode="AU1_ATTENTION_ROI"
-                        elif "AU2_MATCHED_ATTENTION_ROI" in compute_set:
-                            roi_mode="AU2_MATCHED_ATTENTION_ROI"
-                        else:
-                            roi_mode=""
-                        if roi_mode:
-                            groups.append(
-                                (
-                                    roi_mode,
-                                    FeatureStage.region_normalize(
-                                        selected_raw, support
-                                    ),
-                                    selected_rows,
-                                )
-                            )
-
-                        if "C1_ATTENTION_COMPLEMENT" in compute_set:
-                            complement_mode="C1_ATTENTION_COMPLEMENT"
-                        elif "C2_MATCHED_ATTENTION_COMPLEMENT" in compute_set:
-                            complement_mode="C2_MATCHED_ATTENTION_COMPLEMENT"
-                        else:
-                            complement_mode=""
-                        if complement_mode:
-                            groups.append(
-                                (
-                                    complement_mode,
-                                    FeatureStage.region_normalize(
-                                        selected_raw,
-                                        (selected_content > 0.5).float()
-                                        * (1.0 - support),
-                                    ),
-                                    selected_rows,
-                                )
-                            )
-
-                if (
-                    compute_set & FeatureStage.MANUAL_SUBSET_MODES
-                    and manual_positions):
-                    positions=torch.as_tensor(manual_positions, dtype=torch.long)
-                    selected_raw=raw.index_select(0, positions)
-                    selected_content=content.index_select(0, positions)
-                    manual_mask=manual.index_select(0, positions)
-                    attention_mask=attention.index_select(0, positions)
-                    manual_support=FeatureStage.support_mask(
-                        manual_mask, selected_content
-                    )
-                    attention_support=FeatureStage.support_mask(
-                        attention_mask, selected_content
-                    )
-                    selected_rows=[
-                        batch_rows[position] for position in manual_positions
-                    ]
-                    visible_content=(selected_content > 0.5).float()
-                    manual_groups=(
-                        (
-                            "M1_MANUAL_ROI",
-                            FeatureStage.region_normalize(
-                                selected_raw, manual_support
-                            ),
-                        ),
-                        (
-                            "C3_MANUAL_COMPLEMENT",
-                            FeatureStage.region_normalize(
-                                selected_raw,
-                                visible_content * (1.0 - manual_support),
-                            ),
-                        ),
-                        (
-                            "AU3_ATTENTION_ROI_MANUAL_SUBSET",
-                            FeatureStage.region_normalize(
-                                selected_raw, attention_support
-                            ),
-                        ),
-                        (
-                            "C4_ATTENTION_COMPLEMENT_MANUAL_SUBSET",
-                            FeatureStage.region_normalize(
-                                selected_raw,
-                                visible_content * (1.0 - attention_support),
-                            ),
-                        ),
+                # All four manual-reference experiments use exactly these same slices.
+                if manual_positions:
+                    positions = torch.as_tensor(manual_positions, dtype=torch.long)
+                    selected_raw = raw.index_select(0, positions)
+                    selected_content = content.index_select(0, positions)
+                    manual_support = FeatureStage.support_mask(manual.index_select(0, positions), selected_content)
+                    attention_support = FeatureStage.support_mask(attention.index_select(0, positions), selected_content)
+                    selected_rows = [batch_rows[i] for i in manual_positions]
+                    visible_content = (selected_content > 0.5).float()
+                    regions = (
+                        ("M1_MANUAL_ROI", manual_support),
+                        ("C3_MANUAL_COMPLEMENT", visible_content * (1.0 - manual_support)),
+                        ("AU3_ATTENTION_ROI_MANUAL_SUBSET", attention_support),
+                        ("C4_ATTENTION_COMPLEMENT_MANUAL_SUBSET", visible_content * (1.0 - attention_support)),
                     )
                     groups.extend(
-                        (mode, images, selected_rows)
-                        for mode, images in manual_groups
-                        if mode in compute_set
+                        (mode, FeatureStage.region_normalize(selected_raw, support), selected_rows)
+                        for mode, support in regions
                     )
-
                 encode_groups(groups)
                 del groups
 
-        computed_bank={
-            mode: pool.finalize(mode)
-            for mode in modes_to_compute
-        }
-        bank=dict(reusable_bank)
-        bank.update(computed_bank)
-        missing_modes=[
-            mode for mode in FeatureStage.MODES if mode not in bank
-        ]
-        if missing_modes:
-            raise RuntimeError(
-                f"Feature-bank rebuild is missing modes: {missing_modes}"
-            )
-
+        bank = {mode: pool.finalize(mode) for mode in FeatureStage.MODES}
         FeatureStage.validate_cohort_alignment(bank)
-        print("[FEATURES] all experiment representations built in memory")
-        del extractor, loader
+        print("[FEATURES] all experiment representations built in RAM | "
+              + DataStage.format_seconds(time.perf_counter() - started))
+        del extractor, loader, pool
         DataStage.release_device(device)
         return bank
 
@@ -5930,10 +5344,9 @@ class EvaluationStage:
             "ci_low": float(np.quantile(differences, 0.025)) if differences else np.nan,
             "ci_high": float(np.quantile(differences, 0.975)) if differences else np.nan,
         }
-    # All hyperparameters and probability thresholds are selected inside the outer
-    # training fold. The held-out patients are used once, only for OOF scoring.
+    # Select classifier settings inside outer training folds and return all results in RAM.
     @staticmethod
-    def evaluate_experiments(bank, workspace):
+    def evaluate_experiments(bank):
         fold_map=EvaluationStage.patient_fold_map(bank["B0_FULL_IMAGE"])
         summary_rows=[]
         prediction_tables={}
@@ -6087,7 +5500,7 @@ class EvaluationStage:
                     **comparison,
                 }
             )
-        return summary, pd.DataFrame(comparisons)
+        return summary, pd.DataFrame(comparisons), prediction_tables
 
 # =============================================================================
 # STAGE 7 — SIMPLE USER API
@@ -6099,108 +5512,119 @@ class Pipeline:
 
     @staticmethod
     def run(dataset_path=None, manual_root=None, minimum_masks=None):
-        """Retrain and reevaluate the complete research pipeline from scratch."""
-        line="=" * 88
-        print(f"\n{line}\nCARDIAC MRI CAD — FRESH FULL RUN\n{line}")
-
-        # STEP 1 — DATASET ---------------------------------------------------------
+        """Run all research stages in one call; write only manual targets when necessary."""
+        line = "=" * 88
+        print(f"\n{line}\nCARDIAC MRI CAD — ONE-STEP IN-MEMORY RUN\n{line}")
+        print("[ORDER] Dataset -> quality/manual targets -> five Attention U-Nets -> OOF masks")
+        print("[ORDER] -> Sick/Normal matching -> 11 EfficientNet representations -> patient-level evaluation")
+        print("[REVIEW] Optional HTML editing is separate; new labels apply to the next full run.")
+        # A failed new run must never masquerade as the results of an older run.
+        Pipeline.last_run = None
+        DataStage.clear_image_cache()
         DataStage.seed_everything(include_cuda=False)
-        dataset_path=Path(dataset_path or DataStage._default_dataset_path())
-        workspace=DataStage.create_workspace(manual_root)
-        samples=DataStage.discover_dataset(dataset_path, workspace)
-        rows=DataStage.build_dataset_rows(samples, workspace)
-        print(f"[PERSISTENT] manual masks: {workspace.manual_masks}")
-        print(f"[PERSISTENT] manual labels: {workspace.manual_annotations}")
-        print(f"[TEMPORARY] this run only: {workspace.root}")
+        dataset_path = Path(dataset_path or DataStage._default_dataset_path())
+        workspace = DataStage.create_workspace(manual_root)
+        rows = DataStage.discover_dataset(dataset_path, workspace)
+        rows = DataStage.build_quality_audit(rows)
+        state = {"rows": rows, "workspace": workspace, "status": "manual_targets"}
+        Pipeline.last_run = state
+        print(f"[PERSISTENT] {workspace.manual_masks}")
+        print(f"[PERSISTENT] {workspace.manual_annotations}")
+        print("[FILES] No output directory, checkpoint, automatic-mask PNG, CSV/JSON audit, or feature archive.")
 
-        # STEP 2 — QUALITY + MANUAL TARGETS --------------------------------------
-        # Quality is measured again because no audit history is retained.
-        quality=DataStage.build_quality_audit(rows, workspace, refresh=True)
-        accepted, manual_summary=DataStage.audit_manual_masks(
-            rows, quality, workspace, minimum_masks=minimum_masks
+        # STEP 1 — MANUAL TARGETS: preserve PNGs, explicit negative labels and weights.
+        accepted, manual_audit, manual_summary = DataStage.audit_manual_masks(
+            rows, workspace, minimum_masks=minimum_masks
         )
+        state.update(manual_audit=manual_audit, manual_summary=manual_summary)
         print("\n[MANUAL TARGETS]")
         display(pd.DataFrame([manual_summary]))
 
-        # STEP 3 — ATTENTION U-NET ------------------------------------------------
-        # Every fold is retrained. Patient k never appears in the model/calibration
-        # that predicts patient k, so all automatic masks remain genuinely OOF.
-        device=DataStage.start_device_stage("cuda", "Attention U-Net training")
+        # STEP 2 — TRAIN: best weights stay on CPU in RAM until their OOF prediction.
+        state["status"] = "attention_training"
+        device = DataStage.start_device_stage("cuda", "Attention U-Net training")
         try:
-            checkpoints=AttentionStage.train_attention_crossfit(accepted, workspace, device)
+            fold_states = AttentionStage.train_attention_crossfit(accepted, device)
         finally:
+            DataStage.clear_image_cache()
             DataStage.finish_device_stage(device, "Attention U-Net training")
+        state["training"] = {
+            fold: {key: value for key, value in fold_state.items() if key != "state_dict"}
+            for fold, fold_state in fold_states.items()
+        }
 
-        device=DataStage.start_device_stage("cuda", "Attention U-Net OOF prediction")
+        # STEP 3 — OOF PREDICTION: masks are losslessly packed in RAM, not saved.
+        state["status"] = "attention_prediction"
+        device = DataStage.start_device_stage("cuda", "Attention U-Net OOF prediction")
         try:
-            predictions=AttentionStage.predict_attention_masks(rows, workspace, device, checkpoints)
+            rows, prediction_summary = AttentionStage.predict_attention_masks(rows, device, fold_states)
         finally:
+            fold_states.clear()
+            DataStage.clear_image_cache()
             DataStage.finish_device_stage(device, "Attention U-Net OOF prediction")
+        state.update(rows=rows, predictions=rows, prediction_summary=prediction_summary)
+        segmentation_summary, segmentation_metrics = AttentionStage.evaluate_oof_segmentation(manual_audit, rows)
+        state.update(segmentation_summary=segmentation_summary, segmentation_metrics=segmentation_metrics)
+        print("\n[ATTENTION OOF SUMMARY]")
+        display(pd.DataFrame([prediction_summary]))
+        display(pd.DataFrame([segmentation_summary]))
 
-        # STEP 4 — MATCHING -------------------------------------------------------
-        matching=MatchingStage.build_cross_class_matching(rows, workspace)
-        matching_summary=DataStage.read_json(workspace.cross_class_matching_summary, {}) or {}
+        # STEP 4 — MATCHING: retain both the strict core and expanded cohort in RAM.
+        # Review remains available even if matching or a later stage fails.
+        state["status"] = "matching"
+        matching, matching_summary = MatchingStage.build_cross_class_matching(rows)
+        state.update(matching=matching, matching_summary=matching_summary)
         print("\n[MATCHING]")
         display(pd.DataFrame([matching_summary]))
 
-        # STEP 5 — FROZEN EFFICIENTNET FEATURES ---------------------------------
-        # ImageNet EfficientNet-B0 is frozen. The same extractor is used for every
-        # full-image / ROI / complement experiment.
-        device=DataStage.start_device_stage("cuda", "EfficientNet feature extraction")
+        # STEP 5 — FEATURES: frozen ImageNet EfficientNet-B0; all eleven modes.
+        state["status"] = "feature_extraction"
+        device = DataStage.start_device_stage("cuda", "EfficientNet feature extraction")
         try:
-            bank=FeatureStage.build_feature_bank(rows, workspace, device)
+            bank = FeatureStage.build_feature_bank(rows, accepted, matching, device)
         finally:
             DataStage.finish_device_stage(device, "EfficientNet feature extraction")
+        state["feature_bank"] = bank
 
-        # STEP 6 — PATIENT-LEVEL EVALUATION -------------------------------------
-        results, comparisons=EvaluationStage.evaluate_experiments(bank, workspace)
+        # STEP 6 — EVALUATION: nested patient-level CV and paired bootstrap AUC tests.
+        state["status"] = "evaluation"
+        results, comparisons, patient_predictions = EvaluationStage.evaluate_experiments(bank)
+        state.update(results=results, comparisons=comparisons, patient_predictions=patient_predictions, status="complete")
         print("\n[EVALUATION SUMMARY]")
         display(results)
         print("\n[PAIRED AUC COMPARISONS]")
         display(comparisons)
-
-        # Keep only in-memory references for an optional review in this same session.
-        # Starting a new run creates a new temporary workspace and recomputes everything.
-        Pipeline.last_run={
-            "rows": rows,
-            "workspace": workspace,
-            "predictions": predictions,
-            "matching": matching,
-            "feature_bank": bank,
-            "results": results,
-            "comparisons": comparisons,
-        }
-        return Pipeline.last_run
+        print("[DONE] Results are displayed above and available through result / Pipeline.last_run.")
+        return state
     @staticmethod
-    def review(scope="invalid", limit=300, start_index=0, review_round=1, seed=42):
-        """Open the HTML editor for the most recent run and save only manual targets."""
-        if Pipeline.last_run is None:
-            raise RuntimeError("Run Pipeline.run() first so automatic OOF masks exist in this session.")
-
-        rows=Pipeline.last_run["rows"]
-        workspace=Pipeline.last_run["workspace"]
+    def review(scope="invalid", limit=300, start_index=0, seed=42, dataset_path=None, manual_root=None):
+        """Open HTML review from current RAM data, or prepare a CPU-only manual-label session."""
+        # Explicit paths intentionally start a review of that dataset/workspace.
+        if Pipeline.last_run is None or dataset_path is not None or manual_root is not None:
+            workspace = DataStage.create_workspace(manual_root)
+            dataset_path = Path(dataset_path or DataStage._default_dataset_path())
+            rows = DataStage.discover_dataset(dataset_path, workspace)
+            rows = DataStage.build_quality_audit(rows)
+            Pipeline.last_run = {"rows": rows, "workspace": workspace, "status": "manual_review"}
+        rows = Pipeline.last_run["rows"]
+        workspace = Pipeline.last_run["workspace"]
         DataStage.register_existing_manual_masks(rows, workspace)
+        if scope in {"invalid", "uncertain"} and not any(row.get("attention_mask_bits") is not None for row in rows):
+            print("[REVIEW] This scope needs current-session OOF predictions. "
+                  "Use scope='all' to draw initial manual masks, or run Pipeline.run() first.")
+            return None
         try:
-            queue=ReviewStage.select_review_rows(
-                rows, workspace, scope=scope, limit=limit, seed=seed, review_round=review_round
-            )
+            queue = ReviewStage.select_review_rows(rows, workspace, scope=scope, limit=limit, seed=seed)
         except RuntimeError as error:
             print(error)
             return None
-
-        # Editor actions persist only the manual PNG and its explicit label. Review
-        # queues/history/automatic masks live under the temporary workspace.
-        editor=MaskEditor(
-            queue,
-            workspace,
-            start_index=start_index,
-            brush_radius=8,  # editor brush radius in pixels
-            review_round=review_round,
-            review_scope=scope,
-        )
+        editor = MaskEditor(queue, workspace, start_index=start_index, brush_radius=8, review_scope=scope)
         return editor.show()
 
-# Importing the file does not train a model. It only prepares reproducible CPU state.
+# Importing definitions does not train models or create output directories.
 DataStage.seed_everything(include_cuda=False)
+print("[PIPELINE] Run all stages: result = Pipeline.run()")
+print("[PIPELINE] Optional editing: editor = Pipeline.review(scope='invalid')")
+print("[PIPELINE] Before the first training run: Pipeline.review(scope='all')")
 print("[PIPELINE] Persistent data: manual_masks/ + manual_annotation_labels.csv only")
-print("[PIPELINE] Run: Pipeline.run() -> optional Pipeline.review() -> Pipeline.run() again")
+print("[PIPELINE] After manual changes, rerun Pipeline.run(); no generated state is resumed.")
