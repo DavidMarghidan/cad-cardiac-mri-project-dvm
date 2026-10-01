@@ -22,6 +22,7 @@ import contextlib
 import csv
 import gc
 import hashlib
+import importlib
 import json
 import math
 import os
@@ -971,7 +972,7 @@ class DataStage:
     ):
         # The research pipeline was trained only after at least 800 positive manual masks
         # survived quality/mask QC. The caller may override this only for diagnostics.
-        minimum_masks=int(minimum_masks or 800)
+        minimum_masks=800 if minimum_masks is None else int(minimum_masks)
         by_token={str(row["image_token"]): dict(row) for row in rows}
         manual_files={path.stem: path for path in workspace.manual_masks.glob("*.png")}
         annotations=DataStage.load_annotations(workspace)
@@ -1099,7 +1100,13 @@ class DataStage:
                 negative_count +=1
                 fold_negative_counts[fold] +=1
 
-        DataStage.write_csv(workspace.manual_audit, audit, audit[0].keys())
+        # Use a fixed schema even when the audit is empty or begins with a stale token.
+        manual_audit_fields=(
+            "image_token", "patient_id", "series_id", "manual_mask_path", "status",
+            "target_type", "heart_present", "annotation_source", "sample_weight",
+            "area_ratio", "quality_valid", "quality_reason", "reason",
+        )
+        DataStage.write_csv(workspace.manual_audit, audit, manual_audit_fields)
         rejected=sum(row.get("status") == "REJECTED" for row in audit)
         excluded=sum(row.get("status") == "EXCLUDED" for row in audit)
         unlabeled_empty=sum(
@@ -2680,8 +2687,6 @@ class HammingBKTree:
     def __init__(self):
         self.root=None
 
-    @staticmethod
-
     def add(self, value):
         value=int(value)
         if self.root is None:
@@ -3070,7 +3075,13 @@ class MaskEditor:
         brush_radius=8,
         review_round=1,
         review_scope="invalid",):
-        import ipywidgets as widgets
+        try:
+            widgets=importlib.import_module("ipywidgets")
+        except ModuleNotFoundError as error:
+            raise RuntimeError(
+                "The HTML review editor requires ipywidgets in the active Python/Jupyter "
+                "environment. Install it with: python -m pip install ipywidgets"
+            ) from error
 
         annotations=DataStage.load_annotations(workspace)
         unlabeled_rows=[]
@@ -4958,9 +4969,28 @@ class MatchingStage:
             per_patient[str(row["patient_id"])] +=1
         selected_fraction_eligible=len(selected) / max(1, len(eligible_rows))
         selected_fraction_dataset=len(selected) / max(1, len(dataset_rows))
+        matching_settings=MatchingStage.matching_settings_payload()
+        fingerprint_payload={
+            "settings": matching_settings,
+            "selected_pairs": sorted(
+                (
+                    str(row.get("pair_id", "")),
+                    str(row.get("image_token", "")),
+                    str(row.get("matched_partner_token", "")),
+                )
+                for row in selected_sick
+            ),
+        }
+        fingerprint=hashlib.sha256(
+            json.dumps(
+                fingerprint_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
         summary={
             "fingerprint": fingerprint,
-            **MatchingStage.matching_settings_payload(),
+            **matching_settings,
             "dataset_images": len(dataset_rows),
             "eligible_images": len(eligible_rows),
             "acquisition_families": family_count,
@@ -6140,7 +6170,7 @@ class Pipeline:
             "results": results,
             "comparisons": comparisons,
         }
-        return LAST_RUN
+        return Pipeline.last_run
     @staticmethod
     def review(scope="invalid", limit=300, start_index=0, review_round=1, seed=42):
         """Open the HTML editor for the most recent run and save only manual targets."""
