@@ -38,8 +38,8 @@ performs only the explicitly requested cleanup and never deletes manual masks or
 ``manual_annotation_labels.csv``. Existing artifacts from the former ``current_run/``
 layout are copied once into the persistent layout when their destination is absent.
 
-CPU/GPU hand-offs continue to use semantic fingerprints of normalized labels and
-binary mask pixels rather than timestamps or PNG/CSV encoding. Scientific safeguards
+CPU/GPU hand-offs use mount-independent semantic fingerprints of dataset context,
+normalized labels, and binary mask pixels rather than absolute paths or CSV encoding. Scientific safeguards
 remain unchanged: patient-level folds, genuinely out-of-fold masks, same-slice
 controls, balanced matched cohorts, and patient-level evaluation.
 """
@@ -133,6 +133,15 @@ class DataStage:
     @staticmethod
     def _as_int(value, default=0):
         return int(round(DataStage._as_float(value, float(default))))
+
+    # Parse large integer metadata such as nanosecond timestamps without float rounding.
+    @staticmethod
+    def _exact_int(value, default=0):
+        try:
+            text=str(value).strip()
+            return int(text) if text else int(default)
+        except (TypeError, ValueError, OverflowError):
+            return int(default)
     # Find the CAD dataset in Kaggle, an environment override, or the local fallback.
     @staticmethod
     def _default_dataset_path():
@@ -849,7 +858,28 @@ class DataStage:
         )
         return False
 
-    # Fingerprint the exact persistent CPU hand-off consumed by Attention training.
+    # Convert one dataset path to a mount-independent reference beginning at Directory_*.
+    @staticmethod
+    def stable_image_reference(value):
+        value=str(value or "").strip()
+        if not value:
+            return ""
+        parts=Path(value).parts
+        for index, part in enumerate(parts):
+            if str(part).startswith("Directory_"):
+                return "/".join(map(str, parts[index:]))
+        return Path(value).name
+
+    # Normalize a sequence-group identifier without retaining the Kaggle mount path.
+    @staticmethod
+    def stable_sequence_group(value):
+        value=str(value or "").strip()
+        if "::" not in value:
+            return value
+        prefix, suffix=value.split("::", 1)
+        return f"{prefix}::{DataStage.stable_image_reference(suffix)}"
+
+    # Fingerprint the semantic CPU hand-off, not CSV bytes or absolute mask paths.
     @staticmethod
     def preparation_fingerprint(workspace):
         required=(
@@ -865,15 +895,100 @@ class DataStage:
         ).strip()
         if not manual_fingerprint:
             return ""
+
+        dataset_rows=[]
+        for row in DataStage.read_csv(workspace.dataset_manifest):
+            image_path=Path(str(row.get("image_path", "")))
+            image_size=image_path.stat().st_size if image_path.is_file() else -1
+            dataset_rows.append(
+                {
+                    "image_token": str(row.get("image_token", "")),
+                    "label": DataStage._as_int(row.get("label"), -1),
+                    "patient_id": str(row.get("patient_id", "")),
+                    "series_id": str(row.get("series_id", "")),
+                    "segmentation_fold": DataStage._as_int(
+                        row.get("segmentation_fold"), -1
+                    ),
+                    "sequence_group_id": DataStage.stable_sequence_group(
+                        row.get("sequence_group_id", "")
+                    ),
+                    "sequence_index": DataStage._as_int(row.get("sequence_index"), 0),
+                    "sequence_length": DataStage._as_int(row.get("sequence_length"), 1),
+                    "image_reference": DataStage.stable_image_reference(
+                        row.get("image_path", "")
+                    ),
+                    "previous_reference": DataStage.stable_image_reference(
+                        row.get("previous_image_path", "")
+                    ),
+                    "next_reference": DataStage.stable_image_reference(
+                        row.get("next_image_path", "")
+                    ),
+                    "image_size_bytes": int(image_size),
+                }
+            )
+
+        quality_rows=[]
+        for row in DataStage.read_csv(workspace.quality_audit):
+            quality_rows.append(
+                {
+                    "image_token": str(row.get("image_token", "")),
+                    "perceptual_hash": str(row.get("perceptual_hash", "")),
+                    "sharpness": format(
+                        DataStage._as_float(row.get("sharpness"), np.nan), ".12g"
+                    ),
+                    "noise_ratio": format(
+                        DataStage._as_float(row.get("noise_ratio"), np.nan), ".12g"
+                    ),
+                    "dynamic_range": format(
+                        DataStage._as_float(row.get("dynamic_range"), np.nan), ".12g"
+                    ),
+                    "patient_blur_threshold": format(
+                        DataStage._as_float(
+                            row.get("patient_blur_threshold"), np.nan
+                        ),
+                        ".12g",
+                    ),
+                    "patient_noise_threshold": format(
+                        DataStage._as_float(
+                            row.get("patient_noise_threshold"), np.nan
+                        ),
+                        ".12g",
+                    ),
+                    "quality_valid": DataStage._as_int(row.get("quality_valid"), 0),
+                    "quality_reason": str(row.get("quality_reason", "")),
+                }
+            )
+
+        manual_rows=[]
+        for row in DataStage.read_csv(workspace.manual_audit):
+            manual_rows.append(
+                {
+                    "image_token": str(row.get("image_token", "")),
+                    "status": str(row.get("status", "")).strip().upper(),
+                    "target_type": str(row.get("target_type", "")).strip().upper(),
+                    "heart_present": str(row.get("heart_present", "")).strip(),
+                    "annotation_source": str(row.get("annotation_source", "")),
+                    "sample_weight": format(
+                        DataStage._as_float(row.get("sample_weight"), 0.0), ".12g"
+                    ),
+                    "area_ratio": format(
+                        DataStage._as_float(row.get("area_ratio"), np.nan), ".12g"
+                    ),
+                    "quality_valid": DataStage._as_int(row.get("quality_valid"), 0),
+                    "quality_reason": str(row.get("quality_reason", "")),
+                    "reason": str(row.get("reason", "")),
+                }
+            )
+
         payload={
-            "schema": "cad-cpu-handoff-v2-dvm-workspace",
-            "dataset_manifest": DataStage.file_sha256(workspace.dataset_manifest),
-            "quality_audit": DataStage.file_sha256(workspace.quality_audit),
-            "manual_audit": DataStage.file_sha256(workspace.manual_audit),
+            "schema": "cad-cpu-handoff-v3-semantic-dvm-workspace",
             "manual_data": manual_fingerprint,
+            "dataset_rows": sorted(dataset_rows, key=lambda row: row["image_token"]),
+            "quality_rows": sorted(quality_rows, key=lambda row: row["image_token"]),
+            "manual_rows": sorted(manual_rows, key=lambda row: row["image_token"]),
         }
         return hashlib.sha256(
-            json.dumps(payload, sort_keys=True).encode("utf-8")
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
 
     # Build a stable fingerprint for the completed checkpoint and prediction hand-off.
@@ -888,24 +1003,392 @@ class DataStage:
             digest.update(DataStage.file_sha256(checkpoint).encode("ascii"))
         return digest.hexdigest()
 
+    # Verify that prediction rows describe exactly the current dataset and 2.5D context.
+    @staticmethod
+    def prediction_rows_match_dataset(dataset_rows, prediction_rows):
+        if len(dataset_rows) != len(prediction_rows):
+            return False, f"prediction rows={len(prediction_rows)}, dataset rows={len(dataset_rows)}"
+        predictions={
+            str(row.get("image_token", "")): row
+            for row in prediction_rows
+            if str(row.get("image_token", ""))
+        }
+        if len(predictions) != len(dataset_rows):
+            return False, "duplicate or missing image_token values in the prediction audit"
+        for dataset_row in dataset_rows:
+            token=str(dataset_row.get("image_token", ""))
+            prediction=predictions.get(token)
+            if prediction is None:
+                return False, f"prediction missing for {token}"
+            comparisons=(
+                ("patient_id", str(dataset_row.get("patient_id", "")), str(prediction.get("patient_id", ""))),
+                ("series_id", str(dataset_row.get("series_id", "")), str(prediction.get("series_id", ""))),
+                (
+                    "segmentation_fold",
+                    DataStage._as_int(dataset_row.get("segmentation_fold"), -1),
+                    DataStage._as_int(prediction.get("segmentation_fold"), -1),
+                ),
+                (
+                    "image_path",
+                    DataStage.stable_image_reference(dataset_row.get("image_path", "")),
+                    DataStage.stable_image_reference(prediction.get("image_path", "")),
+                ),
+                (
+                    "previous_image_path",
+                    DataStage.stable_image_reference(dataset_row.get("previous_image_path", "")),
+                    DataStage.stable_image_reference(prediction.get("previous_image_path", "")),
+                ),
+                (
+                    "next_image_path",
+                    DataStage.stable_image_reference(dataset_row.get("next_image_path", "")),
+                    DataStage.stable_image_reference(prediction.get("next_image_path", "")),
+                ),
+            )
+            for field, expected, actual in comparisons:
+                if expected != actual:
+                    return False, f"{field} differs for {token}"
+        return True, "complete token/context match"
+
+    # Reproduce the checkpoint fingerprint written by cad-cardiac-mri-project-dvm.
+    @staticmethod
+    def dvm_manual_fingerprint(
+        rows, fold, file_hash_cache=None, image_metadata=None
+    ):
+        file_hash_cache=file_hash_cache if file_hash_cache is not None else {}
+        image_metadata=image_metadata if image_metadata is not None else {}
+        payload={
+            "schema": "simple-attention-2p5d-presence-v3",
+            "fold": int(fold),
+            "size": 256,
+            "input_channels": 3,
+            "use_2_5d": True,
+            "base_channels": 24,
+            "epochs": 36,
+            "learning_rate": 8e-4,
+            "weight_decay": 1e-4,
+            "loss": {
+                "focal": 0.40,
+                "tversky": 0.60,
+                "presence": 0.30,
+                "alpha_fp": 0.65,
+                "beta_fn": 0.35,
+            },
+            "seed": 42,
+        }
+        digest=hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8"))
+        for row in sorted(rows, key=lambda item: item["image_token"]):
+            mask_path=Path(row["manual_mask_path"])
+            image_path=Path(row["image_path"])
+            if not mask_path.is_file() or not image_path.is_file():
+                return ""
+            image_stat=image_path.stat()
+            metadata=image_metadata.get(str(row["image_token"]), {})
+            image_size=DataStage._exact_int(
+                metadata.get("image_size_bytes"), image_stat.st_size
+            )
+            image_mtime=DataStage._exact_int(
+                metadata.get("image_mtime_ns"), image_stat.st_mtime_ns
+            )
+            digest.update(str(row["image_token"]).encode("utf-8"))
+            digest.update(str(row.get("segmentation_target_type", "")).encode("utf-8"))
+            digest.update(str(row.get("annotation_source", "")).encode("utf-8"))
+            digest.update(str(row.get("sample_weight", 1.0)).encode("ascii"))
+            digest.update(str(image_size).encode("ascii"))
+            digest.update(str(image_mtime).encode("ascii"))
+            cache_key=str(mask_path)
+            if cache_key not in file_hash_cache:
+                file_hash_cache[cache_key]=DataStage.file_sha256(mask_path)
+            digest.update(file_hash_cache[cache_key].encode("ascii"))
+        return digest.hexdigest()
+
+    # Validate all five large-project checkpoints against the current manual targets.
+    @staticmethod
+    def compatible_dvm_checkpoint_map(dataset_rows, workspace):
+        accepted=DataStage.accepted_training_rows(dataset_rows, workspace)
+        if not accepted:
+            return None, "no accepted manual training targets"
+        result={}
+        file_hash_cache={}
+        image_metadata={
+            str(row.get("image_token", "")): row
+            for row in DataStage.read_csv(workspace.quality_audit)
+        }
+        for fold in range(5):
+            checkpoint_path=workspace.checkpoints / f"attention_unet_fold_{fold}.pt"
+            if not checkpoint_path.is_file():
+                return None, f"missing checkpoint for fold {fold}"
+            non_test_rows=[
+                row for row in accepted
+                if DataStage._as_int(row.get("segmentation_fold"), -1) != fold
+            ]
+            expected_current=DataStage.dvm_manual_fingerprint(
+                non_test_rows,
+                fold,
+                file_hash_cache=file_hash_cache,
+                image_metadata={},
+            )
+            expected_audit=DataStage.dvm_manual_fingerprint(
+                non_test_rows,
+                fold,
+                file_hash_cache=file_hash_cache,
+                image_metadata=image_metadata,
+            )
+            expected_values={value for value in (expected_current, expected_audit) if value}
+            if not expected_values:
+                return None, f"could not fingerprint fold {fold} training inputs"
+            try:
+                try:
+                    checkpoint=torch.load(
+                        str(checkpoint_path), map_location="cpu", weights_only=False
+                    )
+                except TypeError:
+                    checkpoint=torch.load(str(checkpoint_path), map_location="cpu")
+            except Exception as error:
+                return None, f"unreadable fold {fold} checkpoint: {type(error).__name__}"
+            schema=str(checkpoint.get("schema", "")) if isinstance(checkpoint, dict) else ""
+            fingerprint=str(checkpoint.get("fingerprint", "")) if isinstance(checkpoint, dict) else ""
+            del checkpoint
+            if schema != "simple-attention-2p5d-presence-v3":
+                return None, f"fold {fold} checkpoint schema is {schema or 'missing'}"
+            if fingerprint not in expected_values:
+                return None, f"fold {fold} checkpoint does not match current manual targets"
+            result[fold]=checkpoint_path
+        return result, "all five DVM checkpoints match current manual targets"
+
+    # Reproduce the large project's completed-prediction fingerprint exactly.
+    @staticmethod
+    def dvm_prediction_fingerprint(
+        dataset_rows, checkpoint_map, image_metadata=None
+    ):
+        digest=hashlib.sha256()
+        image_metadata=image_metadata if image_metadata is not None else {}
+        settings_payload={
+            "schema": "simple-predictions-2p5d-presence-v5",
+            "thresholds": (
+                0.20, 0.25, 0.30, 0.35, 0.40, 0.45,
+                0.50, 0.55, 0.60, 0.65, 0.70, 0.75,
+            ),
+            "presence_thresholds": (
+                0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50,
+                0.55, 0.60, 0.65, 0.70, 0.75, 0.80,
+            ),
+            "area": [0.003, 0.65],
+            "repair_offsets": (-0.20, -0.15, -0.10, -0.05, 0.05, 0.10, 0.15, 0.20),
+            "tta_contrast": 1.10,
+            "presence_override_peak": 0.80,
+            "prior_z": 5.5,
+        }
+        digest.update(json.dumps(settings_payload, sort_keys=True).encode("utf-8"))
+        digest.update(str(len(dataset_rows)).encode("ascii"))
+        for row in dataset_rows:
+            image_path=Path(row["image_path"])
+            if not image_path.is_file():
+                return ""
+            image_stat=image_path.stat()
+            metadata=image_metadata.get(str(row["image_token"]), {})
+            image_size=DataStage._exact_int(
+                metadata.get("image_size_bytes"), image_stat.st_size
+            )
+            image_mtime=DataStage._exact_int(
+                metadata.get("image_mtime_ns"), image_stat.st_mtime_ns
+            )
+            digest.update(str(row["image_token"]).encode("utf-8"))
+            digest.update(str(row["segmentation_fold"]).encode("ascii"))
+            digest.update(str(row.get("previous_image_path", "")).encode("utf-8"))
+            digest.update(str(row.get("next_image_path", "")).encode("utf-8"))
+            digest.update(str(image_size).encode("ascii"))
+            digest.update(str(image_mtime).encode("ascii"))
+        for fold, checkpoint_path in sorted(checkpoint_map.items()):
+            digest.update(str(fold).encode("ascii"))
+            digest.update(DataStage.file_sha256(checkpoint_path).encode("ascii"))
+        return digest.hexdigest()
+
+    # Create the semantic snapshot only when current files still match the manual audit.
+    @staticmethod
+    def ensure_manual_snapshot_for_adoption(workspace):
+        saved=DataStage.load_manual_data_snapshot(workspace)
+        if saved:
+            if DataStage.manual_data_changed_after(workspace):
+                return None, "manual masks or labels differ from the saved CPU snapshot"
+            return DataStage.load_manual_data_snapshot(workspace), "existing snapshot is current"
+        if not DataStage.manual_data_matches_preparation(workspace):
+            return None, "current manual masks/labels do not match simple_manual_mask_audit.csv"
+        accepted_count=sum(
+            str(row.get("status", "")).strip().upper() == "ACCEPTED"
+            for row in DataStage.read_csv(workspace.manual_audit)
+        )
+        snapshot=DataStage.save_manual_data_snapshot(
+            workspace,
+            accepted_training_targets=accepted_count,
+        )
+        print(
+            "[HAND-OFF] Created a semantic CPU snapshot from the compatible "
+            "persistent manual audit; no CPU preparation rerun was needed."
+        )
+        return snapshot, "semantic snapshot created from current manual audit"
+
+    # Adopt a valid cache produced by the large DVM pipeline without retraining it.
+    @staticmethod
+    def adopt_compatible_dvm_attention_outputs(
+        workspace, dataset_rows, prediction_rows, state
+    ):
+        schema=str(state.get("schema", ""))
+        if schema != "simple-predictions-2p5d-presence-v5":
+            return False, f"prediction summary schema {schema or 'missing'} is not the DVM v5 cache"
+        checkpoint_map, checkpoint_reason=DataStage.compatible_dvm_checkpoint_map(
+            dataset_rows, workspace
+        )
+        if checkpoint_map is None:
+            return False, checkpoint_reason
+        image_metadata={
+            str(row.get("image_token", "")): row
+            for row in DataStage.read_csv(workspace.quality_audit)
+        }
+        expected_prediction_current=DataStage.dvm_prediction_fingerprint(
+            dataset_rows, checkpoint_map, image_metadata={}
+        )
+        expected_prediction_audit=DataStage.dvm_prediction_fingerprint(
+            dataset_rows, checkpoint_map, image_metadata=image_metadata
+        )
+        expected_predictions={
+            value
+            for value in (expected_prediction_current, expected_prediction_audit)
+            if value
+        }
+        if not expected_predictions:
+            return False, "could not recompute the DVM prediction fingerprint"
+        if str(state.get("fingerprint", "")) not in expected_predictions:
+            return False, "DVM prediction fingerprint does not match the current dataset/checkpoints"
+        snapshot, snapshot_reason=DataStage.ensure_manual_snapshot_for_adoption(workspace)
+        if snapshot is None:
+            return False, snapshot_reason
+        preparation=DataStage.preparation_fingerprint(workspace)
+        if not preparation:
+            return False, "semantic CPU preparation fingerprint could not be created"
+        migrated=dict(state)
+        migrated["preparation_fingerprint"]=preparation
+        migrated["manual_semantic_fingerprint"]=snapshot["fingerprint"]
+        migrated["images"]=len(prediction_rows)
+        migrated["compatibility_adoption"]={
+            "source": "cad-cardiac-mri-project-dvm",
+            "validation": "checkpoint fingerprints + prediction fingerprint + full mask coverage",
+        }
+        DataStage.write_json(workspace.prediction_summary, migrated)
+        print(
+            "[HAND-OFF] Existing DVM Attention checkpoints and OOF predictions were "
+            "fully validated and adopted. Pipeline.gpu_attention() is not required."
+        )
+        return True, "validated and adopted DVM Attention cache"
+
+    # Adopt an older semantic-fix completion record after a path-only workspace migration.
+    @staticmethod
+    def adopt_compatible_semantic_attention_outputs(
+        workspace, dataset_rows, prediction_rows, state
+    ):
+        state_manual=str(state.get("manual_semantic_fingerprint", "")).strip()
+        if not state_manual:
+            return False, "prediction summary has no manual semantic fingerprint"
+        current_manual=DataStage.manual_data_fingerprint(workspace)["fingerprint"]
+        if state_manual != current_manual:
+            return False, "manual semantic fingerprint changed after Attention inference"
+        checkpoint_paths=[
+            workspace.checkpoints / f"attention_unet_fold_{fold}.pt"
+            for fold in range(5)
+        ]
+        if not all(path.is_file() for path in checkpoint_paths):
+            return False, "one or more of the five Attention checkpoints are missing"
+        snapshot, snapshot_reason=DataStage.ensure_manual_snapshot_for_adoption(workspace)
+        if snapshot is None:
+            return False, snapshot_reason
+        preparation=DataStage.preparation_fingerprint(workspace)
+        if not preparation:
+            return False, "semantic CPU preparation fingerprint could not be created"
+        migrated=dict(state)
+        migrated["preparation_fingerprint"]=preparation
+        migrated["manual_semantic_fingerprint"]=snapshot["fingerprint"]
+        migrated["images"]=len(prediction_rows)
+        if not str(migrated.get("fingerprint", "")).strip():
+            migrated["fingerprint"]=DataStage.attention_output_fingerprint(
+                workspace, preparation
+            )
+        migrated["compatibility_adoption"]={
+            "source": "semantic-fix/current_run path migration",
+            "validation": "manual semantic fingerprint + dataset context + full mask coverage",
+        }
+        DataStage.write_json(workspace.prediction_summary, migrated)
+        print(
+            "[HAND-OFF] Existing semantic-fix OOF outputs were validated after the "
+            "path-only workspace migration. GPU inference is not required."
+        )
+        return True, "validated semantic-fix cache after path migration"
+
+    # Return both the hand-off result and a useful diagnostic for Kaggle.
+    @staticmethod
+    def attention_outputs_status(workspace):
+        if DataStage.attention_in_progress_path(workspace).is_file():
+            return False, "attention_run_in_progress.json exists; a GPU run did not commit cleanly"
+        dataset_rows=DataStage.read_csv(workspace.dataset_manifest)
+        prediction_rows=DataStage.read_csv(workspace.prediction_audit)
+        if not dataset_rows:
+            return False, "simple_dataset_manifest.csv is missing or empty"
+        if not prediction_rows:
+            return False, "simple_attention_prediction_audit.csv is missing or empty"
+        rows_match, rows_reason=DataStage.prediction_rows_match_dataset(
+            dataset_rows, prediction_rows
+        )
+        if not rows_match:
+            return False, rows_reason
+        missing_masks=[
+            str(row.get("image_token", ""))
+            for row in prediction_rows
+            if not Path(row.get("predicted_attention_mask_path", "")).is_file()
+        ]
+        if missing_masks:
+            return False, f"{len(missing_masks)} predicted mask PNG files are missing"
+
+        state=DataStage.read_json(workspace.prediction_summary, {}) or {}
+        expected=DataStage.preparation_fingerprint(workspace)
+        if (
+            expected
+            and state.get("preparation_fingerprint") == expected
+            and len(prediction_rows) == DataStage._as_int(state.get("images"), -1)
+        ):
+            return True, "current semantic CPU/GPU hand-off"
+
+        adopted, reason=DataStage.adopt_compatible_dvm_attention_outputs(
+            workspace, dataset_rows, prediction_rows, state
+        )
+        if adopted:
+            return True, reason
+
+        semantic_state=state
+        legacy_state=DataStage.read_json(
+            workspace.root / "current_run" / "attention_run.json", {}
+        ) or {}
+        if not str(semantic_state.get("manual_semantic_fingerprint", "")).strip() and legacy_state:
+            semantic_state=legacy_state
+        adopted, semantic_reason=DataStage.adopt_compatible_semantic_attention_outputs(
+            workspace, dataset_rows, prediction_rows, semantic_state
+        )
+        if adopted:
+            return True, semantic_reason
+
+        if not state:
+            return False, "simple_prediction_summary.json is missing or unreadable"
+        if not expected:
+            return False, (
+                "no semantic CPU snapshot is available and compatibility adoption failed: "
+                + reason
+            )
+        return False, (
+            "saved preparation fingerprint differs from the current semantic hand-off; "
+            f"DVM validation: {reason}; semantic migration: {semantic_reason}"
+        )
+
     # Confirm that OOF predictions belong to the current persistent CPU hand-off.
     @staticmethod
     def attention_outputs_are_current(workspace):
-        if DataStage.attention_in_progress_path(workspace).is_file():
-            return False
-        if not workspace.prediction_audit.is_file():
-            return False
-        state=DataStage.read_json(workspace.prediction_summary, {}) or {}
-        expected=DataStage.preparation_fingerprint(workspace)
-        if not expected or state.get("preparation_fingerprint") != expected:
-            return False
-        predictions=DataStage.read_csv(workspace.prediction_audit)
-        if len(predictions) != DataStage._as_int(state.get("images"), -1):
-            return False
-        return all(
-            Path(row.get("predicted_attention_mask_path", "")).is_file()
-            for row in predictions
-        )
+        return DataStage.attention_outputs_status(workspace)[0]
     # Write JSON atomically so interrupted Kaggle sessions cannot leave a partial file.
     @staticmethod
     def write_json(path, payload):
@@ -7245,10 +7728,12 @@ class Pipeline:
                 "OOF masks are missing. Run Pipeline.cpu_prepare() and "
                 "Pipeline.gpu_attention() first."
             )
-        if not DataStage.attention_outputs_are_current(workspace):
+        outputs_current, output_reason=DataStage.attention_outputs_status(workspace)
+        if not outputs_current:
             raise RuntimeError(
-                "The saved OOF outputs are older than the current CPU preparation or "
-                "checkpoint files. Run Pipeline.gpu_attention() again."
+                "The saved OOF outputs could not be validated. "
+                f"Reason: {output_reason}. Run Pipeline.cpu_prepare(reset_files=False) "
+                "on CPU, then Pipeline.gpu_attention(reset_files=False) on GPU."
             )
 
         DataStage.register_existing_manual_masks(rows, workspace)
@@ -7299,10 +7784,12 @@ class Pipeline:
                 "Prepared rows or OOF predictions are missing. Run "
                 "Pipeline.cpu_prepare() and Pipeline.gpu_attention() first."
             )
-        if not DataStage.attention_outputs_are_current(workspace):
+        outputs_current, output_reason=DataStage.attention_outputs_status(workspace)
+        if not outputs_current:
             raise RuntimeError(
-                "The saved OOF outputs are older than the current CPU preparation or "
-                "checkpoint files. Run Pipeline.gpu_attention() again."
+                "The saved OOF outputs could not be validated. "
+                f"Reason: {output_reason}. Run Pipeline.cpu_prepare(reset_files=False) "
+                "on CPU, then Pipeline.gpu_attention(reset_files=False) on GPU."
             )
         if DataStage.manual_data_changed_after(workspace):
             raise RuntimeError(
@@ -7368,4 +7855,4 @@ print("[PIPELINE] 3. Accelerator None  -> optional Pipeline.review()")
 print("[PIPELINE] 4. Accelerator None  -> Pipeline.cpu_final(reset_files=False)")
 print("[FILES] Persistent DVM workspace: /kaggle/working/cad_attention_unet_workspace")
 print("[FILES] Nothing is deleted unless reset_files=True is passed explicitly.")
-print("[VALIDATION] Hand-offs use normalized labels and binary-mask fingerprints, not timestamps or PNG/CSV encoding.")
+print("[VALIDATION] Hand-offs use mount-independent dataset context, normalized labels, and binary-mask fingerprints.")
