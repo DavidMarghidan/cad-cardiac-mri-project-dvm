@@ -1,37 +1,47 @@
 """Simple cardiac MRI CAD pipeline split into CPU and GPU Kaggle sessions.
 
-The code is organized by research stage, and each public Pipeline method is run in
-its own Kaggle accelerator mode:
+The scientific workflow and four Kaggle entry points are unchanged:
 
 1. ``Pipeline.cpu_prepare()`` — Accelerator: None
    Scan the dataset, build patient-safe sequence rows, measure image quality, audit
-   the manual targets, and write the current CPU-to-GPU hand-off tables.
+   the manual targets, and persist the CPU-to-GPU hand-off.
 2. ``Pipeline.gpu_attention()`` — Accelerator: GPU
    Train all five patient-level Attention U-Nets and generate every out-of-fold mask.
 3. ``Pipeline.review()`` — Accelerator: None, optional
    Open the HTML editor using the saved OOF masks.
 4. ``Pipeline.cpu_final()`` — Accelerator: None
    Rebuild matching, frozen EfficientNet features, nested patient-level evaluation,
-   and paired AUC comparisons. Results are displayed directly in Kaggle.
+   and paired AUC comparisons.
 
-Generated files under ``current_run/`` are preserved by default. Nothing is deleted
-unless ``reset_files=True`` is passed explicitly. CPU/GPU hand-offs are validated with
-semantic fingerprints of normalized labels and binary mask pixels, not timestamps or
-raw PNG/CSV encoding, so restarting a Kaggle session does not create a false
-"manual data changed" error:
+All stages use the same persistent workspace contract as ``cad-cardiac-mri-project-dvm``:
 
-- ``cpu_prepare(reset_files=True)`` clears the complete generated run first;
-- ``gpu_attention(reset_files=True)`` clears only old Attention masks, checkpoints,
-  and prediction metadata before retraining;
-- ``cpu_final(reset_files=True)`` deletes ``current_run/`` only after a successful
-  final evaluation.
+``/kaggle/working/cad_attention_unet_workspace/``
+    ``manual_masks/``
+    ``predicted_attention_masks/``
+    ``mask_overlays/``
+    ``checkpoints/``
+    ``simple_pipeline_outputs/``
+    ``simple_dataset_manifest.csv``
+    ``simple_image_quality_audit.csv``
+    ``simple_manual_mask_audit.csv``
+    ``manual_annotation_labels.csv``
+    ``simple_attention_prediction_audit.csv``
+    ``attention_invalid_after_retrain.csv``
+    ``simple_review_history.csv``
+    ``simple_training_summary.json``
+    ``simple_prediction_summary.json``
 
-Manual masks and ``manual_annotation_labels.csv`` are never removed by these reset
-options. The same filenames are overwritten when a stage regenerates its own output,
-so the workspace stores the latest run rather than an accumulating run history.
+Feature banks, matching files, OOF tables, segmentation metrics, and evaluation
+results remain under ``simple_pipeline_outputs/``. No active stage writes to ``current_run/``.
+Files are preserved across CPU/GPU Kaggle sessions by default; ``reset_files=True``
+performs only the explicitly requested cleanup and never deletes manual masks or
+``manual_annotation_labels.csv``. Existing artifacts from the former ``current_run/``
+layout are copied once into the persistent layout when their destination is absent.
 
-Scientific safeguards remain unchanged: patient-level folds, genuinely out-of-fold
-masks, same-slice controls, balanced matched cohorts, and patient-level evaluation.
+CPU/GPU hand-offs continue to use semantic fingerprints of normalized labels and
+binary mask pixels rather than timestamps or PNG/CSV encoding. Scientific safeguards
+remain unchanged: patient-level folds, genuinely out-of-fold masks, same-slice
+controls, balanced matched cohorts, and patient-level evaluation.
 """
 
 import base64
@@ -80,10 +90,12 @@ os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 Sample=namedtuple("Sample", "image_path label patient_id series_id image_token segmentation_fold")
 Workspace=namedtuple(
     "Workspace",
-    "root current manual_masks manual_annotations dataset_manifest quality_audit "
-    "manual_audit accepted_targets manual_snapshot predicted_masks prediction_audit "
-    "checkpoints attention_state attention_in_progress "
-    "cross_class_matching_manifest cross_class_matching_summary",
+    "root manual_masks predicted_masks mask_overlays checkpoints outputs "
+    "dataset_manifest quality_audit manual_audit manual_annotations prediction_audit "
+    "prediction_parts_dir invalid_predictions review_history training_summary "
+    "prediction_summary segmentation_metrics segmentation_metrics_summary "
+    "cross_class_matching_manifest cross_class_matching_summary feature_bank "
+    "feature_metadata results_csv predictions_dir",
 )
 
 # Manual target labels are semantic values, not experiment settings.
@@ -100,11 +112,11 @@ ANNOTATION_FIELDS = (
 # STAGE 1 — DATASET, PREPROCESSING, QUALITY, AND MANUAL TARGETS
 # =============================================================================
 class DataStage:
-    """CPU preparation plus the small shared file helpers used by later stages.
+    """CPU preparation and shared persistence helpers for every pipeline stage.
 
-    ``current_run/`` contains the latest CPU→GPU→CPU hand-off. It is preserved by
-    default and is cleared only when a public pipeline call receives
-    ``reset_files=True``.
+    The root workspace is stable across accelerator restarts. Manual targets live at
+    the root, generated neural artifacts use their established root folders, and all
+    tabular/model-evaluation outputs use ``simple_pipeline_outputs/``.
     """
 
     image_cache = OrderedDict()  # in-memory only; discarded when the run ends
@@ -265,67 +277,312 @@ class DataStage:
         if minutes:
             return f"{minutes}m {seconds:02d}s"
         return f"{seconds}s"
-    # Build the shared Kaggle workspace used across CPU and GPU sessions.
-    # Manual masks and labels live outside current_run/ and are never reset here.
-    # Generated files inside current_run/ are also preserved unless reset_files=True
-    # is passed to one of the public Pipeline methods.
+    # Build the shared Kaggle workspace used by both the full and simplified pipelines.
     @staticmethod
     def create_workspace(workspace_root=None):
         root=Path(workspace_root or DataStage._default_workspace_path())
-        current=root / "current_run"
+        outputs=root / "simple_pipeline_outputs"
         workspace=Workspace(
             root=root,
-            current=current,
             manual_masks=root / "manual_masks",
+            predicted_masks=root / "predicted_attention_masks",
+            mask_overlays=root / "mask_overlays",
+            checkpoints=root / "checkpoints",
+            outputs=outputs,
+            dataset_manifest=root / "simple_dataset_manifest.csv",
+            quality_audit=root / "simple_image_quality_audit.csv",
+            manual_audit=root / "simple_manual_mask_audit.csv",
             manual_annotations=root / "manual_annotation_labels.csv",
-            dataset_manifest=current / "dataset_rows.csv",
-            quality_audit=current / "image_quality.csv",
-            manual_audit=current / "manual_targets_audit.csv",
-            accepted_targets=current / "accepted_training_targets.csv",
-            # Snapshot of the exact manual masks and labels used by CPU preparation.
-            manual_snapshot=current / "manual_data_snapshot.json",
-            predicted_masks=current / "predicted_attention_masks",
-            prediction_audit=current / "attention_oof_predictions.csv",
-            checkpoints=current / "temporary_checkpoints",
-            # One completed-run record plus a marker that survives interrupted GPU runs.
-            attention_state=current / "attention_run.json",
-            attention_in_progress=current / "attention_run_in_progress.json",
-            cross_class_matching_manifest=current / "matching.csv",
-            cross_class_matching_summary=current / "matching_summary.json",
+            prediction_audit=root / "simple_attention_prediction_audit.csv",
+            prediction_parts_dir=outputs / "attention_prediction_parts",
+            invalid_predictions=root / "attention_invalid_after_retrain.csv",
+            review_history=root / "simple_review_history.csv",
+            training_summary=root / "simple_training_summary.json",
+            prediction_summary=root / "simple_prediction_summary.json",
+            segmentation_metrics=outputs / "attention_oof_segmentation_metrics.csv",
+            segmentation_metrics_summary=outputs / "attention_oof_segmentation_summary.json",
+            cross_class_matching_manifest=outputs / "cross_class_matching_manifest.csv",
+            cross_class_matching_summary=outputs / "cross_class_matching_summary.json",
+            feature_bank=outputs / "patient_feature_bank.npz",
+            feature_metadata=outputs / "patient_feature_bank.json",
+            results_csv=outputs / "evaluation_summary.csv",
+            predictions_dir=outputs / "oof_predictions",
         )
-        workspace.root.mkdir(parents=True, exist_ok=True)
-        workspace.manual_masks.mkdir(parents=True, exist_ok=True)
-        workspace.current.mkdir(parents=True, exist_ok=True)
-        workspace.predicted_masks.mkdir(parents=True, exist_ok=True)
-        workspace.checkpoints.mkdir(parents=True, exist_ok=True)
+        DataStage.ensure_workspace_directories(workspace)
+        DataStage.migrate_legacy_current_run(workspace)
+        DataStage.normalize_workspace_paths(workspace)
         return workspace
 
-    # Explicitly clear all generated files without touching manual masks or labels.
-    # This helper is called only when reset_files=True.
+    # Rewrite imported mask paths so no active stage continues using current_run/.
+    @staticmethod
+    def normalize_workspace_paths(workspace):
+        def normalize_csv(path, include_predicted=False, include_manual=False):
+            rows=DataStage.read_csv(path)
+            if not rows:
+                return 0
+            changed=0
+            for row in rows:
+                token=str(row.get("image_token", "")).strip()
+                if not token:
+                    continue
+                if include_manual:
+                    expected=str(workspace.manual_masks / f"{token}.png")
+                    if str(row.get("manual_mask_path", "")) != expected:
+                        row["manual_mask_path"]=expected
+                        changed +=1
+                if include_predicted:
+                    expected=str(workspace.predicted_masks / f"{token}.png")
+                    if str(row.get("predicted_attention_mask_path", "")) != expected:
+                        row["predicted_attention_mask_path"]=expected
+                        changed +=1
+            if changed:
+                DataStage.write_csv(path, rows, rows[0].keys())
+            return changed
+
+        total=0
+        total +=normalize_csv(
+            workspace.dataset_manifest,
+            include_predicted=True,
+            include_manual=True,
+        )
+        total +=normalize_csv(
+            workspace.prediction_audit,
+            include_predicted=True,
+            include_manual=True,
+        )
+        total +=normalize_csv(
+            workspace.manual_audit,
+            include_manual=True,
+        )
+        total +=normalize_csv(
+            workspace.review_history,
+            include_manual=True,
+        )
+        for part_csv in sorted(workspace.prediction_parts_dir.glob("fold_*.csv")):
+            total +=normalize_csv(
+                part_csv,
+                include_predicted=True,
+                include_manual=True,
+            )
+        if total:
+            print(
+                f"[FILES] Normalized {total} imported mask-path value(s) to the "
+                "persistent DVM workspace."
+            )
+
+    # Create every persistent directory without deleting any existing artifact.
+    @staticmethod
+    def ensure_workspace_directories(workspace):
+        for directory in (
+            workspace.root,
+            workspace.manual_masks,
+            workspace.predicted_masks,
+            workspace.mask_overlays,
+            workspace.checkpoints,
+            workspace.outputs,
+            workspace.prediction_parts_dir,
+            workspace.predictions_dir,
+        ):
+            directory.mkdir(parents=True, exist_ok=True)
+
+    # Keep the interrupted-run marker inside the established prediction-parts folder.
+    @staticmethod
+    def attention_in_progress_path(workspace):
+        return workspace.prediction_parts_dir / "attention_run_in_progress.json"
+
+    # Copy one legacy file only when the persistent destination does not already exist.
+    @staticmethod
+    def copy_legacy_file(source, destination):
+        source=Path(source)
+        destination=Path(destination)
+        if not source.is_file() or destination.exists():
+            return False
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+        return True
+
+    # Copy missing files from one legacy directory without replacing persistent files.
+    @staticmethod
+    def copy_legacy_directory(source, destination):
+        source=Path(source)
+        destination=Path(destination)
+        if not source.is_dir():
+            return 0
+        copied=0
+        destination.mkdir(parents=True, exist_ok=True)
+        for source_path in source.rglob("*"):
+            if not source_path.is_file():
+                continue
+            relative=source_path.relative_to(source)
+            destination_path=destination / relative
+            if destination_path.exists():
+                continue
+            destination_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_path, destination_path)
+            copied +=1
+        return copied
+
+    # One-time compatibility import from the former current_run/ layout.
+    @staticmethod
+    def migrate_legacy_current_run(workspace):
+        legacy=workspace.root / "current_run"
+        marker=workspace.root / ".legacy_current_run_imported.json"
+        if marker.is_file() or not legacy.is_dir():
+            return
+
+        copied=[]
+        file_map=(
+            (legacy / "dataset_rows.csv", workspace.dataset_manifest),
+            (legacy / "image_quality.csv", workspace.quality_audit),
+            (legacy / "manual_targets_audit.csv", workspace.manual_audit),
+            (legacy / "attention_oof_predictions.csv", workspace.prediction_audit),
+            (legacy / "matching.csv", workspace.cross_class_matching_manifest),
+            (legacy / "matching_summary.json", workspace.cross_class_matching_summary),
+            (legacy / "attention_invalid_after_retrain.csv", workspace.invalid_predictions),
+            (legacy / "patient_feature_bank.npz", workspace.feature_bank),
+            (legacy / "patient_feature_bank.json", workspace.feature_metadata),
+            (legacy / "evaluation_summary.csv", workspace.results_csv),
+            (legacy / "paired_auc_comparisons.csv", workspace.outputs / "paired_auc_comparisons.csv"),
+        )
+        for source, destination in file_map:
+            if DataStage.copy_legacy_file(source, destination):
+                copied.append(str(destination.relative_to(workspace.root)))
+
+        directory_map=(
+            (legacy / "predicted_attention_masks", workspace.predicted_masks),
+            (legacy / "temporary_checkpoints", workspace.checkpoints),
+            (legacy / "checkpoints", workspace.checkpoints),
+            (legacy / "attention_prediction_parts", workspace.prediction_parts_dir),
+            (legacy / "oof_predictions", workspace.predictions_dir),
+        )
+        for source, destination in directory_map:
+            count=DataStage.copy_legacy_directory(source, destination)
+            if count:
+                copied.append(f"{destination.relative_to(workspace.root)}/ ({count} files)")
+
+        # Preserve the old semantic hand-off metadata inside the established summary files.
+        legacy_snapshot=DataStage.read_json(legacy / "manual_data_snapshot.json", {}) or {}
+        if legacy_snapshot and not workspace.training_summary.is_file():
+            DataStage.write_json(
+                workspace.training_summary,
+                {
+                    "schema": "cad-training-summary-v1",
+                    "manual_data_snapshot": legacy_snapshot,
+                    "migrated_from": str(legacy / "manual_data_snapshot.json"),
+                },
+            )
+            copied.append(str(workspace.training_summary.relative_to(workspace.root)))
+
+        legacy_attention=DataStage.read_json(legacy / "attention_run.json", {}) or {}
+        if legacy_attention and not workspace.prediction_summary.is_file():
+            migrated=dict(legacy_attention)
+            migrated["migrated_from"]=str(legacy / "attention_run.json")
+            DataStage.write_json(workspace.prediction_summary, migrated)
+            copied.append(str(workspace.prediction_summary.relative_to(workspace.root)))
+
+        DataStage.write_json(
+            marker,
+            {
+                "schema": "legacy-current-run-import-v1",
+                "legacy_directory": str(legacy),
+                "copied_artifacts": copied,
+                "note": (
+                    "The legacy folder is retained as a backup but is never imported "
+                    "again, including after an explicit generated-files reset."
+                ),
+            },
+        )
+        if copied:
+            print(
+                "[FILES] Imported missing artifacts from legacy current_run/ into the "
+                "persistent DVM workspace: " + ", ".join(copied)
+            )
+        else:
+            print(
+                "[FILES] Legacy current_run/ was already represented in the persistent "
+                "workspace; the one-time migration marker was recorded."
+            )
+
+    # Remove all generated artifacts while preserving manual masks and manual labels.
+    @staticmethod
+    def reset_generated_workspace(workspace):
+        for directory in (
+            workspace.predicted_masks,
+            workspace.mask_overlays,
+            workspace.checkpoints,
+            workspace.outputs,
+        ):
+            shutil.rmtree(directory, ignore_errors=True)
+        for path in (
+            workspace.dataset_manifest,
+            workspace.quality_audit,
+            workspace.manual_audit,
+            workspace.prediction_audit,
+            workspace.invalid_predictions,
+            workspace.review_history,
+            workspace.training_summary,
+            workspace.prediction_summary,
+        ):
+            path.unlink(missing_ok=True)
+        DataStage.ensure_workspace_directories(workspace)
+
+    # Backward-compatible helper name retained for existing notebooks.
     @staticmethod
     def reset_current_run(workspace):
-        shutil.rmtree(workspace.current, ignore_errors=True)
-        workspace.current.mkdir(parents=True, exist_ok=True)
-        workspace.predicted_masks.mkdir(parents=True, exist_ok=True)
-        workspace.checkpoints.mkdir(parents=True, exist_ok=True)
+        DataStage.reset_generated_workspace(workspace)
 
-    # Explicitly clear only generated Attention outputs before retraining.
-    # This helper is called only when reset_files=True.
+    # Clear only artifacts that depend on Attention training or prediction.
     @staticmethod
     def reset_attention_outputs(workspace):
-        shutil.rmtree(workspace.predicted_masks, ignore_errors=True)
-        shutil.rmtree(workspace.checkpoints, ignore_errors=True)
-        workspace.predicted_masks.mkdir(parents=True, exist_ok=True)
-        workspace.checkpoints.mkdir(parents=True, exist_ok=True)
-        workspace.prediction_audit.unlink(missing_ok=True)
-        workspace.attention_state.unlink(missing_ok=True)
-        workspace.attention_in_progress.unlink(missing_ok=True)
+        for directory in (
+            workspace.predicted_masks,
+            workspace.mask_overlays,
+            workspace.checkpoints,
+            workspace.prediction_parts_dir,
+            workspace.predictions_dir,
+        ):
+            shutil.rmtree(directory, ignore_errors=True)
+        for path in (
+            workspace.prediction_audit,
+            workspace.invalid_predictions,
+            workspace.prediction_summary,
+            workspace.segmentation_metrics,
+            workspace.segmentation_metrics_summary,
+            workspace.cross_class_matching_manifest,
+            workspace.cross_class_matching_summary,
+            workspace.feature_bank,
+            workspace.feature_metadata,
+            workspace.results_csv,
+            workspace.outputs / "paired_auc_comparisons.csv",
+        ):
+            path.unlink(missing_ok=True)
+        DataStage.ensure_workspace_directories(workspace)
 
-    # Explicitly remove the generated hand-off after final evaluation.
-    # This helper is called only when reset_files=True.
+        # Keep the CPU manual snapshot but remove stale training-run details.
+        training=DataStage.read_json(workspace.training_summary, {}) or {}
+        if training:
+            for key in (
+                "attention_training",
+                "attention_run_id",
+                "training_mode",
+                "device",
+                "accepted_training_targets",
+                "heart_present_targets",
+                "no_heart_targets",
+                "folds",
+            ):
+                training.pop(key, None)
+            DataStage.write_json(workspace.training_summary, training)
+
+    # Explicit post-evaluation cleanup, preserving the permanent workspace contract.
+    @staticmethod
+    def remove_generated_workspace(workspace):
+        DataStage.reset_generated_workspace(workspace)
+
+    # Backward-compatible helper name retained for existing notebooks.
     @staticmethod
     def remove_current_run(workspace):
-        shutil.rmtree(workspace.current, ignore_errors=True)
+        DataStage.remove_generated_workspace(workspace)
 
     # Hash a file by content. Timestamps are deliberately ignored because Kaggle may
     # change them when /kaggle/working is restored in a new accelerator session.
@@ -433,23 +690,75 @@ class DataStage:
             "manual_label_rows": len(labels),
         }
 
-    # Save the semantic snapshot only after CPU preparation has completed. The
-    # preparation key is stable and is used by the GPU completion record.
+    # Save the semantic snapshot in the established training-summary file.
     @staticmethod
-    def save_manual_data_snapshot(workspace):
+    def save_manual_data_snapshot(workspace, accepted_training_targets=None):
         snapshot=DataStage.manual_data_fingerprint(workspace)
         snapshot["preparation_key"]=snapshot["fingerprint"]
-        DataStage.write_json(workspace.manual_snapshot, snapshot)
+        if accepted_training_targets is not None:
+            snapshot["accepted_training_targets"]=int(accepted_training_targets)
+        summary=DataStage.read_json(workspace.training_summary, {}) or {}
+        summary["schema"]="cad-training-summary-v1"
+        summary["manual_data_snapshot"]=snapshot
+        summary["cpu_preparation_completed"]=True
+        DataStage.write_json(workspace.training_summary, summary)
         return snapshot
 
-    # Check whether the current manual files still describe the CPU-prepared audit.
-    # This is used only to migrate a legacy raw-byte snapshot without discarding an
-    # already completed GPU run.
+    # Read the manual snapshot while accepting a directly stored legacy payload.
+    @staticmethod
+    def load_manual_data_snapshot(workspace):
+        summary=DataStage.read_json(workspace.training_summary, {}) or {}
+        nested=summary.get("manual_data_snapshot")
+        if isinstance(nested, dict):
+            return nested
+        if str(summary.get("schema", "")).startswith("cad-manual-data-"):
+            return summary
+        return {}
+
+    # Rebuild the exact accepted training rows from persistent manifest/audit files.
+    @staticmethod
+    def accepted_training_rows(dataset_rows, workspace):
+        quality={
+            str(row.get("image_token", "")): row
+            for row in DataStage.read_csv(workspace.quality_audit)
+        }
+        audit={
+            str(row.get("image_token", "")): row
+            for row in DataStage.read_csv(workspace.manual_audit)
+            if str(row.get("status", "")).strip().upper() == "ACCEPTED"
+        }
+        accepted=[]
+        for original in dataset_rows:
+            token=str(original.get("image_token", ""))
+            target=audit.get(token)
+            if target is None:
+                continue
+            row=dict(original)
+            # Manual targets always use the persistent workspace path, even if an
+            # imported audit contains an absolute path from an older mount.
+            mask_path=str(workspace.manual_masks / f"{token}.png")
+            row.update(
+                {
+                    "manual_mask_path": mask_path,
+                    "manual_mask_area_ratio": DataStage._as_float(
+                        target.get("area_ratio"), 0.0
+                    ),
+                    "quality_valid": 1,
+                    "perceptual_hash": quality.get(token, {}).get("perceptual_hash", ""),
+                    "segmentation_target_type": str(target.get("target_type", "")),
+                    "heart_present": DataStage._as_int(target.get("heart_present"), 1),
+                    "sample_weight": DataStage._as_float(target.get("sample_weight"), 1.0),
+                    "annotation_source": str(target.get("annotation_source", "")),
+                }
+            )
+            accepted.append(row)
+        return accepted
+
+    # Check whether current manual files still describe the CPU-prepared audit.
     @staticmethod
     def manual_data_matches_preparation(workspace):
         audit_rows=DataStage.read_csv(workspace.manual_audit)
-        accepted_rows=DataStage.read_csv(workspace.accepted_targets)
-        if not audit_rows or not accepted_rows:
+        if not audit_rows:
             return False
 
         annotations={
@@ -467,9 +776,7 @@ class DataStage:
         if current_tokens != audit_tokens:
             return False
 
-        pixel_tolerance=2.0 / (256.0 * 256.0)  # at most two pixels of rounding noise
-        accepted_from_audit=set()
-
+        pixel_tolerance=2.0 / (256.0 * 256.0)
         for row in audit_rows:
             token=str(row.get("image_token", "")).strip()
             target_type=str(row.get("target_type", "")).strip().upper()
@@ -497,26 +804,18 @@ class DataStage:
                 return False
 
             if status == "ACCEPTED":
-                accepted_from_audit.add(token)
                 if target_type == HEART_PRESENT and not qc.get("usable"):
                     return False
                 if target_type == NO_HEART_VISIBLE and (
                     not np.isfinite(new_area) or new_area >= 0.0005
                 ):
                     return False
+        return True
 
-        accepted_tokens={
-            str(row.get("image_token", "")).strip()
-            for row in accepted_rows
-            if str(row.get("image_token", "")).strip()
-        }
-        return accepted_tokens == accepted_from_audit
-
-    # Detect a real semantic edit after CPU preparation. Legacy v1 snapshots are
-    # upgraded in place when the current masks/labels still match the prepared audit.
+    # Detect a real semantic edit after CPU preparation and migrate legacy snapshots.
     @staticmethod
     def manual_data_changed_after(workspace, reference_path=None):
-        saved=DataStage.read_json(workspace.manual_snapshot, {}) or {}
+        saved=DataStage.load_manual_data_snapshot(workspace)
         saved_fingerprint=str(
             saved.get("semantic_fingerprint") or saved.get("fingerprint") or ""
         ).strip()
@@ -527,8 +826,6 @@ class DataStage:
         if str(saved.get("schema", "")) == "cad-manual-data-v2":
             return current["fingerprint"] != saved_fingerprint
 
-        # First try an exact v1 raw-byte match. If raw bytes changed, verify the
-        # semantic targets against the CPU-prepared audit before migrating.
         legacy_current=DataStage.legacy_manual_data_fingerprint(workspace)
         migration_is_safe=(
             legacy_current["fingerprint"] == saved_fingerprint
@@ -538,90 +835,136 @@ class DataStage:
             return True
 
         migrated=dict(current)
-        # Preserve the old preparation key so an already completed attention_run.json
-        # remains valid; future CPU preparation will create a native v2 key.
         migrated["preparation_key"]=str(
             saved.get("preparation_key") or saved.get("fingerprint") or ""
         ).strip()
         migrated["migrated_from"]="cad-manual-data-v1"
-        DataStage.write_json(workspace.manual_snapshot, migrated)
+        summary=DataStage.read_json(workspace.training_summary, {}) or {}
+        summary["schema"]="cad-training-summary-v1"
+        summary["manual_data_snapshot"]=migrated
+        DataStage.write_json(workspace.training_summary, summary)
         print(
-            "[HAND-OFF] Legacy manual snapshot upgraded to semantic v2; "
-            "the completed GPU run remains valid."
+            "[HAND-OFF] Legacy manual snapshot upgraded to semantic v2 inside "
+            "simple_training_summary.json."
         )
         return False
 
-    # Fingerprint the exact CPU hand-off consumed by Attention training.
+    # Fingerprint the exact persistent CPU hand-off consumed by Attention training.
     @staticmethod
     def preparation_fingerprint(workspace):
-        if not workspace.dataset_manifest.is_file() or not workspace.accepted_targets.is_file():
+        required=(
+            workspace.dataset_manifest,
+            workspace.quality_audit,
+            workspace.manual_audit,
+        )
+        if not all(path.is_file() for path in required):
             return ""
-        snapshot=DataStage.read_json(workspace.manual_snapshot, {}) or {}
+        snapshot=DataStage.load_manual_data_snapshot(workspace)
         manual_fingerprint=str(
             snapshot.get("preparation_key") or snapshot.get("fingerprint") or ""
         ).strip()
         if not manual_fingerprint:
             return ""
         payload={
-            "schema": "cad-cpu-handoff-v1",
+            "schema": "cad-cpu-handoff-v2-dvm-workspace",
             "dataset_manifest": DataStage.file_sha256(workspace.dataset_manifest),
-            "accepted_targets": DataStage.file_sha256(workspace.accepted_targets),
+            "quality_audit": DataStage.file_sha256(workspace.quality_audit),
+            "manual_audit": DataStage.file_sha256(workspace.manual_audit),
             "manual_data": manual_fingerprint,
         }
         return hashlib.sha256(
             json.dumps(payload, sort_keys=True).encode("utf-8")
         ).hexdigest()
 
-    # Confirm that OOF predictions belong to the current CPU hand-off. A marker left by
-    # an interrupted GPU run prevents stale outputs from being mistaken for completion.
+    # Build a stable fingerprint for the completed checkpoint and prediction hand-off.
+    @staticmethod
+    def attention_output_fingerprint(workspace, preparation_fingerprint):
+        digest=hashlib.sha256(b"cad-attention-output-v1")
+        digest.update(str(preparation_fingerprint).encode("ascii"))
+        if workspace.prediction_audit.is_file():
+            digest.update(DataStage.file_sha256(workspace.prediction_audit).encode("ascii"))
+        for checkpoint in sorted(workspace.checkpoints.glob("attention_unet_fold_*.pt")):
+            digest.update(checkpoint.name.encode("utf-8"))
+            digest.update(DataStage.file_sha256(checkpoint).encode("ascii"))
+        return digest.hexdigest()
+
+    # Confirm that OOF predictions belong to the current persistent CPU hand-off.
     @staticmethod
     def attention_outputs_are_current(workspace):
-        if workspace.attention_in_progress.is_file():
+        if DataStage.attention_in_progress_path(workspace).is_file():
             return False
         if not workspace.prediction_audit.is_file():
             return False
-        state=DataStage.read_json(workspace.attention_state, {}) or {}
+        state=DataStage.read_json(workspace.prediction_summary, {}) or {}
         expected=DataStage.preparation_fingerprint(workspace)
         if not expected or state.get("preparation_fingerprint") != expected:
             return False
         predictions=DataStage.read_csv(workspace.prediction_audit)
-        return len(predictions) == DataStage._as_int(state.get("images"), -1)
-    # JSON is used only for the current matching hand-off and is never historical.
+        if len(predictions) != DataStage._as_int(state.get("images"), -1):
+            return False
+        return all(
+            Path(row.get("predicted_attention_mask_path", "")).is_file()
+            for row in predictions
+        )
+    # Write JSON atomically so interrupted Kaggle sessions cannot leave a partial file.
     @staticmethod
     def write_json(path, payload):
+        path=Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str), encoding="utf-8")
+        temporary=path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+        temporary.write_text(
+            json.dumps(payload, indent=2, sort_keys=True, default=str),
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
     # Read cache metadata; return a simple fallback when the file is absent/corrupt.
     @staticmethod
     def read_json(path, default=None):
+        path=Path(path)
         if not path.is_file():
             return default
         try:
             return json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             return default
-    # Write the current stage hand-off or the persistent manual-label table.
+    # Write CSV atomically while preserving the established filename.
     @staticmethod
     def write_csv(path, rows, fields):
+        path=Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=list(fields), extrasaction="ignore")
+        temporary=path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+        with temporary.open("w", newline="", encoding="utf-8") as handle:
+            writer=csv.DictWriter(handle, fieldnames=list(fields), extrasaction="ignore")
             writer.writeheader()
             writer.writerows({field: row.get(field, "") for field in fields} for row in rows)
-    # Read a current hand-off table as ordinary dictionaries.
+        os.replace(temporary, path)
+    # Read a persistent hand-off table as ordinary dictionaries.
     @staticmethod
     def read_csv(path):
+        path=Path(path)
         if not path.is_file():
             return []
         with path.open(newline="", encoding="utf-8") as handle:
             return list(csv.DictReader(handle))
-    # Save a manual mask or a current-run OOF mask used by the next stage.
+    # Save a manual or automatic mask atomically under the persistent workspace.
     @staticmethod
     def write_png(path, image):
+        path=Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        ok = cv2.imwrite(str(path), np.asarray(image), [cv2.IMWRITE_PNG_COMPRESSION, 9])
+        ok, encoded=cv2.imencode(
+            ".png",
+            np.asarray(image),
+            [cv2.IMWRITE_PNG_COMPRESSION, 9],
+        )
         if not ok:
-            raise RuntimeError(f"OpenCV could not write PNG: {path}")
+            raise RuntimeError(f"OpenCV could not encode PNG: {path}")
+        temporary=path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+        try:
+            temporary.write_bytes(encoded.tobytes())
+            os.replace(temporary, path)
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            raise
     # Create a stable image identifier from its patient-relative path.
     @staticmethod
     def image_token(image_path, patient_id, series_id):
@@ -2064,6 +2407,7 @@ class AttentionStage:
     def train_attention_crossfit(accepted_rows, workspace, device):
         DataStage.seed_everything(include_cuda=device.type == "cuda")
         checkpoint_map={}
+        fold_summaries=[]
         all_patients=sorted({str(row["patient_id"]) for row in accepted_rows})
 
         for fold in range(5):  # five patient-level folds
@@ -2325,12 +2669,53 @@ class AttentionStage:
                 ),
                 "history": history,
             }
-            torch.save(checkpoint, checkpoint_path)
+            temporary=checkpoint_path.with_name(
+                f".{checkpoint_path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+            )
+            torch.save(checkpoint, temporary)
+            os.replace(temporary, checkpoint_path)
             checkpoint_map[fold]=checkpoint_path
+            fold_summaries.append(
+                {
+                    "fold": int(fold),
+                    "checkpoint": str(checkpoint_path),
+                    "best_epoch": int(best_epoch),
+                    "best_selection_metric": float(best_metric),
+                    "calibration": calibration,
+                    "train_positive_targets": int(train_positive),
+                    "train_negative_targets": int(train_negative),
+                    "validation_positive_targets": int(validation_positive),
+                    "validation_negative_targets": int(validation_negative),
+                    "elapsed": DataStage.format_seconds(
+                        time.perf_counter() - fold_started
+                    ),
+                }
+            )
             del model, optimizer, scheduler, scaler, train_loader, validation_loader
             del train_dataset, validation_dataset, checkpoint, best_state, train_sampler
             DataStage.release_device(device)
 
+        training_summary=DataStage.read_json(workspace.training_summary, {}) or {}
+        training_summary["schema"]="cad-training-summary-v1"
+        attention_training={
+            "training_mode": "manual_positive_and_explicit_negative_crossfit_2p5d",
+            "device": device.type,
+            "accepted_training_targets": len(accepted_rows),
+            "heart_present_targets": sum(
+                DataStage._as_int(row.get("heart_present"), 1) == 1
+                for row in accepted_rows
+            ),
+            "no_heart_targets": sum(
+                DataStage._as_int(row.get("heart_present"), 1) == 0
+                for row in accepted_rows
+            ),
+            "folds": fold_summaries,
+        }
+        training_summary["attention_training"]=attention_training
+        # Duplicate the standard DVM fields at the top level for compatibility with
+        # readers that predate the nested semantic hand-off metadata.
+        training_summary.update(attention_training)
+        DataStage.write_json(workspace.training_summary, training_summary)
         DataStage.clear_image_cache()
         return checkpoint_map
     # Keep the dominant connected mask component and discard small detached islands.
@@ -2598,7 +2983,7 @@ class AttentionStage:
             predicted_path=Path(
                 prediction_row.get("predicted_attention_mask_path", "")
             )
-            target_path=Path(target_row.get("manual_mask_path", ""))
+            target_path=workspace.manual_masks / f"{token}.png"
             if not predicted_path.is_file() or not target_path.is_file():
                 continue
             predicted=DataStage.read_binary_mask(predicted_path)
@@ -2658,6 +3043,28 @@ class AttentionStage:
                 }
             )
 
+        metric_fields=(
+            "image_token",
+            "patient_id",
+            "series_id",
+            "target_type",
+            "heart_present",
+            "dice",
+            "iou",
+            "precision",
+            "recall",
+            "target_area_ratio",
+            "predicted_area_ratio",
+            "absolute_area_error",
+            "false_positive_area_ratio",
+            "centroid_distance_normalized",
+            "presence_probability",
+            "predicted_heart_present",
+            "uncertainty_score",
+            "sequence_inconsistency",
+        )
+        DataStage.write_csv(workspace.segmentation_metrics, metrics, metric_fields)
+
         positive=[row for row in metrics if DataStage._as_int(row["heart_present"], 1) == 1]
         negative=[row for row in metrics if DataStage._as_int(row["heart_present"], 1) == 0]
 
@@ -2701,7 +3108,9 @@ class AttentionStage:
                 if negative
                 else np.nan
             ),
+            "metrics_csv": str(workspace.segmentation_metrics),
         }
+        DataStage.write_json(workspace.segmentation_metrics_summary, summary)
         if metrics:
             print(
                 "[ATTENTION OOF] "
@@ -2907,6 +3316,20 @@ class AttentionStage:
             AttentionStage.apply_sequence_consistency(
                 fold_results, fold_rows
             )
+            part_csv=workspace.prediction_parts_dir / f"fold_{int(fold)}.csv"
+            part_json=workspace.prediction_parts_dir / f"fold_{int(fold)}.json"
+            DataStage.write_csv(part_csv, fold_results, fold_results[0].keys())
+            DataStage.write_json(
+                part_json,
+                {
+                    "schema": "simple-prediction-part-2p5d-presence-semantic-v1",
+                    "fold": int(fold),
+                    "images": len(fold_results),
+                    "checkpoint": str(checkpoint_map[fold]),
+                    "device_used": device.type,
+                    "completed": True,
+                },
+            )
             del model, loader, checkpoint, fold_results
             DataStage.release_device(device)
 
@@ -2926,6 +3349,11 @@ class AttentionStage:
             for row in final_results
             if DataStage._as_int(row.get("attention_valid_final"), 0) != 1
         ]
+        DataStage.write_csv(
+            workspace.invalid_predictions,
+            invalid_rows,
+            final_results[0].keys(),
+        )
         segmentation_summary=AttentionStage.evaluate_oof_segmentation(
             workspace, final_results
         )
@@ -3009,7 +3437,20 @@ class HammingBKTree:
         return False
 
 class ReviewStage:
-    """Select unresolved images for manual review in the current session."""
+    """Select unresolved images and persist review queues/history in the DVM layout."""
+
+    HISTORY_FIELDS=(
+        "timestamp_utc",
+        "review_round",
+        "action",
+        "image_token",
+        "patient_id",
+        "series_id",
+        "queue_position",
+        "queue_size",
+        "mask_area_ratio",
+        "manual_mask_path",
+    )
 
     # Merge review rows.
     @staticmethod
@@ -3130,6 +3571,41 @@ class ReviewStage:
                 break
             position +=1
         return selected
+
+    # Persist one editor action so a later session can exclude already reviewed rows.
+    @staticmethod
+    def log_review_action(
+        workspace,
+        row,
+        review_round,
+        action,
+        mask,
+        position,
+        queue_size,
+    ):
+        history=DataStage.read_csv(workspace.review_history)
+        history.append(
+            {
+                "timestamp_utc": pd.Timestamp.utcnow().isoformat(),
+                "review_round": int(review_round),
+                "action": str(action),
+                "image_token": str(row.get("image_token", "")),
+                "patient_id": str(row.get("patient_id", "")),
+                "series_id": str(row.get("series_id", "")),
+                "queue_position": int(position),
+                "queue_size": int(queue_size),
+                "mask_area_ratio": ""
+                if mask is None
+                else float((np.asarray(mask) > 0).mean()),
+                "manual_mask_path": str(row.get("manual_mask_path", "")),
+            }
+        )
+        DataStage.write_csv(
+            workspace.review_history,
+            history,
+            ReviewStage.HISTORY_FIELDS,
+        )
+
     # The UNLABELED filter is always applied before the review scope. This prevents
     # a prior HEART_PRESENT, NO_HEART_VISIBLE, or UNUSABLE decision from silently
     # reappearing in a later annotation round.
@@ -3161,7 +3637,11 @@ class ReviewStage:
             f"UNLABELED={len(rows)}, already-labeled excluded={labeled_excluded}, "
             f"distribution={dict(sorted(target_counts.items()))}"
         )
-        reviewed=set()  # no review history is stored between sessions
+        reviewed={
+            str(row.get("image_token", ""))
+            for row in DataStage.read_csv(workspace.review_history)
+            if DataStage._as_int(row.get("review_round"), 0) == int(review_round)
+        }
 
         if scope == "invalid":
             candidates=[
@@ -3349,7 +3829,10 @@ class ReviewStage:
                 f"scope={scope!r}. HEART_PRESENT, "
                 "NO_HEART_VISIBLE, and UNUSABLE images are excluded automatically."
             )
-        print(f"[REVIEW] scope={scope}, images={len(candidates)}")
+        queue_path=workspace.outputs / f"review_queue_{scope}_round_{review_round}.csv"
+        fields=sorted({key for row in candidates for key in row.keys()})
+        DataStage.write_csv(queue_path, candidates, fields)
+        print(f"[REVIEW] scope={scope}, images={len(candidates)}, queue={queue_path}")
         return candidates
 
 class MaskEditor:
@@ -4145,8 +4628,15 @@ class MaskEditor:
         )
         row["manual_annotation_type"]=target_type
         row["manual_annotation_source"]=source
-
-        # The editor displays overlays live; no overlay/history file is stored.
+        ReviewStage.log_review_action(
+            self.workspace,
+            row,
+            self.review_round,
+            action,
+            binary,
+            self.index + 1,
+            len(self.rows),
+        )
         self.mask=binary.copy()
 
     def save(self):
@@ -4207,9 +4697,27 @@ class MaskEditor:
             sample_weight=0.0,
         )
         row["manual_annotation_type"]=UNUSABLE
+        ReviewStage.log_review_action(
+            self.workspace,
+            row,
+            self.review_round,
+            "mark_unusable",
+            None,
+            self.index + 1,
+            len(self.rows),
+        )
         self._advance_after_target("Marked UNUSABLE; excluded from training.")
 
     def skip(self):
+        ReviewStage.log_review_action(
+            self.workspace,
+            self.rows[self.index],
+            self.review_round,
+            "skip",
+            None,
+            self.index + 1,
+            len(self.rows),
+        )
         self.next()
 
     def reset_to_auto(self):
@@ -4239,6 +4747,15 @@ class MaskEditor:
         DataStage.remove_annotation(self.workspace, str(row["image_token"]))
         row["manual_annotation_type"]=""
         row["manual_annotation_source"]=""
+        ReviewStage.log_review_action(
+            self.workspace,
+            row,
+            self.review_round,
+            "delete_manual",
+            None,
+            self.index + 1,
+            len(self.rows),
+        )
         self.mask=self.auto_mask.copy()
         self.base_mask=self.auto_mask.copy()
         self._sync_python_mask()
@@ -5527,6 +6044,21 @@ class FeatureStage:
     "AU3_ATTENTION_ROI_MANUAL_SUBSET": "manual_positive_same_slices",
     "C4_ATTENTION_COMPLEMENT_MANUAL_SUBSET": "manual_positive_same_slices",
 }
+    # Use the historical storage keys from cad-cardiac-mri-project-dvm so both
+    # pipeline versions can read the same persistent patient_feature_bank.npz.
+    STORAGE_MODE_ALIASES = {
+        "B0_FULL_IMAGE": "FULL_IMAGE",
+        "B2_ATTENTION_ELIGIBLE_FULL_IMAGE": "B2_ATTENTION_ELIGIBLE_FULL_IMAGE",
+        "AU1_ATTENTION_ROI": "AU1_ATTENTION_ROI",
+        "C1_ATTENTION_COMPLEMENT": "AU5_ATTENTION_COMPLEMENT",
+        "B1_MATCHED_FULL_IMAGE": "CROSS_CLASS_MATCHED_FULL_IMAGE",
+        "AU2_MATCHED_ATTENTION_ROI": "CROSS_CLASS_MATCHED_AU1_ATTENTION_ROI",
+        "C2_MATCHED_ATTENTION_COMPLEMENT": "CROSS_CLASS_MATCHED_AU5_ATTENTION_COMPLEMENT",
+        "M1_MANUAL_ROI": "AU6_MANUAL_ROI",
+        "C3_MANUAL_COMPLEMENT": "AU7_MANUAL_COMPLEMENT",
+        "AU3_ATTENTION_ROI_MANUAL_SUBSET": "AU8_ATTENTION_MATCHED_MANUAL_ROI",
+        "C4_ATTENTION_COMPLEMENT_MANUAL_SUBSET": "AU9_ATTENTION_MATCHED_MANUAL_COMPLEMENT",
+    }
 
     @staticmethod
     def region_normalize(images, masks):
@@ -5605,8 +6137,7 @@ class FeatureStage:
                 skipped_nonpositive +=1
                 continue
 
-            path_value=str(row.get("manual_mask_path", "")).strip()
-            path=Path(path_value) if path_value else workspace.manual_masks / f"{token}.png"
+            path=workspace.manual_masks / f"{token}.png"
 
             if target_type == HEART_PRESENT or heart_present_raw == "1":
                 qc=DataStage.manual_mask_qc(path)
@@ -5709,14 +6240,48 @@ class FeatureStage:
             ),
             "manual_positive_same_slices",
         )
+    # Fingerprint all persistent inputs that determine the feature representations.
+    @staticmethod
+    def feature_fingerprint(dataset_rows, workspace):
+        digest=hashlib.sha256(b"simple-patient-feature-bank-semantic-v1")
+        prediction_summary=DataStage.read_json(workspace.prediction_summary, {}) or {}
+        payload={
+            "schema": "simple-patient-feature-bank-cross-class-v6-same-slice-baseline",
+            "modes": [FeatureStage.STORAGE_MODE_ALIASES[mode] for mode in FeatureStage.MODES],
+            "prediction_fingerprint": prediction_summary.get("fingerprint", ""),
+            "support_dilation": 15,
+            "imagenet_weights": True,
+            "classification_size": 224,
+        }
+        digest.update(json.dumps(payload, sort_keys=True).encode("utf-8"))
+        for row in dataset_rows:
+            digest.update(str(row.get("image_token", "")).encode("utf-8"))
+        for path in (
+            workspace.quality_audit,
+            workspace.manual_audit,
+            workspace.manual_annotations,
+            workspace.prediction_audit,
+            workspace.cross_class_matching_manifest,
+        ):
+            if path.is_file():
+                digest.update(path.name.encode("utf-8"))
+                digest.update(DataStage.file_sha256(path).encode("ascii"))
+        for token in sorted(FeatureStage.accepted_manual_tokens(workspace, verbose=False)):
+            path=workspace.manual_masks / f"{token}.png"
+            if path.is_file():
+                digest.update(token.encode("utf-8"))
+                digest.update(DataStage.file_sha256(path).encode("ascii"))
+        return digest.hexdigest()
+
     # Build every experiment from a frozen EfficientNet pass. B2, AU1, and C1
     # are forced to share the exact same Attention-eligible rows. During a full
     # rebuild, B0 embeddings are reused for the B2 and B1 subsets, so the added
     # methodological control does not create duplicate full-image forward passes.
     @staticmethod
     def build_feature_bank(dataset_rows, workspace, device):
-        # Features are always rebuilt. EfficientNet-B0 stays frozen; only the image
-        # representation changes between full-image, ROI, and complement experiments.
+        # Features are rebuilt from the current persistent OOF masks and are then
+        # saved under simple_pipeline_outputs/patient_feature_bank.*.
+        fingerprint=FeatureStage.feature_fingerprint(dataset_rows, workspace)
         reusable_bank={}
         modes_to_compute=FeatureStage.MODES
         compute_set=set(FeatureStage.MODES)
@@ -6044,7 +6609,69 @@ class FeatureStage:
             )
 
         FeatureStage.validate_cohort_alignment(bank)
-        print("[FEATURES] all experiment representations built in memory")
+
+        arrays={}
+        metadata_modes={}
+        for mode in FeatureStage.MODES:
+            values=bank[mode]
+            storage_mode=FeatureStage.STORAGE_MODE_ALIASES[mode]
+            arrays[f"{storage_mode}__X"]=np.asarray(values["X"], dtype=np.float32)
+            arrays[f"{storage_mode}__y"]=np.asarray(values["y"], dtype=np.int64)
+            arrays[f"{storage_mode}__patient_ids"]=np.asarray(
+                values["patient_ids"]
+            ).astype("U")
+            arrays[f"{storage_mode}__source_slices"]=np.asarray(
+                [values["source_slices"]], dtype=np.int64
+            )
+            arrays[f"{storage_mode}__series_proxies"]=np.asarray(
+                [values["series_proxies"]], dtype=np.int64
+            )
+            metadata_modes[mode]={
+                "description": FeatureStage.MODE_DESCRIPTIONS[mode],
+                "cohort": FeatureStage.MODE_COHORTS[mode],
+                "storage_key": storage_mode,
+                "patients": int(len(values["patient_ids"])),
+                "source_slices": int(values["source_slices"]),
+                "series_proxies": int(values["series_proxies"]),
+            }
+
+        workspace.feature_bank.parent.mkdir(parents=True, exist_ok=True)
+        temporary=workspace.feature_bank.with_name(
+            f".{workspace.feature_bank.name}.{os.getpid()}.{time.time_ns()}.tmp.npz"
+        )
+        np.savez_compressed(temporary, **arrays)
+        os.replace(temporary, workspace.feature_bank)
+        DataStage.write_json(
+            workspace.feature_metadata,
+            {
+                "fingerprint": fingerprint,
+                "schema": "simple-patient-feature-bank-cross-class-v6-same-slice-baseline",
+                "preprocessing_device": "cpu",
+                "extractor_device": device.type,
+                "modes": metadata_modes,
+                "same_slice_controls": {
+                    "attention_eligible": [
+                        "B2_ATTENTION_ELIGIBLE_FULL_IMAGE",
+                        "AU1_ATTENTION_ROI",
+                        "C1_ATTENTION_COMPLEMENT",
+                    ],
+                    "cross_class_matched": [
+                        "B1_MATCHED_FULL_IMAGE",
+                        "AU2_MATCHED_ATTENTION_ROI",
+                        "C2_MATCHED_ATTENTION_COMPLEMENT",
+                    ],
+                },
+                "elapsed": DataStage.format_seconds(time.perf_counter() - started),
+                "feature_bank": str(workspace.feature_bank),
+                "cross_class_matching_manifest": str(
+                    workspace.cross_class_matching_manifest
+                ),
+                "cross_class_matching_summary": str(
+                    workspace.cross_class_matching_summary
+                ),
+            },
+        )
+        print("[FEATURE BANK] Saved:", workspace.feature_bank)
         del extractor, loader
         DataStage.release_device(device)
         return bank
@@ -6254,6 +6881,11 @@ class EvaluationStage:
                     "training_threshold": thresholds,
                 }
             ).sort_values("patient_id")
+            DataStage.write_csv(
+                workspace.predictions_dir / f"{mode}.csv",
+                table.to_dict("records"),
+                table.columns,
+            )
             prediction_tables[mode]=table
             summary_rows.append(
                 {
@@ -6277,6 +6909,11 @@ class EvaluationStage:
             )
 
         summary=pd.DataFrame(summary_rows).sort_values("auc", ascending=False)
+        DataStage.write_csv(
+            workspace.results_csv,
+            summary.to_dict("records"),
+            summary.columns,
+        )
 
         comparisons=[]
         for first_mode, second_mode, question in (
@@ -6354,7 +6991,14 @@ class EvaluationStage:
                     **comparison,
                 }
             )
-        return summary, pd.DataFrame(comparisons)
+        comparison_table=pd.DataFrame(comparisons)
+        DataStage.write_csv(
+            workspace.outputs / "paired_auc_comparisons.csv",
+            comparison_table.to_dict("records"),
+            comparison_table.columns,
+        )
+        print("[EVALUATION] Results:", workspace.results_csv)
+        return summary, comparison_table
 
 # =============================================================================
 # STAGE 7 — KAGGLE EXECUTION: CPU → GPU → OPTIONAL REVIEW → CPU
@@ -6379,14 +7023,13 @@ class Pipeline:
         DataStage.seed_everything(include_cuda=False)
         workspace=DataStage.create_workspace(workspace_root)
 
-        # Default behavior is non-destructive. Existing generated files remain until
-        # this stage overwrites files with the same names. Set reset_files=True only
-        # when a completely clean current_run/ directory is required.
+        # Default behavior is non-destructive. A reset clears generated artifacts
+        # from the persistent DVM layout but never removes manual masks or labels.
         if reset_files:
-            DataStage.reset_current_run(workspace)
-            print("[FILES] reset_files=True: previous current_run/ files were removed.")
+            DataStage.reset_generated_workspace(workspace)
+            print("[FILES] reset_files=True: generated workspace artifacts were cleared.")
         else:
-            print("[FILES] reset_files=False: existing current_run/ files are preserved.")
+            print("[FILES] reset_files=False: persistent workspace artifacts are preserved.")
         dataset_path=Path(dataset_path or DataStage._default_dataset_path())
 
         # Dataset rows include deterministic patient folds and previous/current/next
@@ -6409,17 +7052,16 @@ class Pipeline:
             minimum_masks=minimum_masks,
         )
 
-        # Save the complete accepted rows, including sequence context and weights,
-        # because these exact rows define Attention U-Net training in the next session.
-        DataStage.write_csv(
-            workspace.accepted_targets,
-            accepted,
-            accepted[0].keys(),
+        # Store a semantic snapshot after every mask/label write is complete. The GPU
+        # stage reconstructs accepted rows from the persistent manifest and audits, so
+        # no separate current-run hand-off table is required.
+        manual_snapshot=DataStage.save_manual_data_snapshot(
+            workspace,
+            accepted_training_targets=len(accepted),
         )
-
-        # Store a content fingerprint after every mask/label write is complete. This is
-        # the CPU→GPU contract and remains valid across Kaggle session restarts.
-        manual_snapshot=DataStage.save_manual_data_snapshot(workspace)
+        training_summary=DataStage.read_json(workspace.training_summary, {}) or {}
+        training_summary["manual_mask_audit"]=manual_summary
+        DataStage.write_json(workspace.training_summary, training_summary)
 
         print("\n[MANUAL TARGETS]")
         display(pd.DataFrame([manual_summary]))
@@ -6430,7 +7072,8 @@ class Pipeline:
             f"{manual_snapshot['manual_mask_files']} masks, "
             f"fingerprint={manual_snapshot['fingerprint'][:12]}..."
         )
-        print(f"[HAND-OFF] current run: {workspace.current}")
+        print(f"[HAND-OFF] persistent workspace: {workspace.root}")
+        print(f"[HAND-OFF] generated outputs: {workspace.outputs}")
         print("[NEXT] Enable a Kaggle GPU, restart, run the definitions cell, then run Pipeline.gpu_attention().")
 
         return {
@@ -6451,13 +7094,24 @@ class Pipeline:
 
         workspace=DataStage.create_workspace(workspace_root)
         rows=DataStage.read_csv(workspace.dataset_manifest)
-        accepted=DataStage.read_csv(workspace.accepted_targets)
+        accepted=DataStage.accepted_training_rows(rows, workspace) if rows else []
         if not rows or not accepted:
             raise RuntimeError(
-                "CPU preparation files are missing. Disable the accelerator and run "
-                "Pipeline.cpu_prepare() first."
+                "CPU preparation files are missing or contain no accepted targets. "
+                "Disable the accelerator and run Pipeline.cpu_prepare() first."
             )
-        if DataStage.manual_data_changed_after(workspace, workspace.accepted_targets):
+        manual_snapshot=DataStage.load_manual_data_snapshot(workspace)
+        expected_targets=DataStage._as_int(
+            manual_snapshot.get("accepted_training_targets"),
+            len(accepted),
+        )
+        if expected_targets != len(accepted):
+            raise RuntimeError(
+                "The persistent manual audit no longer matches the CPU preparation: "
+                f"expected {expected_targets} accepted targets, found {len(accepted)}. "
+                "Disable the GPU and run Pipeline.cpu_prepare() again."
+            )
+        if DataStage.manual_data_changed_after(workspace):
             raise RuntimeError(
                 "The manual masks/labels do not match the CPU-preparation snapshot, or "
                 "the snapshot was created by an older notebook version. Disable the GPU "
@@ -6482,8 +7136,9 @@ class Pipeline:
 
         # The marker makes an interrupted run explicit instead of relying on mtimes.
         gpu_run_id=uuid.uuid4().hex
+        in_progress_path=DataStage.attention_in_progress_path(workspace)
         DataStage.write_json(
-            workspace.attention_in_progress,
+            in_progress_path,
             {
                 "schema": "cad-attention-run-v1",
                 "run_id": gpu_run_id,
@@ -6506,19 +7161,42 @@ class Pipeline:
             )
 
             # Commit the completed GPU hand-off only after every OOF row was written.
+            valid_masks=sum(
+                DataStage._as_int(row.get("attention_valid_final"), 0)
+                for row in predictions
+            )
+            predicted_heart=sum(
+                DataStage._as_int(row.get("attention_heart_present"), 0)
+                for row in predictions
+            )
+            prediction_fingerprint=DataStage.attention_output_fingerprint(
+                workspace,
+                preparation_fingerprint,
+            )
             DataStage.write_json(
-                workspace.attention_state,
+                workspace.prediction_summary,
                 {
-                    "schema": "cad-attention-run-v1",
+                    "schema": "simple-predictions-2p5d-presence-semantic-v1",
                     "run_id": gpu_run_id,
+                    "fingerprint": prediction_fingerprint,
                     "preparation_fingerprint": preparation_fingerprint,
                     "manual_semantic_fingerprint": DataStage.manual_data_fingerprint(
                         workspace
                     )["fingerprint"],
                     "images": len(predictions),
+                    "valid_final": valid_masks,
+                    "invalid_final": len(predictions) - valid_masks,
+                    "predicted_heart_present": predicted_heart,
+                    "predicted_no_heart": len(predictions) - predicted_heart,
+                    "prediction_audit": str(workspace.prediction_audit),
+                    "invalid_queue": str(workspace.invalid_predictions),
+                    "segmentation_oof": DataStage.read_json(
+                        workspace.segmentation_metrics_summary,
+                        {},
+                    ) or {},
                 },
             )
-            workspace.attention_in_progress.unlink(missing_ok=True)
+            in_progress_path.unlink(missing_ok=True)
         finally:
             DataStage.finish_device_stage(
                 device,
@@ -6587,8 +7265,8 @@ class Pipeline:
             print(error)
             return None
 
-        # The editor writes only manual PNG masks and explicit labels. If anything is
-        # changed, rerun CPU preparation and GPU Attention before final evaluation.
+        # The editor persistently writes manual PNG masks, explicit labels, and review
+        # history. If a target changes, rerun CPU preparation and GPU Attention.
         editor=MaskEditor(
             queue,
             workspace,
@@ -6626,7 +7304,7 @@ class Pipeline:
                 "The saved OOF outputs are older than the current CPU preparation or "
                 "checkpoint files. Run Pipeline.gpu_attention() again."
             )
-        if DataStage.manual_data_changed_after(workspace, workspace.accepted_targets):
+        if DataStage.manual_data_changed_after(workspace):
             raise RuntimeError(
                 "A manual target changed semantically after CPU preparation "
                 "(label, weight, mask membership, or binary mask pixels). Run "
@@ -6672,13 +7350,13 @@ class Pipeline:
             "comparisons": comparisons,
         }
 
-        # Keep the generated hand-off by default so evaluation or review can be rerun
-        # without repeating the GPU stage. Explicit cleanup is available when desired.
+        # Keep every generated artifact by default so evaluation or review can be rerun
+        # after accelerator restarts. Explicit cleanup keeps the root/manual contract.
         if reset_files:
-            DataStage.remove_current_run(workspace)
-            print("[FILES] reset_files=True: current_run/ was removed after evaluation.")
+            DataStage.remove_generated_workspace(workspace)
+            print("[FILES] reset_files=True: generated artifacts were cleared after evaluation.")
         else:
-            print(f"[FILES] reset_files=False: generated files remain in {workspace.current}")
+            print(f"[FILES] reset_files=False: generated files remain in {workspace.root}")
         return output
 
 
@@ -6688,5 +7366,6 @@ print("[PIPELINE] 1. Accelerator None  -> Pipeline.cpu_prepare(reset_files=False
 print("[PIPELINE] 2. Accelerator GPU   -> Pipeline.gpu_attention(reset_files=False)")
 print("[PIPELINE] 3. Accelerator None  -> optional Pipeline.review()")
 print("[PIPELINE] 4. Accelerator None  -> Pipeline.cpu_final(reset_files=False)")
+print("[FILES] Persistent DVM workspace: /kaggle/working/cad_attention_unet_workspace")
 print("[FILES] Nothing is deleted unless reset_files=True is passed explicitly.")
 print("[VALIDATION] Hand-offs use normalized labels and binary-mask fingerprints, not timestamps or PNG/CSV encoding.")
