@@ -10,12 +10,15 @@ PIPELINE
 2. AttentionStage  -> five patient-level cross-fit Attention U-Nets + OOF masks
 3. ReviewStage     -> optional HTML review of unresolved masks
 4. MatchingStage   -> balanced Sick/Normal acquisition matching
-5. FeatureStage    -> frozen EfficientNet features for all 11 experiments
+5. FeatureStage    -> CPU/float32 frozen EfficientNet features for all 11 experiments
 6. EvaluationStage -> nested patient-level classification + paired AUC tests
 7. Pipeline        -> the two commands a user normally calls
 
 Scientific safeguards remain unchanged: patient-level folds, out-of-fold masks,
 same-slice controls, matched cohorts, and patient-level evaluation.
+The numerical feature protocol matches the full pipeline's CPU defaults: float32,
+AMP disabled, batch/forward size 4, ImageNet V1 weights, and unchanged preprocessing.
+Attention training/prediction still use CUDA AMP. Matching remains core + extended.
 """
 
 import base64
@@ -24,11 +27,13 @@ import csv
 import gc
 import hashlib
 import importlib
+from importlib.metadata import version as package_version
 import json
 import math
 import os
 import random
 import re
+import sys
 import time
 import uuid
 from collections import OrderedDict, defaultdict, namedtuple
@@ -151,6 +156,9 @@ class DataStage:
         np.random.seed(seed)
         torch.manual_seed(seed)
         torch.set_num_threads(max(1, min(8, os.cpu_count() or 1)))
+        # Restore the full pipeline's explicit setting instead of inheriting a
+        # deterministic-algorithms switch from an unrelated notebook cell.
+        torch.use_deterministic_algorithms(False, warn_only=True)
         if include_cuda:
             torch.cuda.manual_seed_all(seed)
             # Deterministic algorithms were disabled in the researched runs; cuDNN
@@ -5032,17 +5040,23 @@ class FrozenEfficientNet(nn.Module):
         model.classifier=nn.Identity()
         for parameter in model.parameters():
             parameter.requires_grad_(False)
-        self.model=model.eval()
+        # CPU/float32 is a deliberate experiment protocol, not automatic device selection.
+        self.model=model.to(device="cpu", dtype=torch.float32,
+                            memory_format=torch.contiguous_format).eval()
         self.register_buffer(
-            "mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+            "mean", torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32, device="cpu").view(1, 3, 1, 1)
         )
         self.register_buffer(
-            "std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+            "std", torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32, device="cpu").view(1, 3, 1, 1)
         )
 
     def forward(self, images):
-        images=(images.float() - self.mean) / self.std
-        return self.model(images)
+        if images.device.type != "cpu":
+            raise ValueError("EfficientNet requires CPU inputs in this CPU/float32 pipeline.")
+        # An outer notebook autocast context must not silently enable CPU bfloat16.
+        with torch.autocast(device_type="cpu", enabled=False):
+            images=(images.to(dtype=torch.float32) - self.mean) / self.std
+            return self.model(images.contiguous())
 class StreamingPatientPool:
     """Aggregate slice embeddings first by series and then by patient."""
 
@@ -5097,6 +5111,10 @@ class StreamingPatientPool:
 
 class FeatureStage:
     """Build all eleven full-image/ROI/complement patient feature sets from scratch."""
+
+    # Full-pipeline CPU defaults. Both sizes affect forward grouping, so retain 4/4.
+    BATCH_SIZE = 4
+    FORWARD_BATCH_SIZE = 4
 
     # These names define the research experiments; they are not tunable settings.
     MODES = (
@@ -5264,7 +5282,13 @@ class FeatureStage:
         )
     # Compute all eleven modes every run; share identical embeddings across exact subsets.
     @staticmethod
-    def build_feature_bank(dataset_rows, accepted_rows, matching_manifest, device):
+    def build_feature_bank(dataset_rows, accepted_rows, matching_manifest, device=None):
+        device=torch.device("cpu" if device is None else device)
+        if device.type != "cpu":
+            raise ValueError(
+                "EfficientNet is locked to CPU/float32 to match the full pipeline. "
+                "Pass device='cpu'; CUDA remains enabled only for Attention U-Net."
+            )
         accepted_manual = {
             str(row["image_token"])
             for row in accepted_rows
@@ -5300,13 +5324,18 @@ class FeatureStage:
         if not rows:
             raise RuntimeError("No images are eligible for feature extraction.")
         print(f"[FEATURES] rebuilding all 11 experiments from {len(rows)} source images")
-        extractor = DataStage.prepare_model(FrozenEfficientNet(), device).eval()
+        extractor = FrozenEfficientNet().to(
+            device=device, dtype=torch.float32, memory_format=torch.contiguous_format
+        ).eval()
+        print(f"[FEATURES][NUMERICS] device=cpu | dtype=float32 | autocast=False | "
+              f"batch={FeatureStage.BATCH_SIZE} | forward_batch={FeatureStage.FORWARD_BATCH_SIZE} | "
+              "weights=IMAGENET1K_V1")
         loader = DataLoader(
             FeatureDataset(rows),
-            batch_size=12 if device.type == "cuda" else 4,
+            batch_size=FeatureStage.BATCH_SIZE,
             shuffle=False,
             num_workers=0,
-            pin_memory=device.type == "cuda",
+            pin_memory=False,  # CPU feature extraction never transfers batches to CUDA
         )
         pool = StreamingPatientPool(FeatureStage.MODES)
         started = time.perf_counter()
@@ -5336,15 +5365,18 @@ class FeatureStage:
             combined=torch.cat(
                 [images.contiguous() for _, images, _ in valid_groups], dim=0
             )
-            forward_batch=32 if device.type == "cuda" else 4
+            forward_batch=FeatureStage.FORWARD_BATCH_SIZE
             embedding_chunks=[]
             for begin in range(0, combined.shape[0], forward_batch):
-                images_device=DataStage.move_tensor(
-                    combined[begin : begin + forward_batch], device
-                )
-                with DataStage.autocast(device):
-                    output=extractor(images_device)
-                embedding_chunks.append(output.float().cpu())
+                images_device=combined[begin : begin + forward_batch].to(
+                    device=device, dtype=torch.float32
+                ).contiguous()
+                output=extractor(images_device)
+                # Check the actual computation output; a final .float() alone would
+                # hide a preceding low-precision forward instead of correcting it.
+                if output.device.type != "cpu" or output.dtype != torch.float32:
+                    raise RuntimeError("EfficientNet must produce CPU/float32 embeddings.")
+                embedding_chunks.append(output)
                 del images_device, output
 
             embeddings=torch.cat(embedding_chunks, dim=0).numpy().astype(np.float32)
@@ -5370,7 +5402,8 @@ class FeatureStage:
                 cursor +=count
             del combined, embeddings, embedding_chunks
 
-        with torch.inference_mode():
+        # Disable even an inherited CPU autocast context for the complete feature path.
+        with torch.inference_mode(), torch.autocast(device_type="cpu", enabled=False):
             for robust, raw, content, attention, manual, indices in tqdm(
                 loader, desc=f"EfficientNet feature bank ({device.type})"
             ):
@@ -5746,6 +5779,7 @@ class Pipeline:
         print("[ORDER] Dataset -> quality/manual targets -> five Attention U-Nets -> OOF masks")
         print("[ORDER] -> Sick/Normal matching -> 11 EfficientNet representations -> patient-level evaluation")
         print("[REVIEW] Optional HTML editing is separate; new labels apply to the next full run.")
+        print("[CONFIG] Attention=cuda/AMP | EfficientNet=cpu/float32 (AMP off) | seed=42")
         # A failed new run must never masquerade as the results of an older run.
         Pipeline.last_run = None
         DataStage.clear_image_cache()
@@ -5755,6 +5789,24 @@ class Pipeline:
         rows = DataStage.discover_dataset(dataset_path, workspace)
         rows = DataStage.build_quality_audit(rows)
         state = {"rows": rows, "workspace": workspace, "status": "manual_targets"}
+        # Keep provenance in RAM so a later AUC comparison identifies its numeric path.
+        state["numeric_protocol"] = {
+            "full_reference": "2026-09-25-clean-v3-same-slice-full-image-control",
+            "attention_device": "cuda", "attention_amp": True,
+            "feature_device": "cpu", "feature_dtype": "float32", "feature_amp": False,
+            "feature_batch_size": FeatureStage.BATCH_SIZE,
+            "feature_forward_batch_size": FeatureStage.FORWARD_BATCH_SIZE,
+            "feature_weights": "EfficientNet_B0_Weights.IMAGENET1K_V1",
+            "seed": 42, "num_workers": 0, "cpu_threads": torch.get_num_threads(),
+            "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+            "versions": {
+                "python": sys.version.split()[0], "torch": str(torch.__version__),
+                "torchvision": package_version("torchvision"),
+                "numpy": np.__version__, "scikit_learn": package_version("scikit-learn"),
+                "scipy": package_version("scipy"), "opencv": cv2.__version__,
+            },
+        }
+        print("[VERSIONS] " + json.dumps(state["numeric_protocol"]["versions"], sort_keys=True))
         Pipeline.last_run = state
         print(f"[PERSISTENT] manual masks: {workspace.manual_masks}")
         print(f"[PERSISTENT] automatic masks: {workspace.predicted_masks}")
@@ -5808,9 +5860,9 @@ class Pipeline:
         print("\n[MATCHING]")
         display(pd.DataFrame([matching_summary]))
 
-        # STEP 5 — FEATURES: frozen ImageNet EfficientNet-B0; all eleven modes.
+        # STEP 5 — FEATURES: the full pipeline's CPU/float32 path; all eleven modes.
         state["status"] = "feature_extraction"
-        device = DataStage.start_device_stage("cuda", "EfficientNet feature extraction")
+        device = DataStage.start_device_stage("cpu", "EfficientNet feature extraction")
         try:
             bank = FeatureStage.build_feature_bank(rows, accepted, matching, device)
         finally:
@@ -5888,6 +5940,7 @@ class Pipeline:
 # Importing definitions does not train models or create output directories.
 DataStage.seed_everything(include_cuda=False)
 print("[PIPELINE] Run all stages: result = Pipeline.run()")
+print("[PIPELINE] Attention: CUDA/AMP | EfficientNet: CPU/float32, AMP off, batches 4/4")
 print("[PIPELINE] Optional editing: editor = Pipeline.review(scope='invalid')")
 print("[PIPELINE] Persistent review data: manual + automatic masks, labels, audit, history")
 print("[PIPELINE] After manual changes, rerun Pipeline.run(); automatic masks are replaced.")
