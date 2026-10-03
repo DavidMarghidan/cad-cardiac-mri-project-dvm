@@ -536,6 +536,7 @@ class DataStage:
     # Atomically save manual masks, automatic masks, and review overlays.
     @staticmethod
     def write_png(path, image):
+        """Atomically write a PNG and preserve mtime when pixels are unchanged."""
         path=Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         array=np.asarray(image)
@@ -544,12 +545,20 @@ class DataStage:
         )
         if not ok:
             raise RuntimeError(f"OpenCV could not encode PNG: {path}")
+        encoded_bytes=encoded.tobytes()
+        if path.is_file():
+            try:
+                if path.stat().st_size == len(encoded_bytes) and path.read_bytes() == encoded_bytes:
+                    return False
+            except OSError:
+                pass
         temporary=path.with_name(
             f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp"
         )
         try:
-            temporary.write_bytes(encoded.tobytes())
+            temporary.write_bytes(encoded_bytes)
             os.replace(temporary, path)
+            return True
         finally:
             temporary.unlink(missing_ok=True)
 
@@ -7347,30 +7356,211 @@ class PersistenceStage:
         return expected
 
     @staticmethod
+    def feature_upstream_state(rows, accepted_rows, workspace):
+        """Return semantic lineage consumed by the feature bank.
+
+        Metadata files may be migrated or rewritten without changing the image/mask
+        inputs. These fingerprints describe the underlying pipeline state instead of
+        relying on volatile file modification times.
+        """
+        quality_summary=DataStage.read_json(workspace.quality_summary, {}) or {}
+        manual_summary=DataStage.read_json(workspace.manual_summary, {}) or {}
+        prediction_summary=DataStage.read_json(workspace.prediction_summary, {}) or {}
+        matching_summary=DataStage.read_json(workspace.matching_summary, {}) or {}
+        return {
+            "dataset_fingerprint": (
+                quality_summary.get("dataset_fingerprint")
+                or DataStage.dataset_fingerprint(rows)
+            ),
+            "manual_input_fingerprint": (
+                manual_summary.get("input_fingerprint")
+                or DataStage.manual_state_fingerprint(rows, workspace)
+            ),
+            "prediction_fingerprint": (
+                prediction_summary.get("stable_fingerprint")
+                or prediction_summary.get("fingerprint", "")
+            ),
+            "matching_fingerprint": (
+                matching_summary.get("stable_fingerprint")
+                or matching_summary.get("fingerprint", "")
+            ),
+            "accepted_training_targets": int(len(accepted_rows)),
+            "positive_manual_targets": int(sum(
+                row.get("segmentation_target_type") == HEART_PRESENT
+                for row in accepted_rows
+            )),
+        }
+
+    @staticmethod
     def feature_bank_structurally_compatible(bank, rows, accepted_rows, matching, workspace):
+        """Safely adopt a legacy feature bank when its direct inputs are unchanged.
+
+        ``simple_prediction_summary.json`` is deliberately not compared by mtime:
+        migrating its metadata does not alter any EfficientNet input. For the one-time
+        legacy adoption we instead validate every cohort and ensure that the actual
+        automatic/manual mask PNG files have not changed after the feature bank.
+        Future runs use the stable semantic fingerprint written during adoption.
+        """
         expected=PersistenceStage.expected_feature_cohorts(rows, accepted_rows, matching)
         for mode in FeatureStage.MODES:
             if mode not in bank:
                 return False, f"missing mode {mode}"
-            current=bank[mode]; wanted=expected[mode]
-            if not np.array_equal(np.asarray(current["patient_ids"]).astype(str), wanted["patient_ids"].astype(str)):
+            current=bank[mode]
+            wanted=expected[mode]
+            current_patients=np.asarray(current["patient_ids"]).astype(str)
+            current_labels=np.asarray(current["y"], dtype=np.int64)
+            current_features=np.asarray(current["X"])
+            if current_features.ndim != 2 or current_features.shape[0] != len(current_patients):
+                return False, f"invalid feature matrix for {mode}"
+            if not np.all(np.isfinite(current_features)):
+                return False, f"non-finite feature values for {mode}"
+            if not np.array_equal(current_patients, wanted["patient_ids"].astype(str)):
                 return False, f"patient cohort changed for {mode}"
-            if not np.array_equal(np.asarray(current["y"],dtype=np.int64), wanted["y"]):
+            if not np.array_equal(current_labels, wanted["y"]):
                 return False, f"labels changed for {mode}"
             if int(current["source_slices"]) != int(wanted["source_slices"]):
                 return False, f"slice cohort changed for {mode}"
             if int(current["series_proxies"]) != int(wanted["series_proxies"]):
                 return False, f"series cohort changed for {mode}"
-        bank_mtime=Path(workspace.feature_bank).stat().st_mtime_ns
+
+        bank_path=Path(workspace.feature_bank)
+        if not bank_path.is_file():
+            return False, "feature bank file is missing"
+        bank_mtime=int(bank_path.stat().st_mtime_ns)
+
         positive_masks=[
-            row["manual_mask_path"] for row in accepted_rows
+            Path(row["manual_mask_path"])
+            for row in accepted_rows
             if row.get("segmentation_target_type") == HEART_PRESENT
         ]
-        if DataStage.newest_mtime_ns(positive_masks + [workspace.manual_annotations]) > bank_mtime:
+        if DataStage.newest_mtime_ns(
+            positive_masks + [Path(workspace.manual_annotations)]
+        ) > bank_mtime:
             return False, "manual target changed after feature bank"
-        if Path(workspace.prediction_summary).is_file() and Path(workspace.prediction_summary).stat().st_mtime_ns > bank_mtime:
-            return False, "OOF prediction changed after feature bank"
-        return True, "cohorts and upstream model outputs unchanged"
+
+        predicted_directory=Path(workspace.predicted_masks)
+        predicted_masks=list(predicted_directory.glob("*.png"))
+        if len(predicted_masks) != len(rows):
+            return False, f"automatic mask set incomplete ({len(predicted_masks)}/{len(rows)})"
+        if DataStage.newest_mtime_ns(predicted_masks) > bank_mtime:
+            return False, "automatic OOF mask changed after feature bank"
+
+        # These tables directly determine cohort membership. JSON summaries and
+        # pipeline-stage state are intentionally excluded because metadata-only
+        # migration must not invalidate expensive embeddings.
+        direct_tables=(
+            Path(workspace.quality_audit),
+            Path(workspace.prediction_audit),
+            Path(workspace.matching_manifest),
+        )
+        missing=[str(path) for path in direct_tables if not path.is_file()]
+        if missing:
+            return False, "missing upstream table: " + ", ".join(missing)
+
+        return True, "cohorts and direct image/mask inputs unchanged"
+
+    @staticmethod
+    def feature_metadata_payload(
+        bank, fingerprint, workspace, elapsed="", upstream_state=None,
+        cache_adoption="",
+    ):
+        modes={}
+        for mode in FeatureStage.MODES:
+            values=bank[mode]
+            storage=PersistenceStage.LEGACY_MODE_ALIASES[mode]
+            modes[mode]={
+                "description": FeatureStage.MODE_DESCRIPTIONS[mode],
+                "cohort": FeatureStage.MODE_COHORTS[mode],
+                "storage_key": storage,
+                "patients": int(len(values["patient_ids"])),
+                "source_slices": int(values["source_slices"]),
+                "series_proxies": int(values["series_proxies"]),
+            }
+        payload={
+            "schema": "simple-patient-feature-bank-stable-v7",
+            "fingerprint": fingerprint,
+            "stable_fingerprint": fingerprint,
+            "preprocessing_device": "cpu",
+            "extractor_device": "cpu",
+            "dtype": "float32",
+            "numeric_protocol": {
+                "device": "cpu", "dtype": "float32", "autocast": False,
+                "batch_size": int(FeatureStage.BATCH_SIZE),
+                "forward_batch_size": int(FeatureStage.FORWARD_BATCH_SIZE),
+                "weights": "EfficientNet_B0_Weights.IMAGENET1K_V1",
+            },
+            "modes": modes,
+            "elapsed": str(elapsed or ""),
+            "feature_bank": str(workspace.feature_bank),
+            "upstream_state": dict(upstream_state or {}),
+        }
+        if cache_adoption:
+            payload["cache_adoption"]=str(cache_adoption)
+        return payload
+
+    @staticmethod
+    def feature_bank_cache_status(rows, accepted_rows, matching, workspace):
+        """Validate one feature-bank cache through a single shared code path."""
+        metadata=DataStage.read_json(workspace.feature_metadata, {}) or {}
+        stable=PersistenceStage.feature_fingerprint(rows, accepted_rows, workspace)
+        legacy=(
+            PersistenceStage.legacy_feature_fingerprint(rows, accepted_rows, workspace)
+            if not metadata.get("stable_fingerprint")
+            else ""
+        )
+        bank=None
+        load_error=None
+        if Path(workspace.feature_bank).is_file():
+            try:
+                bank=PersistenceStage.load_feature_bank(workspace)
+            except Exception as error:
+                load_error=error
+        if bank is None:
+            reason=(
+                f"{type(load_error).__name__}: {load_error}"
+                if load_error is not None
+                else "feature bank file is missing"
+            )
+            return {
+                "reusable": False, "reason": reason, "exact": False,
+                "adopted": False, "stable_fingerprint": stable,
+                "legacy_fingerprint": legacy, "metadata": metadata,
+                "bank": None,
+            }
+
+        exact=(
+            metadata.get("stable_fingerprint") == stable
+            or metadata.get("fingerprint") in {stable, legacy}
+        )
+        if exact:
+            return {
+                "reusable": True, "reason": "fingerprint", "exact": True,
+                "adopted": False, "stable_fingerprint": stable,
+                "legacy_fingerprint": legacy, "metadata": metadata,
+                "bank": bank,
+            }
+
+        legacy_adoptable=(
+            metadata.get("schema") == "simple-patient-feature-bank-cross-class-v6-same-slice-baseline"
+            and not metadata.get("stable_fingerprint")
+        )
+        if legacy_adoptable:
+            structural, reason=PersistenceStage.feature_bank_structurally_compatible(
+                bank, rows, accepted_rows, matching, workspace
+            )
+            return {
+                "reusable": bool(structural), "reason": reason,
+                "exact": False, "adopted": bool(structural),
+                "stable_fingerprint": stable, "legacy_fingerprint": legacy,
+                "metadata": metadata, "bank": bank,
+            }
+
+        return {
+            "reusable": False, "reason": "stable fingerprint changed",
+            "exact": False, "adopted": False,
+            "stable_fingerprint": stable, "legacy_fingerprint": legacy,
+            "metadata": metadata, "bank": bank,
+        }
 
     @staticmethod
     def load_feature_bank(workspace):
@@ -7404,9 +7594,10 @@ class PersistenceStage:
         return bank
 
     @staticmethod
-    def save_feature_bank(bank, fingerprint, workspace, elapsed):
+    def save_feature_bank(
+        bank, fingerprint, workspace, elapsed, upstream_state=None,
+    ):
         arrays={}
-        modes={}
         for mode in FeatureStage.MODES:
             values=bank[mode]
             storage=PersistenceStage.LEGACY_MODE_ALIASES[mode]
@@ -7415,71 +7606,47 @@ class PersistenceStage:
             arrays[f"{storage}__patient_ids"]=np.asarray(values["patient_ids"]).astype("U")
             arrays[f"{storage}__source_slices"]=np.asarray([values["source_slices"]], dtype=np.int64)
             arrays[f"{storage}__series_proxies"]=np.asarray([values["series_proxies"]], dtype=np.int64)
-            modes[mode]={
-                "description": FeatureStage.MODE_DESCRIPTIONS[mode],
-                "cohort": FeatureStage.MODE_COHORTS[mode],
-                "storage_key": storage,
-                "patients": int(len(values["patient_ids"])),
-                "source_slices": int(values["source_slices"]),
-                "series_proxies": int(values["series_proxies"]),
-            }
         DataStage.write_npz(workspace.feature_bank, arrays)
         DataStage.write_json(
             workspace.feature_metadata,
-            {
-                "schema": "simple-patient-feature-bank-stable-v7",
-                "fingerprint": fingerprint,
-                "stable_fingerprint": fingerprint,
-                "preprocessing_device": "cpu",
-                "extractor_device": "cpu",
-                "dtype": "float32",
-                "modes": modes,
-                "elapsed": elapsed,
-                "feature_bank": str(workspace.feature_bank),
-            },
+            PersistenceStage.feature_metadata_payload(
+                bank, fingerprint, workspace, elapsed=elapsed,
+                upstream_state=upstream_state,
+            ),
         )
 
     @staticmethod
     def build_feature_bank(rows, accepted_rows, matching, workspace, force=False):
-        metadata=DataStage.read_json(workspace.feature_metadata, {}) or {}
-        stable=PersistenceStage.feature_fingerprint(rows, accepted_rows, workspace)
-        legacy=(
-            PersistenceStage.legacy_feature_fingerprint(rows, accepted_rows, workspace)
-            if not metadata.get("stable_fingerprint")
-            else ""
+        status=PersistenceStage.feature_bank_cache_status(
+            rows, accepted_rows, matching, workspace
         )
-        bank=None
-        load_error=None
-        if Path(workspace.feature_bank).is_file():
-            try:
-                bank=PersistenceStage.load_feature_bank(workspace)
-            except Exception as error:
-                load_error=error
-        exact=(
-            metadata.get("stable_fingerprint") == stable
-            or metadata.get("fingerprint") in {stable, legacy}
-        )
-        adopted=False
-        adoption_reason=""
-        legacy_adoptable=(
-            metadata.get("schema") == "simple-patient-feature-bank-cross-class-v6-same-slice-baseline"
-            and not metadata.get("stable_fingerprint")
-        )
-        if bank is not None and not exact and legacy_adoptable:
-            adopted, adoption_reason=PersistenceStage.feature_bank_structurally_compatible(
-                bank, rows, accepted_rows, matching, workspace
-            )
-        if not force and bank is not None and (exact or adopted):
+        if not force and status["reusable"]:
+            if not status["exact"]:
+                # One-time metadata migration only. The .npz embeddings remain untouched.
+                old_elapsed=str(status["metadata"].get("elapsed", ""))
+                DataStage.write_json(
+                    workspace.feature_metadata,
+                    PersistenceStage.feature_metadata_payload(
+                        status["bank"], status["stable_fingerprint"], workspace,
+                        elapsed=old_elapsed,
+                        upstream_state=PersistenceStage.feature_upstream_state(
+                            rows, accepted_rows, workspace
+                        ),
+                        cache_adoption=status["reason"],
+                    ),
+                )
             print(
                 "[FEATURE BANK] Compatible CPU/float32 bank reused"
-                + (f" ({adoption_reason})" if adopted else "")
+                + (f" ({status['reason']})" if status["reason"] != "fingerprint" else "")
                 + f": {workspace.feature_bank}"
             )
-            return bank
-        if load_error is not None:
-            print(f"[FEATURE BANK] Cache invalid; rebuilding ({type(load_error).__name__}: {load_error}).")
-        elif bank is not None and not force:
-            print(f"[FEATURE BANK] Cache invalid; rebuilding ({adoption_reason or 'fingerprint changed'}).")
+            return status["bank"]
+
+        if status["bank"] is not None and not force:
+            print(f"[FEATURE BANK] Cache invalid; rebuilding ({status['reason']}).")
+        elif status["bank"] is None and Path(workspace.feature_bank).is_file():
+            print(f"[FEATURE BANK] Cache invalid; rebuilding ({status['reason']}).")
+
         started=time.perf_counter()
         device=DataStage.start_device_stage("cpu", "EfficientNet feature extraction")
         try:
@@ -7487,7 +7654,13 @@ class PersistenceStage:
         finally:
             DataStage.finish_device_stage(device, "EfficientNet feature extraction")
         PersistenceStage.save_feature_bank(
-            bank, stable, workspace, DataStage.format_seconds(time.perf_counter()-started)
+            bank,
+            status["stable_fingerprint"],
+            workspace,
+            DataStage.format_seconds(time.perf_counter()-started),
+            upstream_state=PersistenceStage.feature_upstream_state(
+                rows, accepted_rows, workspace
+            ),
         )
         print(f"[FEATURE BANK] Saved: {workspace.feature_bank}")
         return bank
@@ -7975,33 +8148,20 @@ class Pipeline:
         rows=context["rows"]
         matching_status=PersistenceStage.matching_cache_status(rows, workspace)
         matching=matching_status["cached"] if matching_status["reusable"] else []
-        feature_reusable=False; feature_reason="matching cache is not reusable"; bank=None
+
         if matching:
-            metadata=DataStage.read_json(workspace.feature_metadata, {}) or {}
-            stable=PersistenceStage.feature_fingerprint(rows, context["accepted"], workspace)
-            legacy=(
-                PersistenceStage.legacy_feature_fingerprint(rows, context["accepted"], workspace)
-                if not metadata.get("stable_fingerprint")
-                else ""
+            feature_status=PersistenceStage.feature_bank_cache_status(
+                rows, context["accepted"], matching, workspace
             )
-            if Path(workspace.feature_bank).is_file():
-                try:
-                    bank=PersistenceStage.load_feature_bank(workspace)
-                    exact=(metadata.get("stable_fingerprint")==stable or metadata.get("fingerprint") in {stable,legacy})
-                    structural, structural_reason=PersistenceStage.feature_bank_structurally_compatible(
-                        bank, rows, context["accepted"], matching, workspace
-                    )
-                    legacy_adoptable=(
-                        metadata.get("schema") == "simple-patient-feature-bank-cross-class-v6-same-slice-baseline"
-                        and not metadata.get("stable_fingerprint")
-                    )
-                    feature_reusable=bool(exact or (legacy_adoptable and structural))
-                    feature_reason="fingerprint" if exact else structural_reason if legacy_adoptable else "stable fingerprint changed"
-                except Exception as error:
-                    feature_reason=f"{type(error).__name__}: {error}"
+        else:
+            feature_status={
+                "reusable":False, "reason":"matching cache is not reusable",
+                "bank":None,
+            }
+
         evaluation_status=(
-            PersistenceStage.evaluation_cache_status(bank, workspace)
-            if feature_reusable and bank is not None
+            PersistenceStage.evaluation_cache_status(feature_status["bank"], workspace)
+            if feature_status.get("reusable") and feature_status.get("bank") is not None
             else {"reusable":False,"reason":"feature bank is not reusable"}
         )
         report={
@@ -8010,8 +8170,8 @@ class Pipeline:
             "predictions_complete": context["persisted_predictions"].get("mask_files",0)==len(rows),
             "matching_reusable": matching_status["reusable"],
             "matching_reason": matching_status["reason"],
-            "feature_bank_reusable": feature_reusable,
-            "feature_bank_reason": feature_reason,
+            "feature_bank_reusable": bool(feature_status.get("reusable",False)),
+            "feature_bank_reason": str(feature_status.get("reason","")),
             "evaluation_reusable": evaluation_status.get("reusable",False),
             "evaluation_reason": evaluation_status.get("reason",""),
         }
