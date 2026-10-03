@@ -6,6 +6,10 @@ fingerprint-validated artifacts under ``/kaggle/working/cad_attention_unet_works
 quality audits, per-fold Attention U-Net checkpoints, per-fold OOF predictions,
 matching, the EfficientNet feature bank, or the final patient-level evaluation.
 
+The workspace cleaner keeps only artifacts addressed by this pipeline and can also
+remove unrelated non-hidden files from ``/kaggle/working``. Cleanup is explicit and
+never runs automatically while importing the notebook.
+
 KAGGLE EXECUTION
 1. CPU initial   -> dataset manifest, quality audit, manual-target audit
 2. GPU           -> five resumable Attention U-Nets + resumable OOF prediction
@@ -296,6 +300,238 @@ class DataStage:
         ):
             directory.mkdir(parents=True, exist_ok=True)
         return workspace
+
+    @staticmethod
+    def workspace_contract(workspace):
+        """Return the only files/directories this pipeline is allowed to persist.
+
+        The contract deliberately includes restart caches, manual-review state, and
+        final scientific outputs. Legacy files, temporary files, ad-hoc exports, and
+        artifacts from older pipeline layouts are not part of the contract.
+        """
+        workspace=workspace if hasattr(workspace, "root") else DataStage.create_workspace(workspace)
+        root_files={
+            Path(workspace.manual_annotations),
+            Path(workspace.prediction_audit),
+            Path(workspace.review_history),
+            Path(workspace.dataset_manifest),
+            Path(workspace.quality_audit),
+            Path(workspace.manual_audit),
+            Path(workspace.training_summary),
+            Path(workspace.prediction_summary),
+            Path(workspace.invalid_predictions),
+        }
+        output_files={
+            Path(workspace.quality_summary),
+            Path(workspace.manual_summary),
+            Path(workspace.segmentation_metrics),
+            Path(workspace.segmentation_summary),
+            Path(workspace.matching_manifest),
+            Path(workspace.matching_summary),
+            Path(workspace.feature_bank),
+            Path(workspace.feature_metadata),
+            Path(workspace.results_csv),
+            Path(workspace.comparisons_csv),
+            Path(workspace.evaluation_metadata),
+            Path(workspace.stage_state),
+        }
+        directories={
+            Path(workspace.manual_masks),
+            Path(workspace.predicted_masks),
+            Path(workspace.mask_overlays),
+            Path(workspace.checkpoints),
+            Path(workspace.outputs),
+            Path(workspace.prediction_parts_dir),
+            Path(workspace.predictions_dir),
+        }
+        return {
+            "root_files": root_files,
+            "output_files": output_files,
+            "directories": directories,
+            "checkpoint_names": {f"attention_unet_fold_{fold}.pt" for fold in range(5)},
+            "prediction_part_names": {
+                f"fold_{fold}.{suffix}"
+                for fold in range(5)
+                for suffix in ("csv", "json")
+            },
+        }
+
+    @staticmethod
+    def clean_kaggle_working(
+        workspace_root=None,
+        dry_run=True,
+        remove_other_working_items=True,
+        keep_backup_zips=False,
+        working_root=None,
+    ):
+        """Keep only the persistent contract used by this pipeline.
+
+        Safety rules:
+        - never touches ``/kaggle/input``;
+        - never deletes the workspace itself, manual masks, automatic masks, or
+          compatible restart/evaluation artifacts;
+        - hidden top-level Kaggle entries are left alone;
+        - ``dry_run=True`` only prints the cleanup plan.
+
+        ``working_root`` exists mainly for local tests; on Kaggle it resolves to
+        ``/kaggle/working``.
+        """
+        import shutil
+
+        workspace=DataStage.create_workspace(workspace_root)
+        workspace_root_path=Path(workspace.root).resolve()
+        if working_root is None:
+            working_root_path=(
+                Path("/kaggle/working").resolve()
+                if Path("/kaggle/working").exists()
+                else workspace_root_path.parent.resolve()
+            )
+        else:
+            working_root_path=Path(working_root).resolve()
+
+        try:
+            workspace_root_path.relative_to(working_root_path)
+        except ValueError as error:
+            raise RuntimeError(
+                f"Refusing cleanup: workspace {workspace_root_path} is not inside "
+                f"working root {working_root_path}."
+            ) from error
+        if working_root_path == Path("/"):
+            raise RuntimeError("Refusing cleanup with filesystem root as working_root.")
+
+        contract=DataStage.workspace_contract(workspace)
+        allowed_root_entries={path.resolve() for path in contract["root_files"]}
+        allowed_root_entries.update({path.resolve() for path in contract["directories"]})
+        allowed_output_entries={path.resolve() for path in contract["output_files"]}
+        allowed_output_entries.update({
+            Path(workspace.prediction_parts_dir).resolve(),
+            Path(workspace.predictions_dir).resolve(),
+        })
+
+        removals=[]
+        def queue(path, reason):
+            path=Path(path)
+            if path.exists() or path.is_symlink():
+                removals.append((path, reason))
+
+        # Remove old/foreign entries inside the current workspace root.
+        if workspace_root_path.is_dir():
+            for child in workspace_root_path.iterdir():
+                if child.resolve() not in allowed_root_entries:
+                    queue(child, "not in current workspace contract")
+
+        outputs=Path(workspace.outputs)
+        if outputs.is_dir():
+            for child in outputs.iterdir():
+                if child.resolve() not in allowed_output_entries:
+                    queue(child, "not in current output contract")
+
+        checkpoints=Path(workspace.checkpoints)
+        if checkpoints.is_dir():
+            for child in checkpoints.iterdir():
+                if child.name not in contract["checkpoint_names"]:
+                    queue(child, "obsolete/non-fold checkpoint")
+
+        parts=Path(workspace.prediction_parts_dir)
+        if parts.is_dir():
+            for child in parts.iterdir():
+                if child.name not in contract["prediction_part_names"]:
+                    queue(child, "obsolete/incomplete prediction part")
+
+        predictions=Path(workspace.predictions_dir)
+        if predictions.is_dir():
+            allowed_prediction_names={f"{mode}.csv" for mode in FeatureStage.MODES}
+            for child in predictions.iterdir():
+                if child.name not in allowed_prediction_names:
+                    queue(child, "not a current evaluation prediction table")
+
+        # Mask/review folders contain only their native PNG artifacts.
+        for directory, label in (
+            (Path(workspace.manual_masks), "manual mask"),
+            (Path(workspace.predicted_masks), "automatic mask"),
+            (Path(workspace.mask_overlays), "review overlay"),
+        ):
+            if directory.is_dir():
+                for child in directory.iterdir():
+                    if not child.is_file() or child.suffix.lower() != ".png":
+                        queue(child, f"not a {label} PNG")
+
+        # Remove unrelated visible top-level entries from /kaggle/working. Hidden
+        # Kaggle/runtime entries are deliberately left untouched.
+        if remove_other_working_items and working_root_path.is_dir():
+            for child in working_root_path.iterdir():
+                if child.resolve() == workspace_root_path:
+                    continue
+                if child.name.startswith(".") or child.name.startswith("__"):
+                    continue
+                if keep_backup_zips and child.is_file() and child.suffix.lower() == ".zip":
+                    continue
+                queue(child, "outside current pipeline workspace")
+
+        # De-duplicate nested removals so a parent directory is removed once.
+        unique=[]
+        for path, reason in sorted(removals, key=lambda item: len(item[0].parts)):
+            resolved=path.resolve() if path.exists() else path.absolute()
+            if any(
+                resolved == parent or parent in resolved.parents
+                for parent, _ in unique
+            ):
+                continue
+            unique.append((resolved, reason))
+
+        def size_bytes(path):
+            try:
+                if path.is_file() or path.is_symlink():
+                    return path.stat().st_size
+                return sum(
+                    item.stat().st_size
+                    for item in path.rglob("*")
+                    if item.is_file()
+                )
+            except OSError:
+                return 0
+
+        total_bytes=sum(size_bytes(path) for path, _ in unique)
+        action="WOULD REMOVE" if dry_run else "REMOVE"
+        print(f"[CLEANUP] workspace={workspace_root_path}")
+        print(f"[CLEANUP] {action}: {len(unique)} entries, {total_bytes / 1024**2:.1f} MiB")
+        for path, reason in unique:
+            print(f"  - {path}  [{reason}]")
+
+        removed=[]
+        if not dry_run:
+            for path, reason in unique:
+                try:
+                    if path.is_dir() and not path.is_symlink():
+                        shutil.rmtree(path)
+                    else:
+                        path.unlink(missing_ok=True)
+                    removed.append(str(path))
+                except FileNotFoundError:
+                    pass
+            # Recreate exactly the directories expected by the active pipeline.
+            DataStage.create_workspace(workspace_root_path)
+            print(f"[CLEANUP] Removed {len(removed)} entries.")
+        else:
+            print("[CLEANUP] Dry run only. Re-run with dry_run=False to apply.")
+
+        return {
+            "workspace": str(workspace_root_path),
+            "working_root": str(working_root_path),
+            "dry_run": bool(dry_run),
+            "planned_entries": len(unique),
+            "planned_bytes": int(total_bytes),
+            "removed": removed,
+            "kept_contract": {
+                "manual_masks": str(workspace.manual_masks),
+                "predicted_masks": str(workspace.predicted_masks),
+                "checkpoints": str(workspace.checkpoints),
+                "prediction_parts": str(workspace.prediction_parts_dir),
+                "feature_bank": str(workspace.feature_bank),
+                "evaluation_results": str(workspace.results_csv),
+            },
+        }
+
     # Atomically save manual masks, automatic masks, and review overlays.
     @staticmethod
     def write_png(path, image):
@@ -7127,6 +7363,21 @@ class Pipeline:
         return status
 
     @staticmethod
+    def clean_kaggle_working(
+        workspace_root=None,
+        dry_run=True,
+        remove_other_working_items=True,
+        keep_backup_zips=False,
+    ):
+        """Clean Kaggle working storage while preserving this pipeline's contract."""
+        return DataStage.clean_kaggle_working(
+            workspace_root=workspace_root,
+            dry_run=dry_run,
+            remove_other_working_items=remove_other_working_items,
+            keep_backup_zips=keep_backup_zips,
+        )
+
+    @staticmethod
     def backup(name="cad_attention_workspace_backup", workspace_root=None):
         import shutil
         workspace=DataStage.create_workspace(workspace_root)
@@ -7217,6 +7468,7 @@ run_kaggle_cpu_final_stage = Pipeline.run_kaggle_cpu_final_stage
 
 # Importing definitions does not train models. It only seeds CPU-side randomness.
 DataStage.seed_everything(include_cuda=False)
+print("[PIPELINE] Cleanup preview: Pipeline.clean_kaggle_working(dry_run=True)")
 print("[PIPELINE] CPU initial: cpu_state = Pipeline.run_kaggle_cpu_stage()")
 print("[PIPELINE] GPU Attention: gpu_state = Pipeline.run_kaggle_gpu_stage()")
 print("[PIPELINE] CPU final: final_state = Pipeline.run_kaggle_cpu_final_stage(action='evaluate')")
