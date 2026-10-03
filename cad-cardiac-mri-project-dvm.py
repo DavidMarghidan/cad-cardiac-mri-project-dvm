@@ -8,7 +8,8 @@ matching, the EfficientNet feature bank, or the final patient-level evaluation.
 
 The workspace cleaner keeps only artifacts addressed by this pipeline and can also
 remove unrelated non-hidden files from ``/kaggle/working``. Cleanup is explicit and
-never runs automatically while importing the notebook.
+never runs automatically while importing the notebook. Cache identities are semantic:
+volatile Kaggle input mtimes and harmless CSV rewrites do not invalidate expensive work.
 
 KAGGLE EXECUTION
 1. CPU initial   -> dataset manifest, quality audit, manual-target audit
@@ -555,6 +556,7 @@ class DataStage:
     # Atomically persist the small CSV tables required to reopen the editor.
     @staticmethod
     def write_csv(path, rows, fields):
+        """Atomically write a CSV, leaving an identical persistent file untouched."""
         path=Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary=path.with_name(
@@ -568,7 +570,24 @@ class DataStage:
                 writer.writeheader()
                 for row in rows:
                     writer.writerow({field: row.get(field, "") for field in fields})
+
+            unchanged=False
+            if path.is_file() and path.stat().st_size == temporary.stat().st_size:
+                unchanged=True
+                with path.open("rb") as existing, temporary.open("rb") as candidate:
+                    while True:
+                        old_chunk=existing.read(1024 * 1024)
+                        new_chunk=candidate.read(1024 * 1024)
+                        if old_chunk != new_chunk:
+                            unchanged=False
+                            break
+                        if not old_chunk:
+                            break
+            if unchanged:
+                temporary.unlink(missing_ok=True)
+                return False
             os.replace(temporary, path)
+            return True
         finally:
             temporary.unlink(missing_ok=True)
 
@@ -583,15 +602,23 @@ class DataStage:
 
     @staticmethod
     def write_json(path, payload):
+        """Atomically write canonical JSON and preserve mtime when content is unchanged."""
         path=Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
+        encoded=json.dumps(
+            payload, indent=2, sort_keys=True, default=str
+        ).encode("utf-8")
+        if path.is_file():
+            try:
+                if path.read_bytes() == encoded:
+                    return False
+            except OSError:
+                pass
         temporary=path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
         try:
-            temporary.write_text(
-                json.dumps(payload, indent=2, sort_keys=True, default=str),
-                encoding="utf-8",
-            )
+            temporary.write_bytes(encoded)
             os.replace(temporary, path)
+            return True
         finally:
             temporary.unlink(missing_ok=True)
 
@@ -649,6 +676,141 @@ class DataStage:
                     fields.append(field)
                     seen.add(field)
         return fields
+    @staticmethod
+    def stable_path_key(path):
+        """Return a mount-independent path beginning at Directory_* when possible."""
+        path=Path(str(path))
+        parts=path.parts
+        patient_index=next(
+            (index for index, part in enumerate(parts) if str(part).startswith("Directory_")),
+            None,
+        )
+        if patient_index is not None:
+            return "/".join(map(str, parts[patient_index:]))
+        return path.name
+
+    @staticmethod
+    def stable_sequence_group(row):
+        image_parent=Path(str(row.get("image_path", ""))).parent
+        return f"{row.get('series_id', '')}::{DataStage.stable_path_key(image_parent)}"
+
+    @staticmethod
+    def is_kaggle_input_path(path):
+        text=str(Path(str(path))).replace("\\", "/")
+        return text == "/kaggle/input" or text.startswith("/kaggle/input/")
+
+    @staticmethod
+    def canonical_float(value, default="nan"):
+        try:
+            number=float(value)
+        except (TypeError, ValueError):
+            return str(default)
+        if not np.isfinite(number):
+            return str(default)
+        return format(number, ".12g")
+
+    @staticmethod
+    def file_identity(path):
+        """Stable source-image identity; Kaggle mount mtimes are intentionally ignored."""
+        path=Path(str(path))
+        if not path.is_file():
+            return (DataStage.stable_path_key(path), -1, "missing")
+        stat=path.stat()
+        mutable_marker=(
+            "readonly_kaggle_input"
+            if DataStage.is_kaggle_input_path(path)
+            else str(int(stat.st_mtime_ns))
+        )
+        return (
+            DataStage.stable_path_key(path),
+            int(stat.st_size),
+            mutable_marker,
+        )
+
+    @staticmethod
+    def dataset_fingerprint(rows):
+        """Hash dataset semantics without using volatile /kaggle/input mtimes."""
+        digest=hashlib.sha256(b"cad-dataset-stable-v2")
+        for row in sorted(rows, key=lambda item: str(item.get("image_token", ""))):
+            identity=DataStage.file_identity(row.get("image_path", ""))
+            values=(
+                str(row.get("image_token", "")),
+                DataStage._as_int(row.get("label"), -1),
+                str(row.get("patient_id", "")),
+                str(row.get("series_id", "")),
+                DataStage._as_int(row.get("segmentation_fold"), -1),
+                DataStage.stable_sequence_group(row),
+                DataStage._as_int(row.get("sequence_index"), 0),
+                DataStage._as_int(row.get("sequence_length"), 1),
+                DataStage.stable_path_key(row.get("previous_image_path") or row.get("image_path", "")),
+                DataStage.stable_path_key(row.get("next_image_path") or row.get("image_path", "")),
+                identity,
+            )
+            digest.update(json.dumps(values, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+        return digest.hexdigest()
+
+    @staticmethod
+    def manual_state_fingerprint(rows, workspace):
+        """Hash every training-relevant manual decision and mask by content."""
+        by_token={str(row.get("image_token", "")): row for row in rows}
+        annotations=DataStage.load_annotations(workspace)
+        manual_files={path.stem: path for path in Path(workspace.manual_masks).glob("*.png")}
+        digest=hashlib.sha256(b"manual-target-state-v2")
+        for token in sorted(set(annotations) | set(manual_files)):
+            row=by_token.get(token, {})
+            annotation=annotations.get(token, {})
+            mask_path=manual_files.get(token)
+            mask_hash=(DataStage.sha256_file(mask_path) if mask_path and mask_path.is_file() else "")
+            values=(
+                token,
+                str(row.get("patient_id", "")),
+                str(row.get("series_id", "")),
+                DataStage._as_int(row.get("segmentation_fold"), -1),
+                DataStage._as_int(row.get("quality_valid"), 0),
+                str(row.get("quality_reason", "")),
+                str(annotation.get("target_type", "")).strip().upper(),
+                str(annotation.get("source", "")).strip(),
+                DataStage.canonical_float(annotation.get("sample_weight", ""), default=""),
+                mask_hash,
+            )
+            digest.update(json.dumps(values, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+        return digest.hexdigest()
+
+    @staticmethod
+    def accepted_from_manual_audit(rows, audit):
+        """Reconstruct accepted training rows from a compatible persisted audit."""
+        by_token={str(row.get("image_token", "")): dict(row) for row in rows}
+        accepted=[]
+        for record in audit:
+            if str(record.get("status", "")).upper() != "ACCEPTED":
+                continue
+            token=str(record.get("image_token", ""))
+            base=by_token.get(token)
+            if base is None:
+                continue
+            base.update({
+                "manual_mask_path": str(record.get("manual_mask_path", base.get("manual_mask_path", ""))),
+                "manual_mask_area_ratio": DataStage._as_float(record.get("area_ratio"), 0.0),
+                "quality_valid": 1,
+                "segmentation_target_type": str(record.get("target_type", "")),
+                "heart_present": DataStage._as_int(record.get("heart_present"), 1),
+                "sample_weight": DataStage._as_float(record.get("sample_weight"), 1.0),
+                "annotation_source": str(record.get("annotation_source", "")),
+            })
+            accepted.append(base)
+        return accepted
+
+    @staticmethod
+    def newest_mtime_ns(paths):
+        newest=0
+        for path in paths:
+            path=Path(path)
+            try:
+                if path.is_file():
+                    newest=max(newest, int(path.stat().st_mtime_ns))
+            except OSError:
+                continue
+        return newest
     # Create a stable image identifier from its patient-relative path.
     @staticmethod
     def image_token(image_path, patient_id, series_id):
@@ -1042,19 +1204,12 @@ class DataStage:
 
     @staticmethod
     def build_quality_audit(rows, workspace=None, refresh=False):
-        """Reuse a complete quality audit; otherwise compute and atomically save it."""
+        """Reuse a complete quality audit across Kaggle remounts when images are unchanged."""
         workspace=workspace if hasattr(workspace, "quality_audit") else None
-
-        def exact_int(value, default=-1):
-            try:
-                return int(str(value).strip())
-            except (TypeError, ValueError):
-                return int(default)
-
+        current_dataset_fingerprint=DataStage.dataset_fingerprint(rows)
         required={
-            "image_size_bytes", "image_mtime_ns",
-            "perceptual_hash", "sharpness", "noise_ratio", "dynamic_range",
-            "patient_blur_threshold", "patient_noise_threshold",
+            "image_size_bytes", "perceptual_hash", "sharpness", "noise_ratio",
+            "dynamic_range", "patient_blur_threshold", "patient_noise_threshold",
             "quality_valid", "quality_reason",
         }
         candidates=[]
@@ -1063,48 +1218,93 @@ class DataStage:
                 workspace.quality_audit,
                 workspace.root / "attention_image_quality_audit.csv",
             ])
+
+        invalid_reasons=[]
         if not refresh:
+            summary=(DataStage.read_json(workspace.quality_summary, {}) or {}) if workspace else {}
             for path in candidates:
                 cached=DataStage.read_csv(path)
                 by_token={
-                    str(row.get("image_token", "")): row
-                    for row in cached if str(row.get("image_token", ""))
+                    str(record.get("image_token", "")): record
+                    for record in cached if str(record.get("image_token", ""))
                 }
+                expected_tokens={str(row["image_token"]) for row in rows}
                 token_match=(
-                    len(by_token) == len(rows)
-                    and set(by_token) == {str(row["image_token"]) for row in rows}
-                    and cached and required.issubset(cached[0])
+                    bool(cached)
+                    and len(by_token) == len(rows)
+                    and set(by_token) == expected_tokens
+                    and required.issubset(set(cached[0]))
                 )
-                files_match=bool(token_match)
-                if files_match:
+                if not token_match:
+                    invalid_reasons.append(f"{Path(path).name}: token/schema mismatch")
+                    continue
+
+                # A v2 summary proves the full stable dataset identity. Older audits are
+                # adopted by checking size and, only for mutable non-Kaggle sources, mtime.
+                files_match=(
+                    path == getattr(workspace, "quality_audit", None)
+                    and summary.get("dataset_fingerprint") == current_dataset_fingerprint
+                )
+                if not files_match:
+                    files_match=True
                     for base in rows:
                         image_path=Path(base["image_path"])
-                        stat=image_path.stat() if image_path.is_file() else None
-                        old=by_token[str(base["image_token"])]
-                        if (
-                            stat is None
-                            or exact_int(old.get("image_size_bytes"), -1) != int(stat.st_size)
-                            or exact_int(old.get("image_mtime_ns"), -1) != int(stat.st_mtime_ns)
-                        ):
+                        if not image_path.is_file():
                             files_match=False
+                            invalid_reasons.append(f"{Path(path).name}: missing source image")
                             break
-                if files_match:
-                    merged=[]
-                    for base in rows:
+                        stat=image_path.stat()
                         old=by_token[str(base["image_token"])]
-                        record=dict(base)
-                        for field in required:
-                            record[field]=old.get(field, "")
-                        merged.append(record)
-                    if workspace is not None and path != workspace.quality_audit:
+                        if DataStage._as_int(old.get("image_size_bytes"), -1) != int(stat.st_size):
+                            files_match=False
+                            invalid_reasons.append(f"{Path(path).name}: image size changed")
+                            break
+                        if not DataStage.is_kaggle_input_path(image_path):
+                            try:
+                                old_mtime=int(str(old.get("image_mtime_ns", "-1")).strip())
+                            except (TypeError, ValueError):
+                                old_mtime=-1
+                            if old_mtime >= 0 and old_mtime != int(stat.st_mtime_ns):
+                                files_match=False
+                                invalid_reasons.append(f"{Path(path).name}: mutable image mtime changed")
+                                break
+                if not files_match:
+                    continue
+
+                merged=[]
+                for base in rows:
+                    old=by_token[str(base["image_token"])]
+                    record=dict(base)
+                    for field in required | {"image_mtime_ns"}:
+                        record[field]=old.get(field, "")
+                    image_path=Path(base["image_path"])
+                    stat=image_path.stat()
+                    record["image_size_bytes"]=int(stat.st_size)
+                    record["image_mtime_ns"]=int(stat.st_mtime_ns)
+                    merged.append(record)
+
+                if workspace is not None:
+                    if path != workspace.quality_audit:
                         DataStage.write_csv(
                             workspace.quality_audit,
                             merged,
                             DataStage.csv_fields(merged, rows[0].keys() if rows else ()),
                         )
-                    print(f"[QUALITY] Compatible persisted audit reused: {len(merged)} images.")
-                    return merged
+                    DataStage.write_json(
+                        workspace.quality_summary,
+                        {
+                            "schema": "simple-image-quality-cache-v2-stable-dataset",
+                            "dataset_images": len(rows),
+                            "dataset_fingerprint": current_dataset_fingerprint,
+                            "valid_images": sum(DataStage._as_int(row.get("quality_valid"), 0) for row in merged),
+                            "quality_audit": str(workspace.quality_audit),
+                        },
+                    )
+                print(f"[QUALITY] Compatible persisted audit reused: {len(merged)} images.")
+                return merged
 
+        if invalid_reasons and not refresh:
+            print("[QUALITY][CACHE] " + invalid_reasons[-1] + "; rebuilding audit.")
         records=DataStage._compute_quality_audit(rows)
         for record in records:
             image_path=Path(record["image_path"])
@@ -1117,15 +1317,12 @@ class DataStage:
                 records,
                 DataStage.csv_fields(records, rows[0].keys() if rows else ()),
             )
-            dataset_digest=hashlib.sha256()
-            for row in rows:
-                dataset_digest.update(str(row["image_token"]).encode("utf-8"))
             DataStage.write_json(
                 workspace.quality_summary,
                 {
-                    "schema": "simple-image-quality-cache-v1",
+                    "schema": "simple-image-quality-cache-v2-stable-dataset",
                     "dataset_images": len(rows),
-                    "dataset_token_fingerprint": dataset_digest.hexdigest(),
+                    "dataset_fingerprint": current_dataset_fingerprint,
                     "valid_images": sum(DataStage._as_int(row.get("quality_valid"), 0) for row in records),
                     "quality_audit": str(workspace.quality_audit),
                 },
@@ -1310,7 +1507,7 @@ class DataStage:
         return summary
     # Validate current manual targets and return the audit in memory, never as a CSV.
     @staticmethod
-    def audit_manual_masks(
+    def _compute_manual_masks(
         rows,
         workspace,
         minimum_masks=None,
@@ -1509,6 +1706,52 @@ class DataStage:
             )
         if len(positive_patient_counts) < 5 + 1:
             raise RuntimeError("Too few patients have positive masks for cross-fitting.")
+        return accepted, audit, summary
+    @staticmethod
+    def audit_manual_masks(rows, workspace, minimum_masks=None):
+        """Reuse the persisted manual audit when labels, masks, and quality are unchanged."""
+        minimum_masks=800 if minimum_masks is None else int(minimum_masks)
+        fingerprint=DataStage.manual_state_fingerprint(rows, workspace)
+        summary=DataStage.read_json(workspace.manual_summary, {}) or {}
+        cached=DataStage.read_csv(workspace.manual_audit)
+        required={
+            "image_token", "manual_mask_path", "status", "target_type",
+            "heart_present", "annotation_source", "sample_weight", "area_ratio",
+        }
+        if (
+            cached
+            and required.issubset(set(cached[0]))
+            and summary.get("input_fingerprint") == fingerprint
+        ):
+            accepted=DataStage.accepted_from_manual_audit(rows, cached)
+            positive=[row for row in accepted if DataStage._as_int(row.get("heart_present"), 1) == 1]
+            if len(positive) < minimum_masks:
+                raise RuntimeError(
+                    f"Only {len(positive)} valid HEART_PRESENT masks remain, below the minimum of {minimum_masks}."
+                )
+            missing_folds=[
+                fold for fold in range(5)
+                if not any(DataStage._as_int(row.get("segmentation_fold"), -1) == fold for row in positive)
+            ]
+            if missing_folds:
+                raise RuntimeError(f"No valid HEART_PRESENT masks exist in folds {missing_folds}.")
+            if len({str(row.get("patient_id", "")) for row in positive}) < 6:
+                raise RuntimeError("Too few patients have positive masks for cross-fitting.")
+            print(
+                "[MANUAL MASKS] Compatible persisted audit reused: "
+                f"accepted={len(accepted)}, positive={len(positive)}."
+            )
+            return accepted, cached, summary
+
+        accepted, audit, summary=DataStage._compute_manual_masks(
+            rows, workspace, minimum_masks=minimum_masks
+        )
+        # NO_HEART targets may create a zero mask during computation, so fingerprint after it.
+        summary={
+            **summary,
+            "schema": "simple-manual-mask-cache-v2",
+            "input_fingerprint": DataStage.manual_state_fingerprint(rows, workspace),
+        }
         return accepted, audit, summary
 
 # =============================================================================
@@ -1768,21 +2011,44 @@ class AttentionStage:
 
     @staticmethod
     def manual_fingerprint(rows, fold):
+        """Stable training fingerprint independent of volatile Kaggle input mtimes."""
         payload={
-            "schema": "simple-attention-2p5d-presence-v3",
-            "fold": int(fold),
-            "size": 256,
-            "input_channels": 3,
-            "use_2_5d": True,
-            "base_channels": 24,
-            "epochs": 36,
-            "learning_rate": 8e-4,
-            "weight_decay": 1e-4,
-            "loss": {
-                "focal": 0.40, "tversky": 0.60, "presence": 0.30,
-                "alpha_fp": 0.65, "beta_fn": 0.35,
-            },
+            "schema": "simple-attention-input-stable-v4",
+            "model_schema": "simple-attention-2p5d-presence-v3",
+            "fold": int(fold), "size": 256, "input_channels": 3,
+            "use_2_5d": True, "base_channels": 24, "epochs": 36,
+            "learning_rate": 8e-4, "weight_decay": 1e-4,
+            "loss": {"focal": 0.40, "tversky": 0.60, "presence": 0.30,
+                     "alpha_fp": 0.65, "beta_fn": 0.35},
             "seed": 42,
+        }
+        digest=hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8"))
+        for row in sorted(rows, key=lambda item: str(item["image_token"])):
+            mask_path=Path(row["manual_mask_path"])
+            values=(
+                str(row["image_token"]),
+                str(row.get("segmentation_target_type", "")),
+                str(row.get("annotation_source", "")),
+                DataStage.canonical_float(row.get("sample_weight", 1.0)),
+                DataStage._as_int(row.get("heart_present"), 1),
+                DataStage.file_identity(row["image_path"]),
+                DataStage.stable_path_key(row.get("previous_image_path") or row["image_path"]),
+                DataStage.stable_path_key(row.get("next_image_path") or row["image_path"]),
+                DataStage.sha256_file(mask_path),
+            )
+            digest.update(json.dumps(values, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+        return digest.hexdigest()
+
+    @staticmethod
+    def legacy_manual_fingerprint(rows, fold):
+        """Original v3 fingerprint retained only to reuse historical checkpoints."""
+        payload={
+            "schema": "simple-attention-2p5d-presence-v3", "fold": int(fold),
+            "size": 256, "input_channels": 3, "use_2_5d": True,
+            "base_channels": 24, "epochs": 36, "learning_rate": 8e-4,
+            "weight_decay": 1e-4,
+            "loss": {"focal": 0.40, "tversky": 0.60, "presence": 0.30,
+                     "alpha_fp": 0.65, "beta_fn": 0.35}, "seed": 42,
         }
         digest=hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8"))
         for row in sorted(rows, key=lambda item: str(item["image_token"])):
@@ -1799,6 +2065,54 @@ class AttentionStage:
         return digest.hexdigest()
 
     @staticmethod
+    def checkpoint_reuse_status(
+        checkpoint, checkpoint_path, summary_entry, stable_fingerprint,
+        legacy_fingerprint, train_rows, validation_patients, accepted_rows,
+        fold, workspace,
+    ):
+        if checkpoint.get("schema") != "simple-attention-2p5d-presence-v3":
+            return False, "checkpoint schema changed"
+        if checkpoint.get("stable_fingerprint") == stable_fingerprint:
+            return True, "stable fingerprint"
+        if checkpoint.get("fingerprint") in {stable_fingerprint, legacy_fingerprint}:
+            return True, "exact stored fingerprint"
+        checkpoint_sha=DataStage.sha256_file(checkpoint_path)
+        if (
+            summary_entry.get("stable_fingerprint") == stable_fingerprint
+            and summary_entry.get("checkpoint_sha256") == checkpoint_sha
+        ):
+            return True, "stable summary sidecar"
+
+        # One-time safe adoption of the old mtime-sensitive checkpoint. The model,
+        # split membership, counts, summary fingerprint, and manual-file freshness
+        # must all agree; otherwise the fold is retrained.
+        if not summary_entry or checkpoint.get("fingerprint") != summary_entry.get("fingerprint"):
+            return False, "legacy checkpoint has no matching training summary"
+        expected_train=sorted({str(row["patient_id"]) for row in train_rows})
+        expected_validation=sorted(map(str, validation_patients))
+        expected_excluded=sorted({
+            str(row["patient_id"]) for row in accepted_rows
+            if DataStage._as_int(row.get("segmentation_fold"), -1) == int(fold)
+        })
+        if checkpoint.get("train_patients", []) != expected_train:
+            return False, "training-patient split changed"
+        if checkpoint.get("validation_patients", []) != expected_validation:
+            return False, "validation-patient split changed"
+        if checkpoint.get("excluded_test_patients", []) != expected_excluded:
+            return False, "held-out-patient split changed"
+        train_positive=sum(DataStage._as_int(row.get("heart_present"), 1) == 1 for row in train_rows)
+        train_negative=len(train_rows) - train_positive
+        if DataStage._as_int(checkpoint.get("train_positive_targets"), -1) != train_positive:
+            return False, "positive target count changed"
+        if DataStage._as_int(checkpoint.get("train_negative_targets"), -1) != train_negative:
+            return False, "negative target count changed"
+        manual_paths=[row["manual_mask_path"] for row in train_rows]
+        manual_paths.append(workspace.manual_annotations)
+        if DataStage.newest_mtime_ns(manual_paths) > int(checkpoint_path.stat().st_mtime_ns):
+            return False, "manual target changed after checkpoint"
+        return True, "legacy checkpoint safely adopted"
+
+    @staticmethod
     def load_checkpoint_map(workspace):
         result={}
         for fold in range(5):
@@ -1812,22 +2126,34 @@ class AttentionStage:
 
     @staticmethod
     def prediction_fingerprint(rows, checkpoint_map):
+        payload={
+            "schema": "simple-predictions-stable-v6",
+            "thresholds": (0.20,0.25,0.30,0.35,0.40,0.45,0.50,0.55,0.60,0.65,0.70,0.75),
+            "presence_thresholds": (0.20,0.25,0.30,0.35,0.40,0.45,0.50,0.55,0.60,0.65,0.70,0.75,0.80),
+            "area": [0.003,0.65], "repair_offsets": (-0.20,-0.15,-0.10,-0.05,0.05,0.10,0.15,0.20),
+            "tta_contrast": 1.10, "presence_override_peak": 0.80, "prior_z": 5.5,
+            "dataset_fingerprint": DataStage.dataset_fingerprint(rows),
+        }
+        digest=hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8"))
+        for fold, checkpoint_path in sorted(checkpoint_map.items()):
+            digest.update(str(fold).encode("ascii"))
+            digest.update(DataStage.sha256_file(checkpoint_path).encode("ascii"))
+        return digest.hexdigest()
+
+    @staticmethod
+    def legacy_prediction_fingerprint(rows, checkpoint_map):
         digest=hashlib.sha256()
         settings_payload={
             "schema": "simple-predictions-2p5d-presence-v5",
-            "thresholds": (0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75),
-            "presence_thresholds": (0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80),
-            "area": [0.003, 0.65],
-            "repair_offsets": (-0.20, -0.15, -0.10, -0.05, 0.05, 0.10, 0.15, 0.20),
-            "tta_contrast": 1.10,
-            "presence_override_peak": 0.80,
-            "prior_z": 5.5,
+            "thresholds": (0.20,0.25,0.30,0.35,0.40,0.45,0.50,0.55,0.60,0.65,0.70,0.75),
+            "presence_thresholds": (0.20,0.25,0.30,0.35,0.40,0.45,0.50,0.55,0.60,0.65,0.70,0.75,0.80),
+            "area": [0.003,0.65], "repair_offsets": (-0.20,-0.15,-0.10,-0.05,0.05,0.10,0.15,0.20),
+            "tta_contrast": 1.10, "presence_override_peak": 0.80, "prior_z": 5.5,
         }
         digest.update(json.dumps(settings_payload, sort_keys=True).encode("utf-8"))
         digest.update(str(len(rows)).encode("ascii"))
         for row in rows:
-            image_path=Path(row["image_path"])
-            image_stat=image_path.stat()
+            image_path=Path(row["image_path"]); image_stat=image_path.stat()
             digest.update(str(row["image_token"]).encode("utf-8"))
             digest.update(str(row["segmentation_fold"]).encode("ascii"))
             digest.update(str(row.get("previous_image_path", "")).encode("utf-8"))
@@ -1848,28 +2174,112 @@ class AttentionStage:
 
     @staticmethod
     def prediction_part_fingerprint(fold, fold_rows, checkpoint_path):
+        payload={
+            "schema": "simple-prediction-part-stable-v6", "fold": int(fold),
+            "thresholds": (0.20,0.25,0.30,0.35,0.40,0.45,0.50,0.55,0.60,0.65,0.70,0.75),
+            "presence_thresholds": (0.20,0.25,0.30,0.35,0.40,0.45,0.50,0.55,0.60,0.65,0.70,0.75,0.80),
+            "repair_offsets": (-0.20,-0.15,-0.10,-0.05,0.05,0.10,0.15,0.20),
+            "morphology": 5, "tta_contrast": 1.10, "presence_override_peak": 0.80,
+        }
+        digest=hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8"))
+        digest.update(DataStage.sha256_file(checkpoint_path).encode("ascii"))
+        for row in sorted(fold_rows, key=lambda item: str(item["image_token"])):
+            values=(
+                str(row["image_token"]), DataStage.file_identity(row["image_path"]),
+                DataStage.stable_path_key(row.get("previous_image_path") or row["image_path"]),
+                DataStage.stable_path_key(row.get("next_image_path") or row["image_path"]),
+            )
+            digest.update(json.dumps(values, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+        return digest.hexdigest()
+
+    @staticmethod
+    def legacy_prediction_part_fingerprint(fold, fold_rows, checkpoint_path):
         digest=hashlib.sha256()
         payload={
-            "schema": "simple-prediction-part-2p5d-presence-v5",
-            "fold": int(fold),
-            "thresholds": (0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75),
-            "presence_thresholds": (0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80),
-            "repair_offsets": (-0.20, -0.15, -0.10, -0.05, 0.05, 0.10, 0.15, 0.20),
-            "morphology": 5,
-            "tta_contrast": 1.10,
-            "presence_override_peak": 0.80,
+            "schema": "simple-prediction-part-2p5d-presence-v5", "fold": int(fold),
+            "thresholds": (0.20,0.25,0.30,0.35,0.40,0.45,0.50,0.55,0.60,0.65,0.70,0.75),
+            "presence_thresholds": (0.20,0.25,0.30,0.35,0.40,0.45,0.50,0.55,0.60,0.65,0.70,0.75,0.80),
+            "repair_offsets": (-0.20,-0.15,-0.10,-0.05,0.05,0.10,0.15,0.20),
+            "morphology": 5, "tta_contrast": 1.10, "presence_override_peak": 0.80,
         }
         digest.update(json.dumps(payload, sort_keys=True).encode("utf-8"))
         digest.update(DataStage.sha256_file(checkpoint_path).encode("ascii"))
         for row in fold_rows:
-            image_path=Path(row["image_path"])
-            image_stat=image_path.stat()
+            image_path=Path(row["image_path"]); image_stat=image_path.stat()
             digest.update(str(row["image_token"]).encode("utf-8"))
             digest.update(str(image_stat.st_size).encode("ascii"))
             digest.update(str(image_stat.st_mtime_ns).encode("ascii"))
             digest.update(str(row.get("previous_image_path", "")).encode("utf-8"))
             digest.update(str(row.get("next_image_path", "")).encode("utf-8"))
         return digest.hexdigest()
+
+    @staticmethod
+    def prediction_part_cache_status(fold, fold_rows, workspace, checkpoint_path):
+        part_csv, part_json=AttentionStage.prediction_part_paths(workspace, fold)
+        metadata=DataStage.read_json(part_json, {}) or {}
+        cached=DataStage.read_csv(part_csv)
+        cached_by_token={
+            str(row.get("image_token", "")): row
+            for row in cached if str(row.get("image_token", ""))
+        }
+        expected_tokens={str(row["image_token"]) for row in fold_rows}
+        required={
+            "attention_presence_probability", "attention_uncertainty_score",
+            "attention_sequence_inconsistency", "attention_centroid_x",
+            "attention_centroid_y", "attention_heart_present",
+        }
+        masks_complete=all(
+            (Path(workspace.predicted_masks) / f"{token}.png").is_file()
+            for token in expected_tokens
+        )
+        rows_match=True
+        current_by_token={str(row["image_token"]): row for row in fold_rows}
+        for token, saved in cached_by_token.items():
+            current=current_by_token.get(token, {})
+            if (
+                str(saved.get("patient_id", "")) != str(current.get("patient_id", ""))
+                or str(saved.get("series_id", "")) != str(current.get("series_id", ""))
+                or DataStage._as_int(saved.get("segmentation_fold"), -1) != int(fold)
+            ):
+                rows_match=False
+                break
+        complete=(
+            len(cached_by_token) == len(fold_rows)
+            and set(cached_by_token) == expected_tokens
+            and bool(cached) and required.issubset(set(cached[0]))
+            and masks_complete and rows_match
+        )
+        stable=AttentionStage.prediction_part_fingerprint(fold, fold_rows, checkpoint_path)
+        legacy=AttentionStage.legacy_prediction_part_fingerprint(fold, fold_rows, checkpoint_path)
+        exact=(
+            metadata.get("stable_fingerprint") == stable
+            or metadata.get("fingerprint") in {stable, legacy}
+        )
+        adopted=False
+        legacy_adoptable=(
+            metadata.get("schema") == "simple-prediction-part-2p5d-presence-v5"
+            and not metadata.get("stable_fingerprint")
+        )
+        if complete and not exact and legacy_adoptable and bool(metadata.get("completed", False)):
+            checkpoint=AttentionStage.torch_load(checkpoint_path)
+            acceptable={
+                str(checkpoint.get("fingerprint", "")),
+                str(checkpoint.get("stable_fingerprint", "")),
+            } - {""}
+            cached_checkpoint_fingerprints={
+                str(row.get("checkpoint_fingerprint", ""))
+                for row in cached if str(row.get("checkpoint_fingerprint", ""))
+            }
+            adopted=bool(acceptable) and cached_checkpoint_fingerprints.issubset(acceptable)
+        reusable=bool(complete and (exact or adopted))
+        return {
+            "reusable": reusable, "adopted": adopted, "complete": complete,
+            "stable_fingerprint": stable, "legacy_fingerprint": legacy,
+            "metadata": metadata, "cached": cached,
+            "cached_by_token": cached_by_token,
+            "part_csv": part_csv, "part_json": part_json,
+            "reason": "compatible" if reusable else "fingerprint or completeness mismatch",
+        }
 
     # Combine focal, Tversky, and heart-presence losses using per-target review weights.
     @staticmethod
@@ -2233,6 +2643,12 @@ class AttentionStage:
         fold_states={}
         fold_summaries=[]
         all_patients=sorted({str(row["patient_id"]) for row in accepted_rows})
+        previous_summary=(DataStage.read_json(workspace.training_summary, {}) or {}) if workspace is not None else {}
+        previous_by_fold={
+            DataStage._as_int(item.get("fold"), -1): item
+            for item in previous_summary.get("folds", [])
+            if isinstance(item, dict)
+        }
 
         for fold in range(5):  # five patient-level folds
             fold_started=time.perf_counter()
@@ -2257,7 +2673,8 @@ class AttentionStage:
                 for row in non_test_rows
                 if row["patient_id"] in validation_patients
             ]
-            fingerprint=AttentionStage.manual_fingerprint(non_test_rows, fold)
+            stable_fingerprint=AttentionStage.manual_fingerprint(non_test_rows, fold)
+            legacy_fingerprint=AttentionStage.legacy_manual_fingerprint(non_test_rows, fold)
             checkpoint_path=(
                 AttentionStage.checkpoint_path(workspace, fold)
                 if workspace is not None else None
@@ -2271,20 +2688,25 @@ class AttentionStage:
                         f"({type(error).__name__}: {error})."
                     )
                 else:
-                    if (
-                        checkpoint.get("schema") == "simple-attention-2p5d-presence-v3"
-                        and checkpoint.get("fingerprint") == fingerprint
-                    ):
+                    reusable, cache_reason=AttentionStage.checkpoint_reuse_status(
+                        checkpoint, checkpoint_path, previous_by_fold.get(fold, {}),
+                        stable_fingerprint, legacy_fingerprint, train_rows,
+                        validation_patients, accepted_rows, fold, workspace,
+                    )
+                    if reusable:
                         fold_states[fold]=checkpoint_path
                         fold_summaries.append({
                             "fold": fold, "status": "reused",
                             "checkpoint": str(checkpoint_path),
-                            "fingerprint": fingerprint,
+                            "fingerprint": checkpoint.get("fingerprint", ""),
+                            "stable_fingerprint": stable_fingerprint,
+                            "checkpoint_sha256": DataStage.sha256_file(checkpoint_path),
+                            "cache_reason": cache_reason,
                             "calibration": checkpoint.get("calibration", {}),
                         })
-                        print(f"[ATTENTION] Fold {fold}: compatible checkpoint reused.")
+                        print(f"[ATTENTION] Fold {fold}: compatible checkpoint reused ({cache_reason}).")
                         continue
-                    print(f"[ATTENTION] Fold {fold}: checkpoint fingerprint changed; retraining.")
+                    print(f"[ATTENTION] Fold {fold}: {cache_reason}; retraining.")
             if not train_rows or not validation_rows:
                 raise RuntimeError(f"Fold {fold}: train or validation split is empty.")
 
@@ -2496,7 +2918,9 @@ class AttentionStage:
             fold_state={
                 "schema": "simple-attention-2p5d-presence-v3",
                 "state_dict": best_state,
-                "fingerprint": fingerprint,
+                "fingerprint": stable_fingerprint,
+                "stable_fingerprint": stable_fingerprint,
+                "fingerprint_schema": "stable-v4",
                     "fold": fold,
                 "base_channels": 24,
                 "input_channels": 3,
@@ -2529,7 +2953,12 @@ class AttentionStage:
             fold_summaries.append({
                 "fold": fold, "status": "trained",
                 "checkpoint": str(checkpoint_path) if checkpoint_path is not None else "",
-                "fingerprint": fingerprint,
+                "fingerprint": stable_fingerprint,
+                "stable_fingerprint": stable_fingerprint,
+                "checkpoint_sha256": (
+                    DataStage.sha256_file(checkpoint_path)
+                    if checkpoint_path is not None and checkpoint_path.is_file() else ""
+                ),
                 "best_epoch": best_epoch,
                 "best_selection_metric": best_metric,
                 "calibration": calibration,
@@ -3196,65 +3625,33 @@ class AttentionStage:
         return final_results, summary
 
     @staticmethod
-    def predict_attention_masks(
-        rows, workspace, device, fold_states=None, force=False
-    ):
-        """Run OOF inference one fold at a time and commit each completed fold."""
+    def predict_attention_masks(rows, workspace, device, fold_states=None, force=False):
+        """Run OOF inference per fold and adopt complete legacy parts without recomputation."""
         rows=list(rows)
         fold_states={} if fold_states is None else dict(fold_states)
         checkpoint_map=AttentionStage.load_checkpoint_map(workspace)
-        prediction_fingerprint=AttentionStage.prediction_fingerprint(rows, checkpoint_map)
+        stable_prediction_fingerprint=AttentionStage.prediction_fingerprint(rows, checkpoint_map)
+        existing_summary=DataStage.read_json(workspace.prediction_summary, {}) or {}
         results=[None] * len(rows)
         reused_folds=[]
         computed_folds=[]
-        part_fingerprints={}
+        adopted_folds=[]
         started=time.perf_counter()
 
         for fold in range(5):
-            fold_indices=[
-                index for index, row in enumerate(rows)
-                if int(row["segmentation_fold"]) == fold
-            ]
+            fold_indices=[index for index,row in enumerate(rows) if int(row["segmentation_fold"]) == fold]
             fold_rows=[rows[index] for index in fold_indices]
             if not fold_rows:
                 continue
             checkpoint_path=checkpoint_map[fold]
-            part_csv, part_json=AttentionStage.prediction_part_paths(workspace, fold)
-            part_fingerprint=AttentionStage.prediction_part_fingerprint(
-                fold, fold_rows, checkpoint_path
+            cache=AttentionStage.prediction_part_cache_status(
+                fold, fold_rows, workspace, checkpoint_path
             )
-            part_fingerprints[str(fold)]=part_fingerprint
-            metadata=DataStage.read_json(part_json, {}) or {}
-            cached=DataStage.read_csv(part_csv)
-            cached_by_token={
-                str(row.get("image_token", "")): row
-                for row in cached if str(row.get("image_token", ""))
-            }
-            expected_tokens={str(row["image_token"]) for row in fold_rows}
-            required={
-                "attention_presence_probability", "attention_uncertainty_score",
-                "attention_sequence_inconsistency", "attention_centroid_x",
-                "attention_centroid_y", "attention_heart_present",
-            }
-            masks_complete=all(
-                (Path(workspace.predicted_masks) / f"{token}.png").is_file()
-                for token in expected_tokens
-            )
-            part_complete=(
-                len(cached_by_token) == len(fold_rows)
-                and set(cached_by_token) == expected_tokens
-                and cached and required.issubset(cached[0])
-                and masks_complete
-            )
-            if (
-                not force
-                and metadata.get("fingerprint") == part_fingerprint
-                and part_complete
-            ):
+            if not force and cache["reusable"]:
                 for global_index, base in zip(fold_indices, fold_rows):
                     token=str(base["image_token"])
                     record=dict(base)
-                    saved=cached_by_token[token]
+                    saved=cache["cached_by_token"][token]
                     for field in AttentionStage.PREDICTION_FIELDS:
                         if field.startswith("attention_") or field == "checkpoint_fingerprint":
                             record[field]=saved.get(field, record.get(field, ""))
@@ -3263,7 +3660,20 @@ class AttentionStage:
                     )
                     results[global_index]=record
                 reused_folds.append(fold)
-                print(f"[ATTENTION] Fold {fold}: persisted prediction part reused.")
+                if cache["adopted"]:
+                    adopted_folds.append(fold)
+                    metadata={
+                        **cache["metadata"],
+                        "stable_fingerprint": cache["stable_fingerprint"],
+                        "checkpoint_sha256": DataStage.sha256_file(checkpoint_path),
+                        "completed": True,
+                        "legacy_cache_adopted": True,
+                    }
+                    DataStage.write_json(cache["part_json"], metadata)
+                print(
+                    f"[ATTENTION] Fold {fold}: persisted prediction part reused"
+                    + (" (legacy metadata adopted)." if cache["adopted"] else ".")
+                )
                 fold_states.pop(fold, None)
                 continue
 
@@ -3272,32 +3682,27 @@ class AttentionStage:
                 fold_state=AttentionStage.torch_load(Path(fold_state))
             if fold_state is None:
                 fold_state=AttentionStage.torch_load(checkpoint_path)
-            checkpoint_fingerprint=str(fold_state.get("fingerprint", ""))
-            part_workspace=workspace._replace(prediction_audit=part_csv)
+            checkpoint_fingerprint=str(
+                fold_state.get("stable_fingerprint") or fold_state.get("fingerprint", "")
+            )
+            part_workspace=workspace._replace(prediction_audit=cache["part_csv"])
             fold_results, _fold_summary=AttentionStage._predict_attention_masks_in_memory(
-                fold_rows,
-                part_workspace,
-                device,
-                {fold: fold_state},
+                fold_rows, part_workspace, device, {fold: fold_state}
             )
             for record in fold_results:
                 record["checkpoint_fingerprint"]=checkpoint_fingerprint
             AttentionStage.apply_sequence_consistency(fold_results, fold_rows)
-            DataStage.write_csv(
-                part_csv,
-                fold_results,
-                AttentionStage.PREDICTION_FIELDS,
-            )
+            DataStage.write_csv(cache["part_csv"], fold_results, AttentionStage.PREDICTION_FIELDS)
             DataStage.write_json(
-                part_json,
+                cache["part_json"],
                 {
-                    "schema": "simple-prediction-part-2p5d-presence-v5",
-                    "fingerprint": part_fingerprint,
-                    "fold": fold,
-                    "images": len(fold_results),
+                    "schema": "simple-prediction-part-stable-v6",
+                    "fingerprint": cache["stable_fingerprint"],
+                    "stable_fingerprint": cache["stable_fingerprint"],
+                    "fold": fold, "images": len(fold_results),
                     "checkpoint": str(checkpoint_path),
-                    "device_used": device.type,
-                    "completed": True,
+                    "checkpoint_sha256": DataStage.sha256_file(checkpoint_path),
+                    "device_used": device.type, "completed": True,
                 },
             )
             by_token={str(row["image_token"]): row for row in fold_results}
@@ -3309,54 +3714,46 @@ class AttentionStage:
 
         final_results=[result for result in results if result is not None]
         if len(final_results) != len(rows):
-            raise RuntimeError(
-                "Prediction resume did not produce exactly one metadata row per image."
-            )
+            raise RuntimeError("Prediction resume did not produce exactly one metadata row per image.")
         AttentionStage.apply_sequence_consistency(final_results, rows)
-        DataStage.write_csv(
-            workspace.prediction_audit,
-            final_results,
-            AttentionStage.PREDICTION_FIELDS,
+        DataStage.write_csv(workspace.prediction_audit, final_results, AttentionStage.PREDICTION_FIELDS)
+        invalid_rows=[row for row in final_results if DataStage._as_int(row.get("attention_valid_final"),0) != 1]
+        DataStage.write_csv(workspace.invalid_predictions, invalid_rows, AttentionStage.PREDICTION_FIELDS)
+
+        all_reused=(
+            not computed_folds
+            and set(reused_folds) == set(range(5))
+            and DataStage._as_int(existing_summary.get("images"), -1) == len(final_results)
         )
-        invalid_rows=[
-            row for row in final_results
-            if DataStage._as_int(row.get("attention_valid_final"), 0) != 1
-        ]
-        DataStage.write_csv(
-            workspace.invalid_predictions,
-            invalid_rows,
-            AttentionStage.PREDICTION_FIELDS,
-        )
-        summary={
-            "schema": "simple-predictions-2p5d-presence-v5",
-            "fingerprint": prediction_fingerprint,
-            "device_used_for_computed_folds": device.type,
-            "reused_folds": reused_folds,
-            "computed_folds": computed_folds,
-            "images": len(final_results),
-            "valid_initial": sum(
-                DataStage._as_int(row.get("attention_valid_initial"), 0)
-                for row in final_results
-            ),
-            "valid_final": sum(
-                DataStage._as_int(row.get("attention_valid_final"), 0)
-                for row in final_results
-            ),
-            "predicted_heart_present": sum(
-                DataStage._as_int(row.get("attention_heart_present"), 0)
-                for row in final_results
-            ),
-            "predicted_no_heart": sum(
-                DataStage._as_int(row.get("attention_heart_present"), 0) == 0
-                for row in final_results
-            ),
-            "invalid_final": len(invalid_rows),
-            "prediction_audit": str(workspace.prediction_audit),
-            "prediction_parts": str(workspace.prediction_parts_dir),
-            "predicted_masks": str(workspace.predicted_masks),
-            "elapsed": DataStage.format_seconds(time.perf_counter() - started),
-        }
-        DataStage.write_json(workspace.prediction_summary, summary)
+        if all_reused:
+            # Keep the existing summary byte-for-byte so a harmless verification run
+            # cannot invalidate an already computed feature bank.
+            summary={
+                **existing_summary,
+                "reused_folds": reused_folds,
+                "computed_folds": [],
+                "adopted_legacy_folds": adopted_folds,
+            }
+        else:
+            summary={
+                "schema": "simple-predictions-stable-v6",
+                "fingerprint": stable_prediction_fingerprint,
+                "stable_fingerprint": stable_prediction_fingerprint,
+                "device_used_for_computed_folds": device.type,
+                "reused_folds": reused_folds, "computed_folds": computed_folds,
+                "adopted_legacy_folds": adopted_folds,
+                "images": len(final_results),
+                "valid_initial": sum(DataStage._as_int(row.get("attention_valid_initial"),0) for row in final_results),
+                "valid_final": sum(DataStage._as_int(row.get("attention_valid_final"),0) for row in final_results),
+                "predicted_heart_present": sum(DataStage._as_int(row.get("attention_heart_present"),0) for row in final_results),
+                "predicted_no_heart": sum(DataStage._as_int(row.get("attention_heart_present"),0)==0 for row in final_results),
+                "invalid_final": len(invalid_rows),
+                "prediction_audit": str(workspace.prediction_audit),
+                "prediction_parts": str(workspace.prediction_parts_dir),
+                "predicted_masks": str(workspace.predicted_masks),
+                "elapsed": DataStage.format_seconds(time.perf_counter()-started),
+            }
+            DataStage.write_json(workspace.prediction_summary, summary)
         print(
             "[ATTENTION] resumable OOF prediction complete: "
             f"reused_folds={reused_folds}, computed_folds={computed_folds}, "
@@ -3367,57 +3764,39 @@ class AttentionStage:
 
     @staticmethod
     def combine_complete_prediction_parts(rows, workspace):
-        """Assemble a final prediction audit without loading CUDA or any model.
-
-        This covers the narrow failure window in which all five fold parts were committed
-        but the Kaggle connection was lost before the combined audit/summary was written.
-        """
+        """Assemble a final audit from five complete parts, including legacy parts."""
         rows=list(rows)
         try:
             checkpoint_map=AttentionStage.load_checkpoint_map(workspace)
         except Exception:
             return None
         results=[None] * len(rows)
+        adopted=[]
         for fold in range(5):
-            fold_indices=[
-                index for index, row in enumerate(rows)
-                if int(row["segmentation_fold"]) == fold
-            ]
+            fold_indices=[index for index,row in enumerate(rows) if int(row["segmentation_fold"]) == fold]
             fold_rows=[rows[index] for index in fold_indices]
             if not fold_rows:
                 continue
-            part_csv, part_json=AttentionStage.prediction_part_paths(workspace, fold)
-            metadata=DataStage.read_json(part_json, {}) or {}
-            cached=DataStage.read_csv(part_csv)
-            cached_by_token={
-                str(row.get("image_token", "")): row
-                for row in cached if str(row.get("image_token", ""))
-            }
-            expected_tokens={str(row["image_token"]) for row in fold_rows}
-            expected_fingerprint=AttentionStage.prediction_part_fingerprint(
-                fold, fold_rows, checkpoint_map[fold]
+            cache=AttentionStage.prediction_part_cache_status(
+                fold, fold_rows, workspace, checkpoint_map[fold]
             )
-            required={
-                "attention_presence_probability", "attention_uncertainty_score",
-                "attention_sequence_inconsistency", "attention_centroid_x",
-                "attention_centroid_y", "attention_heart_present",
-            }
-            if (
-                metadata.get("fingerprint") != expected_fingerprint
-                or set(cached_by_token) != expected_tokens
-                or len(cached_by_token) != len(fold_rows)
-                or not cached
-                or not required.issubset(cached[0])
-                or not all(
-                    (Path(workspace.predicted_masks) / f"{token}.png").is_file()
-                    for token in expected_tokens
-                )
-            ):
+            if not cache["reusable"]:
                 return None
+            if cache["adopted"]:
+                adopted.append(fold)
+                DataStage.write_json(
+                    cache["part_json"],
+                    {
+                        **cache["metadata"],
+                        "stable_fingerprint": cache["stable_fingerprint"],
+                        "checkpoint_sha256": DataStage.sha256_file(checkpoint_map[fold]),
+                        "completed": True, "legacy_cache_adopted": True,
+                    },
+                )
             for global_index, base in zip(fold_indices, fold_rows):
                 token=str(base["image_token"])
                 record=dict(base)
-                saved=cached_by_token[token]
+                saved=cache["cached_by_token"][token]
                 for field in AttentionStage.PREDICTION_FIELDS:
                     if field.startswith("attention_") or field == "checkpoint_fingerprint":
                         record[field]=saved.get(field, record.get(field, ""))
@@ -3430,43 +3809,23 @@ class AttentionStage:
         if len(final_results) != len(rows):
             return None
         AttentionStage.apply_sequence_consistency(final_results, rows)
-        DataStage.write_csv(
-            workspace.prediction_audit,
-            final_results,
-            AttentionStage.PREDICTION_FIELDS,
-        )
-        invalid_rows=[
-            row for row in final_results
-            if DataStage._as_int(row.get("attention_valid_final"), 0) != 1
-        ]
-        DataStage.write_csv(
-            workspace.invalid_predictions,
-            invalid_rows,
-            AttentionStage.PREDICTION_FIELDS,
-        )
+        DataStage.write_csv(workspace.prediction_audit, final_results, AttentionStage.PREDICTION_FIELDS)
+        invalid_rows=[row for row in final_results if DataStage._as_int(row.get("attention_valid_final"),0) != 1]
+        DataStage.write_csv(workspace.invalid_predictions, invalid_rows, AttentionStage.PREDICTION_FIELDS)
+        stable=AttentionStage.prediction_fingerprint(rows, checkpoint_map)
+        old=DataStage.read_json(workspace.prediction_summary, {}) or {}
         summary={
-            "schema": "simple-predictions-2p5d-presence-v5",
-            "fingerprint": AttentionStage.prediction_fingerprint(rows, checkpoint_map),
+            "schema": "simple-predictions-stable-v6",
+            "fingerprint": old.get("fingerprint") or stable,
+            "stable_fingerprint": stable,
             "device_used_for_computed_folds": "none_part_assembly_only",
-            "reused_folds": list(range(5)),
-            "computed_folds": [],
+            "reused_folds": list(range(5)), "computed_folds": [],
+            "adopted_legacy_folds": adopted,
             "images": len(final_results),
-            "valid_initial": sum(
-                DataStage._as_int(row.get("attention_valid_initial"), 0)
-                for row in final_results
-            ),
-            "valid_final": sum(
-                DataStage._as_int(row.get("attention_valid_final"), 0)
-                for row in final_results
-            ),
-            "predicted_heart_present": sum(
-                DataStage._as_int(row.get("attention_heart_present"), 0)
-                for row in final_results
-            ),
-            "predicted_no_heart": sum(
-                DataStage._as_int(row.get("attention_heart_present"), 0) == 0
-                for row in final_results
-            ),
+            "valid_initial": sum(DataStage._as_int(row.get("attention_valid_initial"),0) for row in final_results),
+            "valid_final": sum(DataStage._as_int(row.get("attention_valid_final"),0) for row in final_results),
+            "predicted_heart_present": sum(DataStage._as_int(row.get("attention_heart_present"),0) for row in final_results),
+            "predicted_no_heart": sum(DataStage._as_int(row.get("attention_heart_present"),0)==0 for row in final_results),
             "invalid_final": len(invalid_rows),
             "prediction_audit": str(workspace.prediction_audit),
             "prediction_parts": str(workspace.prediction_parts_dir),
@@ -6718,46 +7077,78 @@ class PersistenceStage:
         DataStage.write_json(workspace.segmentation_summary, summary)
 
     @staticmethod
-    def matching_fingerprint(rows, workspace):
+    def matching_fingerprint(rows, workspace=None):
+        """Semantic matching identity; ignores CSV formatting and Kaggle mount mtimes."""
         payload={
-            "schema": "cross-class-matching-v2-core-plus-extended",
-            "min_families": 8,
-            "max_families": 32,
-            "target_images_per_family": 1800,
-            "minimum_images_per_class_per_family": 12,
-            "minimum_patients_per_class_per_family": 2,
-            "core_mutual_neighbors": 5,
-            "core_caliper_mad_multiplier": 2.5,
-            "core_caliper_quantile": 0.90,
-            "maximum_sequence_position_difference": 0.25,
-            "maximum_area_ratio_difference": 0.20,
-            "core_maximum_matches_per_patient_per_family": 20,
-            "core_maximum_matches_per_sequence_group": 5,
-            "target_matched_image_fraction": 0.50,
-            "extended_neighbors": 12,
-            "extended_caliper_mad_multiplier": 3.5,
-            "extended_caliper_quantile": 0.97,
-            "extended_max_caliper_multiplier": 1.18,
-            "extended_maximum_sequence_position_difference": 0.25,
-            "extended_maximum_area_ratio_difference": 0.20,
-            "extended_maximum_matches_per_patient_per_family": 60,
-            "extended_maximum_matches_per_sequence_group": 15,
-            "extended_maximum_matches_per_sequence_pair": 12,
-            "extended_maximum_matches_per_patient_pair": 60,
-            "patient_total_cap_multiplier": 1.70,
-            "prioritize_core_sequence_pairs": True,
-            "block_weights": {
-                "phash": 0.45, "geometry": 0.25,
-                "sequence": 0.15, "quality": 0.15,
-            },
-            "random_seed": 42,
+            "schema": "cross-class-matching-stable-v3",
+            "min_families":8,"max_families":32,"target_images_per_family":1800,
+            "minimum_images_per_class_per_family":12,
+            "minimum_patients_per_class_per_family":2,
+            "core_mutual_neighbors":5,"core_caliper_mad_multiplier":2.5,
+            "core_caliper_quantile":0.90,"maximum_sequence_position_difference":0.25,
+            "maximum_area_ratio_difference":0.20,
+            "core_maximum_matches_per_patient_per_family":20,
+            "core_maximum_matches_per_sequence_group":5,
+            "target_matched_image_fraction":0.50,"extended_neighbors":12,
+            "extended_caliper_mad_multiplier":3.5,"extended_caliper_quantile":0.97,
+            "extended_max_caliper_multiplier":1.18,
+            "extended_maximum_sequence_position_difference":0.25,
+            "extended_maximum_area_ratio_difference":0.20,
+            "extended_maximum_matches_per_patient_per_family":60,
+            "extended_maximum_matches_per_sequence_group":15,
+            "extended_maximum_matches_per_sequence_pair":12,
+            "extended_maximum_matches_per_patient_pair":60,
+            "patient_total_cap_multiplier":1.70,"prioritize_core_sequence_pairs":True,
+            "block_weights":{"phash":0.45,"geometry":0.25,"sequence":0.15,"quality":0.15},
+            "random_seed":42,
+        }
+        digest=hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8"))
+        for row in sorted(rows, key=lambda item: str(item.get("image_token", ""))):
+            values=(
+                str(row.get("image_token", "")), DataStage._as_int(row.get("label"),-1),
+                str(row.get("patient_id", "")), str(row.get("series_id", "")),
+                DataStage.stable_sequence_group(row),
+                DataStage._as_int(row.get("sequence_index"),0),
+                DataStage._as_int(row.get("sequence_length"),1),
+                DataStage._as_int(row.get("quality_valid"),0), str(row.get("perceptual_hash", "")),
+                DataStage.canonical_float(row.get("sharpness")),
+                DataStage.canonical_float(row.get("noise_ratio")),
+                DataStage.canonical_float(row.get("dynamic_range")),
+                DataStage._as_int(row.get("attention_valid_final"),0),
+                DataStage._as_int(row.get("attention_heart_present"),0),
+                DataStage.canonical_float(row.get("attention_area_ratio")),
+                DataStage.canonical_float(row.get("attention_centroid_x")),
+                DataStage.canonical_float(row.get("attention_centroid_y")),
+                DataStage.canonical_float(row.get("attention_boundary_touch_fraction")),
+            )
+            digest.update(json.dumps(values, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+        return digest.hexdigest()
+
+    @staticmethod
+    def legacy_matching_fingerprint(rows, workspace):
+        payload={
+            "schema":"cross-class-matching-v2-core-plus-extended","min_families":8,
+            "max_families":32,"target_images_per_family":1800,
+            "minimum_images_per_class_per_family":12,"minimum_patients_per_class_per_family":2,
+            "core_mutual_neighbors":5,"core_caliper_mad_multiplier":2.5,
+            "core_caliper_quantile":0.90,"maximum_sequence_position_difference":0.25,
+            "maximum_area_ratio_difference":0.20,"core_maximum_matches_per_patient_per_family":20,
+            "core_maximum_matches_per_sequence_group":5,"target_matched_image_fraction":0.50,
+            "extended_neighbors":12,"extended_caliper_mad_multiplier":3.5,
+            "extended_caliper_quantile":0.97,"extended_max_caliper_multiplier":1.18,
+            "extended_maximum_sequence_position_difference":0.25,
+            "extended_maximum_area_ratio_difference":0.20,
+            "extended_maximum_matches_per_patient_per_family":60,
+            "extended_maximum_matches_per_sequence_group":15,
+            "extended_maximum_matches_per_sequence_pair":12,
+            "extended_maximum_matches_per_patient_pair":60,"patient_total_cap_multiplier":1.70,
+            "prioritize_core_sequence_pairs":True,
+            "block_weights":{"phash":0.45,"geometry":0.25,"sequence":0.15,"quality":0.15},
+            "random_seed":42,
         }
         digest=hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8"))
         for row in rows:
-            for key in (
-                "image_token", "label", "patient_id", "sequence_group_id",
-                "sequence_index", "sequence_length",
-            ):
+            for key in ("image_token","label","patient_id","sequence_group_id","sequence_index","sequence_length"):
                 digest.update(str(row.get(key, "")).encode("utf-8"))
         for audit_path in (workspace.quality_audit, workspace.prediction_audit):
             if Path(audit_path).is_file():
@@ -6766,27 +7157,70 @@ class PersistenceStage:
         return digest.hexdigest()
 
     @staticmethod
-    def build_matching(rows, workspace, force=False):
-        fingerprint=PersistenceStage.matching_fingerprint(rows, workspace)
+    def matching_cache_status(rows, workspace):
         summary=DataStage.read_json(workspace.matching_summary, {}) or {}
-        cached=DataStage.read_csv(workspace.matching_manifest)
-        cached_tokens={str(row.get("image_token", "")) for row in cached}
-        expected_tokens={str(row["image_token"]) for row in rows}
-        if (
-            not force
-            and summary.get("fingerprint") == fingerprint
-            and cached
-            and cached_tokens == expected_tokens
-        ):
-            print(f"[MATCHING] Compatible persisted manifest reused: {workspace.matching_manifest}")
-            return cached, summary
-        manifest, summary=MatchingStage.build_cross_class_matching(rows)
-        summary={**summary, "fingerprint": fingerprint, "schema": "cross-class-matching-v2-core-plus-extended"}
-        DataStage.write_csv(
-            workspace.matching_manifest,
-            manifest,
-            DataStage.csv_fields(manifest),
+        stable=PersistenceStage.matching_fingerprint(rows, workspace)
+        legacy=(
+            PersistenceStage.legacy_matching_fingerprint(rows, workspace)
+            if not summary.get("stable_fingerprint")
+            else ""
         )
+        cached=DataStage.read_csv(workspace.matching_manifest)
+        expected_tokens={str(row["image_token"]) for row in rows}
+        cached_tokens=[str(row.get("image_token", "")) for row in cached]
+        required={"image_token","selected_for_matched_cohort","label","patient_id","series_id"}
+        structural=(
+            bool(cached) and len(cached_tokens)==len(expected_tokens)
+            and len(set(cached_tokens))==len(cached_tokens)
+            and set(cached_tokens)==expected_tokens
+            and required.issubset(set(cached[0]))
+        )
+        if structural:
+            selected=sum(DataStage._as_int(row.get("selected_for_matched_cohort"),0) for row in cached)
+            structural=(selected == DataStage._as_int(summary.get("selected_images"), selected))
+        fingerprint_match=(
+            summary.get("stable_fingerprint") == stable
+            or summary.get("fingerprint") in {stable, legacy}
+        )
+        freshness=False
+        if structural and Path(workspace.matching_manifest).is_file():
+            manifest_mtime=Path(workspace.matching_manifest).stat().st_mtime_ns
+            input_mtime=DataStage.newest_mtime_ns([workspace.quality_audit, workspace.prediction_audit])
+            freshness=manifest_mtime >= input_mtime
+        legacy_adoptable=(
+            summary.get("schema") == "cross-class-matching-v2-core-plus-extended"
+            and not summary.get("stable_fingerprint")
+        )
+        reusable=bool(structural and (fingerprint_match or (legacy_adoptable and freshness)))
+        reason=("fingerprint" if fingerprint_match else "legacy-structural+freshness" if reusable else "invalid")
+        return {
+            "reusable":reusable,"reason":reason,"stable_fingerprint":stable,
+            "legacy_fingerprint":legacy,"summary":summary,"cached":cached,
+        }
+
+    @staticmethod
+    def build_matching(rows, workspace, force=False):
+        status=PersistenceStage.matching_cache_status(rows, workspace)
+        if not force and status["reusable"]:
+            if status["summary"].get("stable_fingerprint") != status["stable_fingerprint"]:
+                DataStage.write_json(
+                    workspace.matching_summary,
+                    {**status["summary"], "stable_fingerprint": status["stable_fingerprint"],
+                     "cache_adoption": status["reason"]},
+                )
+            print(
+                f"[MATCHING] Compatible persisted manifest reused ({status['reason']}): "
+                f"{workspace.matching_manifest}"
+            )
+            return status["cached"], status["summary"]
+        manifest, summary=MatchingStage.build_cross_class_matching(rows)
+        summary={
+            **summary,
+            "fingerprint": status["stable_fingerprint"],
+            "stable_fingerprint": status["stable_fingerprint"],
+            "schema": "cross-class-matching-stable-v3",
+        }
+        DataStage.write_csv(workspace.matching_manifest, manifest, DataStage.csv_fields(manifest))
         DataStage.write_json(workspace.matching_summary, summary)
         print(f"[MATCHING] Manifest persisted: {workspace.matching_manifest}")
         return manifest, summary
@@ -6794,30 +7228,62 @@ class PersistenceStage:
     @staticmethod
     def feature_fingerprint(rows, accepted_rows, workspace):
         prediction_summary=DataStage.read_json(workspace.prediction_summary, {}) or {}
+        quality_summary=DataStage.read_json(workspace.quality_summary, {}) or {}
+        manual_summary=DataStage.read_json(workspace.manual_summary, {}) or {}
         payload={
-            "schema": "simple-patient-feature-bank-cross-class-v6-same-slice-baseline",
-            "modes": tuple(PersistenceStage.LEGACY_MODE_ALIASES.values()),
-            "prediction_fingerprint": prediction_summary.get("fingerprint", ""),
-            "support_dilation": 15,
-            "imagenet_weights": True,
-            "classification_size": 224,
-            "quality_thresholds": {
-                "dynamic_range": 12.0,
-                "laplacian_variance": 4.0,
-                "noise_ratio": 0.30,
-                "patient_blur_quantile": 0.03,
-                "patient_noise_quantile": 0.97,
-            },
+            "schema":"simple-patient-feature-bank-stable-v7",
+            "modes":tuple(PersistenceStage.LEGACY_MODE_ALIASES.values()),
+            "prediction_fingerprint":prediction_summary.get("stable_fingerprint") or prediction_summary.get("fingerprint", ""),
+            "manual_input_fingerprint":manual_summary.get("input_fingerprint", ""),
+            "support_dilation":15,"imagenet_weights":"IMAGENET1K_V1",
+            "classification_size":224,"dtype":"float32","device":"cpu",
+            "batch":4,"forward_batch":4,
+            "quality_thresholds":{"dynamic_range":12.0,"laplacian_variance":4.0,
+                "noise_ratio":0.30,"patient_blur_quantile":0.03,"patient_noise_quantile":0.97},
+            "dataset_fingerprint":quality_summary.get("dataset_fingerprint") or DataStage.dataset_fingerprint(rows),
+        }
+        digest=hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8"))
+        for row in sorted(rows, key=lambda item: str(item.get("image_token", ""))):
+            values=(
+                str(row.get("image_token", "")), DataStage._as_int(row.get("label"),-1),
+                str(row.get("patient_id", "")), str(row.get("series_id", "")),
+                DataStage._as_int(row.get("quality_valid"),0),
+                DataStage._as_int(row.get("attention_valid_final"),0),
+                DataStage._as_int(row.get("attention_heart_present"),0),
+                DataStage.canonical_float(row.get("attention_area_ratio")),
+            )
+            digest.update(json.dumps(values, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+        matching=DataStage.read_csv(workspace.matching_manifest)
+        for row in sorted(matching, key=lambda item: str(item.get("image_token", ""))):
+            values=(str(row.get("image_token", "")),
+                    DataStage._as_int(row.get("selected_for_matched_cohort"),0),
+                    str(row.get("pair_id", "")))
+            digest.update(json.dumps(values, separators=(",", ":")).encode("utf-8"))
+        for row in sorted(accepted_rows, key=lambda item: str(item["image_token"])):
+            if row.get("segmentation_target_type") != HEART_PRESENT:
+                continue
+            values=(str(row["image_token"]), str(row.get("segmentation_target_type", "")),
+                    DataStage.canonical_float(row.get("sample_weight", 1.0)))
+            digest.update(json.dumps(values, separators=(",", ":")).encode("utf-8"))
+        return digest.hexdigest()
+
+    @staticmethod
+    def legacy_feature_fingerprint(rows, accepted_rows, workspace):
+        prediction_summary=DataStage.read_json(workspace.prediction_summary, {}) or {}
+        payload={
+            "schema":"simple-patient-feature-bank-cross-class-v6-same-slice-baseline",
+            "modes":tuple(PersistenceStage.LEGACY_MODE_ALIASES.values()),
+            "prediction_fingerprint":prediction_summary.get("fingerprint", ""),
+            "support_dilation":15,"imagenet_weights":True,"classification_size":224,
+            "quality_thresholds":{"dynamic_range":12.0,"laplacian_variance":4.0,
+                "noise_ratio":0.30,"patient_blur_quantile":0.03,"patient_noise_quantile":0.97},
         }
         digest=hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8"))
         digest.update(str(len(rows)).encode("ascii"))
         for row in rows:
             digest.update(str(row["image_token"]).encode("utf-8"))
-        for path in (
-            workspace.quality_audit, workspace.manual_audit,
-            workspace.manual_annotations, workspace.prediction_audit,
-            workspace.matching_manifest,
-        ):
+        for path in (workspace.quality_audit,workspace.manual_audit,workspace.manual_annotations,
+                     workspace.prediction_audit,workspace.matching_manifest):
             if Path(path).is_file():
                 digest.update(Path(path).name.encode("utf-8"))
                 digest.update(DataStage.sha256_file(path).encode("ascii"))
@@ -6829,6 +7295,82 @@ class PersistenceStage:
                 digest.update(str(row["image_token"]).encode("utf-8"))
                 digest.update(DataStage.sha256_file(mask_path).encode("ascii"))
         return digest.hexdigest()
+
+    @staticmethod
+    def expected_feature_cohorts(rows, accepted_rows, matching):
+        accepted_manual={
+            str(row["image_token"]) for row in accepted_rows
+            if row.get("segmentation_target_type") == HEART_PRESENT
+            and DataStage.manual_mask_qc(row["manual_mask_path"])["usable"]
+        }
+        matched={
+            str(row.get("image_token", "")) for row in matching
+            if DataStage._as_int(row.get("selected_for_matched_cohort"),0)==1
+        }
+        prepared=[]
+        for source in rows:
+            row=dict(source)
+            keep_attention=(
+                DataStage._as_int(row.get("attention_valid_final"),0)==1
+                and DataStage._as_int(row.get("attention_heart_present"),1)==1
+                and DataStage._as_int(row.get("quality_valid"),0)==1
+                and DataStage._as_float(row.get("attention_area_ratio"),0.0)>=0.003
+            )
+            row["keep_attention"]=int(keep_attention)
+            row["keep_manual"]=int(str(row["image_token"]) in accepted_manual)
+            row["keep_matched"]=int(str(row["image_token"]) in matched and keep_attention)
+            prepared.append(row)
+        selectors={
+            "B0_FULL_IMAGE":lambda row: True,
+            "B2_ATTENTION_ELIGIBLE_FULL_IMAGE":lambda row: row["keep_attention"],
+            "AU1_ATTENTION_ROI":lambda row: row["keep_attention"],
+            "C1_ATTENTION_COMPLEMENT":lambda row: row["keep_attention"],
+            "B1_MATCHED_FULL_IMAGE":lambda row: row["keep_matched"],
+            "AU2_MATCHED_ATTENTION_ROI":lambda row: row["keep_matched"],
+            "C2_MATCHED_ATTENTION_COMPLEMENT":lambda row: row["keep_matched"],
+            "M1_MANUAL_ROI":lambda row: row["keep_manual"],
+            "C3_MANUAL_COMPLEMENT":lambda row: row["keep_manual"],
+            "AU3_ATTENTION_ROI_MANUAL_SUBSET":lambda row: row["keep_manual"],
+            "C4_ATTENTION_COMPLEMENT_MANUAL_SUBSET":lambda row: row["keep_manual"],
+        }
+        expected={}
+        for mode, selector in selectors.items():
+            selected=[row for row in prepared if selector(row)]
+            patients=sorted({str(row["patient_id"]) for row in selected})
+            labels={str(row["patient_id"]):DataStage._as_int(row.get("label"),-1) for row in selected}
+            expected[mode]={
+                "patient_ids":np.asarray(patients),
+                "y":np.asarray([labels[patient] for patient in patients], dtype=np.int64),
+                "source_slices":len(selected),
+                "series_proxies":len({(str(row["patient_id"]),str(row["series_id"])) for row in selected}),
+            }
+        return expected
+
+    @staticmethod
+    def feature_bank_structurally_compatible(bank, rows, accepted_rows, matching, workspace):
+        expected=PersistenceStage.expected_feature_cohorts(rows, accepted_rows, matching)
+        for mode in FeatureStage.MODES:
+            if mode not in bank:
+                return False, f"missing mode {mode}"
+            current=bank[mode]; wanted=expected[mode]
+            if not np.array_equal(np.asarray(current["patient_ids"]).astype(str), wanted["patient_ids"].astype(str)):
+                return False, f"patient cohort changed for {mode}"
+            if not np.array_equal(np.asarray(current["y"],dtype=np.int64), wanted["y"]):
+                return False, f"labels changed for {mode}"
+            if int(current["source_slices"]) != int(wanted["source_slices"]):
+                return False, f"slice cohort changed for {mode}"
+            if int(current["series_proxies"]) != int(wanted["series_proxies"]):
+                return False, f"series cohort changed for {mode}"
+        bank_mtime=Path(workspace.feature_bank).stat().st_mtime_ns
+        positive_masks=[
+            row["manual_mask_path"] for row in accepted_rows
+            if row.get("segmentation_target_type") == HEART_PRESENT
+        ]
+        if DataStage.newest_mtime_ns(positive_masks + [workspace.manual_annotations]) > bank_mtime:
+            return False, "manual target changed after feature bank"
+        if Path(workspace.prediction_summary).is_file() and Path(workspace.prediction_summary).stat().st_mtime_ns > bank_mtime:
+            return False, "OOF prediction changed after feature bank"
+        return True, "cohorts and upstream model outputs unchanged"
 
     @staticmethod
     def load_feature_bank(workspace):
@@ -6885,8 +7427,9 @@ class PersistenceStage:
         DataStage.write_json(
             workspace.feature_metadata,
             {
-                "schema": "simple-patient-feature-bank-cross-class-v6-same-slice-baseline",
+                "schema": "simple-patient-feature-bank-stable-v7",
                 "fingerprint": fingerprint,
+                "stable_fingerprint": fingerprint,
                 "preprocessing_device": "cpu",
                 "extractor_device": "cpu",
                 "dtype": "float32",
@@ -6898,20 +7441,45 @@ class PersistenceStage:
 
     @staticmethod
     def build_feature_bank(rows, accepted_rows, matching, workspace, force=False):
-        fingerprint=PersistenceStage.feature_fingerprint(rows, accepted_rows, workspace)
         metadata=DataStage.read_json(workspace.feature_metadata, {}) or {}
-        if (
-            not force
-            and metadata.get("fingerprint") == fingerprint
-            and Path(workspace.feature_bank).is_file()
-        ):
+        stable=PersistenceStage.feature_fingerprint(rows, accepted_rows, workspace)
+        legacy=(
+            PersistenceStage.legacy_feature_fingerprint(rows, accepted_rows, workspace)
+            if not metadata.get("stable_fingerprint")
+            else ""
+        )
+        bank=None
+        load_error=None
+        if Path(workspace.feature_bank).is_file():
             try:
                 bank=PersistenceStage.load_feature_bank(workspace)
             except Exception as error:
-                print(f"[FEATURE BANK] Cache invalid; rebuilding ({type(error).__name__}: {error}).")
-            else:
-                print(f"[FEATURE BANK] Compatible CPU/float32 bank reused: {workspace.feature_bank}")
-                return bank
+                load_error=error
+        exact=(
+            metadata.get("stable_fingerprint") == stable
+            or metadata.get("fingerprint") in {stable, legacy}
+        )
+        adopted=False
+        adoption_reason=""
+        legacy_adoptable=(
+            metadata.get("schema") == "simple-patient-feature-bank-cross-class-v6-same-slice-baseline"
+            and not metadata.get("stable_fingerprint")
+        )
+        if bank is not None and not exact and legacy_adoptable:
+            adopted, adoption_reason=PersistenceStage.feature_bank_structurally_compatible(
+                bank, rows, accepted_rows, matching, workspace
+            )
+        if not force and bank is not None and (exact or adopted):
+            print(
+                "[FEATURE BANK] Compatible CPU/float32 bank reused"
+                + (f" ({adoption_reason})" if adopted else "")
+                + f": {workspace.feature_bank}"
+            )
+            return bank
+        if load_error is not None:
+            print(f"[FEATURE BANK] Cache invalid; rebuilding ({type(load_error).__name__}: {load_error}).")
+        elif bank is not None and not force:
+            print(f"[FEATURE BANK] Cache invalid; rebuilding ({adoption_reason or 'fingerprint changed'}).")
         started=time.perf_counter()
         device=DataStage.start_device_stage("cpu", "EfficientNet feature extraction")
         try:
@@ -6919,16 +7487,25 @@ class PersistenceStage:
         finally:
             DataStage.finish_device_stage(device, "EfficientNet feature extraction")
         PersistenceStage.save_feature_bank(
-            bank,
-            fingerprint,
-            workspace,
-            DataStage.format_seconds(time.perf_counter() - started),
+            bank, stable, workspace, DataStage.format_seconds(time.perf_counter()-started)
         )
         print(f"[FEATURE BANK] Saved: {workspace.feature_bank}")
         return bank
 
     @staticmethod
     def evaluation_fingerprint(workspace):
+        payload={
+            "schema":"patient-evaluation-stable-v2","pca_variance":0.95,
+            "outer_folds":5,"inner_folds":3,"c_grid":(0.01,0.1,1.0,10.0),
+            "bootstrap_repeats":2000,"random_seed":42,"modes":FeatureStage.MODES,
+        }
+        digest=hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8"))
+        if Path(workspace.feature_bank).is_file():
+            digest.update(DataStage.sha256_file(workspace.feature_bank).encode("ascii"))
+        return digest.hexdigest()
+
+    @staticmethod
+    def legacy_evaluation_fingerprint(workspace):
         digest=hashlib.sha256(b"patient-evaluation-v1")
         for path in (workspace.feature_bank, workspace.feature_metadata):
             if Path(path).is_file():
@@ -6936,37 +7513,90 @@ class PersistenceStage:
         return digest.hexdigest()
 
     @staticmethod
-    def evaluate(bank, workspace, force=False):
-        fingerprint=PersistenceStage.evaluation_fingerprint(workspace)
+    def evaluation_cache_status(bank, workspace):
         metadata=DataStage.read_json(workspace.evaluation_metadata, {}) or {}
-        if (
-            not force
-            and metadata.get("fingerprint") == fingerprint
-            and Path(workspace.results_csv).is_file()
-            and Path(workspace.comparisons_csv).is_file()
-            and all((Path(workspace.predictions_dir) / f"{mode}.csv").is_file() for mode in FeatureStage.MODES)
-        ):
-            results=pd.read_csv(workspace.results_csv)
-            comparisons=pd.read_csv(workspace.comparisons_csv)
-            predictions={
-                mode: pd.read_csv(Path(workspace.predictions_dir) / f"{mode}.csv")
-                for mode in FeatureStage.MODES
-            }
-            print(f"[EVALUATION] Compatible persisted results reused: {workspace.results_csv}")
-            return results, comparisons, predictions
+        stable=PersistenceStage.evaluation_fingerprint(workspace)
+        legacy=(
+            PersistenceStage.legacy_evaluation_fingerprint(workspace)
+            if not metadata.get("stable_fingerprint")
+            else ""
+        )
+        result_path=Path(workspace.results_csv)
+        comparison_path=Path(workspace.comparisons_csv)
+        prediction_paths={mode:Path(workspace.predictions_dir)/f"{mode}.csv" for mode in FeatureStage.MODES}
+        files_complete=result_path.is_file() and comparison_path.is_file() and all(path.is_file() for path in prediction_paths.values())
+        structural=False
+        if files_complete:
+            try:
+                results=pd.read_csv(result_path)
+                comparisons=pd.read_csv(comparison_path)
+                predictions={mode:pd.read_csv(path) for mode,path in prediction_paths.items()}
+                structural=set(results.get("mode", pd.Series(dtype=str)).astype(str)) == set(FeatureStage.MODES)
+                for mode, table in predictions.items():
+                    expected_patients=np.asarray(bank[mode]["patient_ids"]).astype(str)
+                    expected_labels=np.asarray(bank[mode]["y"], dtype=np.int64)
+                    table=table.sort_values("patient_id")
+                    order=np.argsort(expected_patients)
+                    if not np.array_equal(table["patient_id"].astype(str).to_numpy(), expected_patients[order]):
+                        structural=False; break
+                    if not np.array_equal(table["true_label"].to_numpy(dtype=np.int64), expected_labels[order]):
+                        structural=False; break
+            except Exception:
+                structural=False
+                results=comparisons=predictions=None
+        else:
+            results=comparisons=predictions=None
+        fingerprint_match=(
+            metadata.get("stable_fingerprint") == stable
+            or metadata.get("fingerprint") in {stable, legacy}
+        )
+        freshness=False
+        if structural:
+            output_mtime=min(
+                [result_path.stat().st_mtime_ns, comparison_path.stat().st_mtime_ns]
+                + [path.stat().st_mtime_ns for path in prediction_paths.values()]
+            )
+            freshness=output_mtime >= Path(workspace.feature_bank).stat().st_mtime_ns
+        legacy_adoptable=(
+            metadata.get("schema") == "patient-evaluation-cache-v1"
+            and not metadata.get("stable_fingerprint")
+        )
+        reusable=bool(structural and (fingerprint_match or (legacy_adoptable and freshness)))
+        return {
+            "reusable":reusable,"reason":"fingerprint" if fingerprint_match else "legacy-structural+freshness" if reusable else "invalid",
+            "stable_fingerprint":stable,"legacy_fingerprint":legacy,"metadata":metadata,
+            "results":results,"comparisons":comparisons,"predictions":predictions,
+        }
+
+    @staticmethod
+    def evaluate(bank, workspace, force=False):
+        status=PersistenceStage.evaluation_cache_status(bank, workspace)
+        if not force and status["reusable"]:
+            if status["metadata"].get("stable_fingerprint") != status["stable_fingerprint"]:
+                DataStage.write_json(
+                    workspace.evaluation_metadata,
+                    {**status["metadata"], "stable_fingerprint":status["stable_fingerprint"],
+                     "cache_adoption":status["reason"]},
+                )
+            print(
+                f"[EVALUATION] Compatible persisted results reused ({status['reason']}): "
+                f"{workspace.results_csv}"
+            )
+            return status["results"], status["comparisons"], status["predictions"]
         results, comparisons, predictions=EvaluationStage.evaluate_experiments(bank)
         results.to_csv(workspace.results_csv, index=False)
         comparisons.to_csv(workspace.comparisons_csv, index=False)
         for mode, table in predictions.items():
-            table.to_csv(Path(workspace.predictions_dir) / f"{mode}.csv", index=False)
+            table.to_csv(Path(workspace.predictions_dir)/f"{mode}.csv", index=False)
         DataStage.write_json(
             workspace.evaluation_metadata,
             {
-                "schema": "patient-evaluation-cache-v1",
-                "fingerprint": fingerprint,
-                "modes": list(FeatureStage.MODES),
-                "results": str(workspace.results_csv),
-                "comparisons": str(workspace.comparisons_csv),
+                "schema":"patient-evaluation-stable-v2",
+                "fingerprint":status["stable_fingerprint"],
+                "stable_fingerprint":status["stable_fingerprint"],
+                "modes":list(FeatureStage.MODES),
+                "results":str(workspace.results_csv),
+                "comparisons":str(workspace.comparisons_csv),
             },
         )
         print(f"[EVALUATION] Results persisted: {workspace.results_csv}")
@@ -7333,6 +7963,62 @@ class Pipeline:
         return editor.show()
 
     @staticmethod
+    def persistence_status(dataset_path=None, workspace_root=None, minimum_masks=None):
+        """Validate every cache without starting matching, EfficientNet, or evaluation."""
+        context=Pipeline._prepare_context(
+            dataset_path=dataset_path, workspace_root=workspace_root,
+            refresh_quality=False, minimum_masks=minimum_masks,
+            require_manual=True, load_predictions=True,
+            require_complete_predictions=True,
+        )
+        workspace=context["workspace"]
+        rows=context["rows"]
+        matching_status=PersistenceStage.matching_cache_status(rows, workspace)
+        matching=matching_status["cached"] if matching_status["reusable"] else []
+        feature_reusable=False; feature_reason="matching cache is not reusable"; bank=None
+        if matching:
+            metadata=DataStage.read_json(workspace.feature_metadata, {}) or {}
+            stable=PersistenceStage.feature_fingerprint(rows, context["accepted"], workspace)
+            legacy=(
+                PersistenceStage.legacy_feature_fingerprint(rows, context["accepted"], workspace)
+                if not metadata.get("stable_fingerprint")
+                else ""
+            )
+            if Path(workspace.feature_bank).is_file():
+                try:
+                    bank=PersistenceStage.load_feature_bank(workspace)
+                    exact=(metadata.get("stable_fingerprint")==stable or metadata.get("fingerprint") in {stable,legacy})
+                    structural, structural_reason=PersistenceStage.feature_bank_structurally_compatible(
+                        bank, rows, context["accepted"], matching, workspace
+                    )
+                    legacy_adoptable=(
+                        metadata.get("schema") == "simple-patient-feature-bank-cross-class-v6-same-slice-baseline"
+                        and not metadata.get("stable_fingerprint")
+                    )
+                    feature_reusable=bool(exact or (legacy_adoptable and structural))
+                    feature_reason="fingerprint" if exact else structural_reason if legacy_adoptable else "stable fingerprint changed"
+                except Exception as error:
+                    feature_reason=f"{type(error).__name__}: {error}"
+        evaluation_status=(
+            PersistenceStage.evaluation_cache_status(bank, workspace)
+            if feature_reusable and bank is not None
+            else {"reusable":False,"reason":"feature bank is not reusable"}
+        )
+        report={
+            "quality_audit_compatible": True,
+            "manual_audit_compatible": True,
+            "predictions_complete": context["persisted_predictions"].get("mask_files",0)==len(rows),
+            "matching_reusable": matching_status["reusable"],
+            "matching_reason": matching_status["reason"],
+            "feature_bank_reusable": feature_reusable,
+            "feature_bank_reason": feature_reason,
+            "evaluation_reusable": evaluation_status.get("reusable",False),
+            "evaluation_reason": evaluation_status.get("reason",""),
+        }
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+        return report
+
+    @staticmethod
     def status(workspace_root=None):
         workspace=DataStage.create_workspace(workspace_root)
         checkpoints=[
@@ -7473,5 +8159,6 @@ print("[PIPELINE] CPU initial: cpu_state = Pipeline.run_kaggle_cpu_stage()")
 print("[PIPELINE] GPU Attention: gpu_state = Pipeline.run_kaggle_gpu_stage()")
 print("[PIPELINE] CPU final: final_state = Pipeline.run_kaggle_cpu_final_stage(action='evaluate')")
 print("[PIPELINE] Review: editor = Pipeline.review(scope='invalid')")
+print("[PIPELINE] Cache validation: Pipeline.persistence_status()")
 print("[PIPELINE] Status: Pipeline.status()")
 print("[PIPELINE] Workspace: /kaggle/working/cad_attention_unet_workspace")
