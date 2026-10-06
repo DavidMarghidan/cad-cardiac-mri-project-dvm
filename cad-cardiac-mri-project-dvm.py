@@ -26,6 +26,24 @@ selection, atomic writes, and semantic fingerprints. Compatible audits, checkpoi
 prediction parts, matching, feature banks, and evaluations can be reused after a
 Kaggle restart from ``/kaggle/working/cad_attention_unet_workspace``.
 
+PUBLIC PROJECT LINKS
+--------------------
+Kaggle notebook:
+https://www.kaggle.com/code/davidvladmarghidan/cardiac-mri-cad-classification-attention-u-net#Cardiac-MRI-CAD-%E2%80%94-leakage-controlled,-resumable-research-pipeline
+
+GitHub source repository:
+https://github.com/DavidMarghidan/cad-cardiac-mri-project-dvm/tree/main
+
+GitHub documentation directory and main documents:
+- Documentation directory: https://github.com/DavidMarghidan/cad-cardiac-mri-project-dvm/tree/main/docs
+- Documentation index: https://github.com/DavidMarghidan/cad-cardiac-mri-project-dvm/blob/main/docs/README.md
+- Research overview: https://github.com/DavidMarghidan/cad-cardiac-mri-project-dvm/blob/main/docs/project-overview/David_Vlad_Marghidan_Cardiac_MRI_AI_Research_Overview.pdf
+- Technical pipeline summary: https://github.com/DavidMarghidan/cad-cardiac-mri-project-dvm/blob/main/docs/technical/David_Vlad_Marghidan_Cardiac_MRI_AI_Technical_Pipeline_Summary.pdf
+- Preprint manuscript: https://github.com/DavidMarghidan/cad-cardiac-mri-project-dvm/blob/main/docs/manuscript/Research_Square_Preprint_David_Vlad_Marghidan_v1_2.pdf
+- Research abstract poster: https://github.com/DavidMarghidan/cad-cardiac-mri-project-dvm/blob/main/docs/research-supplement/David_Vlad_Marghidan_Cardiac_MRI_AI_Research_Abstract_Poster.pdf
+- Contribution statement: https://github.com/DavidMarghidan/cad-cardiac-mri-project-dvm/blob/main/docs/research-supplement/David_Vlad_Marghidan_Cardiac_MRI_AI_Contribution_Statement.pdf
+- Research portfolio index: https://github.com/DavidMarghidan/cad-cardiac-mri-project-dvm/blob/main/docs/research-supplement/David_Vlad_Marghidan_Cardiac_MRI_AI_Research_Portfolio_Index.pdf
+
 LICENSING AND CONTACT
 ---------------------
 Original source code and code cells: Apache License 2.0. Original repository prose,

@@ -7,6 +7,13 @@
 **Repository packaging and license update:** 6 October 2026  
 **Source-code license:** Apache License 2.0
 
+## Public project links
+
+- **Executable Kaggle notebook:** [Cardiac MRI CAD — leakage-controlled, resumable research pipeline](https://www.kaggle.com/code/davidvladmarghidan/cardiac-mri-cad-classification-attention-u-net#Cardiac-MRI-CAD-%E2%80%94-leakage-controlled,-resumable-research-pipeline)
+- **GitHub repository:** [DavidMarghidan/cad-cardiac-mri-project-dvm](https://github.com/DavidMarghidan/cad-cardiac-mri-project-dvm/tree/main)
+- **GitHub documentation:** [`docs/`](https://github.com/DavidMarghidan/cad-cardiac-mri-project-dvm/tree/main/docs)
+- **Source dataset on Kaggle:** [CAD Cardiac MRI Dataset](https://www.kaggle.com/datasets/danialsharifrazi/cad-cardiac-mri-dataset)
+
 > **Research-use notice**  
 > This repository documents a methodological proof-of-concept study. It is not a medical device, has not been externally or clinically validated, and must not be used for diagnosis, treatment, triage, or any patient-care decision.
 
@@ -181,6 +188,8 @@ Kaggle images may already provide several packages. Before reproducing a reporte
 
 ## Public API and Kaggle execution
 
+The public executable version of this pipeline is available in the [Kaggle notebook](https://www.kaggle.com/code/davidvladmarghidan/cardiac-mri-cad-classification-attention-u-net#Cardiac-MRI-CAD-%E2%80%94-leakage-controlled,-resumable-research-pipeline). The maintained source code and extended documentation are available in the [GitHub repository](https://github.com/DavidMarghidan/cad-cardiac-mri-project-dvm/tree/main) and its [`docs/` directory](https://github.com/DavidMarghidan/cad-cardiac-mri-project-dvm/tree/main/docs).
+
 Run the notebook's definitions cell after every kernel restart. Importing the source defines classes and seeds CPU-side randomness; it does not train a model.
 
 ### Initial CPU stage
@@ -279,7 +288,7 @@ The former standalone documentation-license and data/third-party notice files ha
 
 ### CAD Cardiac MRI Dataset
 
-The Apache-2.0 source-code license and the CC BY 4.0 documentation notice do **not** grant rights to the CAD Cardiac MRI Dataset, its JPEG images, metadata, labels, or any other source material. Obtain the dataset from its official distribution source and comply with the dataset provider's current terms and the associated publication.
+The Apache-2.0 source-code license and the CC BY 4.0 documentation notice do **not** grant rights to the CAD Cardiac MRI Dataset, its JPEG images, metadata, labels, or any other source material. Obtain the dataset from its [official Kaggle distribution page](https://www.kaggle.com/datasets/danialsharifrazi/cad-cardiac-mri-dataset) and comply with the dataset provider's current terms and the associated publication.
 
 The associated preprint records project-specific correspondence in which the dataset creator granted David Vlad Marghidan academic-research use with citation and clarified that each top-level `Directory_*` folder represents one patient in the analysed Kaggle subset. That communication is not a sublicense or a general redistribution permission for repository users.
 
