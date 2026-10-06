@@ -1,26 +1,42 @@
-"""Resumable cardiac MRI CAD research pipeline for Kaggle CPU/GPU sessions.
+"""Leakage-controlled cardiac MRI CAD research pipeline.
 
-The scientific workflow is unchanged, but every expensive stage now writes atomic,
-fingerprint-validated artifacts under ``/kaggle/working/cad_attention_unet_workspace``
-(or a user-selected workspace). A disconnected kernel can resume from completed
-quality audits, per-fold Attention U-Net checkpoints, per-fold OOF predictions,
-matching, the EfficientNet feature bank, or the final patient-level evaluation.
+PURPOSE
+-------
+This research pipeline tests whether label-related information in a public cardiac
+MRI JPEG release is concentrated in the cardiac region rather than in image-wide or
+extra-cardiac shortcuts. It is a methodological proof of concept, not a medical
+device or a clinically validated diagnostic system.
 
-The workspace cleaner keeps only artifacts addressed by this pipeline and can also
-remove unrelated non-hidden files from ``/kaggle/working``. Cleanup is explicit and
-never runs automatically while importing the notebook. Cache identities are semantic:
-volatile Kaggle input mtimes and harmless CSV rewrites do not invalidate expensive work.
+PIPELINE
+--------
+1. Initial CPU: discover the dataset, build stable patient/series/image identities,
+   standardize images, audit image quality, and validate manual segmentation targets.
+2. GPU: train or reuse five patient-level 2.5D Attention U-Net folds and generate an
+   out-of-fold heart mask for every slice. A patient's masks come only from a model
+   that did not train on that patient.
+3. Final CPU: build same-slice and matched controls, extract eleven frozen
+   EfficientNet-B0 representations in CPU/float32, pool slice -> series -> patient,
+   and perform nested patient-level classification and paired bootstrap evaluation.
 
-KAGGLE EXECUTION
-1. CPU initial   -> dataset manifest, quality audit, manual-target audit
-2. GPU           -> five resumable Attention U-Nets + resumable OOF prediction
-3. CPU final     -> matching, 11-mode EfficientNet bank, evaluation, HTML review
+CORE SAFEGUARDS AND RECOVERY
+----------------------------
+The implementation uses patient-level folds, out-of-fold masks, aligned
+full-image/ROI/complement controls, series-balanced patient pooling, nested model
+selection, atomic writes, and semantic fingerprints. Compatible audits, checkpoints,
+prediction parts, matching, feature banks, and evaluations can be reused after a
+Kaggle restart from ``/kaggle/working/cad_attention_unet_workspace``.
 
-Scientific safeguards remain unchanged: patient-level folds, out-of-fold masks,
-same-slice controls, matched cohorts, and patient-level evaluation. EfficientNet
-remains CPU/float32 with ImageNet V1 weights and batch/forward size 4; Attention
-training and inference use CUDA AMP when the GPU stage is selected.
+LICENSING
+---------
+Original source code: MIT License. Original repository documentation and
+explanatory diagrams: CC BY 4.0. Dataset content, manual masks, trained checkpoints,
+pretrained weights, generated data-derived artifacts, and third-party dependencies
+are not relicensed by this source-code repository. See ``README.md``, ``LICENSE``,
+``LICENSES/CC-BY-4.0.txt``, and ``DATA_AND_THIRD_PARTY_NOTICE.md``.
 """
+
+# Copyright 2026 David Vlad Marghidan
+# SPDX-License-Identifier: MIT
 
 import base64
 import contextlib

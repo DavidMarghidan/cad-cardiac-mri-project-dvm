@@ -1,0 +1,30 @@
+# Documentation and explanatory-figure license
+
+**SPDX identifier:** `CC-BY-4.0`  
+**Copyright:** 2026 David Vlad Marghidan
+
+Unless a file or figure states otherwise, the original prose, tables, diagrams, and explanatory figures in this repository—including `README.md` and the original narrative markdown in the Kaggle notebook—are licensed under the **Creative Commons Attribution 4.0 International License (CC BY 4.0)**.
+
+You may share and adapt this material, including for commercial use, provided that you:
+
+1. give appropriate credit;
+2. identify the license and provide a link to it;
+3. indicate whether changes were made; and
+4. do not imply endorsement by the author, scientific supervisor, institution, dataset creator, or clinical organisations.
+
+Full legal code: <https://creativecommons.org/licenses/by/4.0/legalcode>
+
+## Suggested attribution
+
+> "Cardiac MRI CAD Pipeline Documentation," David Vlad Marghidan, 2026, licensed under CC BY 4.0. Changes, if any, should be identified.
+
+## What this notice does not cover
+
+This documentation license does **not** apply to:
+
+- the CAD Cardiac MRI Dataset, source patient images, or associated metadata;
+- third-party text, logos, screenshots, papers, software, APIs, or pretrained weights;
+- manual masks, checkpoints, automatic masks, feature banks, or other data-derived artifacts unless a separate file expressly licenses them;
+- the Python source and code cells, which are covered by the MIT License in `LICENSE`.
+
+See `DATA_AND_THIRD_PARTY_NOTICE.md` before redistributing any dataset-derived material.

@@ -1,8 +1,38 @@
-/pretrained_models
-/debug_output
-/cad_patient_pipeline_outputs
-/.idea
-/.vs
-/__pycache__
-/.vscode
-/cad_attention_unet_workspace
+# Python and notebook caches
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+
+# Local editor / OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Secrets and local environments
+.env
+.env.*
+.venv/
+venv/
+
+# Kaggle and pipeline workspaces
+/kaggle/working/
+cad_attention_unet_workspace/
+manual_masks/
+predicted_attention_masks/
+mask_overlays/
+checkpoints/
+simple_pipeline_outputs/
+
+# Dataset folders must be obtained separately
+Normal/
+Sick/
+*.dcm
+
+# Large or sensitive generated artifacts
+*.pt
+*.pth
+patient_feature_bank.npz
+*.zip

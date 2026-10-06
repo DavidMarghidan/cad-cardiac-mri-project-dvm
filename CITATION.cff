@@ -1,0 +1,35 @@
+cff-version: 1.2.0
+message: "If you use this software or documentation, please cite the preferred citation below and the source dataset publication."
+title: "Cardiac MRI CAD: leakage-controlled, resumable research pipeline"
+type: software
+authors:
+  - family-names: "Marghidan"
+    given-names: "David Vlad"
+    affiliation: "INFusion Artificial Intelligence Research Laboratory, University of Craiova"
+version: "1.0.0"
+date-released: "2026-10-05"
+license: MIT
+keywords:
+  - cardiac magnetic resonance
+  - coronary artery disease
+  - medical image analysis
+  - Attention U-Net
+  - EfficientNet
+  - patient-level validation
+  - data leakage
+  - shortcut learning
+  - reproducibility
+abstract: >-
+  A patient-level, leakage-controlled research pipeline for a secondary analysis
+  of a public cardiac MRI JPEG release. Five cross-fitted 2.5D Attention U-Nets
+  produce out-of-fold cardiac masks; frozen EfficientNet-B0 representations compare
+  full-image, cardiac-ROI, and complement controls before nested patient-level
+  classification. The software is a methodological proof of concept, not a medical device.
+preferred-citation:
+  type: article
+  authors:
+    - family-names: "Marghidan"
+      given-names: "David Vlad"
+  title: "Patient-level coronary artery disease classification from cardiac MRI using out-of-fold heart segmentation and same-slice region controls"
+  year: 2026
+  notes: "Preprint version 1.2, 5 October 2026; not peer reviewed"

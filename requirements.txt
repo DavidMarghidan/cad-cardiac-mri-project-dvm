@@ -1,0 +1,12 @@
+# Direct runtime dependencies.
+# This is a convenience list, not an exact environment lock for the 5 October 2026 Kaggle run.
+numpy
+pandas
+opencv-python-headless
+torch
+torchvision
+scikit-learn
+tqdm
+ipython
+ipywidgets
+nbformat
