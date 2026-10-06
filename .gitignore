@@ -36,3 +36,4 @@ Sick/
 *.pth
 patient_feature_bank.npz
 *.zip
+/.vs
