@@ -1,22 +1,14 @@
 # Cardiac MRI CAD: leakage-controlled, resumable research pipeline
 
 **Author and implementation:** David Vlad Marghidan  
+**Contact:** [david_marghidan@yahoo.com](mailto:david_marghidan@yahoo.com)  
 **Scientific supervision:** Prof. Dr. Smaranda Belciug, INFusion Artificial Intelligence Research Laboratory, University of Craiova  
-**Reference release:** 5 October 2026
+**Reference scientific execution:** 5 October 2026  
+**Repository packaging and license update:** 6 October 2026  
+**Source-code license:** Apache License 2.0
 
-
-## Documentation map
-
-| Document | Best for | Link |
-|---|---|---|
-| One-page abstract poster | quick review or research-supplement upload | [`docs/research-supplement/`](docs/research-supplement/) |
-| Six-page research overview | admissions officers and interdisciplinary readers | [`docs/project-overview/`](docs/project-overview/) |
-| Contribution statement | authorship, supervision, and AI-use boundaries | [`docs/research-supplement/`](docs/research-supplement/) |
-| Current technical pipeline summary | technical faculty and reproducibility review | [`docs/technical/`](docs/technical/) |
-| Full preprint v1.2 | complete methods, results, declarations, and references | [`docs/manuscript/`](docs/manuscript/) |
-| Documentation index | complete reading map | [`docs/README.md`](docs/README.md) |
-
-The new overview and technical summary are synchronized to the complete 5 October 2026 execution. The earlier 3 October extended visual guide is not used as the release-specific source of current numerical results.
+> **Research-use notice**  
+> This repository documents a methodological proof-of-concept study. It is not a medical device, has not been externally or clinically validated, and must not be used for diagnosis, treatment, triage, or any patient-care decision.
 
 ## Scope
 
@@ -177,6 +169,16 @@ Examples:
 
 PNG, CSV, JSON, PyTorch, and NPZ artifacts are written through temporary files and `os.replace`. Identical PNG, CSV, and JSON content is left untouched when possible, preventing harmless rewrites from invalidating downstream work.
 
+## Installation and dependencies
+
+The repository includes `requirements.txt` as a convenience list of direct runtime dependencies; it is **not** an exact environment lock for the 5 October 2026 Kaggle execution.
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+Kaggle images may already provide several packages. Before reproducing a reported result, record the Python, PyTorch, torchvision, CUDA, OpenCV, NumPy, pandas, and scikit-learn versions actually used.
+
 ## Public API and Kaggle execution
 
 Run the notebook's definitions cell after every kernel restart. Importing the source defines classes and seeds CPU-side randomness; it does not train a model.
@@ -262,40 +264,107 @@ The repository preserves source and restart-safe logic, but it does not freeze a
 ## Repository layout
 
 ```text
-cad-cardiac-mri-project-dvm.py       # complete pipeline implementation
-cad-cardiac-mri-project-dvm.ipynb    # Kaggle execution cells plus this documentation
-README.md                             # technical repository guide
-LICENSE                               # MIT License for original source code
-LICENSES/CC-BY-4.0.txt              # CC BY 4.0 notice for original prose/diagrams
-DATA_AND_THIRD_PARTY_NOTICE.md         # dataset, weights, dependencies, and clinical-use boundaries
-.gitignore                            # excludes workspaces, model artifacts, and dataset folders
+README.md                             # technical guide plus all repository notices
+LICENSE                               # full Apache License 2.0 text for original code
+CITATION.cff                          # machine-readable software/manuscript citation
+requirements.txt                      # direct dependencies; not an exact environment lock
+.gitignore                            # excludes datasets, workspaces, masks, and model artifacts
+cad-cardiac-mri-project-dvm.py        # complete pipeline implementation
+cad-cardiac-mri-project-dvm.ipynb     # Kaggle execution cells plus synchronized documentation
 ```
 
-## Licensing and redistribution boundaries
+The former standalone documentation-license and data/third-party notice files have been consolidated into this README. `LICENSE`, `CITATION.cff`, `requirements.txt`, and `.gitignore` remain separate because they have machine-readable or operational roles that a README cannot replace.
 
-| Material | Terms |
-|---|---|
-| Original Python source and original code cells | MIT License |
-| Original README/notebook prose, tables, and explanatory diagrams | Creative Commons Attribution 4.0 International (`CC BY 4.0`) |
-| Combined notebook | code cells are MIT-licensed; original narrative material is CC BY 4.0 |
-| CAD Cardiac MRI Dataset and source images | not covered by this repository's licenses; obtain separately and follow the dataset provider's terms |
-| Manual masks, checkpoints, automatic masks, feature banks, and data-derived outputs | not granted for redistribution by the source-code license; review dataset and institutional terms before sharing |
-| Third-party Python packages and pretrained weights | remain under their own licenses and terms |
+## Data, generated artifacts, third-party materials, and clinical boundaries
 
-The project-specific academic-use permission described in the associated manuscript is not a sublicense for repository users. No source patient image is included in this publication package.
+### CAD Cardiac MRI Dataset
 
-See `LICENSE`, `LICENSES/CC-BY-4.0.txt`, and `DATA_AND_THIRD_PARTY_NOTICE.md` for the complete repository notice.
+The Apache-2.0 source-code license and the CC BY 4.0 documentation notice do **not** grant rights to the CAD Cardiac MRI Dataset, its JPEG images, metadata, labels, or any other source material. Obtain the dataset from its official distribution source and comply with the dataset provider's current terms and the associated publication.
+
+The associated preprint records project-specific correspondence in which the dataset creator granted David Vlad Marghidan academic-research use with citation and clarified that each top-level `Directory_*` folder represents one patient in the analysed Kaggle subset. That communication is not a sublicense or a general redistribution permission for repository users.
+
+No source patient image is included in this publication package.
+
+### Manual and generated artifacts
+
+This repository package does not include the project's manual-mask archive, annotation-label CSV, trained checkpoints, automatic mask PNGs, feature bank, or complete persistent Kaggle workspace. The Apache-2.0 code license does not automatically grant permission to redistribute those materials.
+
+Generated outputs may encode or be derived from the source dataset. Before publishing masks, embeddings, checkpoints, patient-level predictions, examples, or other artifacts, review the dataset provider's terms, institutional and supervisory requirements, privacy and re-identification risk, whether the artifact can reveal source-image content, and the intended citation and provenance record.
+
+### Third-party software and pretrained weights
+
+The pipeline depends on Python, PyTorch, torchvision, OpenCV, NumPy, pandas, scikit-learn, IPython, ipywidgets, nbformat, and tqdm. These projects remain under their own licenses. They are dependencies, not relicensed copies of this repository's original source.
+
+`EfficientNet_B0_Weights.IMAGENET1K_V1` is obtained through torchvision. The pretrained weights and the ImageNet source material remain subject to their own terms. Apache-2.0 for this repository does not relicense them.
+
+### Research and clinical boundary
+
+This software is supplied for research and education. It is a secondary analysis of a small public JPEG release and has not been externally or clinically validated. It must not be used to diagnose, treat, triage, or make decisions about a patient.
+
+No warranty is provided regarding scientific validity, fitness for a particular purpose, clinical safety, regulatory compliance, or reproducibility on different hardware and software environments. The warranty and liability terms in `LICENSE` apply to the original source code.
+
+### Citation and provenance
+
+When using the code or documentation, retain the applicable notices and cite the relevant project manuscript and dataset article. When reporting results, identify the exact source version, notebook version, target state, workspace lineage, and whether each cache was reused or rebuilt.
+
+## Licensing
+
+### Original source code and code cells — Apache License 2.0
+
+Copyright 2026 David Vlad Marghidan.
+
+The original Python source and original code cells in this repository are licensed under the **Apache License, Version 2.0** (`Apache-2.0`). The complete license text is in [`LICENSE`](LICENSE).
+
+A brief source notice is included at the top of the Python file and in the notebook's main code cell:
+
+```text
+SPDX-License-Identifier: Apache-2.0
+```
+
+### Original documentation and explanatory figures — CC BY 4.0
+
+Unless a file or figure states otherwise, original prose, tables, diagrams, and explanatory figures authored for this repository—including `README.md` and original narrative markdown in the Kaggle notebook—are licensed under the **Creative Commons Attribution 4.0 International License (CC BY 4.0)**.
+
+You may share and adapt that material, including commercially, provided that you:
+
+1. give appropriate credit;
+2. identify CC BY 4.0 and link to its legal code;
+3. indicate whether changes were made; and
+4. do not imply endorsement by the author, scientific supervisor, institution, dataset creator, or clinical organisations.
+
+Full legal code: <https://creativecommons.org/licenses/by/4.0/legalcode>
+
+Suggested attribution:
+
+> “Cardiac MRI CAD Pipeline Documentation,” David Vlad Marghidan, 2026, licensed under CC BY 4.0. Changes, if any, should be identified.
+
+The CC BY 4.0 notice does not cover the Python source/code cells, dataset, patient images, third-party material, pretrained weights, or data-derived artifacts unless a separate statement expressly says so.
+
+### Combined notebook
+
+The notebook is a mixed-content publication: original code cells are Apache-2.0 licensed, while original narrative prose and explanatory figures are CC BY 4.0 licensed. Dataset content, third-party outputs, execution-environment components, and externally created material retain their own terms.
 
 ## Authorship, supervision, and AI assistance
 
 David Vlad Marghidan performed the dataset audit, implementation, experiments, manual review, analysis, and documentation under the scientific supervision of Prof. Dr. Smaranda Belciug. Danial Sharifrazi created and distributed the public dataset and clarified its patient-folder structure to the project author.
 
-OpenAI ChatGPT was used as an assistive tool for code-review and refactoring discussions, debugging support, documentation, language editing, and consistency checking. It did not execute the Kaggle training run or generate, estimate, or impute the scientific metrics. Final scientific and editorial responsibility remains with David Vlad Marghidan under human supervision.
+OpenAI ChatGPT was used as an assistive tool for code-review and refactoring discussions, debugging support, documentation, language editing, consistency checking, and explanatory-figure preparation. It did not execute the reported Kaggle training run and did not generate, estimate, or impute the scientific metrics. Study design, dataset audit, annotations, software execution, validation decisions, scientific interpretation, and final editorial responsibility remained with David Vlad Marghidan under human scientific supervision.
 
-## Suggested citation
+## Citation
+
+A machine-readable citation is provided in [`CITATION.cff`](CITATION.cff).
+
+Suggested project manuscript citation:
 
 > Marghidan, David Vlad. *Patient-level coronary artery disease classification from cardiac MRI using out-of-fold heart segmentation and same-slice region controls*. Preprint manuscript, version 1.2, 5 October 2026.
 
 Dataset article:
 
 > Khozeimeh F, Sharifrazi D, Izadi NH, et al. RF-CNN-F: random forest with convolutional neural network features for coronary artery disease diagnosis based on cardiac magnetic resonance. *Scientific Reports*. 2022;12:11178. DOI: 10.1038/s41598-022-15374-5.
+
+## Contact
+
+Questions about the source code, experimental protocol, reproducibility, academic use, or corrections may be sent to:
+
+**David Vlad Marghidan**  
+Email: [david_marghidan@yahoo.com](mailto:david_marghidan@yahoo.com)

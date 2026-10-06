@@ -26,17 +26,21 @@ selection, atomic writes, and semantic fingerprints. Compatible audits, checkpoi
 prediction parts, matching, feature banks, and evaluations can be reused after a
 Kaggle restart from ``/kaggle/working/cad_attention_unet_workspace``.
 
-LICENSING
----------
-Original source code: MIT License. Original repository documentation and
-explanatory diagrams: CC BY 4.0. Dataset content, manual masks, trained checkpoints,
-pretrained weights, generated data-derived artifacts, and third-party dependencies
-are not relicensed by this source-code repository. See ``README.md``, ``LICENSE``,
-``LICENSES/CC-BY-4.0.txt``, and ``DATA_AND_THIRD_PARTY_NOTICE.md``.
+LICENSING AND CONTACT
+---------------------
+Original source code and code cells: Apache License 2.0. Original repository prose,
+tables, and explanatory figures: CC BY 4.0 unless otherwise stated. Dataset content,
+manual masks, trained checkpoints, pretrained weights, generated data-derived
+artifacts, and third-party dependencies are not relicensed by this repository.
+See ``README.md`` and ``LICENSE`` for the complete notices and boundaries.
+
+Author and contact: David Vlad Marghidan <david_marghidan@yahoo.com>.
 """
 
 # Copyright 2026 David Vlad Marghidan
-# SPDX-License-Identifier: MIT
+# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# Contact: david_marghidan@yahoo.com
 
 import base64
 import contextlib

@@ -1,14 +1,15 @@
 cff-version: 1.2.0
-message: "If you use this software or documentation, please cite the preferred citation below and the source dataset publication."
+message: "If you use this software, please cite the preferred citation below and the source dataset publication."
 title: "Cardiac MRI CAD: leakage-controlled, resumable research pipeline"
 type: software
 authors:
   - family-names: "Marghidan"
     given-names: "David Vlad"
+    email: "david_marghidan@yahoo.com"
     affiliation: "INFusion Artificial Intelligence Research Laboratory, University of Craiova"
 version: "1.0.0"
 date-released: "2026-10-05"
-license: MIT
+license: Apache-2.0
 keywords:
   - cardiac magnetic resonance
   - coronary artery disease
@@ -30,6 +31,7 @@ preferred-citation:
   authors:
     - family-names: "Marghidan"
       given-names: "David Vlad"
+      email: "david_marghidan@yahoo.com"
   title: "Patient-level coronary artery disease classification from cardiac MRI using out-of-fold heart segmentation and same-slice region controls"
   year: 2026
   notes: "Preprint version 1.2, 5 October 2026; not peer reviewed"
