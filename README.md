@@ -13,6 +13,7 @@
 - **GitHub repository:** [DavidMarghidan/cad-cardiac-mri-project-dvm](https://github.com/DavidMarghidan/cad-cardiac-mri-project-dvm/tree/main)
 - **GitHub documentation:** [`docs/`](https://github.com/DavidMarghidan/cad-cardiac-mri-project-dvm/tree/main/docs)
 - **Source dataset on Kaggle:** [CAD Cardiac MRI Dataset](https://www.kaggle.com/datasets/danialsharifrazi/cad-cardiac-mri-dataset)
+- **Research Article on Research Square:** [Patient-level coronary artery disease classification from cardiac MRI using out-of-fold heart segmentation and same-slice region controls](https://www.researchsquare.com/article/rs-11277802/v1)
 
 > **Research-use notice**  
 > This repository documents a methodological proof-of-concept study. It is not a medical device, has not been externally or clinically validated, and must not be used for diagnosis, treatment, triage, or any patient-care decision.

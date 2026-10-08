@@ -34,15 +34,17 @@ https://www.kaggle.com/code/davidvladmarghidan/cardiac-mri-cad-classification-at
 GitHub source repository:
 https://github.com/DavidMarghidan/cad-cardiac-mri-project-dvm/tree/main
 
+Research Article on Research Square: 
+Patient-level coronary artery disease classification from cardiac MRI using out-of-fold heart segmentation and same-slice region controls
+https://www.researchsquare.com/article/rs-11277802/v1
+
+
 GitHub documentation directory and main documents:
 - Documentation directory: https://github.com/DavidMarghidan/cad-cardiac-mri-project-dvm/tree/main/docs
 - Documentation index: https://github.com/DavidMarghidan/cad-cardiac-mri-project-dvm/blob/main/docs/README.md
-- Research overview: https://github.com/DavidMarghidan/cad-cardiac-mri-project-dvm/blob/main/docs/project-overview/David_Vlad_Marghidan_Cardiac_MRI_AI_Research_Overview.pdf
-- Technical pipeline summary: https://github.com/DavidMarghidan/cad-cardiac-mri-project-dvm/blob/main/docs/technical/David_Vlad_Marghidan_Cardiac_MRI_AI_Technical_Pipeline_Summary.pdf
-- Preprint manuscript: https://github.com/DavidMarghidan/cad-cardiac-mri-project-dvm/blob/main/docs/manuscript/Research_Square_Preprint_David_Vlad_Marghidan_v1_2.pdf
-- Research abstract poster: https://github.com/DavidMarghidan/cad-cardiac-mri-project-dvm/blob/main/docs/research-supplement/David_Vlad_Marghidan_Cardiac_MRI_AI_Research_Abstract_Poster.pdf
-- Contribution statement: https://github.com/DavidMarghidan/cad-cardiac-mri-project-dvm/blob/main/docs/research-supplement/David_Vlad_Marghidan_Cardiac_MRI_AI_Contribution_Statement.pdf
-- Research portfolio index: https://github.com/DavidMarghidan/cad-cardiac-mri-project-dvm/blob/main/docs/research-supplement/David_Vlad_Marghidan_Cardiac_MRI_AI_Research_Portfolio_Index.pdf
+- Research overview: https://github.com/DavidMarghidan/cad-cardiac-mri-project-dvm/blob/main/docs/David_Vlad_Marghidan_Cardiac_MRI_AI_Research_Overview.pdf
+- Preprint manuscript: https://github.com/DavidMarghidan/cad-cardiac-mri-project-dvm/blob/main/docs/Research_Square_Preprint_David_Vlad_Marghidan_v1_2.pdf
+
 
 LICENSING AND CONTACT
 ---------------------
